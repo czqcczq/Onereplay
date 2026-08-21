@@ -125,6 +125,22 @@ def find_data_files(directory: Path) -> tuple[str, list[str]]:
     )
 
 
+def load_local(fmt: str, files: list[str]):
+    """Read local data files without any Hub round-trip.
+
+    load_dataset("json", ...) first resolves the packaged builder remotely, which
+    hangs on an offline or firewalled node. Dataset.from_json / from_parquet
+    instantiate that builder directly, so they stay local while keeping the
+    Arrow backing (important at 395K rows).
+    """
+
+    from datasets import Dataset
+
+    if fmt == "parquet":
+        return Dataset.from_parquet(files if len(files) > 1 else files[0])
+    return Dataset.from_json(files if len(files) > 1 else files[0])
+
+
 def load_metamath(args: argparse.Namespace):
     """Load MetaMathQA from a save_to_disk dir, a plain dir, a file, or the hub."""
 
@@ -142,12 +158,12 @@ def load_metamath(args: argparse.Namespace):
             return dataset
         fmt, files = find_data_files(source)
         print(f"loading {len(files)} {fmt} file(s) from {source}")
-        return load_dataset(fmt, data_files=files, split="train")
+        return load_local(fmt, files)
 
     fmt = dict(DATA_SUFFIXES).get(source.suffix.lower())
     if fmt is None:
         raise ValueError(f"Unsupported MetaMath file type: {source}")
-    return load_dataset(fmt, data_files=str(source), split="train")
+    return load_local(fmt, [str(source)])
 
 
 def split_type(type_value: str) -> tuple[str, str]:
@@ -217,11 +233,18 @@ def assign_views(
     order = list(questions)
     rng.shuffle(order)
     remaining = {view: int(round(weights.get(view, 0.0) * len(order))) for view in AUG_VIEWS}
+    # A zero-weight view is excluded outright, never used as a fallback, so
+    # --aug_weights "Rephrased=1.0" really means Rephrased only.
+    allowed = {view for view in AUG_VIEWS if weights.get(view, 0.0) > 0}
 
     assignment: dict[str, str] = {}
     stats = {"assigned": 0, "no_aug": 0, "off_quota": 0}
     for question in order:
-        options = [view for view in AUG_VIEWS if available[question].get(view)]
+        options = [
+            view
+            for view in AUG_VIEWS
+            if view in allowed and available[question].get(view)
+        ]
         if not options:
             stats["no_aug"] += 1
             continue

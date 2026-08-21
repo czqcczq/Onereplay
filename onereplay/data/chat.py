@@ -80,8 +80,13 @@ def build_sft_tokenize_fn(tokenizer, max_len: int):
     return add_tokenized_fields
 
 
-def apply_prompt_template(tokenizer, user_content: str) -> str:
-    """Render a user-only chat prompt with an open assistant turn."""
+def apply_prompt_template(tokenizer, user_content: str, enable_thinking: bool = False) -> str:
+    """Render a user-only chat prompt with an open assistant turn.
+
+    enable_thinking stays False by default so every existing caller (evaluation,
+    replay generation) keeps its current behavior; only self-distillation that
+    explicitly asks for reasoning traces turns it on.
+    """
 
     messages = [{"role": "user", "content": user_content}]
     try:
@@ -89,7 +94,7 @@ def apply_prompt_template(tokenizer, user_content: str) -> str:
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=enable_thinking,
         )
     except TypeError:
         return tokenizer.apply_chat_template(

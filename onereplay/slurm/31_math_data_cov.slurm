@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:1
-#SBATCH --time=16:00:00
+#SBATCH --time=24:00:00
 #SBATCH --chdir=/home/xsz96350/K-RES
 #SBATCH --output=/home/xsz96350/K-RES/onereplay/slurm/outputs/%x-%j.out
 #SBATCH --error=/home/xsz96350/K-RES/onereplay/slurm/outputs/%x-%j.err
@@ -20,33 +20,49 @@ set -euo pipefail
 set -x
 
 # =============================================================================
-# 问题2 数据链（一个 job 串完）: MATH 自蒸馏 -> 采 C_math -> 混合 C_mix
+# 问题2 数据链（一个 job 串完）: MetaMath 池 -> 自蒸馏 -> 采 C_math -> 混合 C_mix
 #
-# 三步本来就是串行依赖，合并成一个脚本；每步有独立 SKIP 开关，避免长链中途失败
-# 要从头重跑。
+#   Step 0  建池      MetaMathQA -> 每道唯一原题各出 2 个视角:
+#                       canonical  原题逐字（与 MATH-500/AMC/AIME 的题面一致）
+#                       rephrased  一条 MetaMath 改写（同题不同措辞）
+#                     每题恰好 2 条 => 每题等权，无任何"哪些题选哪种增强"的任意性。
+#                     不用 AnsAug（其 query 就是原题，等于复制 canonical）；
+#                     不用 SV/FOBAR（backward 形式在所有评测集里没有对应，且
+#                     pilot 显示其 prompt 有模板缺陷、截断率高达 ~14%）。
+#   Step 1  自蒸馏    base 对每个视角分别贪心生成自己的解答（THINKING 可开）。
+#                     分视角写文件：generate_replay_targets 只回写固定字段，
+#                     合成一个文件会丢掉 view 标签，之后就没法按视角统计。
+#   Step 2  采 C_math 用 {prompt, 自蒸馏解答} 采二阶矩，两个视角一起 glob 读入。
+#   Step 3  混合      C_mix = w_if*C_if + w_math*C_math（默认等权 0.5/0.5）。
 #
-#   Step 1  自蒸馏      base 对 MATH train 7500 的 problem 贪心生成自己的 CoT 解答，
-#                       作为采 C_math 的语料（不能用 gold solution，理由见下）。
-#   Step 2  采 C_math   用 {problem, 自蒸馏解答} 采二阶矩，qv scope，与 C_if 层对齐。
-#   Step 3  混合 C_mix  C_mix = w_if*C_if + w_math*C_math（加权求和，无 trace 归一化）。
+# 为什么自蒸馏而不是 MetaMath 自带 response
+#   C=E[x x^T] 锚定"产生这些激活的行为"。MetaMath 的 response 不是 1.7B 自己会
+#   产生的东西；用它采 C 等于保护一个模型本来不具备的行为。也正因为丢弃 response，
+#   AnsAug 的价值（同题多份参考解）在我们的设置里完全失效。
+#   注意：不按正确性筛选自蒸馏轨迹——采 C 要的是模型做数学时的代表性激活，
+#   按正确性过滤会让 C 偏向简单题。
 #
-# 为什么自蒸馏而不是 gold solution
-#   C=E[x x^T] 锚定"产生这些激活的行为"。gold solution 是教科书风格，不是 1.7B 自己
-#   会产生的东西；用它采 C 等于保护一个模型本来不具备的行为。自蒸馏让 C 捕捉模型自己
-#   的数学推理激活——那才是要保住的历史能力。与 19 号对 FLAN 的做法同理。
+# THINKING=1 的三个连带要求
+#   1) 生成侧 --enable_thinking 1（打开 <think> 块）。
+#   2) 采 C 侧 --concat_prompt_target 1：Qwen3 的 chat template 会把 assistant
+#      消息里的 <think>...</think> 剥掉，直接重渲染等于把思考轨迹丢掉。改成
+#      "生成提示 + 原始 target" 拼接，才与真实生成的序列逐 token 一致。
+#      本脚本用 DEBUG_EXAMPLES 打印渲染结果，务必确认 contains <think>: True。
+#   3) 预算要大得多：非 thinking 的 pilot 中位数只有 ~260 token，开 thinking 后
+#      通常上千。MAXLEN/MAX_NEW_TOKENS 不提上去，大量行会因未吐 EOS 被判截断、
+#      写成空 target 并丢弃。**先跑 DIAG=1 定预算**，别直接全量。
 #
 # MAXLEN 一致性
-#   自蒸馏(Step1)与采 C(Step2)必须用同一个 MAXLEN，否则 C 看到的上下文长度和语料不符。
-#   本脚本用同一个 ${MAXLEN} 贯穿两步。它不必等于 34/32 号训练的 max_len——C 是与序列
-#   长无关的 d×d 二阶矩。
+#   自蒸馏(Step1)与采 C(Step2)必须用同一个 MAXLEN，否则 C 看到的上下文长度和
+#   语料不符。本脚本用同一个 ${MAXLEN} 贯穿两步。
 #
 # 用法:
-#   DIAG=1 sbatch onereplay/slurm/31_math_data_cov.slurm          # 先诊断长度定 MAXLEN
-#   sbatch onereplay/slurm/31_math_data_cov.slurm                 # 全链: 自蒸馏->C_math->C_mix
-#   MAXLEN=1536 MAX_NEW_TOKENS=1280 sbatch onereplay/slurm/31_math_data_cov.slurm
-#   SKIP_GEN=1 sbatch onereplay/slurm/31_math_data_cov.slurm      # 语料已生成，从采 C 起
-#   SKIP_GEN=1 SKIP_COV=1 sbatch onereplay/slurm/31_math_data_cov.slurm   # 只做混合
-#   W_IF=1 W_MATH=0.3 sbatch onereplay/slurm/31_math_data_cov.slurm       # 按 trace 反比设权重
+#   DIAG=1 sbatch onereplay/slurm/31_math_data_cov.slurm         # 先诊断长度定预算
+#   sbatch onereplay/slurm/31_math_data_cov.slurm                # 全链
+#   SKIP_PREP=1 SKIP_GEN=1 sbatch ...                            # 语料已好，从采 C 起
+#   SKIP_PREP=1 SKIP_GEN=1 SKIP_COV=1 sbatch ...                 # 只做混合
+#   THINKING=0 sbatch ...                                        # 关掉 thinking
+#   自蒸馏支持 --resume 1：作业超时后原样再投一次即可接着跑。
 # =============================================================================
 
 GCC_MODULE="${GCC_MODULE:-GCC}"
@@ -75,58 +91,73 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 
 # ---- 项目路径 ----
 REPO_ROOT="${REPO_ROOT:-/home/xsz96350/K-RES}"
-CODE="${CODE:-onereplay}"
 MODEL_DIR="${MODEL_DIR:-/hpcwork/xsz96350/Chen_logs/checkpoints/}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
 RESULTS_ROOT="${RESULTS_ROOT:-/hpcwork/xsz96350/Chen_logs/onereplay/results}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
-MATH_DATA_DIR="${MATH_DATA_DIR:-/hpcwork/xsz96350/Chen_logs/onereplay/datasets/math}"
-MATH_TRAIN_FILE="${MATH_TRAIN_FILE:-${MATH_DATA_DIR}/math_train_inputs_targets.jsonl}"
+
+# ---- MetaMath 池 ----
+METAMATH_PATH="${METAMATH_PATH:-/hpcwork/xsz96350/Chen_logs/onereplay/datasets/MetaMathQA}"
+VIEW_DIR="${VIEW_DIR:-/hpcwork/xsz96350/Chen_logs/onereplay/datasets/MetaMathQA_views}"
+VIEW_PREFIX="${VIEW_PREFIX:-metamath_cmath_30k}"
+AUG_WEIGHTS="${AUG_WEIGHTS:-Rephrased=1.0}"
+SOURCES="${SOURCES:-GSM,MATH}"
+VIEWS="${VIEWS:-canonical rephrased}"
 
 # ---- 自蒸馏 + 采 C 共用 ----
 SEED="${SEED:-1}"
-POOL_SIZE="${POOL_SIZE:-7500}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
-GEN_BATCH="${GEN_BATCH:-32}"
-MAXLEN="${MAXLEN:-1280}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+GEN_BATCH="${GEN_BATCH:-16}"
+THINKING="${THINKING:-1}"
+# thinking 的轨迹长得多，默认预算按 thinking 给；THINKING=0 时可自行调小。
+MAXLEN="${MAXLEN:-4096}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-3072}"
 MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-16}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+COV_BATCH="${COV_BATCH:-1}"
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-1}"
 
 # ---- 阶段开关 ----
 DIAG="${DIAG:-0}"
-DIAG_SAMPLES="${DIAG_SAMPLES:-200}"
+DIAG_SAMPLES="${DIAG_SAMPLES:-100}"
+SKIP_PREP="${SKIP_PREP:-0}"
 SKIP_GEN="${SKIP_GEN:-0}"
 SKIP_COV="${SKIP_COV:-0}"
 SKIP_MIX="${SKIP_MIX:-0}"
 
 # ---- 文件 ----
-SELF_DISTILL_FILE="${SELF_DISTILL_FILE:-${RESULTS_ROOT}/replay/math_selfdistill_${POOL_SIZE}_seed${SAMPLE_SEED}.jsonl}"
-DIAG_FILE="${DIAG_FILE:-${RESULTS_ROOT}/replay/math_selfdistill_diag_${DIAG_SAMPLES}_seed${SAMPLE_SEED}.jsonl}"
-MATH_COV="${MATH_COV:-${RESULTS_ROOT}/cov/cov_math_selfdistill_${POOL_SIZE}_qv.pt}"
+# thinking 与非 thinking 的语料/协方差必须分开存，否则两种模式会互相覆盖。
+if [[ "${THINKING}" == "1" ]]; then THINK_SUFFIX="_think"; else THINK_SUFFIX=""; fi
+TAG="${TAG:-metamath30k${THINK_SUFFIX}}"
+DISTILL_DIR="${DISTILL_DIR:-${RESULTS_ROOT}/replay}"
+MATH_COV="${MATH_COV:-${RESULTS_ROOT}/cov/cov_math_${TAG}_qv.pt}"
 IF_COV="${IF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
-MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_math_mix_qv.pt}"
+MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_math_${TAG}_mix_qv.pt}"
 W_IF="${W_IF:-0.5}"
 W_MATH="${W_MATH:-0.5}"
 
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
-mkdir -p "$(dirname "${SELF_DISTILL_FILE}")" "$(dirname "${MATH_COV}")" "${DATASET_CACHE}"
+mkdir -p "${DISTILL_DIR}" "$(dirname "${MATH_COV}")" "${DATASET_CACHE}" "${VIEW_DIR}"
 
-echo "MATH_TRAIN_FILE=${MATH_TRAIN_FILE}"
-echo "DIAG=${DIAG} MAXLEN=${MAXLEN} MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "METAMATH_PATH=${METAMATH_PATH}"
+echo "THINKING=${THINKING} MAXLEN=${MAXLEN} MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
 echo "MATH_COV=${MATH_COV}  MIX_COV=${MIX_COV}  weights if=${W_IF} math=${W_MATH}"
 
+distill_file () {
+  echo "${DISTILL_DIR}/${VIEW_PREFIX}_$1_selfdistill_seed${SAMPLE_SEED}${THINK_SUFFIX}.jsonl"
+}
+
 # ---------------------------------------------------------------------------
-# 长度诊断分析器：读一份自蒸馏 jsonl，打印 token 分位数 + 截断率 + MAXLEN 建议
+# 长度诊断分析器：读一份自蒸馏 jsonl，打印 token 分位数 + 截断率 + 预算建议
 # ---------------------------------------------------------------------------
 analyze_lengths () {
   local jsonl_file="$1"
-  python - "${jsonl_file}" "${MAXLEN}" <<'PY'
+  python - "${jsonl_file}" "${MAXLEN}" "${MAX_NEW_TOKENS}" <<'PY'
 import json
 import sys
 
-path, max_len = sys.argv[1], int(sys.argv[2])
+path, max_len, max_new = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 prompt_toks, target_toks, total_toks = [], [], []
 truncated = 0
 n = 0
@@ -144,86 +175,127 @@ with open(path, encoding="utf-8") as f:
         if row.get("truncated"):
             truncated += 1
 
+
 def pct(values, q):
     if not values:
         return 0
     s = sorted(values)
-    idx = min(len(s) - 1, int(round(q / 100 * (len(s) - 1))))
-    return s[idx]
+    return s[min(len(s) - 1, int(round(q / 100 * (len(s) - 1))))]
 
-print(f"==== length diagnostic on {n} rows (MAXLEN={max_len}) ====")
-for label, values in (("prompt", prompt_toks), ("target", target_toks), ("prompt+target", total_toks)):
-    print(f"{label:>14}: P50={pct(values,50)} P90={pct(values,90)} P95={pct(values,95)} max={max(values) if values else 0}")
+
+print(f"==== length diagnostic on {n} rows (MAXLEN={max_len} MAX_NEW={max_new}) ====")
+for label, values in (
+    ("prompt", prompt_toks),
+    ("target", target_toks),
+    ("prompt+target", total_toks),
+):
+    print(
+        f"{label:>14}: P50={pct(values,50)} P90={pct(values,90)} "
+        f"P95={pct(values,95)} P99={pct(values,99)} max={max(values) if values else 0}"
+    )
 frac = truncated / n if n else 0.0
-print(f"truncated fraction: {truncated}/{n} = {frac:.3f}")
-p90 = pct(total_toks, 90)
-if frac <= 0.05 and p90 <= max_len:
-    print(f"verdict: MAXLEN={max_len} 够用（截断率低且 P90={p90}<=MAXLEN），可直接全量")
+print(f"truncated fraction: {truncated}/{n} = {frac:.3f}  (截断行会被写空并在采 C 时丢弃)")
+p99 = pct(total_toks, 99)
+if frac <= 0.05 and p99 <= max_len:
+    print(f"verdict: 预算够用（截断率 {frac:.3f} 且 P99={p99}<=MAXLEN={max_len}），可全量")
 else:
-    print(f"verdict: 建议调大 —— 截断率 {frac:.3f} 或 P90={p90} 逼近/超过 MAXLEN={max_len}；"
-          f"提高 MAX_NEW_TOKENS / MAXLEN 后重跑（自蒸馏与采 C 的 MAXLEN 必须一致）")
+    print(
+        f"verdict: 建议调大 —— 截断率 {frac:.3f} 或 P99={p99} 逼近/超过 MAXLEN={max_len}。"
+        f"把 MAXLEN 提到 >= {int(p99 * 1.15)} 并相应提高 MAX_NEW_TOKENS 后重跑"
+        "（自蒸馏与采 C 的 MAXLEN 必须一致）"
+    )
 PY
 }
 
 # ---------------------------------------------------------------------------
-# DIAG 模式：小样本自蒸馏 + 长度诊断，然后退出
+# Step 0: 建 MetaMath 池（canonical + rephrased，每题各一条）
 # ---------------------------------------------------------------------------
-if [[ "${DIAG}" == "1" ]]; then
-  [[ -f "${MATH_TRAIN_FILE}" ]] || { echo "缺 MATH train: ${MATH_TRAIN_FILE}（先跑 download_math_data / prepare_math_data）"; exit 1; }
-  echo "==== DIAG: self-distill ${DIAG_SAMPLES} samples -> ${DIAG_FILE} ===="
+if [[ "${SKIP_PREP}" != "1" ]]; then
+  echo "==== Step0 build MetaMath pool -> ${VIEW_DIR}/${VIEW_PREFIX}_*.jsonl ===="
+  python -m onereplay.scripts.prepare_metamath_cmath \
+    --metamath_path "${METAMATH_PATH}" \
+    --out_dir "${VIEW_DIR}" \
+    --prefix "${VIEW_PREFIX}" \
+    --sources "${SOURCES}" \
+    --aug_weights "${AUG_WEIGHTS}" \
+    --seed "${SAMPLE_SEED}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+else
+  echo "SKIP_PREP=1：使用已有池 ${VIEW_DIR}/${VIEW_PREFIX}_*.jsonl"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1: 分视角自蒸馏（断点续跑）。DIAG=1 时只跑小样本并诊断后退出。
+# ---------------------------------------------------------------------------
+self_distill () {
+  local view=$1
+  local num_samples=$2
+  local out_file=$3
+  local pool_file="${VIEW_DIR}/${VIEW_PREFIX}_${view}.jsonl"
+  [[ -f "${pool_file}" ]] || { echo "缺池文件: ${pool_file}"; exit 1; }
+
+  echo "==== self-distill [${view}] thinking=${THINKING} -> ${out_file} ===="
   python -m onereplay.scripts.generate_replay_targets \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
-    --data_files "${MATH_TRAIN_FILE}" --split train \
+    --data_files "${pool_file}" --split train \
     --cache_dir "${DATASET_CACHE}" \
     --input_column inputs --target_column targets \
-    --pool_size "${POOL_SIZE}" --sample_seed "${SAMPLE_SEED}" \
-    --num_samples "${DIAG_SAMPLES}" \
+    --pool_size 0 --sample_seed "${SAMPLE_SEED}" \
+    --num_samples "${num_samples}" \
     --batch_size "${GEN_BATCH}" --max_len "${MAXLEN}" \
     --max_new_tokens "${MAX_NEW_TOKENS}" --min_new_tokens "${MIN_NEW_TOKENS}" \
-    --output_path "${DIAG_FILE}" --resume 0
-  analyze_lengths "${DIAG_FILE}"
-  echo "DIAG 完成：据上面分位数与建议定 MAXLEN / MAX_NEW_TOKENS，再不带 DIAG 跑全链"
+    --enable_thinking "${THINKING}" \
+    --output_path "${out_file}" --resume 1
+}
+
+if [[ "${DIAG}" == "1" ]]; then
+  for view in ${=VIEWS}; do
+    diag_file="${DISTILL_DIR}/${VIEW_PREFIX}_${view}_diag${DIAG_SAMPLES}.jsonl"
+    rm -f "${diag_file}"
+    self_distill "${view}" "${DIAG_SAMPLES}" "${diag_file}"
+    analyze_lengths "${diag_file}"
+  done
+  echo "DIAG 完成：据上面 P99/截断率定 MAXLEN 与 MAX_NEW_TOKENS，再不带 DIAG 跑全链"
   echo "Job finished at: $(date)"
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Step 1: 全量自蒸馏（断点续跑；SKIP_GEN=1 直接用已有语料）
-# ---------------------------------------------------------------------------
 if [[ "${SKIP_GEN}" != "1" ]]; then
-  [[ -f "${MATH_TRAIN_FILE}" ]] || { echo "缺 MATH train: ${MATH_TRAIN_FILE}（先跑 download_math_data / prepare_math_data）"; exit 1; }
-  echo "==== Step1 self-distill -> ${SELF_DISTILL_FILE} ===="
-  python -m onereplay.scripts.generate_replay_targets \
-    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
-    --data_files "${MATH_TRAIN_FILE}" --split train \
-    --cache_dir "${DATASET_CACHE}" \
-    --input_column inputs --target_column targets \
-    --pool_size "${POOL_SIZE}" --sample_seed "${SAMPLE_SEED}" \
-    --num_samples 0 \
-    --batch_size "${GEN_BATCH}" --max_len "${MAXLEN}" \
-    --max_new_tokens "${MAX_NEW_TOKENS}" --min_new_tokens "${MIN_NEW_TOKENS}" \
-    --output_path "${SELF_DISTILL_FILE}" --resume 1
-  analyze_lengths "${SELF_DISTILL_FILE}"
+  for view in ${=VIEWS}; do
+    out_file="$(distill_file "${view}")"
+    self_distill "${view}" 0 "${out_file}"
+    analyze_lengths "${out_file}"
+  done
 else
-  echo "SKIP_GEN=1：使用已有自蒸馏语料 ${SELF_DISTILL_FILE}"
+  echo "SKIP_GEN=1：使用已有自蒸馏语料"
 fi
-[[ -f "${SELF_DISTILL_FILE}" ]] || { echo "缺自蒸馏语料: ${SELF_DISTILL_FILE}"; exit 1; }
+
+DISTILL_GLOB="${DISTILL_DIR}/${VIEW_PREFIX}_*_selfdistill_seed${SAMPLE_SEED}${THINK_SUFFIX}.jsonl"
+for view in ${=VIEWS}; do
+  f="$(distill_file "${view}")"
+  [[ -f "${f}" ]] || { echo "缺自蒸馏语料: ${f}"; exit 1; }
+done
 
 # ---------------------------------------------------------------------------
-# Step 2: 采 C_math（与自蒸馏同源：require_target + 左截断）+ 对 C_if 出 trace 比值
+# Step 2: 采 C_math（两个视角一起读）+ 对 C_if 出 trace 比值
+#   THINKING=1 时必须 --concat_prompt_target 1，否则 <think> 会被模板剥掉。
+#   DEBUG_EXAMPLES 会打印渲染结果，确认 "contains <think>: True"。
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_COV}" != "1" ]]; then
   echo "==== Step2 collect C_math -> ${MATH_COV} ===="
   python -m onereplay.scripts.collect_cov \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
-    --data_files "${SELF_DISTILL_FILE}" --dataset_split train \
+    --data_files "${DISTILL_GLOB}" --dataset_split train \
     --cache_dir "${DATASET_CACHE}" \
     --input_column inputs --target_column targets \
     --use_chat_template 1 --include_target_in_chat 1 \
+    --enable_thinking "${THINKING}" \
+    --concat_prompt_target "${THINKING}" \
+    --debug_print_examples "${DEBUG_EXAMPLES}" \
     --require_target 1 \
     --max_samples 0 \
     --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
-    --batch_size 2 --max_len "${MAXLEN}" \
+    --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
     --truncation_side left \
     --target_modules "${TARGET_MODULES}" \
     --output_path "${MATH_COV}"
@@ -260,8 +332,8 @@ if ratios:
         f"mean={mean_ratio:.3f} min={r.min().item():.3f} max={r.max().item():.3f}"
     )
     print(
-        "混合建议: 要两个 C 贡献相当，权重可设 w_if:w_math ≈ 1 : "
-        f"{1.0 / mean_ratio:.3f}（按 trace 反比），否则大 trace 一方主导。"
+        "注：本轮按要求用等权 0.5/0.5 混合。若 trace 比值远离 1，"
+        f"等权实际上会让大 trace 一方主导；按 trace 反比应为 w_if:w_math ≈ 1 : {1.0 / mean_ratio:.3f}"
     )
 else:
     print("no comparable layers; skipping scale report")
@@ -275,7 +347,7 @@ fi
 [[ -f "${MATH_COV}" ]] || { echo "缺 C_math: ${MATH_COV}"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# Step 3: 混合 C_mix = w_if*C_if + w_math*C_math + trace 诊断（供 32 号定 λ）
+# Step 3: 混合 C_mix = w_if*C_if + w_math*C_math（等权）+ trace 诊断（供 32 号定 λ）
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_MIX}" != "1" ]]; then
   [[ -f "${IF_COV}" ]] || { echo "缺 C_if(混合需要): ${IF_COV}"; exit 1; }
@@ -335,5 +407,5 @@ else
 fi
 
 echo "下一步: COV_KIND 由 32 号内部循环 math/mix 训练并评测"
-echo "  sbatch onereplay/slurm/32_math_train_eval.slurm"
+echo "  MATH_COV=${MATH_COV} MIX_COV=${MIX_COV} sbatch onereplay/slurm/32_math_train_eval.slurm"
 echo "Job finished at: $(date)"

@@ -219,12 +219,23 @@ def example_to_model_text(example: dict[str, Any], tokenizer, args: argparse.Nam
     if args.use_chat_template != 1:
         return example_to_plain_text(example, args)
 
-    messages = example_to_messages(example, args)
     if getattr(tokenizer, "chat_template", None) is None:
         return example_to_plain_text(example, args)
 
+    # Qwen3's template drops <think>...</think> out of assistant turns, which
+    # would silently discard a self-distilled reasoning trace exactly where C is
+    # supposed to see it. Concatenating the generation prompt with the raw target
+    # reproduces the sequence the model actually produced instead of re-rendering
+    # it, so the trace survives verbatim.
+    if getattr(args, "concat_prompt_target", 0) == 1 and args.include_target_in_chat == 1:
+        target = str(example.get(args.target_column) or "").strip()
+        if target:
+            text = f"{example_to_prompt_text(example, tokenizer, args)}{target}"
+            eos = tokenizer.eos_token or ""
+            return text if not eos or text.endswith(eos) else text + eos
+
     return tokenizer.apply_chat_template(
-        messages,
+        example_to_messages(example, args),
         tokenize=False,
         add_generation_prompt=False,
     )
@@ -259,7 +270,7 @@ def example_to_prompt_text(example: dict[str, Any], tokenizer, args: argparse.Na
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=getattr(args, "enable_thinking", 0) == 1,
         )
     except TypeError:
         return tokenizer.apply_chat_template(

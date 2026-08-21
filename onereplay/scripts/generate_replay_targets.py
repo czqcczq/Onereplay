@@ -129,6 +129,18 @@ def parse_args() -> argparse.Namespace:
         help="Tokens held back from the budget for the trailing template tokens.",
     )
 
+    parser.add_argument(
+        "--enable_thinking",
+        type=int,
+        default=0,
+        help=(
+            "1 opens Qwen3's thinking block so the distilled target carries a "
+            "reasoning trace. Traces are several times longer, so raise "
+            "--max_len / --max_new_tokens or most rows come back truncated. "
+            "collect_cov must then run with --concat_prompt_target 1, otherwise "
+            "the chat template strips <think> back out."
+        ),
+    )
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument(
         "--resume",
@@ -257,7 +269,9 @@ def generate_targets(args: argparse.Namespace) -> None:
     instructions = dict(zip(todo, rows["instruction"]))
     gold = dict(zip(todo, rows["output"]))
     prompts = {
-        index: apply_prompt_template(tokenizer, instruction)
+        index: apply_prompt_template(
+            tokenizer, instruction, enable_thinking=args.enable_thinking == 1
+        )
         for index, instruction in instructions.items()
     }
     prompt_tokens = {

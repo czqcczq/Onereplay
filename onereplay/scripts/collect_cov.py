@@ -101,6 +101,28 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional system message inserted before each FLAN example",
     )
+    parser.add_argument(
+        "--enable_thinking",
+        type=int,
+        default=0,
+        help="1 renders the prompt with Qwen3's thinking block open; must match "
+        "the self-distillation setting so C sees the sequence that was generated",
+    )
+    parser.add_argument(
+        "--concat_prompt_target",
+        type=int,
+        default=0,
+        help="1 builds the text as generation_prompt + raw target instead of "
+        "re-rendering the assistant turn. Required with --enable_thinking 1, "
+        "because the chat template strips <think> out of assistant messages",
+    )
+    parser.add_argument(
+        "--debug_print_examples",
+        type=int,
+        default=0,
+        help="Print this many fully rendered texts before collecting, to verify "
+        "what C actually sees (e.g. that <think> survived)",
+    )
 
     parser.add_argument("--max_samples", type=int, default=20000)
     parser.add_argument(
@@ -210,6 +232,15 @@ def collect_covariances(args: argparse.Namespace) -> None:
     pool_rows, pool_hash = fingerprint_pool(dataset, args)
     print(f"Stage 1: pool rows={pool_rows} fingerprint={pool_hash}")
     print("  collect_fisher must print the same value, or C and F saw different rows")
+
+    if args.debug_print_examples > 0:
+        from onereplay.data.old_knowledge import example_to_model_text
+
+        for row in range(min(args.debug_print_examples, len(dataset))):
+            rendered = example_to_model_text(dataset[row], tokenizer, args)
+            print(f"---- rendered example {row} ({len(rendered)} chars) ----")
+            print(rendered)
+            print(f"---- contains <think>: {'<think>' in rendered} ----")
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
