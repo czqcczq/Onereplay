@@ -1,0 +1,528 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_mathcov
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity) 版本的「问题2 数据链」
+#   MetaMath 池 -> 自蒸馏 -> 采 C_math -> 混合 C_mix
+#
+# 与 onereplay/slurm/31_math_data_cov.slurm 的算法逻辑完全一致，改动只在集群层:
+#   1) PBS 指令替代 SBATCH；提交用 qsub，不用 sbatch/srun。
+#   2) 计算全部在 Singularity 容器里跑，venv 在容器内激活（不用 conda/module CUDA）。
+#   3) zsh -> bash（`${=VIEWS}` 的 zsh 分词改成 bash 默认分词 `${VIEWS}`）。
+#   4) 路径迁到 /scratch。
+#
+# 脚本会把自己在容器里再跑一遍：外层只做 module load singularity + singularity exec
+# 和临时目录清理，内层（ONEREPLAY_IN_CONTAINER=1）跑真正的数据链，两段共用这一个文件。
+#
+# -----------------------------------------------------------------------------
+# 流程（与 Slurm 版逐字相同的科学设定，此处只摘要，详细论证见 slurm/31_*.slurm）
+#   Step 0  建池      MetaMathQA -> 每道唯一原题各出 2 个视角 canonical / rephrased。
+#                     新集群上 datasets/MetaMathQA_views 已经有池，所以本脚本
+#                     SKIP_PREP 默认 = 1；要重建池就传 SKIP_PREP=0 且给 METAMATH_PATH。
+#   Step 1  自蒸馏    base 对每个视角分别贪心生成自己的解答（THINKING 可开）。
+#   Step 2  采 C_math 用 {prompt, 自蒸馏解答} 采二阶矩，两个视角一起 glob 读入。
+#   Step 3  混合      C_mix = w_if*C_if + w_math*C_math（默认等权 0.5/0.5）。
+#                     需要 C_if；新集群上若还没传过来，SKIP_MIX=auto 会自动跳过。
+#
+# THINKING=1 的三个连带要求
+#   1) 生成侧 --enable_thinking 1（打开 <think> 块）。
+#   2) 采 C 侧 --concat_prompt_target 1：Qwen3 的 chat template 会把 assistant
+#      消息里的 <think>...</think> 剥掉，直接重渲染等于把思考轨迹丢掉。
+#      本脚本用 DEBUG_EXAMPLES 打印渲染结果，务必确认 contains <think>: True。
+#   3) 预算要大得多，**先跑 DIAG=1 定预算**，别直接全量。
+#
+# MAXLEN 一致性：自蒸馏(Step1)与采 C(Step2)必须用同一个 MAXLEN，本脚本用同一个变量贯穿。
+#
+# -----------------------------------------------------------------------------
+# 用法（PBS 默认不带入提交环境，覆盖变量必须走 qsub -v，不能像 sbatch 那样前置赋值）:
+#   qsub -v DIAG=1 onereplay/pbs/31_math_data_cov.pbs        # 先诊断长度定预算
+#   qsub onereplay/pbs/31_math_data_cov.pbs                  # 全链
+#   qsub -v SKIP_GEN=1 onereplay/pbs/31_math_data_cov.pbs    # 语料已好，从采 C 起
+#   qsub -v SKIP_GEN=1,SKIP_COV=1 onereplay/pbs/31_math_data_cov.pbs   # 只做混合
+#   qsub -v THINKING=0 onereplay/pbs/31_math_data_cov.pbs    # 关掉 thinking
+#   qsub -v MAXLEN=6144,MAX_NEW_TOKENS=5120 onereplay/pbs/31_math_data_cov.pbs
+#   自蒸馏支持 --resume 1：作业超时后原样再投一次即可接着跑。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+#
+# 日志: -k oed 把合并后的 stdout+stderr 边跑边直接写到 -o 指定的目录，文件名
+#       or_mathcov.o<job_id>。该目录必须在 qsub 之前就存在:
+#         mkdir -p /scratch/weiliu87/logs/onereplay
+#       故意放在仓库外面：仓库是 rsync 的目标，而运行中的作业一直握着日志的 fd，
+#       rsync 覆盖会换 inode 把作业打成 ESTALE（旧集群上就这么丢过几个 job）。
+#       -q auto 和 -k oed 来自 Hopper 官方文档；若本站点的 qsub 不认，删掉对应行即可
+#       （没有 -k 时日志会在作业结束后才一次性拷过去，跑到一半看不到进度）。
+#
+# walltime: 1-2 GPU 最长 144h、最多 8 个并发。自蒸馏 6w 条 thinking 轨迹很慢，
+#           48h 大概率跑不完；靠 --resume 续投，或直接把上面 walltime 提到 120:00:00。
+# GPU 数:   生成/采 C 都是单进程单卡，ngpus 加到 2 以上不会自动变快（PBS 只是把卡
+#           预留给你），所以这里固定 ngpus=1。
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/31_math_data_cov.pbs}"
+
+# 用本站点已经跑通的 NGC PyTorch 镜像，不要用裸 cuda:*-u20.04 那个:
+# u20.04 自带 python3.8，而 venv 的 bin/python 只是个指向"创建它的那个解释器"的
+# 软链，解释器版本对不上 venv 根本起不来。ngc 24.04 是 ubuntu22.04 + python3.10。
+# 提交前确认一致: grep version ${REPO_ROOT}/.venv/pyvenv.cfg
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+# 容器里的 /tmp 常是 tmpfs（吃内存），datasets 的 .arrow 和 torch 的临时文件写进去
+# 有把节点写爆的风险，所以显式指到真盘上。优先节点本地 NVMe，没有就退回 /scratch。
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  # 只删本次作业自己建的那一个目录，且必须匹配前缀，避免手滑清掉共享缓存。
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的这个 shell 不一定是 login shell，module 可能还没被定义；
+  # set -e 下那会让作业在第一步就静默挂掉，所以先兜一层初始化。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  # 把 qsub -v 传进来的可调项逐个转发，保持“外面怎么写、里面就怎么生效”。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE
+    METAMATH_PATH VIEW_DIR VIEW_PREFIX AUG_WEIGHTS SOURCES VIEWS
+    SEED SAMPLE_SEED GEN_BATCH THINKING MAXLEN MAX_NEW_TOKENS MIN_NEW_TOKENS
+    TARGET_MODULES COV_BATCH DEBUG_EXAMPLES
+    DIAG DIAG_SAMPLES SKIP_PREP SKIP_GEN SKIP_COV SKIP_MIX
+    TAG DISTILL_DIR MATH_COV IF_COV MIX_COV W_IF W_MATH
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动，本站点跑通的作业脚本
+  # 都是裸 `singularity exec -e -B /scratch:/scratch`，容器里 nvidia-smi 直接可用。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的数据链。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+# 打印 torch.__file__：镜像自带的 torch 和 venv 里的 torch 谁生效，看这一行就知道
+# （NGC 镜像有时会预置 PYTHONPATH，会排在 venv 的 site-packages 前面）。
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+# 各 step 都用 --cache_dir 显式指到这里；同步设环境变量，避免哪条路径漏了就退回
+# 容器内的默认位置（HF_HOME 下），造成同一份语料被重复缓存两次。
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- MetaMath 池 ----
+METAMATH_PATH="${METAMATH_PATH:-${REPO_ROOT}/datasets/MetaMathQA}"
+VIEW_DIR="${VIEW_DIR:-${REPO_ROOT}/datasets/MetaMathQA_views}"
+VIEW_PREFIX="${VIEW_PREFIX:-metamath_cmath_30k}"
+AUG_WEIGHTS="${AUG_WEIGHTS:-Rephrased=1.0}"
+SOURCES="${SOURCES:-GSM,MATH}"
+VIEWS="${VIEWS:-canonical rephrased}"
+
+# ---- 自蒸馏 + 采 C 共用 ----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+GEN_BATCH="${GEN_BATCH:-16}"
+THINKING="${THINKING:-1}"
+# thinking 的轨迹长得多，默认预算按 thinking 给；THINKING=0 时可自行调小。
+MAXLEN="${MAXLEN:-4096}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-3072}"
+MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-16}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+COV_BATCH="${COV_BATCH:-1}"
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-1}"
+
+# ---- 阶段开关 ----
+DIAG="${DIAG:-0}"
+DIAG_SAMPLES="${DIAG_SAMPLES:-100}"
+# 池已经随数据一起搬到新集群，默认不重建（要重建：qsub -v SKIP_PREP=0）
+SKIP_PREP="${SKIP_PREP:-1}"
+SKIP_GEN="${SKIP_GEN:-0}"
+SKIP_COV="${SKIP_COV:-0}"
+# auto = 有 C_if 就混合，没有就跳过并告警（新集群上 C_if 可能还没传过来）
+SKIP_MIX="${SKIP_MIX:-auto}"
+
+# ---- 文件 ----
+# thinking 与非 thinking 的语料/协方差必须分开存，否则两种模式会互相覆盖。
+if [[ "${THINKING}" == "1" ]]; then THINK_SUFFIX="_think"; else THINK_SUFFIX=""; fi
+TAG="${TAG:-metamath30k${THINK_SUFFIX}}"
+DISTILL_DIR="${DISTILL_DIR:-${RESULTS_ROOT}/replay}"
+MATH_COV="${MATH_COV:-${RESULTS_ROOT}/cov/cov_math_${TAG}_qv.pt}"
+IF_COV="${IF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_math_${TAG}_mix_qv.pt}"
+W_IF="${W_IF:-0.5}"
+W_MATH="${W_MATH:-0.5}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${DISTILL_DIR}" "$(dirname "${MATH_COV}")" "${DATASET_CACHE}" "${VIEW_DIR}"
+
+if [[ "${SKIP_MIX}" == "auto" ]]; then
+  if [[ -f "${IF_COV}" ]]; then
+    SKIP_MIX=0
+  else
+    SKIP_MIX=1
+    echo "WARNING: 未找到 C_if ${IF_COV}，Step3 混合自动跳过。把 C_if 传过来后用 "
+    echo "         qsub -v SKIP_GEN=1,SKIP_COV=1 onereplay/pbs/31_math_data_cov.pbs 单独补混合。"
+  fi
+fi
+
+echo "METAMATH_PATH=${METAMATH_PATH}"
+echo "VIEW_DIR=${VIEW_DIR}"
+echo "THINKING=${THINKING} MAXLEN=${MAXLEN} MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "MATH_COV=${MATH_COV}  MIX_COV=${MIX_COV}  weights if=${W_IF} math=${W_MATH}"
+
+distill_file () {
+  echo "${DISTILL_DIR}/${VIEW_PREFIX}_$1_selfdistill_seed${SAMPLE_SEED}${THINK_SUFFIX}.jsonl"
+}
+
+# ---------------------------------------------------------------------------
+# 长度诊断分析器：读一份自蒸馏 jsonl，打印 token 分位数 + 截断率 + 预算建议
+# ---------------------------------------------------------------------------
+analyze_lengths () {
+  local jsonl_file="$1"
+  python - "${jsonl_file}" "${MAXLEN}" "${MAX_NEW_TOKENS}" <<'PY'
+import json
+import sys
+
+path, max_len, max_new = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+prompt_toks, target_toks, total_toks = [], [], []
+truncated = 0
+n = 0
+with open(path, encoding="utf-8") as f:
+    for line in f:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        n += 1
+        p = int(row.get("prompt_tokens", 0))
+        t = int(row.get("target_tokens", 0))
+        prompt_toks.append(p)
+        target_toks.append(t)
+        total_toks.append(p + t)
+        if row.get("truncated"):
+            truncated += 1
+
+
+def pct(values, q):
+    if not values:
+        return 0
+    s = sorted(values)
+    return s[min(len(s) - 1, int(round(q / 100 * (len(s) - 1))))]
+
+
+print(f"==== length diagnostic on {n} rows (MAXLEN={max_len} MAX_NEW={max_new}) ====")
+for label, values in (
+    ("prompt", prompt_toks),
+    ("target", target_toks),
+    ("prompt+target", total_toks),
+):
+    print(
+        f"{label:>14}: P50={pct(values,50)} P90={pct(values,90)} "
+        f"P95={pct(values,95)} P99={pct(values,99)} max={max(values) if values else 0}"
+    )
+frac = truncated / n if n else 0.0
+print(f"truncated fraction: {truncated}/{n} = {frac:.3f}  (截断行会被写空并在采 C 时丢弃)")
+p99 = pct(total_toks, 99)
+if frac <= 0.05 and p99 <= max_len:
+    print(f"verdict: 预算够用（截断率 {frac:.3f} 且 P99={p99}<=MAXLEN={max_len}），可全量")
+else:
+    print(
+        f"verdict: 建议调大 —— 截断率 {frac:.3f} 或 P99={p99} 逼近/超过 MAXLEN={max_len}。"
+        f"把 MAXLEN 提到 >= {int(p99 * 1.15)} 并相应提高 MAX_NEW_TOKENS 后重跑"
+        "（自蒸馏与采 C 的 MAXLEN 必须一致）"
+    )
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Step 0: 建 MetaMath 池（canonical + rephrased，每题各一条）
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_PREP}" != "1" ]]; then
+  echo "==== Step0 build MetaMath pool -> ${VIEW_DIR}/${VIEW_PREFIX}_*.jsonl ===="
+  [[ -d "${METAMATH_PATH}" ]] || { echo "缺 MetaMathQA 原始数据: ${METAMATH_PATH}"; exit 1; }
+  python -m onereplay.scripts.prepare_metamath_cmath \
+    --metamath_path "${METAMATH_PATH}" \
+    --out_dir "${VIEW_DIR}" \
+    --prefix "${VIEW_PREFIX}" \
+    --sources "${SOURCES}" \
+    --aug_weights "${AUG_WEIGHTS}" \
+    --seed "${SAMPLE_SEED}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+else
+  echo "SKIP_PREP=1：使用已有池 ${VIEW_DIR}/${VIEW_PREFIX}_*.jsonl"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1: 分视角自蒸馏（断点续跑）。DIAG=1 时只跑小样本并诊断后退出。
+# ---------------------------------------------------------------------------
+self_distill () {
+  local view=$1
+  local num_samples=$2
+  local out_file=$3
+  local pool_file="${VIEW_DIR}/${VIEW_PREFIX}_${view}.jsonl"
+  [[ -f "${pool_file}" ]] || { echo "缺池文件: ${pool_file}"; exit 1; }
+
+  echo "==== self-distill [${view}] thinking=${THINKING} -> ${out_file} ===="
+  python -m onereplay.scripts.generate_replay_targets \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --data_files "${pool_file}" --split train \
+    --cache_dir "${DATASET_CACHE}" \
+    --input_column inputs --target_column targets \
+    --pool_size 0 --sample_seed "${SAMPLE_SEED}" \
+    --num_samples "${num_samples}" \
+    --batch_size "${GEN_BATCH}" --max_len "${MAXLEN}" \
+    --max_new_tokens "${MAX_NEW_TOKENS}" --min_new_tokens "${MIN_NEW_TOKENS}" \
+    --enable_thinking "${THINKING}" \
+    --output_path "${out_file}" --resume 1
+}
+
+if [[ "${DIAG}" == "1" ]]; then
+  for view in ${VIEWS}; do
+    diag_file="${DISTILL_DIR}/${VIEW_PREFIX}_${view}_diag${DIAG_SAMPLES}.jsonl"
+    rm -f "${diag_file}"
+    self_distill "${view}" "${DIAG_SAMPLES}" "${diag_file}"
+    analyze_lengths "${diag_file}"
+  done
+  echo "DIAG 完成：据上面 P99/截断率定 MAXLEN 与 MAX_NEW_TOKENS，再不带 DIAG 跑全链"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+if [[ "${SKIP_GEN}" != "1" ]]; then
+  for view in ${VIEWS}; do
+    out_file="$(distill_file "${view}")"
+    self_distill "${view}" 0 "${out_file}"
+    analyze_lengths "${out_file}"
+  done
+else
+  echo "SKIP_GEN=1：使用已有自蒸馏语料"
+fi
+
+DISTILL_GLOB="${DISTILL_DIR}/${VIEW_PREFIX}_*_selfdistill_seed${SAMPLE_SEED}${THINK_SUFFIX}.jsonl"
+for view in ${VIEWS}; do
+  f="$(distill_file "${view}")"
+  [[ -f "${f}" ]] || { echo "缺自蒸馏语料: ${f}"; exit 1; }
+done
+
+# ---------------------------------------------------------------------------
+# Step 2: 采 C_math（两个视角一起读）+ 对 C_if 出 trace 比值
+#   THINKING=1 时必须 --concat_prompt_target 1，否则 <think> 会被模板剥掉。
+#   DEBUG_EXAMPLES 会打印渲染结果，确认 "contains <think>: True"。
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_COV}" != "1" ]]; then
+  echo "==== Step2 collect C_math -> ${MATH_COV} ===="
+  python -m onereplay.scripts.collect_cov \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --data_files "${DISTILL_GLOB}" --dataset_split train \
+    --cache_dir "${DATASET_CACHE}" \
+    --input_column inputs --target_column targets \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --enable_thinking "${THINKING}" \
+    --concat_prompt_target "${THINKING}" \
+    --debug_print_examples "${DEBUG_EXAMPLES}" \
+    --require_target 1 \
+    --max_samples 0 \
+    --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+    --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
+    --truncation_side left \
+    --target_modules "${TARGET_MODULES}" \
+    --output_path "${MATH_COV}"
+
+  if [[ -f "${IF_COV}" ]]; then
+    echo "==== compare C_math against C_if: ${IF_COV} ===="
+    python - "${MATH_COV}" "${IF_COV}" <<'PY'
+import sys
+
+import torch
+
+from onereplay.core.covariance import load_covariance_file
+
+math_cov = load_covariance_file(sys.argv[1])
+if_cov = load_covariance_file(sys.argv[2])
+shared = sorted(set(math_cov) & set(if_cov))
+print(f"layers: {len(math_cov)} C_math, {len(if_cov)} C_if, {len(shared)} shared")
+only_math = sorted(set(math_cov) - set(if_cov))
+only_if = sorted(set(if_cov) - set(math_cov))
+if only_math or only_if:
+    print(f"WARNING: layer sets differ. only-math={only_math[:5]} only-if={only_if[:5]}")
+
+ratios = []
+for name in shared:
+    m = torch.diagonal(math_cov[name].float()).sum().item()
+    f = torch.diagonal(if_cov[name].float()).sum().item()
+    if f > 0:
+        ratios.append(m / f)
+if ratios:
+    r = torch.tensor(ratios)
+    mean_ratio = r.mean().item()
+    print(
+        "trace(C_math)/trace(C_if) per layer: "
+        f"mean={mean_ratio:.3f} min={r.min().item():.3f} max={r.max().item():.3f}"
+    )
+    print(
+        "注：本轮按要求用等权 0.5/0.5 混合。若 trace 比值远离 1，"
+        f"等权实际上会让大 trace 一方主导；按 trace 反比应为 w_if:w_math ≈ 1 : {1.0 / mean_ratio:.3f}"
+    )
+else:
+    print("no comparable layers; skipping scale report")
+PY
+  else
+    echo "跳过 C_math/C_if 尺度对比：未找到 C_if ${IF_COV}"
+  fi
+else
+  echo "SKIP_COV=1：使用已有 C_math ${MATH_COV}"
+fi
+[[ -f "${MATH_COV}" ]] || { echo "缺 C_math: ${MATH_COV}"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Step 3: 混合 C_mix = w_if*C_if + w_math*C_math（等权）+ trace 诊断（供 32 号定 λ）
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_MIX}" != "1" ]]; then
+  [[ -f "${IF_COV}" ]] || { echo "缺 C_if(混合需要): ${IF_COV}"; exit 1; }
+  echo "==== Step3 mix -> ${MIX_COV} (if=${W_IF} math=${W_MATH}) ===="
+  python -m onereplay.mix_covariances \
+    --inputs "${IF_COV},${MATH_COV}" \
+    --weights "${W_IF},${W_MATH}" \
+    --output_path "${MIX_COV}" \
+    --normalize_weights 1
+
+  echo "==== trace diagnostic: C_mix vs C_if / C_math ===="
+  python - "${MIX_COV}" "${IF_COV}" "${MATH_COV}" <<'PY'
+import sys
+
+import torch
+
+from onereplay.core.covariance import load_covariance_file
+
+mix = load_covariance_file(sys.argv[1])
+c_if = load_covariance_file(sys.argv[2])
+c_math = load_covariance_file(sys.argv[3])
+shared = sorted(set(mix) & set(c_if) & set(c_math))
+print(f"shared layers: {len(shared)}")
+
+
+def trace(cov, name):
+    return torch.diagonal(cov[name].float()).sum().item()
+
+
+ratio_mix_if, ratio_mix_math = [], []
+for name in shared:
+    ti, tm, tx = trace(c_if, name), trace(c_math, name), trace(mix, name)
+    if ti > 0:
+        ratio_mix_if.append(tx / ti)
+    if tm > 0:
+        ratio_mix_math.append(tx / tm)
+
+
+def report(label, values):
+    if not values:
+        print(f"{label}: n/a")
+        return
+    t = torch.tensor(values)
+    print(f"{label}: mean={t.mean().item():.3f} min={t.min().item():.3f} max={t.max().item():.3f}")
+
+
+report("trace(C_mix)/trace(C_if)  ", ratio_mix_if)
+report("trace(C_mix)/trace(C_math)", ratio_mix_math)
+mean_mix_if = torch.tensor(ratio_mix_if).mean().item() if ratio_mix_if else 1.0
+print(
+    "定 λ: C_if 单独 run 用 λ=3e-2；要让 C_mix 上 IF 保护强度相当，"
+    f"可用 λ_mix ≈ 3e-2 / {mean_mix_if:.3f} = {3e-2 / mean_mix_if:.2e}（32 号可据此覆盖 LAMBDA）"
+)
+PY
+else
+  echo "SKIP_MIX=1：跳过混合"
+fi
+
+echo "产物:"
+echo "  MATH_COV=${MATH_COV}"
+echo "  MIX_COV=${MIX_COV}"
+echo "下一步: 32 号训练+评测脚本还没有 PBS 版本，需要时再按同样方式转一份"
+echo "Job finished at: $(date)"

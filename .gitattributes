@@ -1,2 +1,3 @@
 *.slurm text eol=lf
+*.pbs text eol=lf
 *.sh text eol=lf
