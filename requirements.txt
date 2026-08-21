@@ -1,0 +1,25 @@
+# OneReplay / k-res runtime dependencies.
+# Cluster CUDA module: CUDA/12.6.3 -> install torch cu124 wheels, e.g.
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   uv pip install -r requirements.txt
+
+# --- core: training + eval ---
+torch
+transformers
+peft
+datasets
+huggingface_hub
+accelerate
+numpy
+tqdm
+pandas
+sentencepiece
+
+# --- IFEval / MultiIF (onereplay/third_party/instruction_following_eval) ---
+absl-py
+langdetect
+nltk
+immutabledict
+
+# --- optional: legacy standard_ft/vanilla_lora.py TensorBoard logging ---
+tensorboardX
