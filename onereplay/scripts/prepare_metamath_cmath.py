@@ -49,6 +49,17 @@ NATIVE_WEIGHTS = {
 
 AUG_VIEWS = ("Rephrased", "SV", "FOBAR")
 
+REQUIRED_COLUMNS = ("type", "query", "original_question", "response")
+
+# Suffix -> datasets loader name, in the order preferred when a directory holds
+# several formats. ".json" covers MetaMathQA's official single-array release.
+DATA_SUFFIXES = ((".parquet", "parquet"), (".jsonl", "json"), (".json", "json"))
+
+# Files a save_to_disk / hub snapshot leaves behind that are not data.
+METADATA_NAMES = frozenset(
+    {"dataset_info.json", "state.json", "dataset_dict.json", "config.json"}
+)
+
 
 def parse_args() -> argparse.Namespace:
     """Parse the MetaMathQA location, quotas, and output settings."""
@@ -97,24 +108,46 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def find_data_files(directory: Path) -> tuple[str, list[str]]:
+    """Locate the data files inside a plain directory of downloaded files."""
+
+    for suffix, fmt in DATA_SUFFIXES:
+        matches = sorted(
+            path
+            for path in directory.rglob(f"*{suffix}")
+            if path.is_file() and path.name not in METADATA_NAMES
+        )
+        if matches:
+            return fmt, [str(path) for path in matches]
+    raise ValueError(
+        f"No .parquet/.jsonl/.json data files found under {directory}. "
+        "Point --metamath_path at the file itself or a directory containing it."
+    )
+
+
 def load_metamath(args: argparse.Namespace):
-    """Load MetaMathQA from a local path or the hub."""
+    """Load MetaMathQA from a save_to_disk dir, a plain dir, a file, or the hub."""
 
     from datasets import load_dataset, load_from_disk
 
-    if args.metamath_path:
-        source = Path(args.metamath_path)
-        if source.is_dir() and (source / "dataset_info.json").exists():
+    if not args.metamath_path:
+        return load_dataset(args.metamath_repo, split=args.split)
+
+    source = Path(args.metamath_path)
+    if source.is_dir():
+        if (source / "dataset_info.json").exists() or (source / "dataset_dict.json").exists():
             dataset = load_from_disk(str(source))
             if hasattr(dataset, "keys"):
                 dataset = dataset[args.split if args.split in dataset else next(iter(dataset))]
             return dataset
-        suffix = source.suffix.lower()
-        fmt = {".jsonl": "json", ".json": "json", ".parquet": "parquet"}.get(suffix)
-        if fmt is None:
-            raise ValueError(f"Unsupported MetaMath file type: {source}")
-        return load_dataset(fmt, data_files=str(source), split="train")
-    return load_dataset(args.metamath_repo, split=args.split)
+        fmt, files = find_data_files(source)
+        print(f"loading {len(files)} {fmt} file(s) from {source}")
+        return load_dataset(fmt, data_files=files, split="train")
+
+    fmt = dict(DATA_SUFFIXES).get(source.suffix.lower())
+    if fmt is None:
+        raise ValueError(f"Unsupported MetaMath file type: {source}")
+    return load_dataset(fmt, data_files=str(source), split="train")
 
 
 def split_type(type_value: str) -> tuple[str, str]:
@@ -315,6 +348,13 @@ def main() -> None:
         raise SystemExit(f"Unknown sources {unknown}; expected from {sorted(NATIVE_WEIGHTS)}")
 
     dataset = load_metamath(args)
+    missing = [name for name in REQUIRED_COLUMNS if name not in dataset.column_names]
+    if missing:
+        raise SystemExit(
+            f"MetaMathQA columns {missing} not found; got {dataset.column_names}. "
+            "Check that --metamath_path points at the MetaMathQA release."
+        )
+    print(f"loaded {len(dataset)} rows, columns={dataset.column_names}")
     index = index_questions(dataset, sources)
     rng = random.Random(args.seed)
     views, manifest = build_records(dataset, index, args, rng)
