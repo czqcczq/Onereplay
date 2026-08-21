@@ -1,0 +1,13 @@
+# Paths that must never be pushed to the cluster. See sync_cluster.sh.
+.git/
+__pycache__/
+*.pyc
+*.pyo
+
+# Slurm writes job stdout/stderr here. Running jobs hold these files open, and
+# overwriting one kills the job with ESTALE. Pull them, never push them.
+onereplay/slurm/outputs/
+
+# Downloaded on the cluster from a network-enabled node; no local copy exists,
+# so pushing with --delete would remove it.
+onereplay/third_party/Multi-IF/

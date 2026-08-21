@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual env / conda leftovers
+.venv/
+venv/
+env/
+.env/
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+hf_token
+.huggingface/
+.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Slurm job stdout/stderr. Do not commit; pull with sync_cluster.sh if needed.
+outputs/
+onereplay/slurm/outputs/
+
+# Cluster-downloaded third-party (see .rsync-exclude)
+onereplay/third_party/Multi-IF/
+
+# Model weights, adapters, checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.gguf
+*.onnx
+adapter_model*
+adapter_config.json
+checkpoints/
+runs/
+wandb/
+lightning_logs/
+
+# Generated datasets / covariance / fisher / map cache
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.h5
+*.arrow
+*.parquet
+map_cache/
+hf_cache/
+datasets_cache/
+
+# Hugging Face / torch local caches if created inside the repo
+huggingface/
+.transformers/
+.torch/
