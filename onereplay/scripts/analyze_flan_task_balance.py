@@ -81,6 +81,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_samples", type=int, default=20000)
     parser.add_argument("--sample_shuffle", type=int, default=1)
     parser.add_argument("--sample_seed", type=int, default=1)
+    parser.add_argument(
+        "--sample_strategy",
+        type=str,
+        choices=["uniform", "balanced"],
+        default="uniform",
+        help="uniform previews the random sample; balanced previews the FLAN-style "
+        "task-balanced sample that --sample_strategy balanced would feed collect_cov.",
+    )
     parser.add_argument("--shuffle_buffer_size", type=int, default=10000)
     parser.add_argument("--require_target", type=int, default=0)
 

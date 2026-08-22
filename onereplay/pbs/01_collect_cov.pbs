@@ -64,10 +64,16 @@
 #
 # -----------------------------------------------------------------------------
 # 用法（PBS 默认不带入提交环境，覆盖变量必须走 qsub -v）:
-#   qsub onereplay/pbs/01_collect_cov.pbs                        # 默认 qv
+#   qsub onereplay/pbs/01_collect_cov.pbs                        # 默认 qv，随机 20k（复现旧 C_if）
 #   qsub -v COV_SCOPE=full onereplay/pbs/01_collect_cov.pbs      # 全量八类层
 #   qsub -v EXPECT_FINGERPRINT=<sha256> onereplay/pbs/01_collect_cov.pbs
 #   qsub -v PREFLIGHT_ONLY=1 onereplay/pbs/01_collect_cov.pbs    # 只查语料，不上 GPU
+#   qsub -v SAMPLE_STRATEGY=balanced onereplay/pbs/01_collect_cov.pbs
+#                     # 任务平衡 20k，输出到 cov_flan_chat_20k_balanced_qv.pt（不覆盖随机版）
+#                     # 建议先本地预览分布再提交:
+#                     #   python -m onereplay.scripts.analyze_flan_task_balance \
+#                     #     --data_files ".../flan/train/*.jsonl" --cache_dir .../dataset_cache \
+#                     #     --tokenizer_path .../models/Qwen3-1.7B --sample_strategy balanced
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
 # 日志目录需在 qsub 前存在: mkdir -p /scratch/weiliu87/logs/onereplay
@@ -137,6 +143,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME FLAN_DIR RESULTS_ROOT DATASET_CACHE
     COV_SCOPE TARGET_MODULES COV_PATH
     FLAN_SAMPLES SAMPLE_SHUFFLE SAMPLE_SEED COV_BATCH MAXLEN
+    SAMPLE_STRATEGY TASK_COLUMN MIXING_RATE_MAX
     EXPECT_FINGERPRINT REF_COV PREFLIGHT_ONLY
   )
   for _v in "${FORWARD_VARS[@]}"; do
@@ -218,37 +225,56 @@ SAMPLE_SEED="${SAMPLE_SEED:-1}"
 COV_BATCH="${COV_BATCH:-2}"
 MAXLEN="${MAXLEN:-512}"
 
+# ---- 抽样策略 ----
+# uniform  : 随机 20k，复现旧 C_if（默认，与旧集群逐字一致）
+# balanced : 按 FLAN 的 min(N_i,3000) 归一化配额分任务抽 20k，得到任务平衡的新 C_if
+# balanced 会自动给默认 COV_PATH 加 _balanced 后缀，绝不覆盖 uniform 那份。
+SAMPLE_STRATEGY="${SAMPLE_STRATEGY:-uniform}"
+TASK_COLUMN="${TASK_COLUMN:-task}"
+MIXING_RATE_MAX="${MIXING_RATE_MAX:-3000}"
+case "${SAMPLE_STRATEGY}" in
+  uniform)  STRATEGY_INFIX="" ;;
+  balanced) STRATEGY_INFIX="_balanced" ;;
+  *) echo "未知 SAMPLE_STRATEGY=${SAMPLE_STRATEGY}，可选 uniform / balanced"; exit 1 ;;
+esac
+
 # ---- 覆盖范围预设。显式给 TARGET_MODULES / COV_PATH 可覆盖预设值 ----
 COV_SCOPE="${COV_SCOPE:-qv}"
 case "${COV_SCOPE}" in
   qv)
     TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
-    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k${STRATEGY_INFIX}_qv.pt}"
     ;;
   full)
     TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
-    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt}"
+    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k${STRATEGY_INFIX}_full.pt}"
     ;;
   *)
     echo "未知 COV_SCOPE=${COV_SCOPE}，可选 qv / full"; exit 1
     ;;
 esac
 echo "COV_SCOPE=${COV_SCOPE} TARGET_MODULES=${TARGET_MODULES}"
+echo "SAMPLE_STRATEGY=${SAMPLE_STRATEGY} -> COV_PATH=${COV_PATH}"
 
 EXPECT_FINGERPRINT="${EXPECT_FINGERPRINT:-}"
 REF_COV="${REF_COV:-}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 
-# 任何一个偏离都会换掉那 20000 行或改变前向，产出的 C 不再可比。
-if [[ "${FLAN_SAMPLES}" != "20000" || "${SAMPLE_SHUFFLE}" != "1" || "${SAMPLE_SEED}" != "1" \
-      || "${COV_BATCH}" != "2" || "${MAXLEN}" != "512" ]]; then
-  echo "########################################################################"
-  echo "WARNING: 采样/前向参数偏离旧集群的取值，产出的 C 不会等于旧 C_if。"
-  echo "  当前: samples=${FLAN_SAMPLES} shuffle=${SAMPLE_SHUFFLE} seed=${SAMPLE_SEED}"
-  echo "        batch=${COV_BATCH} max_len=${MAXLEN}"
-  echo "  旧值: samples=20000     shuffle=1           seed=1"
-  echo "        batch=2           max_len=512"
-  echo "########################################################################"
+# uniform 时任何一个偏离都会换掉那 20000 行或改变前向，产出的 C 不再可比。
+# balanced 是另一套受控实验（本就换了抽样），不参与这条"复现旧 C_if"的校验。
+if [[ "${SAMPLE_STRATEGY}" == "uniform" ]]; then
+  if [[ "${FLAN_SAMPLES}" != "20000" || "${SAMPLE_SHUFFLE}" != "1" || "${SAMPLE_SEED}" != "1" \
+        || "${COV_BATCH}" != "2" || "${MAXLEN}" != "512" ]]; then
+    echo "########################################################################"
+    echo "WARNING: 采样/前向参数偏离旧集群的取值，产出的 C 不会等于旧 C_if。"
+    echo "  当前: samples=${FLAN_SAMPLES} shuffle=${SAMPLE_SHUFFLE} seed=${SAMPLE_SEED}"
+    echo "        batch=${COV_BATCH} max_len=${MAXLEN}"
+    echo "  旧值: samples=20000     shuffle=1           seed=1"
+    echo "        batch=2           max_len=512"
+    echo "########################################################################"
+  fi
+else
+  echo "SAMPLE_STRATEGY=balanced：跳过'复现旧 C_if'的参数校验（这是一份新的任务平衡 C）。"
 fi
 
 cd "${REPO_ROOT}"
@@ -303,6 +329,8 @@ python -m onereplay.scripts.collect_cov \
   --use_chat_template 1 --include_target_in_chat 1 \
   --max_samples "${FLAN_SAMPLES}" \
   --sample_shuffle "${SAMPLE_SHUFFLE}" --sample_seed "${SAMPLE_SEED}" \
+  --sample_strategy "${SAMPLE_STRATEGY}" \
+  --task_column "${TASK_COLUMN}" --mixing_rate_max "${MIXING_RATE_MAX}" \
   --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
   --target_modules "${TARGET_MODULES}" \
   --output_path "${COV_PATH}" 2>&1 | tee "${RUN_LOG}"
@@ -391,8 +419,14 @@ fi
 echo "产物:"
 echo "  COV_PATH=${COV_PATH}"
 echo "  RUN_LOG =${RUN_LOG}"
-# qv 的默认输出路径正好就是 31 号里 IF_COV 的默认值，所以那边不用再传路径，
-# SKIP_MIX=auto 会自己发现 C_if 已经就位。
-echo "下一步: 31 号的 Step3 混合现在能跑了（IF_COV 默认就指向这里）"
-echo "  qsub -v SKIP_GEN=1,SKIP_COV=1 onereplay/pbs/31_math_data_cov.pbs"
+if [[ "${SAMPLE_STRATEGY}" == "uniform" ]]; then
+  # uniform+qv 的默认输出路径正好就是 31 号里 IF_COV 的默认值，所以那边不用再传路径，
+  # SKIP_MIX=auto 会自己发现 C_if 已经就位。
+  echo "下一步: 31 号的 Step3 混合现在能跑了（IF_COV 默认就指向这里）"
+  echo "  qsub -v SKIP_GEN=1,SKIP_COV=1 onereplay/pbs/31_math_data_cov.pbs"
+else
+  # balanced 的文件名带 _balanced，不是 31 号的 IF_COV 默认值，必须显式传进去。
+  echo "下一步: 用这份任务平衡 C_if 去混合（注意 IF_COV 要显式指定）:"
+  echo "  qsub -v SKIP_GEN=1,SKIP_COV=1,IF_COV=${COV_PATH} onereplay/pbs/31_math_data_cov.pbs"
+fi
 echo "Job finished at: $(date)"

@@ -142,6 +142,34 @@ def parse_args() -> argparse.Namespace:
         help="Seed for the reproducible subset shuffle when --sample_shuffle 1.",
     )
     parser.add_argument(
+        "--sample_strategy",
+        type=str,
+        choices=["uniform", "balanced"],
+        default="uniform",
+        help=(
+            "uniform (default) samples rows uniformly, reproducing the corpus's raw "
+            "task mixture. balanced draws a per-task quota with FLAN's capped-"
+            "proportional weighting min(N_i, --mixing_rate_max), so C is not "
+            "dominated by whichever tasks own the most rows. balanced needs a "
+            "--task_column and a map-style dataset."
+        ),
+    )
+    parser.add_argument(
+        "--task_column",
+        type=str,
+        default="task",
+        help="Column naming each row's task, used only by --sample_strategy balanced.",
+    )
+    parser.add_argument(
+        "--mixing_rate_max",
+        type=int,
+        default=3000,
+        help=(
+            "FLAN's mixing rate maximum for --sample_strategy balanced: a task's "
+            "weight is min(N_i, this), so tasks at or above it are equally weighted."
+        ),
+    )
+    parser.add_argument(
         "--shuffle_buffer_size",
         type=int,
         default=10000,
@@ -224,7 +252,12 @@ def collect_covariances(args: argparse.Namespace) -> None:
         # Before limit_dataset, so --max_samples counts usable rows.
         dataset = filter_incomplete_rows(dataset, args)
     dataset = limit_dataset(dataset, args)
-    if args.sample_shuffle == 1:
+    if args.sample_strategy == "balanced":
+        print(
+            f"Stage 1: taking a seed={args.sample_seed} task-balanced sample "
+            f"(mixing_rate_max={args.mixing_rate_max}) of {args.max_samples} rows"
+        )
+    elif args.sample_shuffle == 1:
         print(
             f"Stage 1: taking a seed={args.sample_seed} random sample of "
             f"{'all' if args.max_samples <= 0 else args.max_samples} rows"
@@ -306,6 +339,9 @@ def collect_covariances(args: argparse.Namespace) -> None:
         "max_samples": args.max_samples,
         "sample_shuffle": args.sample_shuffle,
         "sample_seed": args.sample_seed,
+        "sample_strategy": args.sample_strategy,
+        "task_column": args.task_column,
+        "mixing_rate_max": args.mixing_rate_max,
         "shuffle_buffer_size": args.shuffle_buffer_size,
         "max_len": args.max_len,
         "cov_normalization": args.cov_normalization,

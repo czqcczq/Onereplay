@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import random
 from pathlib import Path
 from typing import Any
 
@@ -76,18 +77,138 @@ def filter_incomplete_rows(dataset, args: argparse.Namespace):
     return dataset
 
 
+def allocate_task_quota(
+    counts: dict[str, int],
+    total: int,
+    cap: int,
+) -> tuple[dict[str, int], int]:
+    """Split a row budget across tasks by FLAN's capped-proportional weight.
+
+    Each task i is weighted by w_i = min(N_i, cap), so any task with at least
+    `cap` rows gets equal weight and only smaller ones are down-weighted. This is
+    exactly FLAN's examples-proportional mixing with a mixing rate maximum
+    (Wei et al. 2021): the target share is w_i / sum_j w_j.
+
+    The continuous target is turned into integers with the largest-remainder
+    method: floor every quota, then hand the leftover rows one at a time to the
+    tasks with the largest fractional part. Allocation never exceeds a task's own
+    row count, so the subset can be drawn without replacement; if clamping frees
+    up rows they are redistributed to tasks that still have capacity. Ordering is
+    deterministic (fractional part desc, then task name), so the split is
+    reproducible for a fixed corpus.
+    """
+
+    weights = {task: min(count, cap) for task, count in counts.items()}
+    weight_sum = sum(weights.values())
+    if weight_sum <= 0:
+        raise ValueError("all task weights are zero; check the task column")
+
+    exact = {task: total * weights[task] / weight_sum for task in counts}
+    quota = {task: min(int(exact[task]), counts[task]) for task in counts}
+    allocated = sum(quota.values())
+
+    order = sorted(counts, key=lambda task: (-(exact[task] - int(exact[task])), task))
+    while allocated < total:
+        progressed = False
+        for task in order:
+            if allocated >= total:
+                break
+            if quota[task] < counts[task]:
+                quota[task] += 1
+                allocated += 1
+                progressed = True
+        if not progressed:
+            # Every task is at capacity: the corpus has fewer than `total` rows.
+            break
+    return quota, weight_sum
+
+
+def _task_counts_and_indices(
+    dataset,
+    task_column: str,
+    chunk: int = 100_000,
+) -> tuple[dict[str, int], dict[str, list[int]]]:
+    """One pass over the task column, returning per-task counts and row indices."""
+
+    counts: dict[str, int] = {}
+    indices: dict[str, list[int]] = {}
+    total = len(dataset)
+    for start in range(0, total, chunk):
+        values = dataset[start : min(start + chunk, total)][task_column]
+        for offset, task in enumerate(values):
+            key = str(task)
+            counts[key] = counts.get(key, 0) + 1
+            indices.setdefault(key, []).append(start + offset)
+    return counts, indices
+
+
+def balanced_task_subset(dataset, args: argparse.Namespace):
+    """Draw a task-balanced subset so C is not dominated by the largest tasks.
+
+    Unlike the uniform path, which reproduces the corpus's raw row mixture, this
+    allocates a per-task quota with allocate_task_quota and then draws that many
+    rows from each task without replacement. Each task's draw uses an independent
+    RNG seeded by (sample_seed, task name), so growing the corpus of one task
+    does not reshuffle the others, and the whole selection is reproducible.
+
+    Only the map-style path is supported: a streaming IterableDataset cannot be
+    indexed per task without consuming it.
+    """
+
+    if not hasattr(dataset, "select"):
+        raise ValueError(
+            "balanced sampling needs a map-style dataset; pass --streaming 0 or "
+            "point --data_files at local json/jsonl files"
+        )
+    task_column = getattr(args, "task_column", "task")
+    if task_column not in dataset.column_names:
+        raise ValueError(
+            f"balanced sampling needs a {task_column!r} column; found {dataset.column_names}"
+        )
+
+    total = args.max_samples
+    if total is None or total <= 0:
+        raise ValueError("balanced sampling needs --max_samples > 0")
+    total = min(total, len(dataset))
+    cap = int(getattr(args, "mixing_rate_max", 3000))
+    seed = int(getattr(args, "sample_seed", 1))
+
+    counts, indices = _task_counts_and_indices(dataset, task_column)
+    quota, weight_sum = allocate_task_quota(counts, total, cap)
+
+    selected: list[int] = []
+    for task in sorted(counts):
+        rows = list(indices[task])
+        random.Random(f"{seed}:{task}").shuffle(rows)
+        selected.extend(rows[: quota[task]])
+    # Mix tasks so batching and any debug printing see an interleaved order. This
+    # does not affect C, which is an order-invariant sum over tokens.
+    random.Random(seed).shuffle(selected)
+
+    print(
+        f"balanced sampling: {len(selected)} rows over {len(counts)} tasks "
+        f"(cap={cap}, seed={seed}, weight_sum={weight_sum})"
+    )
+    return dataset.select(selected)
+
+
 def limit_dataset(dataset, args: argparse.Namespace):
     """Take a reproducible subset of a map-style Dataset or streaming IterableDataset.
 
-    With --sample_shuffle 1 (default), the dataset is shuffled with
-    --sample_seed before taking --max_samples, so the subset is a reproducible
-    random sample of the corpus rather than its first N rows. Growing
-    max_samples with the same seed keeps smaller subsets nested in larger ones
-    for map-style datasets.
+    --sample_strategy uniform (default) shuffles with --sample_seed and takes the
+    first --max_samples rows, so the subset reproduces the corpus's raw mixture.
+    Growing max_samples with the same seed keeps smaller subsets nested in larger
+    ones for map-style datasets. Streaming datasets only support approximate
+    buffer shuffling; the result is still deterministic for a fixed seed and
+    buffer size.
 
-    Streaming datasets only support approximate buffer shuffling; the result is
-    still deterministic for a fixed seed and buffer size.
+    --sample_strategy balanced instead draws a per-task quota (FLAN's capped-
+    proportional weighting), so C is not dominated by whichever tasks own the
+    most rows. See balanced_task_subset.
     """
+
+    if getattr(args, "sample_strategy", "uniform") == "balanced":
+        return balanced_task_subset(dataset, args)
 
     max_samples = args.max_samples
     shuffle = args.sample_shuffle == 1
