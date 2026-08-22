@@ -5,7 +5,7 @@
 #PBS -k oed
 #PBS -q auto
 #PBS -l select=1:ngpus=1
-#PBS -l walltime=12:00:00
+#PBS -l walltime=20:00:00
 #PBS -o /scratch/weiliu87/logs/onereplay/
 #
 # =============================================================================
@@ -74,6 +74,16 @@
 #                     #   python -m onereplay.scripts.analyze_flan_task_balance \
 #                     #     --data_files ".../flan/train/*.jsonl" --cache_dir .../dataset_cache \
 #                     #     --tokenizer_path .../models/Qwen3-1.7B --sample_strategy balanced
+#
+#   一步到位：采新 C_if + 立刻用它训 OneReplay + 评测，快速判断这份 C 有没有用:
+#   qsub -v SAMPLE_STRATEGY=balanced,DO_TRAIN_EVAL=1 onereplay/pbs/01_collect_cov.pbs
+#                     # 采完 balanced C_if 后，追加阶段会：
+#                     #   1) 只训 cif（用这份 C_if 做 OneReplay，λ=3e-2）；base/vanilla 复用旧结果
+#                     #   2) 只评 cif：ifeval + Multi-IF(English)(指令遵循保持) 与 commonsense(新任务)
+#                     # 判据：cif 的 ifeval/multiif 明显高于你已有的 vanilla、且 commonsense loss 相当，
+#                     #       就说明这份 C_if 在“学新任务的同时保住旧能力”上起了作用。
+#                     # 这一步是完整训练（commonsense_170k×3ep），要数小时；纯采集则很快。
+#                     # 只想跑训练评测、C 已采好: qsub -v DO_TRAIN_EVAL=1,SKIP_...（见下方 DO_COLLECT）
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
 # 日志目录需在 qsub 前存在: mkdir -p /scratch/weiliu87/logs/onereplay
@@ -145,6 +155,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     FLAN_SAMPLES SAMPLE_SHUFFLE SAMPLE_SEED COV_BATCH MAXLEN
     SAMPLE_STRATEGY TASK_COLUMN MIXING_RATE_MAX
     EXPECT_FINGERPRINT REF_COV PREFLIGHT_ONLY
+    DO_COLLECT DO_TRAIN_EVAL CS_DATASET LAMBDA TRAIN_SEED
+    EPOCHS LR TRAIN_BATCH ACCUM TRAIN_MAXLEN VAL_FRAC MAXVAL
+    TRAIN_MODULES REG_ONCE MAX_STEPS EVAL_LIMIT IFEVAL_INPUT
+    MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT MULTIIF_MAX_NEW_TOKENS
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -260,6 +274,35 @@ EXPECT_FINGERPRINT="${EXPECT_FINGERPRINT:-}"
 REF_COV="${REF_COV:-}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 
+# ---- 采集开关 + 追加的“训练+评测”快速验证阶段 ----
+# DO_COLLECT=0 可跳过采集，直接拿已有的 COV_PATH 去训练评测。
+DO_COLLECT="${DO_COLLECT:-1}"
+DO_TRAIN_EVAL="${DO_TRAIN_EVAL:-0}"
+# 训练消费的新任务语料（OneReplay 在它上面训，用 C_if 保护旧的指令遵循能力）
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+# 训练超参：与参考 run 逐字一致（LoRA qv / lr1e-4 / bs8 / accum64 / ep3 / maxlen512 / reg_once），
+# 唯一变量就是 --cov_path 这份 C。λ 按你的要求默认 3e-2。
+LAMBDA="${LAMBDA:-3e-2}"
+TRAIN_SEED="${TRAIN_SEED:-${SAMPLE_SEED}}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+TRAIN_BATCH="${TRAIN_BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+TRAIN_MAXLEN="${TRAIN_MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TRAIN_MODULES="${TRAIN_MODULES:-q_proj,v_proj}"
+REG_ONCE="${REG_ONCE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"          # >0 时做短跑冒烟（不完整训练，仅验证链路能跑通）
+# 评测：只评这次新训的 cif 一个模型；base/vanilla 复用你之前的结果（已在同名 CSV 里）。
+# 三个 test 集：ifeval + Multi-IF(English) 看指令遵循保持，commonsense 看新任务是否学会。
+EVAL_LIMIT="${EVAL_LIMIT:-0}"        # >0 时只评前 N 条 prompt，用于快速冒烟
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+MULTIIF_MAX_NEW_TOKENS="${MULTIIF_MAX_NEW_TOKENS:-1024}"
+
 # uniform 时任何一个偏离都会换掉那 20000 行或改变前向，产出的 C 不再可比。
 # balanced 是另一套受控实验（本就换了抽样），不参与这条"复现旧 C_if"的校验。
 if [[ "${SAMPLE_STRATEGY}" == "uniform" ]]; then
@@ -320,8 +363,10 @@ fi
 # ---------------------------------------------------------------------------
 # 采集 C。参数与 slurm/01_collect_cov.slurm 逐字相同。
 #   输出同时落一份日志到 C 旁边，方便事后核对 fingerprint 而不用翻 PBS 日志。
+#   DO_COLLECT=0 可跳过采集，直接拿已有的 COV_PATH 去训练评测。
 # ---------------------------------------------------------------------------
 RUN_LOG="${COV_PATH%.pt}.collect.log"
+if [[ "${DO_COLLECT}" == "1" ]]; then
 python -m onereplay.scripts.collect_cov \
   --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
   --data_files "${FLAN_DIR}/train/*.jsonl" --dataset_split train \
@@ -334,6 +379,10 @@ python -m onereplay.scripts.collect_cov \
   --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
   --target_modules "${TARGET_MODULES}" \
   --output_path "${COV_PATH}" 2>&1 | tee "${RUN_LOG}"
+else
+  echo "DO_COLLECT=0：跳过采集，直接用已有 ${COV_PATH}"
+  [[ -f "${COV_PATH}" ]] || { echo "缺 C: ${COV_PATH}（DO_COLLECT=0 时必须已存在）"; exit 1; }
+fi
 
 # ---------------------------------------------------------------------------
 # 校验：选中的 20000 行是否与旧集群同一批
@@ -415,6 +464,81 @@ PY
     echo "REF_COV 指定了但文件不存在，跳过矩阵比对: ${REF_COV}"
   fi
 fi
+set -x
+
+# ===========================================================================
+# 追加阶段（DO_TRAIN_EVAL=1）：用刚采的 C_if 训 OneReplay + 评测，快速判断这份 C 有没有用
+#
+#   train cif : 在 commonsense_170k 上做 OneReplay（同参 LoRA + 正则，--cov_path 这份
+#               C_if，λ=3e-2）。只训这一个模型；base/vanilla 复用你之前的结果，不重训。
+#   eval cif  : ifeval + Multi-IF(English) 看指令遵循保持，commonsense 看新任务是否学会。
+#               结果 append 进同名 CSV，和你之前 base/vanilla 的行放在一起直接对照。
+#
+#   判据：cif 的 ifeval / multiif 明显高于你已有的 vanilla 行，且 commonsense loss 相当，
+#         说明这份 C_if 在“学新任务的同时保住旧能力”上确实起作用。
+#
+#   run 名带上 SAMPLE_STRATEGY，balanced 与 uniform 两份 C_if 的 run 不会互相覆盖。
+# ===========================================================================
+if [[ "${DO_TRAIN_EVAL}" == "1" ]]; then
+  [[ -f "${COV_PATH}" ]] || { echo "缺 C_if: ${COV_PATH}"; exit 1; }
+  [[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}（给 CS_DATASET 指对路径）"; exit 1; }
+  [[ -f "${IFEVAL_INPUT}" ]] || { echo "缺 ifeval 输入: ${IFEVAL_INPUT}"; exit 1; }
+  [[ -f "${MULTIIF_INPUT}" ]] || { echo "缺 Multi-IF 输入: ${MULTIIF_INPUT}（在集群上下载到该路径）"; exit 1; }
+
+  ADAPTERS="${RESULTS_ROOT}/adapters"
+  METRICS_DIR="${RESULTS_ROOT}/metrics"
+  CIF_RUN="cs_onereplay_${SAMPLE_STRATEGY}_lam${LAMBDA}_seed${TRAIN_SEED}_regonce"
+  mkdir -p "${ADAPTERS}" "${METRICS_DIR}" \
+    "${RESULTS_ROOT}/map_cache/${CIF_RUN}" "${RESULTS_ROOT}/map_cache/eval_seed${TRAIN_SEED}"
+
+  echo "==== quick check: cov=${COV_PATH} lambda=${LAMBDA} cif_run=${CIF_RUN} ===="
+
+  # --- 训练 cif（OneReplay，用这份 C_if；已存在则跳过，删掉可强制重训）---
+  if [[ -d "${ADAPTERS}/${CIF_RUN}" ]]; then
+    echo "跳过训练 ${CIF_RUN}：adapter 已存在（删掉它可强制重训）"
+  else
+    echo "==== train cif (OneReplay, cov=${COV_PATH}): ${CIF_RUN} ===="
+    python -m onereplay.scripts.train --paradigm sft \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${TRAIN_SEED}" \
+      --dataset_path "${CS_DATASET}" \
+      --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${TRAIN_BATCH}" --accumulation_size "${ACCUM}" \
+      --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${TRAIN_MAXLEN}" \
+      --target_modules "${TRAIN_MODULES}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/${CIF_RUN}" \
+      --cov_path "${COV_PATH}" --replay_lambda "${LAMBDA}" \
+      --identity_cov 0 --reg_once_per_update "${REG_ONCE}" --max_steps "${MAX_STEPS}" \
+      --save 1 --save_path "${ADAPTERS}/${CIF_RUN}" \
+      --metrics_path "${METRICS_DIR}/${CIF_RUN}.jsonl"
+  fi
+
+  # --- 评测 cif：一次加载模型，跑 ifeval + multiif + commonsense 三个指标 ---
+  [[ -d "${ADAPTERS}/${CIF_RUN}" ]] || { echo "缺 adapter ${ADAPTERS}/${CIF_RUN}，无法评测"; exit 1; }
+  echo "==== eval ${CIF_RUN}: ifeval,multiif,commonsense ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${ADAPTERS}/${CIF_RUN}" --run_name "${CIF_RUN}" \
+    --metrics ifeval,multiif,commonsense --out_dir "${RESULTS_ROOT}" --seed "${TRAIN_SEED}" \
+    --limit "${EVAL_LIMIT}" \
+    --ifeval_input "${IFEVAL_INPUT}" \
+    --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+    --multiif_limit "${MULTIIF_LIMIT}" --multiif_max_new_tokens "${MULTIIF_MAX_NEW_TOKENS}" \
+    --dataset_path "${CS_DATASET}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${TRAIN_MAXLEN}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${TRAIN_SEED}"
+
+  set +x
+  echo "========================================================================"
+  echo "快速验证完成。新的 ${CIF_RUN} 一行已 append 进下列 CSV，和你已有的 base/vanilla 行并列:"
+  echo "  ifeval:      ${RESULTS_ROOT}/ifeval_summary.csv       (指令遵循准确率，越高越好)"
+  echo "  multiif:     ${RESULTS_ROOT}/multiif_summary.csv      (Multi-IF English，越高越好)"
+  echo "  commonsense: ${RESULTS_ROOT}/commonsense_summary.csv  (held-out val loss，越低越好)"
+  echo "判据: 若 ${CIF_RUN} 的 ifeval/multiif 明显高于你已有的 vanilla，且 commonsense loss 相当，"
+  echo "      说明这份 C_if(${SAMPLE_STRATEGY}) 起了保护作用。"
+  set -x
+else
+  echo "DO_TRAIN_EVAL=0：只采集 C，不训练评测。要快速验证这份 C 加 DO_TRAIN_EVAL=1。"
+fi
+set +x
 
 echo "产物:"
 echo "  COV_PATH=${COV_PATH}"
