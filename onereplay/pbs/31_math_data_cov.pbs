@@ -26,28 +26,24 @@
 #   Step 0  建池      MetaMathQA -> 每道唯一原题各出 2 个视角 canonical / rephrased。
 #                     新集群上 datasets/MetaMathQA_views 已经有池，所以本脚本
 #                     SKIP_PREP 默认 = 1；要重建池就传 SKIP_PREP=0 且给 METAMATH_PATH。
-#   Step 1  自蒸馏    base 对每个视角分别贪心生成自己的解答（THINKING 可开）。
+#   Step 1  自蒸馏    base 对每个视角分别用 non-thinking 贪心生成自己的解答。
 #   Step 2  采 C_math 用 {prompt, 自蒸馏解答} 采二阶矩，两个视角一起 glob 读入。
 #   Step 3  混合      C_mix = w_if*C_if + w_math*C_math（默认等权 0.5/0.5）。
 #                     需要 C_if；新集群上若还没传过来，SKIP_MIX=auto 会自动跳过。
 #
-# THINKING=1 的三个连带要求
-#   1) 生成侧 --enable_thinking 1（打开 <think> 块）。
-#   2) 采 C 侧 --concat_prompt_target 1：Qwen3 的 chat template 会把 assistant
-#      消息里的 <think>...</think> 剥掉，直接重渲染等于把思考轨迹丢掉。
-#      本脚本用 DEBUG_EXAMPLES 打印渲染结果，务必确认 contains <think>: True。
-#   3) 预算要大得多，**先跑 DIAG=1 定预算**，别直接全量。
+# 为什么默认关闭 thinking
+#   配对 pilot 显示 Qwen3-1.7B 开 thinking 后会在早已得到答案后反复验证/重启，
+#   canonical 截断率在 4096/3072 下为 32.9%，6144/5120 下仍为 22%；这些
+#   4K-5K token 轨迹主要是重复而非新增数学推理。C 按 token 取均值，会让这种
+#   冗长样本获得异常大的权重。non-thinking 更贴近实际评测模式；实测最终采用
+#   MAXLEN=2048 / MAX_NEW_TOKENS=1792。
 #
 # MAXLEN 一致性：自蒸馏(Step1)与采 C(Step2)必须用同一个 MAXLEN，本脚本用同一个变量贯穿。
 #
 # -----------------------------------------------------------------------------
-# 用法（PBS 默认不带入提交环境，覆盖变量必须走 qsub -v，不能像 sbatch 那样前置赋值）:
-#   qsub -v DIAG=1 onereplay/pbs/31_math_data_cov.pbs        # 先诊断长度定预算
-#   qsub onereplay/pbs/31_math_data_cov.pbs                  # 全链
-#   qsub -v SKIP_GEN=1 onereplay/pbs/31_math_data_cov.pbs    # 语料已好，从采 C 起
-#   qsub -v SKIP_GEN=1,SKIP_COV=1 onereplay/pbs/31_math_data_cov.pbs   # 只做混合
-#   qsub -v THINKING=0 onereplay/pbs/31_math_data_cov.pbs    # 关掉 thinking
-#   qsub -v MAXLEN=6144,MAX_NEW_TOKENS=5120 onereplay/pbs/31_math_data_cov.pbs
+# 用法:
+#   qsub onereplay/pbs/31_math_data_cov.pbs                  # 按定稿参数跑全链
+#   本集群不从 qsub 命令行传额外变量；若要切换阶段，修改下方阶段开关默认值。
 #   自蒸馏支持 --resume 1：作业超时后原样再投一次即可接着跑。
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
@@ -60,8 +56,8 @@
 #       -q auto 和 -k oed 来自 Hopper 官方文档；若本站点的 qsub 不认，删掉对应行即可
 #       （没有 -k 时日志会在作业结束后才一次性拷过去，跑到一半看不到进度）。
 #
-# walltime: 1-2 GPU 最长 144h、最多 8 个并发。自蒸馏 6w 条 thinking 轨迹很慢，
-#           48h 大概率跑不完；靠 --resume 续投，或直接把上面 walltime 提到 120:00:00。
+# walltime: 自蒸馏约 27K 条 non-thinking 轨迹；若 24h 未完成，原样续投会依靠
+#           --resume 跳过已经成功生成的 index。
 # GPU 数:   生成/采 C 都是单进程单卡，ngpus 加到 2 以上不会自动变快（PBS 只是把卡
 #           预留给你），所以这里固定 ngpus=1。
 # =============================================================================
@@ -209,10 +205,10 @@ VIEWS="${VIEWS:-canonical rephrased}"
 SEED="${SEED:-1}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
 GEN_BATCH="${GEN_BATCH:-16}"
-THINKING="${THINKING:-1}"
-# thinking 的轨迹长得多，默认预算按 thinking 给；THINKING=0 时可自行调小。
-MAXLEN="${MAXLEN:-4096}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-3072}"
+# 已通过 canonical/rephrased pilot 定稿：non-thinking + 2048/1792。
+THINKING="${THINKING:-0}"
+MAXLEN="${MAXLEN:-2048}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1792}"
 MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-16}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
 COV_BATCH="${COV_BATCH:-1}"
