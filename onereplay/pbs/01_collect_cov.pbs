@@ -1,0 +1,398 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_cov
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity) 版本的 Stage 1:
+#   从本地 FLAN(chat 模板) 采集旧知识协方差 C_if = E[x x^T]
+#
+# 对应 onereplay/slurm/01_collect_cov.slurm。采样与前向的每一个参数都逐字保留，
+# 集群层的改动（PBS / 容器 / 路径）不进入任何影响数值的路径。
+#
+# -----------------------------------------------------------------------------
+# 【复现契约】新集群产出的 C_if 要和旧集群那份一致，取决于三件事
+#
+# 1) 参数。20k 子集由 collect_cov 里这条链决定:
+#        load_dataset("json", data_files=FLAN_DIR/train/*.jsonl)   # 原始行序
+#          -> dataset.shuffle(seed=SAMPLE_SEED)                    # 全量置换
+#          -> dataset.select(range(FLAN_SAMPLES))                  # 取前 20000
+#    所以 FLAN_SAMPLES / SAMPLE_SHUFFLE / SAMPLE_SEED 必须是 20000 / 1 / 1。
+#    下面把它们连同 MAXLEN=512、batch_size=2 一起做了硬校验，改动任何一个都会
+#    在开跑前打出醒目警告。
+#
+# 2) 语料。shuffle 的置换是 len(dataset) 的函数，所以 FLAN 只要多一个文件、少
+#    一个文件、或者 rsync 传残了，20000 行就整批换人，而不是"差不多"。脚本在
+#    上 GPU 之前先做 preflight：列出 FLAN_DIR/train 下所有 jsonl 的名字+字节数
+#    并算一个摘要，可以直接和旧集群比对，避免白烧几小时卡时。
+#
+# 3) datasets 版本。Dataset.shuffle 的置换实现属于库内部行为，requirements.txt
+#    里 datasets 没有锁版本，新旧环境版本不同就可能给出不同置换。脚本会打印
+#    torch/transformers/datasets 版本，且真正的判据是下面的 fingerprint。
+#
+# 【怎么验】collect_cov 会打印 `Stage 1: pool rows=... fingerprint=...`，
+#   这是选中的 20000 行 (inputs, targets) 的 sha256。在旧集群上取出旧值:
+#
+#     python -c "import torch; m=torch.load('<旧>/cov_flan_chat_20k_qv.pt', \
+#       map_location='cpu')['metadata']; print(m['pool_rows'], m['pool_fingerprint'])"
+#
+#   然后带着它提交，脚本会硬比对，不一致直接失败而不是悄悄产出一份错的 C:
+#
+#     qsub -v EXPECT_FINGERPRINT=<那串 sha256> onereplay/pbs/01_collect_cov.pbs
+#
+#   如果旧的 .pt 本身也传到了新集群，还可以让脚本直接逐层比矩阵:
+#     qsub -v REF_COV=/scratch/.../cov_flan_chat_20k_qv.pt onereplay/pbs/01_collect_cov.pbs
+#
+# -----------------------------------------------------------------------------
+# COV_SCOPE 决定覆盖哪些层，其余参数（采样种子、样本数、chat 模板）两种 scope
+# 完全相同，这样 LoRA 与全量实验消费的是同一批旧知识:
+#
+#   qv    q_proj,v_proj —— 配合 LoRA 训练，只有这两类层有非零 ΔW
+#   full  八类线性投影层 —— 配合全量微调，所有线性层都在动，覆盖必须跟上
+#
+# 全量下 embed_tokens 不会被选中（它是 nn.Embedding 不是 nn.Linear），tied 权重
+# 因此只通过 lm_head 被约束一次，无需额外去重。
+#
+# 注意：Slurm 版的 COV_SCOPE 默认是 full，这里默认改成 qv，因为 31/32 号数学实验
+# 消费的是 cov_flan_chat_20k_qv.pt。要 full 那份就显式传 COV_SCOPE=full。
+# 两种 scope 的 20k 子集完全一样（fingerprint 相同），只是记录的层不同。
+#
+# -----------------------------------------------------------------------------
+# 用法（PBS 默认不带入提交环境，覆盖变量必须走 qsub -v）:
+#   qsub onereplay/pbs/01_collect_cov.pbs                        # 默认 qv
+#   qsub -v COV_SCOPE=full onereplay/pbs/01_collect_cov.pbs      # 全量八类层
+#   qsub -v EXPECT_FINGERPRINT=<sha256> onereplay/pbs/01_collect_cov.pbs
+#   qsub -v PREFLIGHT_ONLY=1 onereplay/pbs/01_collect_cov.pbs    # 只查语料，不上 GPU
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# 日志目录需在 qsub 前存在: mkdir -p /scratch/weiliu87/logs/onereplay
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/01_collect_cov.pbs}"
+
+# 用本站点已经跑通的 NGC PyTorch 镜像，不要用裸 cuda:*-u20.04 那个:
+# u20.04 自带 python3.8，而 venv 的 bin/python 只是个指向"创建它的那个解释器"的
+# 软链，解释器版本对不上 venv 根本起不来。ngc 24.04 是 ubuntu22.04 + python3.10。
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+# 容器里的 /tmp 常是 tmpfs（吃内存），datasets 的 .arrow 和 torch 的临时文件写进去
+# 有把节点写爆的风险，所以显式指到真盘上。优先节点本地 NVMe，没有就退回 /scratch。
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  # 只删本次作业自己建的那一个目录，且必须匹配前缀，避免手滑清掉共享缓存。
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的这个 shell 不一定是 login shell，module 可能还没被定义；
+  # set -e 下那会让作业在第一步就静默挂掉，所以先兜一层初始化。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  # 把 qsub -v 传进来的可调项逐个转发，保持“外面怎么写、里面就怎么生效”。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME FLAN_DIR RESULTS_ROOT DATASET_CACHE
+    COV_SCOPE TARGET_MODULES COV_PATH
+    FLAN_SAMPLES SAMPLE_SHUFFLE SAMPLE_SEED COV_BATCH MAXLEN
+    EXPECT_FINGERPRINT REF_COV PREFLIGHT_ONLY
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动，本站点跑通的作业脚本
+  # 都是裸 `singularity exec -e -B /scratch:/scratch`，容器里 nvidia-smi 直接可用。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的采集流程。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：禁止任何 HuggingFace 联网调用
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+# 版本一并记进日志：fingerprint 万一和旧集群不一致，先看是不是 datasets 换了版本。
+# torch.__file__ 则用来确认生效的是 venv 里的 torch 还是镜像自带的那份
+# （NGC 镜像有时会预置 PYTHONPATH，会排在 venv 的 site-packages 前面）。
+python - <<'PY'
+import datasets
+import torch
+import transformers
+
+print(f"torch        {torch.__version__}  {torch.__file__}")
+print(f"transformers {transformers.__version__}")
+print(f"datasets     {datasets.__version__}  <- shuffle 置换实现来自这里")
+print(f"cuda         available={torch.cuda.is_available()} count={torch.cuda.device_count()}")
+PY
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+FLAN_DIR="${FLAN_DIR:-${REPO_ROOT}/datasets/flan}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 影响数值的参数：必须与旧集群逐字一致 ----
+FLAN_SAMPLES="${FLAN_SAMPLES:-20000}"
+SAMPLE_SHUFFLE="${SAMPLE_SHUFFLE:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+COV_BATCH="${COV_BATCH:-2}"
+MAXLEN="${MAXLEN:-512}"
+
+# ---- 覆盖范围预设。显式给 TARGET_MODULES / COV_PATH 可覆盖预设值 ----
+COV_SCOPE="${COV_SCOPE:-qv}"
+case "${COV_SCOPE}" in
+  qv)
+    TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+    ;;
+  full)
+    TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt}"
+    ;;
+  *)
+    echo "未知 COV_SCOPE=${COV_SCOPE}，可选 qv / full"; exit 1
+    ;;
+esac
+echo "COV_SCOPE=${COV_SCOPE} TARGET_MODULES=${TARGET_MODULES}"
+
+EXPECT_FINGERPRINT="${EXPECT_FINGERPRINT:-}"
+REF_COV="${REF_COV:-}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+
+# 任何一个偏离都会换掉那 20000 行或改变前向，产出的 C 不再可比。
+if [[ "${FLAN_SAMPLES}" != "20000" || "${SAMPLE_SHUFFLE}" != "1" || "${SAMPLE_SEED}" != "1" \
+      || "${COV_BATCH}" != "2" || "${MAXLEN}" != "512" ]]; then
+  echo "########################################################################"
+  echo "WARNING: 采样/前向参数偏离旧集群的取值，产出的 C 不会等于旧 C_if。"
+  echo "  当前: samples=${FLAN_SAMPLES} shuffle=${SAMPLE_SHUFFLE} seed=${SAMPLE_SEED}"
+  echo "        batch=${COV_BATCH} max_len=${MAXLEN}"
+  echo "  旧值: samples=20000     shuffle=1           seed=1"
+  echo "        batch=2           max_len=512"
+  echo "########################################################################"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${FLAN_DIR}/train" ]] || { echo "缺 FLAN JSONL 目录: ${FLAN_DIR}/train"; exit 1; }
+mkdir -p "$(dirname "${COV_PATH}")" "${DATASET_CACHE}"
+
+# ---------------------------------------------------------------------------
+# Preflight: 上 GPU 之前先确认 FLAN 语料和旧集群是同一份
+#   shuffle(seed) 的置换是 len(dataset) 的函数，语料多一个文件/传残一个文件，
+#   选中的 20000 行就整批换人。这里只看文件名+字节数（秒级），拿去和旧集群比。
+# ---------------------------------------------------------------------------
+python - "${FLAN_DIR}/train" <<'PY'
+import glob
+import hashlib
+import os
+import sys
+
+directory = sys.argv[1]
+paths = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
+if not paths:
+    raise SystemExit(f"preflight FAILED: {directory} 下没有 .jsonl")
+
+digest = hashlib.sha256()
+total = 0
+print(f"==== FLAN preflight: {len(paths)} files under {directory} ====")
+for path in paths:
+    size = os.path.getsize(path)
+    total += size
+    digest.update(f"{os.path.basename(path)}:{size}\n".encode())
+    print(f"  {os.path.basename(path):<48} {size:>14,} B")
+print(f"total bytes : {total:,}")
+print(f"corpus digest (names+sizes): {digest.hexdigest()}")
+print("在旧集群上对同一目录跑这段，digest 一致才说明语料是同一份。")
+PY
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：只做语料检查，不采集。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 采集 C。参数与 slurm/01_collect_cov.slurm 逐字相同。
+#   输出同时落一份日志到 C 旁边，方便事后核对 fingerprint 而不用翻 PBS 日志。
+# ---------------------------------------------------------------------------
+RUN_LOG="${COV_PATH%.pt}.collect.log"
+python -m onereplay.scripts.collect_cov \
+  --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+  --data_files "${FLAN_DIR}/train/*.jsonl" --dataset_split train \
+  --cache_dir "${DATASET_CACHE}" \
+  --use_chat_template 1 --include_target_in_chat 1 \
+  --max_samples "${FLAN_SAMPLES}" \
+  --sample_shuffle "${SAMPLE_SHUFFLE}" --sample_seed "${SAMPLE_SEED}" \
+  --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
+  --target_modules "${TARGET_MODULES}" \
+  --output_path "${COV_PATH}" 2>&1 | tee "${RUN_LOG}"
+
+# ---------------------------------------------------------------------------
+# 校验：选中的 20000 行是否与旧集群同一批
+#   fingerprint 是那 20000 行 (inputs, targets) 的 sha256，由 fingerprint_pool 打印。
+# ---------------------------------------------------------------------------
+set +x
+GOT_ROWS="$(grep -oE 'pool rows=[0-9]+' "${RUN_LOG}" | tail -1 | cut -d= -f2 || true)"
+GOT_FP="$(grep -oE 'fingerprint=[0-9a-f]+' "${RUN_LOG}" | tail -1 | cut -d= -f2 || true)"
+echo "========================================================================"
+echo "pool rows        = ${GOT_ROWS}"
+echo "pool fingerprint = ${GOT_FP}"
+
+if [[ -n "${EXPECT_FINGERPRINT}" ]]; then
+  if [[ "${GOT_FP}" == "${EXPECT_FINGERPRINT}" ]]; then
+    echo "OK: fingerprint 与旧集群一致，选中的是同一批 20000 行。"
+  else
+    echo "FAILED: fingerprint 与旧集群不一致！"
+    echo "  期望 ${EXPECT_FINGERPRINT}"
+    echo "  实际 ${GOT_FP}"
+    echo "  两种可能：(a) FLAN 语料不是同一份（看上面 preflight 的 digest）；"
+    echo "            (b) datasets 版本不同导致 shuffle 置换不同（看上面版本行）。"
+    echo "  产出的 ${COV_PATH} 不可与旧 C_if 混用，已保留供排查。"
+    exit 1
+  fi
+else
+  echo "未传 EXPECT_FINGERPRINT，跳过硬校验。想要保证与旧集群一致，"
+  echo "在旧集群上取出旧值后重投一次："
+  echo "  python -c \"import torch; m=torch.load('<旧cov>.pt', map_location='cpu')['metadata']; print(m['pool_fingerprint'])\""
+  echo "  qsub -v EXPECT_FINGERPRINT=<那串> onereplay/pbs/01_collect_cov.pbs"
+fi
+set -x
+
+# ---------------------------------------------------------------------------
+# 可选：旧 .pt 也在新集群上时，直接逐层比矩阵
+#   fingerprint 一致只证明"看的是同一批行"；这一步才回答"数值差多少"。
+#   预期是浮点级别的差异（fp32 累加顺序 + 不同 GPU 的 matmul），相对误差应 ~1e-6。
+# ---------------------------------------------------------------------------
+if [[ -n "${REF_COV}" ]]; then
+  if [[ -f "${REF_COV}" ]]; then
+    echo "==== compare against reference C: ${REF_COV} ===="
+    python - "${COV_PATH}" "${REF_COV}" <<'PY'
+import sys
+
+import torch
+
+new = torch.load(sys.argv[1], map_location="cpu")
+ref = torch.load(sys.argv[2], map_location="cpu")
+
+
+def meta(payload, key):
+    return payload.get("metadata", {}).get(key) if isinstance(payload, dict) else None
+
+
+for key in ("pool_rows", "pool_fingerprint", "max_samples", "sample_seed", "max_len"):
+    n, r = meta(new, key), meta(ref, key)
+    flag = "OK " if n == r else "DIFF"
+    print(f"[{flag}] {key}: new={n} ref={r}")
+
+new_cov = new["covariances"] if "covariances" in new else new
+ref_cov = ref["covariances"] if "covariances" in ref else ref
+shared = sorted(set(new_cov) & set(ref_cov))
+print(f"shared layers: {len(shared)} (new={len(new_cov)} ref={len(ref_cov)})")
+
+worst_name, worst_rel = "", 0.0
+for name in shared:
+    a = new_cov[name].float()
+    b = ref_cov[name].float()
+    denom = b.abs().max().clamp_min(1e-12)
+    rel = ((a - b).abs().max() / denom).item()
+    if rel > worst_rel:
+        worst_name, worst_rel = name, rel
+print(f"worst relative max-abs diff: {worst_rel:.3e} at {worst_name}")
+if worst_rel < 1e-4:
+    print("verdict: 数值一致（浮点级差异），可当作同一份 C_if 使用")
+else:
+    print("verdict: 差异超出浮点级别，先核对上面的 fingerprint 与 datasets 版本")
+PY
+  else
+    echo "REF_COV 指定了但文件不存在，跳过矩阵比对: ${REF_COV}"
+  fi
+fi
+
+echo "产物:"
+echo "  COV_PATH=${COV_PATH}"
+echo "  RUN_LOG =${RUN_LOG}"
+# qv 的默认输出路径正好就是 31 号里 IF_COV 的默认值，所以那边不用再传路径，
+# SKIP_MIX=auto 会自己发现 C_if 已经就位。
+echo "下一步: 31 号的 Step3 混合现在能跑了（IF_COV 默认就指向这里）"
+echo "  qsub -v SKIP_GEN=1,SKIP_COV=1 onereplay/pbs/31_math_data_cov.pbs"
+echo "Job finished at: $(date)"
