@@ -42,11 +42,16 @@
 #   MIX_COV  = ${RESULTS_ROOT}/cov/cov_if_math_metamath30k_mix_qv.pt
 #   若你 31 号用了别的 TAG，改本脚本 TAG 或直接传 MATH_COV/MIX_COV。
 #
-# MATH_MAX_NEW_TOKENS 默认 1792（不是 slurm 版里的 1024）
-#   与 33 号 base/vanilla 基线保持一致，否则数字不可比：math500 判分靠抽最后一个
-#   \boxed{...}，被砍断即记错，且这种偏差跨 run 不均匀（训过的模型更啰嗦、截断更多）。
-#   贪心解码遇 EOS 就停，抬高上限只对长尾生效，几乎不增加总时长。
-#   注意：base/vanilla/cif/cmath/cmix 所有 run 必须用同一个值才可比。
+# MATH_MAX_NEW_TOKENS 默认 4096（原为 1792，据实测预算探针上调）
+#   math500 判分靠抽最后一个 \boxed{...}，被砍断即记错。1792 下 base/vanilla 的
+#   截断率是 12.0%/13.4%，probe_math500_budget.py 对 20 条截断样本在 4096 下复跑:
+#     50% 仍不收敛（任何预算都完不成），正常终止者 P50=2245 max=3984；
+#     放开预算后 10%(2/20) 转为正确 => 绝对准确率约 +1.2pt。
+#   4096 覆盖了实测能终止的那一半；再往上主要是让不收敛的循环按满额烧 token。
+#   注意：base/vanilla/cif/cmath/cmix 所有 run 必须用同一个值才可比。改了这个值就
+#   必须把已有的 math500 结果全部重评（见 33 号文件头的归档步骤）。
+#   gsm8k 不受影响：它的回复远未触顶（has####=99.8%、无 no-answer），1792 与 4096
+#   下逐字相同，不必重跑。amc/aime 的开销会随这个值线性上涨（它们截断率高）。
 #
 # -----------------------------------------------------------------------------
 # 用法（本集群不从 qsub 命令行传变量，要改就改下方默认值；若本站点 qsub 支持 -v，
@@ -242,8 +247,8 @@ MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
 AMC_FILE="${AMC_FILE:-${MATH_DATA_DIR}/amc_test.jsonl}"
 AIME_FILE="${AIME_FILE:-${MATH_DATA_DIR}/aime_test.jsonl}"
 GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
-# 见文件头说明：1792 而非 1024，且所有 run 必须用同一个值。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-1792}"
+# 见文件头说明：4096 由预算探针实测定出，且所有 run 必须用同一个值。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 LIMIT="${LIMIT:-0}"                  # >0 时每个指标只评前 N 题（冒烟用）
 DIAG_LEN="${DIAG_LEN:-1}"            # 1 = 评完打印长度/截断诊断
 

@@ -31,13 +31,20 @@
 #             即 cs_vanilla_seed1，与 32 号里 cs_vanilla_seed${SEED} 同名，
 #             这样 CSV 里的行能和后续 cif/cmath/cmix 直接并排比。
 #
-# MATH_MAX_NEW_TOKENS 默认 1792（不是 32 号里的 1024）
+# MATH_MAX_NEW_TOKENS 默认 4096（原为 1792，据实测预算探针上调）
 #   math500 的判分靠抽最后一个 \boxed{...}，生成被砍断就等于没给答案、直接记错。
-#   更麻烦的是这种偏差跨 run 不均匀：训过的模型往往更啰嗦、截断率更高，会把
-#   "谁更话多" 混进 retention 差异里。贪心解码遇 EOS 就停，所以抬高上限只对长尾
-#   生效，几乎不增加总时长——是很便宜的保险。1792 与 31 号自蒸馏的预算一致。
-#   注意：这个值必须在 base/vanilla/cif/cmath/cmix 所有 run 上保持一致，否则数字
-#   不可比；旧集群上用 1024 出过的数不能和这里的新数混进同一张表。
+#   1792 下实测截断率 base 12.0% / vanilla 13.4%，且这种偏差跨 run 不均匀。
+#   probe_math500_budget.py 对 20 条截断样本在 4096 下复跑的结论:
+#     50% 仍不收敛（循环，任何预算都完不成），正常终止者 P50=2245 max=3984；
+#     放开预算后 10%(2/20) 转为正确 => 绝对准确率约 +1.2pt，对 base-vanilla
+#     差值的影响约 0.14pt（远低于该指标 1.8pt 的配对噪声底）。
+#   4096 覆盖实测能终止的那一半；再往上主要是让不收敛循环按满额烧 token。
+#   注意：这个值必须在所有 run 上保持一致。从 1792 改到 4096 之后，1792 下产出的
+#   math500 结果全部作废，必须归档后重评:
+#     R=/scratch/weiliu87/student/czq/Onereplay/results
+#     mv $R/math500 $R/math500_cap1792
+#     mv $R/math500_summary.csv $R/math500_cap1792_summary.csv
+#   gsm8k 不受影响（回复远未触顶，1792 与 4096 下逐字相同），不要动它的结果。
 #
 # 断点续跑
 #   每个 (指标, run) 的 summary.json 已存在就跳过该指标（FORCE_EVAL=1 可强制重评）。
@@ -192,8 +199,8 @@ GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
 
 # ---- 评测参数 ----
 SEED="${SEED:-1}"
-# 见文件头说明：1792 而非 1024，且所有 run 必须用同一个值。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-1792}"
+# 见文件头说明：4096 由预算探针实测定出，且所有 run 必须用同一个值。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 LIMIT="${LIMIT:-0}"                  # >0 时每个指标只评前 N 题（冒烟用）
 MODELS="${MODELS:-base vanilla}"
 FORCE_EVAL="${FORCE_EVAL:-0}"        # 1 = 忽略已有 summary.json 重评
