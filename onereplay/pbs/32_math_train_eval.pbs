@@ -29,12 +29,13 @@
 #     max_len512 / reg_once），唯一变量是 --cov_path，四个 OneReplay run 之间只差
 #     C，评测才是受控对照。已存在的 adapter 会跳过（FORCE_TRAIN=1 可强制重训）。
 #
-#   DO_EVAL=1   对 MODELS（默认 base vanilla cif cmath cmix）跑数学 retention:
+#   DO_EVAL=1   对 MODELS（默认 base vanilla cmix）跑数学 retention:
 #       math500(主) / amc / aime / gsm8k；缺哪个数据文件就跳过哪个指标。
 #     WITH_IF=1 时额外补 ifeval,(multiif),commonsense 给新 run 填 IF 侧对照。
 #     每个 (指标, run) 的 summary.json 已存在就跳过（FORCE_EVAL=1 强制重评），
 #     这样超时后原样再投能接着跑，也不会往 *_summary.csv 追加重复行。
-#     => base / vanilla / cif 若已在 33 号或别处评过，这里会自动跳过，只补 cmath/cmix。
+#     => base / vanilla 的 math500/gsm8k 已在 33 号评过，这里只会补它们的 amc/aime。
+#     本轮只看 C_mix，cif / cmath 暂不评测；要加回来见下方 MODELS。
 #
 # 协方差默认名（对齐 31 号 PBS，TAG=metamath30k、非 thinking）:
 #   MATH_COV = ${RESULTS_ROOT}/cov/cov_math_metamath30k_qv.pt
@@ -57,8 +58,8 @@
 #   再只评测:  把下方 DO_TRAIN 默认改 0，或 qsub -v DO_TRAIN=0 ...
 # 其他常用:
 #   只训 C_mix:            TRAIN_KINDS=mix
-#   只评新 run:            MODELS="cmath cmix"
-#   补 IF 侧:              WITH_IF=1 MODELS="cmath cmix"
+#   只评新 run:            MODELS="cmix"
+#   补 IF 侧:              WITH_IF=1 MODELS="cmix"
 #   用 31 号 trace 建议 λ: LAMBDA=2e-2（注意 run 名会随之改变）
 #
 # 前置条件:
@@ -227,10 +228,14 @@ MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_math_${TAG}_mix_qv.pt}"
 
 # ---- run 名（可覆盖；cif 指 C_if-only 的 OneReplay run）----
 VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
+# cif 不由本脚本训练，是复用 01 号的产物。01 号把采样策略嵌进了 run 名，本集群上
+# 实际目录叫 cs_onereplay_balanced_lam3e-2_seed1_regonce，与下面这个默认值对不上；
+# 把 cif 加回 MODELS 之前必须先改这一行，否则只会打一行"缺 adapter"然后静默跳过。
 IF_RUN="${IF_RUN:-cs_onereplay_lam${LAMBDA}_seed${SEED}_regonce}"
 MATH_RUN="${MATH_RUN:-cs_onereplay_math_lam${LAMBDA}_seed${SEED}_regonce}"
 MIX_RUN="${MIX_RUN:-cs_onereplay_ifmath_lam${LAMBDA}_seed${SEED}_regonce}"
-MODELS="${MODELS:-base vanilla cif cmath cmix}"
+# 本轮只要 C_mix 这一条线；要补回对照列就写成 "base vanilla cif cmath cmix"。
+MODELS="${MODELS:-base vanilla cmix}"
 
 # ---- 评测数据 ----
 MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
@@ -488,8 +493,8 @@ PY
     done
   fi
   echo "逐题输出: ${RESULTS_ROOT}/<metric>/<run_name>/responses.jsonl"
-  echo "本次训练 run: ${MATH_RUN}（C_math）/ ${MIX_RUN}（C_mix）"
-  echo "对照: base/vanilla 是数学 retention 的两端参照，cif 只保 IF、cmath/cmix 保数学。"
+  echo "本次评测 run: ${MODELS}（TRAIN_KINDS=${TRAIN_KINDS}）"
+  echo "对照: base/vanilla 是数学 retention 的两端参照，cmix 用 C_mix 同时保 IF 与数学。"
   echo "所有 run 必须用同一个 MATH_MAX_NEW_TOKENS=${MATH_MAX_NEW_TOKENS} 才可比。"
   set -x
 else

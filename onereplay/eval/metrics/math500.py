@@ -157,6 +157,16 @@ def extract_answer(text: str) -> str | None:
     return remove_boxed(last_boxed_only_string(text))
 
 
+def build_prompt(question: str) -> str:
+    """Render the eval prompt. Shared so budget probes measure the real thing."""
+
+    return (
+        "Solve the following math problem. Reason step by step, then give "
+        "the final answer as \\boxed{...} at the end.\n\n"
+        f"Problem: {question}"
+    )
+
+
 def load_json_records(path: str) -> list[dict[str, Any]]:
     """Load MATH-500 examples from jsonl or json."""
 
@@ -233,11 +243,7 @@ class MATH500Metric:
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
             for idx, example in enumerate(examples, start=1):
-                prompt = (
-                    "Solve the following math problem. Reason step by step, then give "
-                    "the final answer as \\boxed{...} at the end.\n\n"
-                    f"Problem: {example['question']}"
-                )
+                prompt = build_prompt(example["question"])
                 response = generate_response(model, tokenizer, prompt, device, max_new_tokens)
                 gold = example["answer"]
                 pred = extract_answer(response)

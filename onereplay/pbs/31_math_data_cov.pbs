@@ -512,7 +512,7 @@ print(
     "定 λ: C_if 单独 run 用 λ=3e-2；要让 C_mix 上 IF 保护强度相当，"
     f"可用 λ_mix ≈ 3e-2 / {mean_mix_if:.3f} = {3e-2 / mean_mix_if:.2e}（32 号可据此覆盖 LAMBDA）"
 )
-PY
+PY  
 else
   echo "SKIP_MIX=1：跳过混合"
 fi
