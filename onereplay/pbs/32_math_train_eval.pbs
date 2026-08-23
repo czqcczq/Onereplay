@@ -1,0 +1,500 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_mathtre
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity) 版本的「问题2 训练+评测」
+#   训 C_math / C_mix 两个 OneReplay run -> 对全部模型跑数学 retention 评测。
+#
+# 与 onereplay/slurm/32_math_train_eval.slurm 的算法逻辑一致，改动只在集群层:
+#   1) PBS 指令替代 SBATCH；提交用 qsub。
+#   2) 计算在 Singularity 容器里跑，venv 在容器内激活。
+#   3) zsh -> bash（去掉 `${=VAR}` 的 zsh 分词写法）。
+#   4) 路径迁到 /scratch；协方差默认名对齐 31 号 PBS 的产物（见下）。
+# 脚本会把自己在容器里再跑一遍：外层只做 module load singularity + singularity
+# exec 和临时目录清理，内层（ONEREPLAY_IN_CONTAINER=1）跑真正的训练+评测。
+#
+# -----------------------------------------------------------------------------
+# 流程
+#   DO_TRAIN=1  依次训 TRAIN_KINDS（默认 "math mix"）:
+#       math -> C_math(${MATH_COV}) -> run ${MATH_RUN}
+#       mix  -> C_mix (${MIX_COV})  -> run ${MIX_RUN}
+#     超参与 C_if 生产 run 逐字一致（LoRA qv / lr1e-4 / bs8 / accum64 / ep3 /
+#     max_len512 / reg_once），唯一变量是 --cov_path，四个 OneReplay run 之间只差
+#     C，评测才是受控对照。已存在的 adapter 会跳过（FORCE_TRAIN=1 可强制重训）。
+#
+#   DO_EVAL=1   对 MODELS（默认 base vanilla cif cmath cmix）跑数学 retention:
+#       math500(主) / amc / aime / gsm8k；缺哪个数据文件就跳过哪个指标。
+#     WITH_IF=1 时额外补 ifeval,(multiif),commonsense 给新 run 填 IF 侧对照。
+#     每个 (指标, run) 的 summary.json 已存在就跳过（FORCE_EVAL=1 强制重评），
+#     这样超时后原样再投能接着跑，也不会往 *_summary.csv 追加重复行。
+#     => base / vanilla / cif 若已在 33 号或别处评过，这里会自动跳过，只补 cmath/cmix。
+#
+# 协方差默认名（对齐 31 号 PBS，TAG=metamath30k、非 thinking）:
+#   MATH_COV = ${RESULTS_ROOT}/cov/cov_math_metamath30k_qv.pt
+#   MIX_COV  = ${RESULTS_ROOT}/cov/cov_if_math_metamath30k_mix_qv.pt
+#   若你 31 号用了别的 TAG，改本脚本 TAG 或直接传 MATH_COV/MIX_COV。
+#
+# MATH_MAX_NEW_TOKENS 默认 1792（不是 slurm 版里的 1024）
+#   与 33 号 base/vanilla 基线保持一致，否则数字不可比：math500 判分靠抽最后一个
+#   \boxed{...}，被砍断即记错，且这种偏差跨 run 不均匀（训过的模型更啰嗦、截断更多）。
+#   贪心解码遇 EOS 就停，抬高上限只对长尾生效，几乎不增加总时长。
+#   注意：base/vanilla/cif/cmath/cmix 所有 run 必须用同一个值才可比。
+#
+# -----------------------------------------------------------------------------
+# 用法（本集群不从 qsub 命令行传变量，要改就改下方默认值；若本站点 qsub 支持 -v，
+#       FORWARD_VARS 里的变量也可从命令行传）:
+#   qsub onereplay/pbs/32_math_train_eval.pbs                 # 训两个 run + 评全部
+#
+# 训练很久时建议拆两次提交（各自可续跑）:
+#   先只训练:  把下方 DO_EVAL 默认改 0，或 qsub -v DO_EVAL=0 ...
+#   再只评测:  把下方 DO_TRAIN 默认改 0，或 qsub -v DO_TRAIN=0 ...
+# 其他常用:
+#   只训 C_mix:            TRAIN_KINDS=mix
+#   只评新 run:            MODELS="cmath cmix"
+#   补 IF 侧:              WITH_IF=1 MODELS="cmath cmix"
+#   用 31 号 trace 建议 λ: LAMBDA=2e-2（注意 run 名会随之改变）
+#
+# 前置条件:
+#   1) 31 号已产出 MATH_COV / MIX_COV。
+#   2) cif/vanilla 的 adapter 已在 ${RESULTS_ROOT}/adapters/ 下（否则对应模型跳过）。
+#   3) 数学数据就位: ${MATH_DATA_DIR}/{math500,amc,aime,gsm8k}_test.jsonl（缺的自动跳过）。
+#   4) 训练需要 commonsense_170k: ${CS_DATASET}。
+#   5) 日志目录必须在 qsub 之前就存在: mkdir -p /scratch/weiliu87/logs/onereplay
+#      故意放仓库外：仓库是 rsync 目标，运行中的作业握着日志 fd，rsync 覆盖会换
+#      inode 把作业打成 ESTALE。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/32_math_train_eval.pbs}"
+
+# NGC PyTorch 镜像（ubuntu22.04 + python3.10，与 venv 解释器版本一致）。
+# 提交前确认: grep version ${REPO_ROOT}/.venv/pyvenv.cfg
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+# 容器里的 /tmp 常是 tmpfs（吃内存），优先节点本地 NVMe，没有就退回 /scratch。
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  # 只删本次作业自己建的那一个目录，且必须匹配前缀，避免手滑清掉共享缓存。
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的这个 shell 不一定是 login shell，module 可能还没被定义；
+  # set -e 下那会让作业在第一步就静默挂掉，所以先兜一层初始化。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR
+    DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL TRAIN_KINDS
+    SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LAMBDA IDENTITY_COV REG_ONCE SAVE TAG MATH_COV MIX_COV
+    VANILLA_RUN IF_RUN MATH_RUN MIX_RUN MODELS
+    MATH500_FILE AMC_FILE AIME_FILE GSM8K_FILE MATH_MAX_NEW_TOKENS LIMIT
+    WITH_IF IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT DIAG_LEN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的训练+评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用（本站点联网会卡死）
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+
+# ---- 阶段开关 ----
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+TRAIN_KINDS="${TRAIN_KINDS:-math mix}"
+
+# ---- 训练超参（与 C_if 生产 run 逐字一致，唯一变量是 C）----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+LAMBDA="${LAMBDA:-3e-2}"
+IDENTITY_COV="${IDENTITY_COV:-0}"
+REG_ONCE="${REG_ONCE:-1}"
+SAVE="${SAVE:-1}"
+
+# ---- 协方差（默认名对齐 31 号 PBS 的产物）----
+TAG="${TAG:-metamath30k}"
+MATH_COV="${MATH_COV:-${RESULTS_ROOT}/cov/cov_math_${TAG}_qv.pt}"
+MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_math_${TAG}_mix_qv.pt}"
+
+# ---- run 名（可覆盖；cif 指 C_if-only 的 OneReplay run）----
+VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
+IF_RUN="${IF_RUN:-cs_onereplay_lam${LAMBDA}_seed${SEED}_regonce}"
+MATH_RUN="${MATH_RUN:-cs_onereplay_math_lam${LAMBDA}_seed${SEED}_regonce}"
+MIX_RUN="${MIX_RUN:-cs_onereplay_ifmath_lam${LAMBDA}_seed${SEED}_regonce}"
+MODELS="${MODELS:-base vanilla cif cmath cmix}"
+
+# ---- 评测数据 ----
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+AMC_FILE="${AMC_FILE:-${MATH_DATA_DIR}/amc_test.jsonl}"
+AIME_FILE="${AIME_FILE:-${MATH_DATA_DIR}/aime_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+# 见文件头说明：1792 而非 1024，且所有 run 必须用同一个值。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-1792}"
+LIMIT="${LIMIT:-0}"                  # >0 时每个指标只评前 N 题（冒烟用）
+DIAG_LEN="${DIAG_LEN:-1}"            # 1 = 评完打印长度/截断诊断
+
+# ---- 可选 IF/CS 侧 ----
+WITH_IF="${WITH_IF:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${RESULTS_ROOT}/map_cache/eval_math_seed${SEED}"
+
+echo "TAG=${TAG}  MATH_COV=${MATH_COV}  MIX_COV=${MIX_COV}"
+echo "LAMBDA=${LAMBDA}  MATH_MAX_NEW_TOKENS=${MATH_MAX_NEW_TOKENS}  SEED=${SEED}"
+echo "MODELS=${MODELS}  TRAIN_KINDS=${TRAIN_KINDS}  WITH_IF=${WITH_IF}"
+
+# ===========================================================================
+# 训练：循环 TRAIN_KINDS
+# ===========================================================================
+train_one () {
+  local kind=$1
+  local cov_path run
+  case "${kind}" in
+    math) cov_path="${MATH_COV}"; run="${MATH_RUN}" ;;
+    mix)  cov_path="${MIX_COV}";  run="${MIX_RUN}" ;;
+    *)    echo "未知 TRAIN_KIND=${kind}，可选 math / mix"; return 1 ;;
+  esac
+
+  if [[ "${FORCE_TRAIN}" != "1" && -d "${ADAPTERS}/${run}" ]]; then
+    echo "跳过训练 ${run}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+    return 0
+  fi
+  [[ -f "${cov_path}" ]] || { echo "缺协方差 ${cov_path}（先跑 31 号）"; return 1; }
+  [[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; return 1; }
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+
+  echo "==== train ${kind}: ${run} (cov=${cov_path} lam=${LAMBDA}) ===="
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --cov_path "${cov_path}" --replay_lambda "${LAMBDA}" \
+    --identity_cov "${IDENTITY_COV}" --reg_once_per_update "${REG_ONCE}" \
+    --save "${SAVE}" --save_path "${ADAPTERS}/${run}" \
+    --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
+}
+
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  for kind in ${TRAIN_KINDS}; do
+    train_one "${kind}"
+  done
+else
+  echo "DO_TRAIN=0：跳过训练"
+fi
+
+# ===========================================================================
+# 评测：数学指标（+可选 IF/CS）
+# ===========================================================================
+resolve_adapter () {
+  case "$1" in
+    base)    echo "" ;;
+    vanilla) echo "${ADAPTERS}/${VANILLA_RUN}" ;;
+    cif)     echo "${ADAPTERS}/${IF_RUN}" ;;
+    cmath)   echo "${ADAPTERS}/${MATH_RUN}" ;;
+    cmix)    echo "${ADAPTERS}/${MIX_RUN}" ;;
+    *)       echo "" ;;
+  esac
+}
+
+resolve_name () {
+  case "$1" in
+    base)    echo "base" ;;
+    vanilla) echo "${VANILLA_RUN}" ;;
+    cif)     echo "${IF_RUN}" ;;
+    cmath)   echo "${MATH_RUN}" ;;
+    cmix)    echo "${MIX_RUN}" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+# 已有 summary.json 的指标不再重跑：既省卡时，也防止 *_summary.csv 追加重复行。
+pending_metrics () {
+  local name=$1; shift
+  local out="" m
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${name}" >&2
+      continue
+    fi
+    out="${out},${m}"
+  done
+  echo "${out#,}"
+}
+
+eval_one () {
+  local short=$1
+  local name adapter
+  name="$(resolve_name "${short}")"
+  adapter="$(resolve_adapter "${short}")"
+
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    echo "跳过评测 ${short}：缺 adapter ${adapter}"
+    return 0
+  fi
+
+  # 数学指标
+  if [[ -n "${MATH_AVAIL}" ]]; then
+    local mp
+    # shellcheck disable=SC2086
+    mp="$(pending_metrics "${name}" ${MATH_AVAIL})"
+    if [[ -n "${mp}" ]]; then
+      echo "==== eval math: ${name} (${mp}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${mp}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" --limit "${LIMIT}" \
+        --math500_data_path "${MATH500_FILE}" \
+        --amc_data_path "${AMC_FILE}" \
+        --aime_data_path "${AIME_FILE}" \
+        --gsm8k_data_path "${GSM8K_FILE}"
+    else
+      echo "跳过数学评测 ${name}：所有数学指标都已有结果"
+    fi
+  fi
+
+  # 可选 IF/CS 指标
+  if [[ "${WITH_IF}" == "1" && -n "${IF_AVAIL}" ]]; then
+    local ip
+    # shellcheck disable=SC2086
+    ip="$(pending_metrics "${name}" ${IF_AVAIL})"
+    if [[ -n "${ip}" ]]; then
+      echo "==== eval IF/CS: ${name} (${ip}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${ip}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --dataset_path "${CS_DATASET}" \
+        --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_math_seed${SEED}" \
+        --ifeval_input "${IFEVAL_INPUT}" \
+        --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+        --multiif_limit "${MULTIIF_LIMIT}"
+    else
+      echo "跳过 IF/CS 评测 ${name}：所有 IF/CS 指标都已有结果"
+    fi
+  fi
+}
+
+if [[ "${DO_EVAL}" == "1" ]]; then
+  # 缺哪个数据文件就跳过哪个指标（下载失败时不至于整个 job 白挂）。
+  MATH_AVAIL=""
+  if [[ -f "${MATH500_FILE}" ]]; then MATH_AVAIL="${MATH_AVAIL} math500"; else echo "跳过 math500：缺 ${MATH500_FILE}"; fi
+  if [[ -f "${AMC_FILE}"    ]]; then MATH_AVAIL="${MATH_AVAIL} amc";     else echo "跳过 amc：缺 ${AMC_FILE}"; fi
+  if [[ -f "${AIME_FILE}"   ]]; then MATH_AVAIL="${MATH_AVAIL} aime";    else echo "跳过 aime：缺 ${AIME_FILE}"; fi
+  if [[ -f "${GSM8K_FILE}"  ]]; then MATH_AVAIL="${MATH_AVAIL} gsm8k";   else echo "跳过 gsm8k：缺 ${GSM8K_FILE}"; fi
+  MATH_AVAIL="${MATH_AVAIL# }"
+
+  IF_AVAIL=""
+  if [[ "${WITH_IF}" == "1" ]]; then
+    IF_AVAIL="ifeval commonsense"
+    if [[ -f "${MULTIIF_INPUT}" ]]; then IF_AVAIL="${IF_AVAIL} multiif"; else echo "跳过 multiif：缺 ${MULTIIF_INPUT}"; fi
+    [[ -d "${CS_DATASET}" ]] || echo "警告: commonsense 评测缺 ${CS_DATASET}"
+  fi
+
+  if [[ -z "${MATH_AVAIL}" && -z "${IF_AVAIL}" ]]; then
+    echo "没有任何可评测指标（数学数据文件都不在，且未开 WITH_IF）"; exit 1
+  fi
+  echo "MATH_AVAIL=[${MATH_AVAIL}]  IF_AVAIL=[${IF_AVAIL}]"
+
+  for m in ${MODELS}; do
+    eval_one "${m}"
+  done
+
+  # -------------------------------------------------------------------------
+  # 长度/截断诊断：用 responses.jsonl 反查 MATH_MAX_NEW_TOKENS 够不够
+  #   no-answer : 没抽出答案的比例；hit-cap : 生成长度顶到上限的比例。
+  # hit-cap 接近 0 且 P99 明显低于 cap，就说明预算富余。
+  # -------------------------------------------------------------------------
+  length_diagnostic () {
+    python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, cap, paths = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+print(f"==== response length / truncation diagnostic (cap={cap}) ====")
+for path in paths:
+    file = Path(path)
+    if not file.is_file():
+        continue
+    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+    if not rows:
+        continue
+    lengths = sorted(
+        len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+        for row in rows
+    )
+    missing = sum(row.get("prediction") in (None, "") for row in rows)
+    hit_cap = sum(length >= cap - 8 for length in lengths)
+    label = f"{file.parent.parent.name}/{file.parent.name}"
+    print(
+        f"{label:>40}: n={len(rows)} "
+        f"no-answer={missing} ({missing / len(rows):.1%}) "
+        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
+    )
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则提高 MATH_MAX_NEW_TOKENS 后重评。")
+PY
+  }
+
+  if [[ "${DIAG_LEN}" == "1" && -n "${MATH_AVAIL}" ]]; then
+    DIAG_FILES=()
+    for m in ${MATH_AVAIL}; do
+      for s in ${MODELS}; do
+        DIAG_FILES+=("${RESULTS_ROOT}/${m}/$(resolve_name "${s}")/responses.jsonl")
+      done
+    done
+    if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
+      length_diagnostic "${DIAG_FILES[@]}"
+    fi
+  fi
+
+  set +x
+  echo "========================================================================"
+  echo "评测产物（每个 run 一行，append 进同名 CSV，可直接并排比）:"
+  for m in ${MATH_AVAIL}; do
+    echo "  ${m}: ${RESULTS_ROOT}/${m}_summary.csv"
+  done
+  if [[ "${WITH_IF}" == "1" ]]; then
+    for m in ${IF_AVAIL}; do
+      echo "  ${m}: ${RESULTS_ROOT}/${m}_summary.csv"
+    done
+  fi
+  echo "逐题输出: ${RESULTS_ROOT}/<metric>/<run_name>/responses.jsonl"
+  echo "本次训练 run: ${MATH_RUN}（C_math）/ ${MIX_RUN}（C_mix）"
+  echo "对照: base/vanilla 是数学 retention 的两端参照，cif 只保 IF、cmath/cmix 保数学。"
+  echo "所有 run 必须用同一个 MATH_MAX_NEW_TOKENS=${MATH_MAX_NEW_TOKENS} 才可比。"
+  set -x
+else
+  echo "DO_EVAL=0：跳过评测"
+fi
+
+set +x
+echo "Job finished at: $(date)"
