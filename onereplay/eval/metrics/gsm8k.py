@@ -33,9 +33,18 @@ def gold_answer(answer: str) -> str | None:
 
 
 def predicted_answer(response: str) -> str | None:
-    if "####" in response:
-        response = response.split("####")[-1]
-    return normalize_number(response)
+    """Pull the final number out of a model response.
+
+    Qwen 经常把答案写成 "#### 18 ####"（前后都加分隔符），此时直接取 split 的最后
+    一段会拿到空串，正确答案被判成没作答。所以从后往前找第一个含数字的片段；
+    模型完全没写 "####" 时退回全文的最后一个数字。
+    """
+
+    for chunk in reversed(response.split("####")):
+        value = normalize_number(chunk)
+        if value is not None:
+            return value
+    return None
 
 
 class GSM8KMetric:
