@@ -35,9 +35,10 @@ onereplay/
 ├── eval/         runner.py  generation.py  metrics/           one model load, many metrics
 ├── scripts/      collect_cov.py  collect_fisher.py  generate_replay_targets.py
 │                 train.py  evaluate.py  check_old_knowledge_pool.py
-│                                                             the only CLI entry points
+│                 compare_cov_scale.py                        the only CLI entry points
 ├── legacy/       archived single-purpose scripts, not on the active path
 ├── slurm/        01..27 cluster jobs
+├── pbs/          01..33 the same jobs for the PBS + Singularity cluster
 └── third_party/  vendored IFEval checkers, Multi-IF data
 ```
 

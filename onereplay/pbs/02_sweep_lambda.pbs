@@ -1,0 +1,524 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_lamsweep
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=20:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): OneReplay 的 λ 扫描（训练 + 评测）
+#
+# 【为什么需要它】
+# 01_collect_cov.pbs 的 DO_TRAIN_EVAL=1 只在 λ=3e-2 这一个点上训练评测。用单点比
+# 两份 C 是比不出结论的，原因有两条：
+#
+#   1) 同一个 λ 在两份 C 上不是同一个强度。惩罚项是 (1/L)Σ tr(ΔW C ΔWᵀ)，C 的采集
+#      口径是 cov_sum / token_count，没有做 trace 归一化，所以换语料就换尺度。
+#      λ·reg 才是进 loss 的那一项，C 的尺度变了，λ 不变意味着强度变了。
+#   2) 就算强度对齐了，单点也只是权衡曲线上的一个坐标。"旧知识掉 1 个点、新任务好
+#      0.001" 这种同向位移，在一条曲线上到处都能找到，说明不了曲线本身谁高谁低。
+#      能说明问题的是同一个新任务 val loss 下谁的旧知识保留更多，那要一条曲线。
+#
+# 所以这个脚本做两件事：先量出两份 C 的尺度比、把 λ 折算成等效强度（Step 0，几十秒），
+# 再在一组 λ 上各跑一遍完整训练+评测，最后把这一组结果拼成一张表（Step 2）。
+#
+# 【run 命名与 01 完全一致】
+#   cs_onereplay_${SAMPLE_STRATEGY}_lam${LAMBDA}_seed${SEED}_regonce
+# 所以 01 已经跑过的 balanced λ=3e-2 会被自动识别并跳过训练与评测，不会重复烧 5 小时。
+#
+# 【成本】每个 λ ≈ 训练 1.6h + 评测 3h ≈ 4.6h。20h 的 walltime 塞得下 4 个，但一旦
+# 中途被抢占就全丢。推荐一个 λ 一个作业并行提交，见下面用法。脚本内置 walltime 守卫：
+# 剩余时间不够下一个 λ 时主动停下并打印续跑命令，而不是跑到一半被杀。
+#
+# -----------------------------------------------------------------------------
+# 用法
+#
+# 第一步，先只做尺度诊断（不上训练，几十秒，建议永远先跑这个）:
+#   qsub -v SAMPLE_STRATEGY=balanced,PREFLIGHT_ONLY=1 onereplay/pbs/02_sweep_lambda.pbs
+#   看输出里的 "equivalent lambda" 一行，再决定网格。
+#
+# 第二步，扫描。推荐一个 λ 一个作业（互不阻塞，挂了只重投一个）:
+#   qsub -v SAMPLE_STRATEGY=balanced,LAMBDAS=1e-2 onereplay/pbs/02_sweep_lambda.pbs
+#   qsub -v SAMPLE_STRATEGY=balanced,LAMBDAS=1e-1 onereplay/pbs/02_sweep_lambda.pbs
+#   qsub -v SAMPLE_STRATEGY=balanced,LAMBDAS=3e-1 onereplay/pbs/02_sweep_lambda.pbs
+#
+# 或者一个作业串行跑完整网格（省排队，但风险集中）:
+#   qsub -v SAMPLE_STRATEGY=balanced onereplay/pbs/02_sweep_lambda.pbs
+#
+# 【重要】balanced 的对照必须也在本集群上跑一遍。RWTH 那批 uniform 结果换了集群、
+# 换了 datasets 版本、当时还是旧的正则实现，直接拿来比会把环境差异算进 balanced 头上:
+#   qsub -v SAMPLE_STRATEGY=uniform,LAMBDAS=3e-2 onereplay/pbs/02_sweep_lambda.pbs
+# 前提是 uniform 那份 C 已经采过（01 的默认输出）。
+#
+# 只想重出汇总表、不训练:
+#   qsub -v SAMPLE_STRATEGY=balanced,SUMMARY_ONLY=1 onereplay/pbs/02_sweep_lambda.pbs
+# 冒烟（约 20 分钟，确认链路通）:
+#   qsub -v SAMPLE_STRATEGY=balanced,LAMBDAS=1e-1,MAX_STEPS=200,EPOCHS=1,EVAL_LIMIT=40,MULTIIF_LIMIT=20 \
+#     onereplay/pbs/02_sweep_lambda.pbs
+#   冒烟产物的 run 名会自动带 _smoke 后缀，不会污染正式结果的 CSV。
+#
+# 日志目录需在 qsub 前存在: mkdir -p /scratch/weiliu87/logs/onereplay
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（与 01_collect_cov.pbs 保持一致）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/02_sweep_lambda.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE CS_DATASET
+    COV_SCOPE TARGET_MODULES COV_PATH REF_COV SAMPLE_STRATEGY
+    LAMBDAS LAMBDA_INDEX SEED EPOCHS LR TRAIN_BATCH ACCUM TRAIN_MAXLEN
+    VAL_FRAC MAXVAL TRAIN_MODULES REG_ONCE MAX_STEPS
+    EVAL_METRICS EVAL_LIMIT IFEVAL_INPUT
+    MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT MULTIIF_MAX_NEW_TOKENS
+    PREFLIGHT_ONLY SUMMARY_ONLY FORCE_TRAIN FORCE_EVAL KEEP_ADAPTER
+    WALLTIME_SEC RESERVE_SEC ESTIMATE_SEC REF_LAMBDA SUBSPACE_TOPK
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 哪份 C。命名规则与 01_collect_cov.pbs 逐字一致 ----
+SAMPLE_STRATEGY="${SAMPLE_STRATEGY:-balanced}"
+case "${SAMPLE_STRATEGY}" in
+  uniform)  STRATEGY_INFIX="" ;;
+  balanced) STRATEGY_INFIX="_balanced" ;;
+  *) echo "未知 SAMPLE_STRATEGY=${SAMPLE_STRATEGY}，可选 uniform / balanced"; exit 1 ;;
+esac
+COV_SCOPE="${COV_SCOPE:-qv}"
+case "${COV_SCOPE}" in
+  qv)
+    TRAIN_MODULES="${TRAIN_MODULES:-q_proj,v_proj}"
+    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k${STRATEGY_INFIX}_qv.pt}"
+    ;;
+  full)
+    TRAIN_MODULES="${TRAIN_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+    COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k${STRATEGY_INFIX}_full.pt}"
+    ;;
+  *) echo "未知 COV_SCOPE=${COV_SCOPE}，可选 qv / full"; exit 1 ;;
+esac
+# Step 0 的尺度诊断拿这份当基准；默认指向 uniform 那份（balanced 的对照就是它）。
+REF_COV="${REF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_${COV_SCOPE}.pt}"
+REF_LAMBDA="${REF_LAMBDA:-3e-2}"
+SUBSPACE_TOPK="${SUBSPACE_TOPK:-0}"
+
+# ---- 训练超参：唯一的变量是 λ，其余与 01 的 DO_TRAIN_EVAL 段逐字一致 ----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+TRAIN_BATCH="${TRAIN_BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+TRAIN_MAXLEN="${TRAIN_MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+REG_ONCE="${REG_ONCE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"
+
+# ---- 评测 ----
+EVAL_METRICS="${EVAL_METRICS:-ifeval,multiif,commonsense}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+MULTIIF_MAX_NEW_TOKENS="${MULTIIF_MAX_NEW_TOKENS:-1024}"
+
+# ---- 流程开关 ----
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+KEEP_ADAPTER="${KEEP_ADAPTER:-1}"
+
+# ---- walltime 守卫：宁可少跑一个 λ，也不要跑到一半被杀 ----
+WALLTIME_SEC="${WALLTIME_SEC:-72000}"     # 与 #PBS -l walltime 对齐（20h）
+RESERVE_SEC="${RESERVE_SEC:-1200}"        # 留给收尾汇总
+ESTIMATE_SEC="${ESTIMATE_SEC:-17000}"     # 第一个 λ 的预估（训练 1.6h + 评测 3h）
+
+# ---- λ 网格 ----
+# 默认网格的取法：3e-2 是 01 已经跑过的那个点（会被自动跳过，留在网格里只为让汇总表
+# 完整）；往下一档 1e-2 和往上两档 1e-1 / 3e-1 用来把曲线的两侧都撑开。旧的 gold C
+# 扫描显示 retention 在 1e-2 之前一直单调改善还没到头，所以重点在上侧。
+LAMBDAS="${LAMBDAS:-1e-2 3e-2 1e-1 3e-1}"
+read -r -a LAMBDA_LIST <<< "${LAMBDAS}"
+# PBS Pro 的 job array 会设 PBS_ARRAY_INDEX；没有 array 时也可以手动传 LAMBDA_INDEX。
+PICK_INDEX="${PBS_ARRAY_INDEX:-${LAMBDA_INDEX:-}}"
+if [[ -n "${PICK_INDEX}" ]]; then
+  if (( PICK_INDEX < 0 || PICK_INDEX >= ${#LAMBDA_LIST[@]} )); then
+    echo "错误: 索引 ${PICK_INDEX} 超出 λ 网格（共 ${#LAMBDA_LIST[@]} 个: ${LAMBDAS}）"
+    exit 1
+  fi
+  LAMBDA_LIST=("${LAMBDA_LIST[${PICK_INDEX}]}")
+  echo "按索引 ${PICK_INDEX} 只跑 λ=${LAMBDA_LIST[0]}"
+fi
+
+SUFFIX=""
+if [[ "${MAX_STEPS}" != "0" || "${EPOCHS}" != "3" || "${EVAL_LIMIT}" != "0" ]]; then
+  # 短跑的数字不能和正式结果写进同一个 run 名，否则 CSV 里两种口径会混在一起。
+  SUFFIX="_smoke"
+  echo "检测到短跑参数（MAX_STEPS=${MAX_STEPS} EPOCHS=${EPOCHS} EVAL_LIMIT=${EVAL_LIMIT}），run 名加 _smoke 后缀"
+fi
+
+ADAPTERS="${RESULTS_ROOT}/adapters"
+METRICS_DIR="${RESULTS_ROOT}/metrics"
+IFEVAL_CSV="${RESULTS_ROOT}/ifeval_summary.csv"
+MULTIIF_CSV="${RESULTS_ROOT}/multiif_summary.csv"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+[[ -f "${COV_PATH}" ]] || {
+  echo "缺 C: ${COV_PATH}"
+  echo "先跑: qsub -v SAMPLE_STRATEGY=${SAMPLE_STRATEGY} onereplay/pbs/01_collect_cov.pbs"
+  exit 1
+}
+mkdir -p "${ADAPTERS}" "${METRICS_DIR}" "${DATASET_CACHE}" \
+  "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+
+echo "========================================================================"
+echo "SAMPLE_STRATEGY = ${SAMPLE_STRATEGY}"
+echo "COV_PATH        = ${COV_PATH}"
+echo "REF_COV         = ${REF_COV}"
+echo "λ 网格          = ${LAMBDA_LIST[*]}"
+echo "EPOCHS=${EPOCHS} LR=${LR} BATCH=${TRAIN_BATCH} ACCUM=${ACCUM} REG_ONCE=${REG_ONCE} SEED=${SEED}"
+echo "评测            = ${EVAL_METRICS}"
+echo "========================================================================"
+
+# ---------------------------------------------------------------------------
+# Step 0: 尺度诊断
+#
+# 在烧掉任何 GPU 小时之前先回答一个问题：这两份 C 到底是不是同一个量级？
+# 如果 trace 比值离 1 很远，那么"balanced 在 λ=3e-2 上更差"就只是"balanced 在一个
+# 更弱/更强的正则强度上更差"，扫描的网格应该围绕换算后的等效 λ 展开而不是原来那个。
+# 传 --adapter_path 时还会用真实的 ΔW 把两份 C 各求一次惩罚，那个比值比 trace 更准。
+# ---------------------------------------------------------------------------
+echo "==== Step 0: C 的尺度与结构诊断 ===="
+if [[ -f "${REF_COV}" && "${REF_COV}" != "${COV_PATH}" ]]; then
+  REF_ADAPTER="${ADAPTERS}/cs_onereplay_${SAMPLE_STRATEGY}_lam${REF_LAMBDA}_seed${SEED}_regonce"
+  DIAG_ARGS=(
+    --ref_cov "${REF_COV}" --new_cov "${COV_PATH}" --ref_lambda "${REF_LAMBDA}"
+    --json_out "${RESULTS_ROOT}/cov/scale_${SAMPLE_STRATEGY}_vs_ref_${COV_SCOPE}.json"
+  )
+  if [[ -d "${REF_ADAPTER}" ]]; then
+    echo "用已有 adapter 求精确惩罚比: ${REF_ADAPTER}"
+    DIAG_ARGS+=(--adapter_path "${REF_ADAPTER}")
+  else
+    echo "没有 ${REF_ADAPTER}，只给各向同性的 trace 估计"
+  fi
+  if (( SUBSPACE_TOPK > 0 )); then
+    DIAG_ARGS+=(--subspace_topk "${SUBSPACE_TOPK}")
+  fi
+  python -m onereplay.scripts.compare_cov_scale "${DIAG_ARGS[@]}"
+else
+  echo "跳过：REF_COV 不存在或与 COV_PATH 相同（${REF_COV}）"
+  echo "想要等效 λ 换算，先在本集群采一份 uniform C：qsub onereplay/pbs/01_collect_cov.pbs"
+fi
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：只做诊断，不训练。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1: 逐个 λ 训练 + 评测
+#
+# 训练与评测各自独立判断是否已完成，所以这一步可以反复重投：已经有 adapter 的跳过
+# 训练，CSV 里已经有行的跳过评测，只补缺的那部分。上一次被 walltime 砍在半路时，
+# 直接原样再投一次就是续跑。
+# ---------------------------------------------------------------------------
+if [[ "${SUMMARY_ONLY}" == "1" ]]; then
+  echo "SUMMARY_ONLY=1：跳过训练与评测，直接出汇总表。"
+else
+  LAST_LAMBDA_SEC="${ESTIMATE_SEC}"
+  for LAMBDA in "${LAMBDA_LIST[@]}"; do
+    RUN="cs_onereplay_${SAMPLE_STRATEGY}_lam${LAMBDA}_seed${SEED}_regonce${SUFFIX}"
+    ADAPTER="${ADAPTERS}/${RUN}"
+
+    ELAPSED="${SECONDS}"
+    REMAINING=$(( WALLTIME_SEC - ELAPSED - RESERVE_SEC ))
+    if (( REMAINING < LAST_LAMBDA_SEC )) && [[ ! -d "${ADAPTER}" ]]; then
+      echo "########################################################################"
+      echo "walltime 守卫：已用 ${ELAPSED}s，剩余可用 ${REMAINING}s，不够再跑一个 λ（约 ${LAST_LAMBDA_SEC}s）。"
+      echo "停在 λ=${LAMBDA} 之前。原样重投即可续跑（已完成的会自动跳过）:"
+      echo "  qsub -v SAMPLE_STRATEGY=${SAMPLE_STRATEGY},LAMBDAS='${LAMBDA_LIST[*]}' onereplay/pbs/02_sweep_lambda.pbs"
+      echo "########################################################################"
+      break
+    fi
+    LAMBDA_START="${SECONDS}"
+
+    echo ""
+    echo "========================================================================"
+    echo "λ=${LAMBDA}  run=${RUN}  (已用 ${ELAPSED}s)"
+    echo "========================================================================"
+    mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
+
+    # ---- 训练 ----
+    if [[ -d "${ADAPTER}" && "${FORCE_TRAIN}" != "1" ]]; then
+      echo "跳过训练：${ADAPTER} 已存在（FORCE_TRAIN=1 或删掉它可重训）"
+    else
+      echo "==== train: ${RUN} ===="
+      python -m onereplay.scripts.train --paradigm sft \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+        --dataset_path "${CS_DATASET}" \
+        --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${TRAIN_BATCH}" \
+        --accumulation_size "${ACCUM}" \
+        --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+        --max_len "${TRAIN_MAXLEN}" \
+        --target_modules "${TRAIN_MODULES}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
+        --cov_path "${COV_PATH}" --replay_lambda "${LAMBDA}" \
+        --identity_cov 0 --reg_once_per_update "${REG_ONCE}" --max_steps "${MAX_STEPS}" \
+        --save 1 --save_path "${ADAPTER}" \
+        --metrics_path "${METRICS_DIR}/${RUN}.jsonl"
+    fi
+    [[ -d "${ADAPTER}" ]] || { echo "训练后仍然没有 ${ADAPTER}，中止"; exit 1; }
+
+    # ---- 评测 ----
+    # CSV 是 append 的，同一个 run 评两次会写出两行、汇总表里就有歧义。
+    NEED_EVAL=1
+    if [[ "${FORCE_EVAL}" != "1" ]]; then
+      HAVE_IFEVAL=0
+      HAVE_MULTIIF=0
+      [[ -f "${IFEVAL_CSV}" ]] && grep -q "^${RUN}," "${IFEVAL_CSV}" && HAVE_IFEVAL=1
+      [[ -f "${MULTIIF_CSV}" ]] && grep -q "^${RUN}," "${MULTIIF_CSV}" && HAVE_MULTIIF=1
+      if (( HAVE_IFEVAL == 1 && HAVE_MULTIIF == 1 )); then
+        NEED_EVAL=0
+        echo "跳过评测：${RUN} 在 ifeval / multiif 的 CSV 里都已经有行了（FORCE_EVAL=1 可重评）"
+      fi
+    fi
+    if (( NEED_EVAL == 1 )); then
+      echo "==== eval: ${RUN} (${EVAL_METRICS}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${ADAPTER}" --run_name "${RUN}" \
+        --metrics "${EVAL_METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --limit "${EVAL_LIMIT}" \
+        --ifeval_input "${IFEVAL_INPUT}" \
+        --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+        --multiif_limit "${MULTIIF_LIMIT}" \
+        --multiif_max_new_tokens "${MULTIIF_MAX_NEW_TOKENS}" \
+        --dataset_path "${CS_DATASET}" \
+        --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+        --max_len "${TRAIN_MAXLEN}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+    fi
+
+    if [[ "${KEEP_ADAPTER}" != "1" ]]; then
+      echo "KEEP_ADAPTER=0：删除 ${ADAPTER}"
+      rm -rf "${ADAPTER:?}"
+    fi
+
+    LAMBDA_SEC=$(( SECONDS - LAMBDA_START ))
+    if (( LAMBDA_SEC > 600 )); then
+      # 只有真正跑满的那种才拿来预估下一个；跳过训练的那几秒会把守卫骗过去。
+      LAST_LAMBDA_SEC="${LAMBDA_SEC}"
+    fi
+    echo "λ=${LAMBDA} 用时 ${LAMBDA_SEC}s"
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2: 汇总表
+#
+# 把这一策略下所有 λ 的三个数字拼到一起：IFEval / Multi-IF 是旧知识，val loss 是
+# 新任务。要看的不是某一行的高低，而是"同一个 val loss 上谁的 IFEval 更高"，也就是
+# 这两列构成的权衡曲线。单点没有可比性，一整列才有。
+# ---------------------------------------------------------------------------
+echo ""
+echo "==== Step 2: ${SAMPLE_STRATEGY} 的 λ 曲线 ===="
+python - "${RESULTS_ROOT}" "${SAMPLE_STRATEGY}" "${SEED}" "${SUFFIX}" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+results_root, strategy, seed, suffix = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+root = Path(results_root)
+prefix = f"cs_onereplay_{strategy}_lam"
+tail = f"_seed{seed}_regonce{suffix}"
+
+
+def read_csv(path):
+    if not path.exists():
+        return {}
+    with path.open(encoding="utf-8", newline="") as handle:
+        # 同一个 run 若被评过多次，CSV 里会有多行；后写的覆盖先写的，保留最近一次。
+        return {row["run_name"]: row for row in csv.DictReader(handle)}
+
+
+def last_epoch_record(run):
+    path = root / "metrics" / f"{run}.jsonl"
+    if not path.exists():
+        return {}
+    last = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("record_type", "epoch") == "epoch":
+                last = record
+    return last
+
+
+def pct(row, key):
+    value = row.get(key)
+    return f"{float(value) * 100:.2f}" if value not in (None, "") else "-"
+
+
+def num(record, key, digits):
+    value = record.get(key)
+    return f"{float(value):.{digits}f}" if value is not None else "-"
+
+
+ifeval = read_csv(root / "ifeval_summary.csv")
+multiif = read_csv(root / "multiif_summary.csv")
+
+runs = {name for name in set(ifeval) | set(multiif) if name.startswith(prefix) and name.endswith(tail)}
+for path in (root / "metrics").glob(f"{prefix}*{tail}.jsonl"):
+    runs.add(path.stem)
+
+if not runs:
+    print(f"还没有 {prefix}*{tail} 的结果")
+    raise SystemExit(0)
+
+
+def lambda_of(run):
+    text = run[len(prefix) : -len(tail)] if tail else run[len(prefix) :]
+    try:
+        return float(text)
+    except ValueError:
+        return float("inf")
+
+
+header = (
+    f"{'lambda':>10} {'IFEval sp':>10} {'IFEval si':>10} {'IFEval lp':>10} "
+    f"{'MultiIF sp':>11} {'MultiIF si':>11} {'val loss':>10} {'lam*reg':>10}"
+)
+print(header)
+print("-" * len(header))
+for run in sorted(runs, key=lambda_of):
+    row_if = ifeval.get(run, {})
+    row_mi = multiif.get(run, {})
+    epoch = last_epoch_record(run)
+    print(
+        f"{lambda_of(run):>10.4g} "
+        f"{pct(row_if, 'strict_prompt_accuracy'):>10} "
+        f"{pct(row_if, 'strict_instruction_accuracy'):>10} "
+        f"{pct(row_if, 'loose_prompt_accuracy'):>10} "
+        f"{pct(row_mi, 'avg_strict_prompt_accuracy'):>11} "
+        f"{pct(row_mi, 'avg_strict_instruction_accuracy'):>11} "
+        f"{num(epoch, 'val_loss', 5):>10} "
+        f"{num(epoch, 'train_lambda_reg', 5):>10}"
+    )
+
+print()
+print("sp=strict prompt, si=strict instruction, lp=loose prompt。IFEval 与 Multi-IF 越高越好，")
+print("val loss 越低越好。判据不是单行的高低，而是两条策略在同一个 val loss 上谁的 IFEval 更高。")
+print("参考噪声量级：IFEval 541 条，1 个百分点只有 5.4 条 prompt；Multi-IF 909 组。")
+PY
+
+echo ""
+echo "原始数据:"
+echo "  ${IFEVAL_CSV}"
+echo "  ${MULTIIF_CSV}"
+echo "  ${METRICS_DIR}/cs_onereplay_${SAMPLE_STRATEGY}_lam*_seed${SEED}_regonce${SUFFIX}.jsonl"
+echo "Job finished at: $(date)"
