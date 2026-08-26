@@ -47,6 +47,22 @@ def predicted_answer(response: str) -> str | None:
     return None
 
 
+def build_prompt(question: str) -> str:
+    """Render the eval prompt.
+
+    Module level so anything that has to reproduce what the model actually saw
+    -- the CE probe corpus in particular -- imports the one string instead of
+    keeping a copy that silently drifts. math500.build_prompt exists for the
+    same reason.
+    """
+
+    return (
+        "Solve the following grade-school math problem. "
+        "Reason briefly, then end your answer with '#### ' followed by the final number.\n\n"
+        f"Problem: {question}"
+    )
+
+
 class GSM8KMetric:
     name = "gsm8k"
 
@@ -73,11 +89,7 @@ class GSM8KMetric:
         with response_path.open("w", encoding="utf-8") as file:
             for idx, example in enumerate(examples, start=1):
                 question = example["question"]
-                prompt = (
-                    "Solve the following grade-school math problem. "
-                    "Reason briefly, then end your answer with '#### ' followed by the final number.\n\n"
-                    f"Problem: {question}"
-                )
+                prompt = build_prompt(question)
                 response = generate_response(model, tokenizer, prompt, device, max_new_tokens)
                 gold = gold_answer(example.get("answer", ""))
                 pred = predicted_answer(response)

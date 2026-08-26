@@ -83,6 +83,22 @@ def predicted_answer(response: str) -> str | None:
     return normalize_integer(_strip_boxed(response))
 
 
+def build_prompt(question: str) -> str:
+    """Render the eval prompt.
+
+    Module level for the same reason as math500/gsm8k: the CE probe has to feed
+    the model the exact string the benchmark fed it, and a copied template would
+    drift the moment either side is edited.
+    """
+
+    return (
+        "Solve the following AIME-style math problem. The final answer is an "
+        "integer from 0 to 999. Reason carefully, then end your response with "
+        "'#### ' followed by only the final integer.\n\n"
+        f"Problem: {question}"
+    )
+
+
 class AIMEMetric:
     name = "aime"
 
@@ -115,12 +131,7 @@ class AIMEMetric:
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
             for idx, example in enumerate(examples, start=1):
-                prompt = (
-                    "Solve the following AIME-style math problem. The final answer is an "
-                    "integer from 0 to 999. Reason carefully, then end your response with "
-                    "'#### ' followed by only the final integer.\n\n"
-                    f"Problem: {example['question']}"
-                )
+                prompt = build_prompt(example["question"])
                 response = generate_response(model, tokenizer, prompt, device, max_new_tokens)
                 gold = gold_answer(example["answer"])
                 pred = predicted_answer(response)

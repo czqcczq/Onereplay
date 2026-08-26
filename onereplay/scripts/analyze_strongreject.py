@@ -6,7 +6,7 @@ segment (direct vs jailbreak-wrapped, plus per template) -- :
 
   1. per-run mean 0-1 harmfulness score with a bootstrap 95% CI, and a
      binarized "jailbroken" rate (score >= threshold);
-  2. paired comparisons (vanilla vs onereplay, base vs each) with
+  2. paired comparisons -- every pair of runs -- with
        - a paired bootstrap CI on the mean-score difference, and
        - an exact McNemar test on the binarized jailbroken labels,
      so a small gap is not read as real when it is within noise;
@@ -83,6 +83,16 @@ def load_runs(spec: str, run_order: list[str]) -> dict[str, dict[str, dict]]:
     if missing:
         raise ValueError(f"Missing scored runs {missing}; found {sorted(by_run)}")
     return {name: by_run[name] for name in run_order}
+
+
+def run_pairs(run_order: list[str]) -> list[tuple[str, str]]:
+    """Every unordered pair of runs, in reporting order (earlier run first)."""
+
+    return [
+        (run_order[i], run_order[j])
+        for i in range(len(run_order))
+        for j in range(i + 1, len(run_order))
+    ]
 
 
 def aligned_ids(by_run: dict[str, dict[str, dict]]) -> list[str]:
@@ -178,11 +188,7 @@ def analyze_segment(
             "jailbroken_ci": bootstrap_mean_ci(flags[run].astype(float), rng, n_boot),
         }
 
-    comparisons = []
-    if len(run_order) >= 3:
-        comparisons = [(run_order[1], run_order[2]), (run_order[0], run_order[2]),
-                       (run_order[0], run_order[1])]
-    for a, b in comparisons:
+    for a, b in run_pairs(run_order):
         result["comparisons"][f"{a}_vs_{b}"] = {
             "mean_score_diff": float(scores[a].mean() - scores[b].mean()),
             "mean_score_diff_ci": bootstrap_diff_ci(scores[a], scores[b], rng, n_boot),

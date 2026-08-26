@@ -6,9 +6,10 @@ Reads the judged.jsonl files written by scripts/judge_safety.py (one per run),
 aligns them by the shared prompt `id`, and for each track reports:
 
   1. per-run harmful / refusal / other rates with a paired bootstrap 95% CI;
-  2. paired comparisons (vanilla vs onereplay, base vs each) with a McNemar
-     exact test on the harmful and refusal labels, so a 6-point gap on 200
-     prompts is not read as real when it is within noise;
+  2. paired comparisons -- every pair of runs, so both "did the tuning erode
+     base alignment" and "did the regularizer put it back" are covered -- with a
+     McNemar exact test on the harmful and refusal labels, so a 6-point gap on
+     200 prompts is not read as real when it is within noise;
   3. degeneration diagnostics -- response-length distribution and the share of
      very short / "other" replies -- so a safety change driven by the model
      answering harmful prompts with a stub is not mistaken for retained
@@ -94,6 +95,16 @@ def load_runs(spec: str, run_order: list[str]) -> dict[str, dict[str, dict]]:
     if missing:
         raise ValueError(f"Missing judged runs {missing}; found {sorted(by_run)}")
     return {name: by_run[name] for name in run_order}
+
+
+def run_pairs(run_order: list[str]) -> list[tuple[str, str]]:
+    """Every unordered pair of runs, in reporting order (earlier run first)."""
+
+    return [
+        (run_order[i], run_order[j])
+        for i in range(len(run_order))
+        for j in range(i + 1, len(run_order))
+    ]
 
 
 def aligned_ids(by_run: dict[str, dict[str, dict]]) -> list[str]:
@@ -223,11 +234,7 @@ def net_section(
             "refusal_ci": bootstrap_rate_ci(refusal, rng, n_boot),
         }
 
-    pairs = []
-    if len(run_order) >= 3:
-        pairs = [(run_order[1], run_order[2]), (run_order[0], run_order[2]),
-                 (run_order[0], run_order[1])]
-    for a, b in pairs:
+    for a, b in run_pairs(run_order):
         recs_a, recs_b = by_run[a], by_run[b]
         joint = [
             i
@@ -284,12 +291,8 @@ def analyze_track(
         }
         result["degeneration"][run] = degeneration(by_run[run], track_ids)
 
-    comparisons = []
-    if len(run_order) >= 3:
-        comparisons = [(run_order[1], run_order[2]), (run_order[0], run_order[2]),
-                       (run_order[0], run_order[1])]
     result["comparisons"] = {}
-    for a, b in comparisons:
+    for a, b in run_pairs(run_order):
         result["comparisons"][f"{a}_vs_{b}"] = {
             "harmful": {
                 **mcnemar_exact(vectors[a]["harmful"], vectors[b]["harmful"]),

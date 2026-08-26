@@ -1,0 +1,368 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_probece
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 数学侧的 held-out CE 探针
+#   对已有 checkpoint 在固定语料上算交叉熵。只做前向，不生成，全程约 20-40 分钟。
+#
+# -----------------------------------------------------------------------------
+# 为什么要这个
+#   准确率是个粗量具。MATH-500 上配对可分辨下限是 3.5pp，而要测的遗忘量是
+#   0.8pp——不是"结果不显著"，是这个量具根本读不出来（要 80% 功效需要约 20000
+#   题）。第三章那条 FLAN 曲线说明 CE 灵敏得多：vanilla 的池外 CE 从 base 的
+#   0.1231 涨到 0.4742，动了 285%，同期 IFEval 只掉 11.5pp。
+#
+#   于是这个探针能区分两种在 accuracy 上完全一样、含义却相反的情况:
+#     CE ~= 1.0x base  数学表征根本没动，"没有遗忘"是字面意义上的
+#     CE ~= 2x   base  动了，但没动到翻转答案 —— 漂移存在，只是没有行为后果
+#   这两个结论都能写，而 accuracy 一个都给不出来。
+#
+#   而且它在全参微调那边（36 号 slurm）的两种结局下都有用：数学真掉了，它就是
+#   后面那一轮要用的灵敏量具；数学没掉，它给出上面那个二选一。
+#
+# -----------------------------------------------------------------------------
+# 探针语料从哪来：不生成，复用已有产物
+#   Step0 把 ${RESULTS_ROOT}/{math500,gsm8k}/base/responses.jsonl 直接转成
+#   {inputs, targets} 的自蒸馏格式 —— 那本来就是 base 对评测题的贪心回答，重新
+#   生成一遍要花掉和评测一样的几个小时。
+#
+#   这样做还额外买到一件事：**探针题目和 benchmark 题目完全相同**，所以
+#   "同一批题上 CE 动了 X%、accuracy 只动了 0.8pp" 是关于同一个集合的陈述，
+#   而不是两个集合各说各话。
+#
+#   第三个语料 probe_metamath_cpool 从 C_math 的自蒸馏池里等距抽 1000 行。它是
+#   第三章池内/池外对照的数学版本：这里没有任何模型在 MetaMath 文本上做过梯度
+#   更新，但 C_math 是从那批激活上采的，锚定在那个分布的正则可能在喂过它的行上
+#   显得更好。Step0 会做 prompt 文本差集自检（第三章就是靠这个抓到 1500 行里有
+#   98 行泄漏回训练池的）。
+#
+# -----------------------------------------------------------------------------
+# 口径与训练期探针完全一致
+#   score_probe_ce 复用 build_self_distilled_probe / build_probe_loader /
+#   SFTTrainer.evaluate_probe 三件套，没有重写任何 loss:
+#     * 只对 assistant token 求 CE（prompt 部分 label = -100）
+#     * **token 加权平均**而不是 batch 平均（数学回答长度从几十到几千，batch
+#       平均会让短回答主导，还会随 batch_size 漂移）
+#     * enable_thinking=False，与自蒸馏生成一致
+#     * shuffle=False，左 padding
+#   所以打出来的数和 metrics jsonl 里的 probe_* 字段可以并排读。
+#
+# MAX_LEN=2048
+#   MATH-500 的回答 P50 就有 528 token、尾部过 4000，Commonsense 用的 512 会把
+#   大部分答案切掉。2048 对齐 31 号自蒸馏的预算。Step0 会打印 target token 的
+#   分位数，Step1 会打印每个语料有多少行顶到 MAX_LEN —— 那个比例高就说明这个值
+#   还不够，CE 只覆盖了答案前缀。**所有 run 必须用同一个值才可比。**
+#
+# -----------------------------------------------------------------------------
+# 用法:
+#   qsub onereplay/pbs/37_math_probe_ce.pbs
+#
+#   只重建语料不打分:   SKIP_SCORE=1
+#   只打分不重建语料:   SKIP_BUILD=1
+#   换模型集合:         MODELS="base vanilla cmix"
+#   加大 max_len:       MAX_LEN=4096（显存不够就把 PROBE_BATCH 降到 4）
+#
+# 前置条件:
+#   1) ${RESULTS_ROOT}/{math500,gsm8k}/base/responses.jsonl（33/32 号评测产物）
+#   2) ${RESULTS_ROOT}/replay/metamath_cmath_30k_canonical_selfdistill_seed1.jsonl
+#      （31 号产物；缺了就只跳过 cpool 那一条，其余照跑）
+#   3) adapter 就位: ${RESULTS_ROOT}/adapters/{cs_vanilla_seed1,
+#      cs_onereplay_balanced_lam3e-2_seed1_regonce,
+#      cs_onereplay_ifmath_lam3e-2_seed1_regonce}
+#   4) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/37_math_probe_ce.pbs}"
+
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT PROBE_DIR CPOOL_FILE
+    MODELS VANILLA_RUN IF_RUN MIX_RUN SEED
+    MAX_LEN PROBE_BATCH PROBE_SIZE CPOOL_SIZE CAP
+    SKIP_BUILD SKIP_SCORE
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+ADAPTERS="${ADAPTERS:-${RESULTS_ROOT}/adapters}"
+PROBE_DIR="${PROBE_DIR:-${RESULTS_ROOT}/probe_ce}"
+CORPUS_DIR="${PROBE_DIR}/corpora"
+SCORES="${PROBE_DIR}/scores.jsonl"
+CPOOL_FILE="${CPOOL_FILE:-${RESULTS_ROOT}/replay/metamath_cmath_30k_canonical_selfdistill_seed1.jsonl}"
+
+# ---- run 名（见 35 号文件头：Hopper 上纯 C_if 是 balanced 那份）----
+SEED="${SEED:-1}"
+VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
+IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam3e-2_seed${SEED}_regonce}"
+MIX_RUN="${MIX_RUN:-cs_onereplay_ifmath_lam3e-2_seed${SEED}_regonce}"
+MODELS="${MODELS:-base vanilla cif cmix}"
+
+# ---- 探针参数（所有 run 必须一致）----
+MAX_LEN="${MAX_LEN:-2048}"
+PROBE_BATCH="${PROBE_BATCH:-8}"
+PROBE_SIZE="${PROBE_SIZE:-0}"     # 0 = 用整个语料
+CPOOL_SIZE="${CPOOL_SIZE:-1000}"
+CAP="${CAP:-4096}"                # responses.jsonl 生成时的 MATH_MAX_NEW_TOKENS
+SKIP_BUILD="${SKIP_BUILD:-0}"
+SKIP_SCORE="${SKIP_SCORE:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${CORPUS_DIR}"
+
+# ---------------------------------------------------------------------------
+# Step 0: 由已有 responses.jsonl 造探针语料（纯 CPU，几秒）
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_BUILD}" != "1" ]]; then
+  echo "==== Step0 build probe corpora -> ${CORPUS_DIR} ===="
+  BUILD_ARGS=()
+  for m in math500 gsm8k; do
+    resp="${RESULTS_ROOT}/${m}/base/responses.jsonl"
+    if [[ -f "${resp}" ]]; then
+      BUILD_ARGS+=(--responses "${m}=${resp}")
+    else
+      echo "跳过 ${m}：缺 ${resp}"
+    fi
+  done
+  if [[ ${#BUILD_ARGS[@]} -eq 0 ]]; then
+    echo "两个 base responses.jsonl 都不在，无法建语料"; exit 1
+  fi
+  BUILD_ARGS+=(--out_dir "${CORPUS_DIR}" --model_path "${MODEL_DIR}/${MODEL_NAME}" --cap "${CAP}")
+  # 用 if 而不是 `[[ ... ]] && arr+=(...)`：后者在文件不存在时整条 && 列表返回 1，
+  # set -e 会直接把作业干掉。
+  if [[ -f "${CPOOL_FILE}" ]]; then
+    BUILD_ARGS+=(--cpool "${CPOOL_FILE}" --cpool_size "${CPOOL_SIZE}")
+  else
+    echo "缺 ${CPOOL_FILE}，跳过 cpool 语料（其余照跑）"
+  fi
+
+  python -m onereplay.scripts.build_math_probe "${BUILD_ARGS[@]}"
+else
+  echo "SKIP_BUILD=1：沿用已有语料 ${CORPUS_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1: 逐个 checkpoint 打分
+# ---------------------------------------------------------------------------
+resolve_path () {
+  case "$1" in
+    base)    echo "" ;;
+    vanilla) echo "${ADAPTERS}/${VANILLA_RUN}" ;;
+    cif)     echo "${ADAPTERS}/${IF_RUN}" ;;
+    cmix)    echo "${ADAPTERS}/${MIX_RUN}" ;;
+    *)       echo "" ;;
+  esac
+}
+
+resolve_name () {
+  case "$1" in
+    base)    echo "base" ;;
+    vanilla) echo "${VANILLA_RUN}" ;;
+    cif)     echo "${IF_RUN}" ;;
+    cmix)    echo "${MIX_RUN}" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+if [[ "${SKIP_SCORE}" != "1" ]]; then
+  PROBES=""
+  for corpus in probe_math500_base probe_gsm8k_base probe_metamath_cpool; do
+    file="${CORPUS_DIR}/${corpus}.jsonl"
+    [[ -f "${file}" ]] || continue
+    short="${corpus#probe_}"; short="${short%_base}"
+    PROBES="${PROBES},${short}=${file}"
+  done
+  PROBES="${PROBES#,}"
+  [[ -n "${PROBES}" ]] || { echo "没有可用的探针语料"; exit 1; }
+  echo "PROBES=${PROBES}"
+
+  # 重跑时先挪走旧结果：scores.jsonl 是 append 的，混着两次的行没法读。
+  if [[ -f "${SCORES}" ]]; then
+    mv "${SCORES}" "${SCORES}.$(date +%Y%m%d_%H%M%S).bak"
+  fi
+
+  for short in ${MODELS}; do
+    name="$(resolve_name "${short}")"
+    path="$(resolve_path "${short}")"
+    if [[ -n "${path}" && ! -d "${path}" ]]; then
+      echo "跳过 ${short}：缺 ${path}"
+      continue
+    fi
+    python -m onereplay.scripts.score_probe_ce \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${path}" --run_name "${name}" \
+      --probes "${PROBES}" \
+      --max_len "${MAX_LEN}" --batch_size "${PROBE_BATCH}" \
+      --probe_size "${PROBE_SIZE}" \
+      --map_cache_dir "${JOB_TMPDIR}/probe_map_${short}" \
+      --out "${SCORES}"
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2: 汇成对照表，并把 CE 折算成"相对 base 的倍数"
+# ---------------------------------------------------------------------------
+set +x
+python - "${SCORES}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print(f"没有 {path}，跳过汇总")
+    raise SystemExit(0)
+
+rows = [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
+if not rows:
+    raise SystemExit(0)
+
+probes = [k[len("probe_"):] for k in rows[0] if k.startswith("probe_")]
+base = next((r for r in rows if r["run_name"] == "base"), None)
+
+print()
+print("=" * 100)
+print(f"数学侧 held-out CE（max_len={rows[0]['max_len']}，token 加权平均，越低越接近 base）")
+print("=" * 100)
+
+header = f"{'run':<48}" + "".join(f"{p:>16}" for p in probes)
+print("\n" + header)
+for row in rows:
+    line = f"{row['run_name']:<48}"
+    for p in probes:
+        value = row.get(f"probe_{p}")
+        line += f"{value:>16.5f}" if value is not None else f"{'--':>16}"
+    print(line)
+
+if base is not None:
+    print(f"\n相对 base 的倍数（1.00 = 完全没动）")
+    print(header)
+    for row in rows:
+        line = f"{row['run_name']:<48}"
+        for p in probes:
+            value, ref = row.get(f"probe_{p}"), base.get(f"probe_{p}")
+            line += f"{value / ref:>16.3f}" if value and ref else f"{'--':>16}"
+        print(line)
+
+print(f"\n{'run':<48}" + "".join(f"{p + '@max_len':>18}" for p in probes))
+for row in rows:
+    line = f"{row['run_name']:<48}"
+    for p in probes:
+        cut, total = row.get(f"{p}_rows_at_max_len"), row.get(f"{p}_rows")
+        line += f"{f'{cut}/{total}':>18}" if total else f"{'--':>18}"
+    print(line)
+
+print()
+print("参照：第三章 FLAN 池外，vanilla 相对 base 是 3.85 倍（0.1231 -> 0.4742），")
+print("同期 IFEval strict prompt 掉 11.46pp。数学侧若接近 1.0，说明数学表征确实没动；")
+print("若明显大于 1 而 accuracy 不动，那是'漂移存在但无行为后果'，同样是个结论。")
+print("最后一张表是顶到 max_len 的行数：占比高就说明 MAX_LEN 不够，CE 只覆盖了答案前缀。")
+PY
+
+echo "========================================================================"
+echo "产物:"
+echo "  语料  : ${CORPUS_DIR}/probe_*.jsonl + manifest.json"
+echo "  分数  : ${SCORES}（每个 run 一行）"
+echo "Job finished at: $(date)"
