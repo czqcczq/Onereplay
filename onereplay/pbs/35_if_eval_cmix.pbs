@@ -1,0 +1,460 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_ifcmix
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 给 C_mix run 补 IF 侧对照
+#   只评测 ifeval / multiif / commonsense，不训练，不碰任何数学指标。
+#
+# 为什么要这个实验
+#   数学侧已经证明：当前配置下数学解题能力**没有**被遗忘（vanilla 正常作答的子集
+#   上 72.6% vs 72.2%，p=0.905），被破坏又被保护的是输出格式与终止行为。
+#   => C_mix 想保护的那个东西从来没被破坏过，数学线回答不了"混入 C_math 有没有用"。
+#
+#   IF 侧是目前**唯一已知有真实信号**的地方：vanilla 相对 base 掉了 IFEval
+#   strict prompt 11.46pp、Multi-IF 平均 prompt 18.00pp。C_mix 把一半的质量分给了
+#   数学，那它还能不能保住 IF？两种结果都有信息量：
+#     * 与纯 C_if 一样好 => 印证第四章 4.4 的分层结论：主导方向跨语料共享，
+#       把一半质量换成数学语料也撼动不了它。
+#     * 明显更差         => C 的领域特异性第一次在**行为**上被看见，比 4.3 那个
+#       静态的 overlap=0.4869 更有说服力。
+#
+# 为什么不直接用 32 号的 WITH_IF=1
+#   32 号在 WITH_IF=1 时仍会走一遍数学指标。math500/gsm8k 因为已有 summary.json
+#   会被跳过，但 **amc / aime 没评过，会被真的跑起来**——那两个已经判定放弃
+#   （Qwen3-1.7B 非 thinking 下接近地板，样本量只有 83 / 60），而且截断率高、
+#   每题都要烧满 4096 token，白白搭进去好几个小时。这里干脆不注册数学指标。
+#
+# -----------------------------------------------------------------------------
+# !! 关于 cif 这一行（很容易踩）
+#   Hopper 上纯 C_if 的 adapter 目录实际叫
+#       cs_onereplay_balanced_lam3e-2_seed1_regonce
+#   而不是 32 号默认的 cs_onereplay_lam3e-2_seed1_regonce（那是 RWTH 的名字）。
+#   名字对不上时 eval_one 只会打一行"缺 adapter"然后静默跳过，很难发现。
+#   本脚本的 IF_RUN 默认值已经改成 Hopper 的实际名字。
+#
+#   用 balanced C 当"纯 C_if"的参照是成立的：第四章测得它与 uniform C 的逐层
+#   trace 比值 0.9999、真实 ΔW 下惩罚比 1.0052、top-64 子空间 overlap 0.9878，
+#   两份 C 在所有指标上不可区分。更重要的是它和 cmix 同集群、同 regonce 实现、
+#   同 seed，**这是唯一一组没有跨集群混淆的对照**。
+#
+# -----------------------------------------------------------------------------
+# 本作业只评 cmix 一个模型，其余三行的数字都已经有了（单位 %）
+#                                    IFEval strict prompt   Multi-IF 平均 prompt   出处
+#   Base                (RWTH)               66.54                 49.47          第一章 1.1
+#   Vanilla             (RWTH)               55.08                 31.47          第一章 1.1
+#   OneReplay uniform C (RWTH, 旧实现)       66.17                 47.06          第一章 1.1
+#   OneReplay balanced C(Hopper, regonce)    64.88                 46.73          第四章 4.1
+#   OneReplay C_mix     (本作业产出)           ?                     ?
+#
+#   要对比的是最后两行：balanced C（= 纯 C_if）与 C_mix 同为 Hopper + regonce +
+#   seed 1，唯一变量就是 --cov_path，这是唯一一组无混淆的对照。前三行来自 RWTH，
+#   只能粗比（第四章记录集群+实现两处差异合计约 1.3pp），本作业不重跑它们。
+#
+# -----------------------------------------------------------------------------
+# 用法（本站点不从 qsub 命令行传变量，要改就改下方默认值）:
+#   qsub onereplay/pbs/35_if_eval_cmix.pbs
+#
+#   补别的行（已有 summary.json 的会自动跳过）:  MODELS="base vanilla cif cmix"
+#   冒烟（IFEval 前 20 条 + Multi-IF 前 20 组，十几分钟）:  LIMIT=20 MULTIIF_LIMIT=20
+#   只看前置判断不评测:                                      DRY_RUN=1
+#   强制重评:                                                FORCE_EVAL=1
+#
+# 前置条件:
+#   1) adapter 就位: ${RESULTS_ROOT}/adapters/{cs_vanilla_seed1,
+#      cs_onereplay_balanced_lam3e-2_seed1_regonce,
+#      cs_onereplay_ifmath_lam3e-2_seed1_regonce}
+#   2) IFEval 数据: onereplay/third_party/instruction_following_eval/data/input_data.jsonl
+#   3) Multi-IF 数据: onereplay/third_party/Multi-IF/multiIF_20241018.csv
+#   4) commonsense val: ${REPO_ROOT}/datasets/commonsense_170k_hf
+#   5) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
+#      故意放仓库外：仓库是 rsync 目标，运行中的作业握着日志 fd，rsync 覆盖会换
+#      inode 把作业打成 ESTALE。
+#
+# 预计耗时: IFEval 541 条 + Multi-IF 909 组 × 3 轮 = 每模型约 3 h；commonsense 只是
+#   1000 条前向，几分钟。默认只评 cmix 一个模型，约 3 h，walltime 给 12 h。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/35_if_eval_cmix.pbs}"
+
+# NGC PyTorch 镜像（ubuntu22.04 + python3.10，与 venv 解释器版本一致）。
+# 提交前确认: grep version ${REPO_ROOT}/.venv/pyvenv.cfg
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+# 只在没继承到时才算：内层是被转发进来的，重算会得到另一个名字，于是内层用一个
+# 目录、外层的 cleanup 删另一个，白白泄漏一份临时数据。
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  # 只删本次作业自己建的那一个目录，且必须匹配前缀，避免手滑清掉共享缓存。
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的这个 shell 不一定是 login shell，module 可能还没被定义；
+  # set -e 下那会让作业在第一步就静默挂掉，所以先兜一层初始化。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT CS_DATASET
+    SEED MAXLEN VAL_FRAC MAXVAL LIMIT
+    MODELS VANILLA_RUN IF_RUN MIX_RUN
+    IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT
+    FORCE_EVAL DRY_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用（本站点联网会卡死）
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+
+# ---- 评测参数（与第一章 / 32 号逐字一致，换了就不可比）----
+SEED="${SEED:-1}"
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+LIMIT="${LIMIT:-0}"                  # >0 时 IFEval 只评前 N 条（冒烟用）
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"  # >0 时 Multi-IF 只评前 N 组（冒烟用）
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+
+# ---- run 名 ----
+# IF_RUN 见文件头：Hopper 上纯 C_if 的 adapter 是 balanced 那份，不是 RWTH 的名字。
+VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
+IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam3e-2_seed${SEED}_regonce}"
+MIX_RUN="${MIX_RUN:-cs_onereplay_ifmath_lam3e-2_seed${SEED}_regonce}"
+# 只评 cmix：base / vanilla 的 IF 数字在 RWTH 上已有（第一章），cif 那行是 Hopper
+# 作业 579879 的 balanced C run，第四章 4.1 已经评过。重跑纯属浪费卡时。
+# 要补别的行再写成 "base vanilla cif cmix"，已有 summary.json 的会自动跳过。
+MODELS="${MODELS:-cmix}"
+
+FORCE_EVAL="${FORCE_EVAL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${RESULTS_ROOT}" "${RESULTS_ROOT}/map_cache/eval_if_seed${SEED}"
+
+if [[ "${LIMIT}" != "0" || "${MULTIIF_LIMIT}" != "0" ]]; then
+  echo "!! LIMIT=${LIMIT} MULTIIF_LIMIT=${MULTIIF_LIMIT}：冒烟模式，产出的 summary.json"
+  echo "!! 只覆盖前若干条，不是正式结果。验证完请删掉这批目录再用 0 重跑。"
+fi
+
+# 缺哪个数据文件就跳过哪个指标，不至于整个 job 白挂。
+METRICS_AVAIL="ifeval"
+if [[ -f "${MULTIIF_INPUT}" ]]; then
+  METRICS_AVAIL="${METRICS_AVAIL} multiif"
+else
+  echo "跳过 multiif：缺 ${MULTIIF_INPUT}"
+fi
+if [[ -d "${CS_DATASET}" ]]; then
+  METRICS_AVAIL="${METRICS_AVAIL} commonsense"
+else
+  echo "跳过 commonsense：缺 ${CS_DATASET}"
+fi
+[[ -f "${IFEVAL_INPUT}" ]] || { echo "缺 IFEval 数据: ${IFEVAL_INPUT}"; exit 1; }
+
+resolve_adapter () {
+  case "$1" in
+    base)    echo "" ;;
+    vanilla) echo "${ADAPTERS}/${VANILLA_RUN}" ;;
+    cif)     echo "${ADAPTERS}/${IF_RUN}" ;;
+    cmix)    echo "${ADAPTERS}/${MIX_RUN}" ;;
+    *)       echo "" ;;
+  esac
+}
+
+resolve_name () {
+  case "$1" in
+    base)    echo "base" ;;
+    vanilla) echo "${VANILLA_RUN}" ;;
+    cif)     echo "${IF_RUN}" ;;
+    cmix)    echo "${MIX_RUN}" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# 前置：把"谁会跑、谁会跳过、为什么跳过"一次打清楚。
+# adapter 名字对不上是这条线上最容易踩的坑（见文件头 cif 那段），静默跳过很难
+# 发现，所以这里显式区分"已有结果"和"缺 adapter"两种跳过。
+# ---------------------------------------------------------------------------
+set +x
+echo "========================================================================"
+echo "前置检查（METRICS=${METRICS_AVAIL}）"
+printf "%-8s %-52s %s\n" "short" "run_name" "待评指标 / 跳过原因"
+PENDING_ANY=0
+for short in ${MODELS}; do
+  name="$(resolve_name "${short}")"
+  adapter="$(resolve_adapter "${short}")"
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    printf "%-8s %-52s %s\n" "${short}" "${name}" "!! 缺 adapter: ${adapter}"
+    continue
+  fi
+  todo=""
+  for m in ${METRICS_AVAIL}; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
+      continue
+    fi
+    todo="${todo},${m}"
+  done
+  todo="${todo#,}"
+  if [[ -z "${todo}" ]]; then
+    printf "%-8s %-52s %s\n" "${short}" "${name}" "全部已有结果，跳过"
+  else
+    printf "%-8s %-52s %s\n" "${short}" "${name}" "${todo}"
+    PENDING_ANY=1
+  fi
+done
+echo "========================================================================"
+set -x
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查，不评测。"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 评测：每个 (指标, run) 已有 summary.json 就跳过，既省卡时也防止 *_summary.csv
+# 追加重复行；作业超时后原样再投可以接着跑。
+# ---------------------------------------------------------------------------
+pending_metrics () {
+  local name=$1
+  local out="" m
+  for m in ${METRICS_AVAIL}; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${name}" >&2
+      continue
+    fi
+    out="${out},${m}"
+  done
+  echo "${out#,}"
+}
+
+eval_one () {
+  local short=$1
+  local name adapter metrics
+  name="$(resolve_name "${short}")"
+  adapter="$(resolve_adapter "${short}")"
+
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    echo "跳过 ${short}：缺 adapter ${adapter}"
+    return 0
+  fi
+
+  metrics="$(pending_metrics "${name}")"
+  if [[ -z "${metrics}" ]]; then
+    echo "跳过 ${name}：所有指标都已有结果（FORCE_EVAL=1 可强制重评）"
+    return 0
+  fi
+
+  echo "==== eval IF/CS: ${name} (${metrics}) ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter}" --run_name "${name}" \
+    --metrics "${metrics}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --limit "${LIMIT}" \
+    --dataset_path "${CS_DATASET}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_if_seed${SEED}" \
+    --ifeval_input "${IFEVAL_INPUT}" \
+    --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+    --multiif_limit "${MULTIIF_LIMIT}"
+}
+
+for short in ${MODELS}; do
+  eval_one "${short}"
+done
+
+# ---------------------------------------------------------------------------
+# 后置：把三个指标的 summary.json 汇成一张可直接读的对照表。
+# *_summary.csv 是 append 的、跨作业混排，不适合直接看。
+# ---------------------------------------------------------------------------
+set +x
+python - "${RESULTS_ROOT}" "$(resolve_name base)" "$(resolve_name vanilla)" \
+          "$(resolve_name cif)" "$(resolve_name cmix)" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+labels = ["Base", "Vanilla", "OneReplay C_if", "OneReplay C_mix"]
+names = sys.argv[2:6]
+
+
+def load(metric: str, name: str):
+    path = root / metric / name / "summary.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def cell(payload, *keys):
+    if payload is None:
+        return "  --  "
+    value = payload
+    for key in keys:
+        if not isinstance(value, dict) or key not in value:
+            return "  --  "
+        value = value[key]
+    return f"{value * 100:6.2f}"
+
+
+print()
+print("=" * 100)
+print("IF 侧对照（%）。'--' = 本集群上没有该结果；base/vanilla 本作业刻意不评，")
+print("它们的数字在下方历史参照里（RWTH，第一章 1.1）。")
+print("=" * 100)
+print(f"\n{'方法':<18} {'run_name':<46} {'strict prompt':>14} {'strict inst':>12} {'loose prompt':>13} {'loose inst':>11}")
+for label, name in zip(labels, names):
+    payload = load("ifeval", name)
+    print(
+        f"{label:<18} {name:<46} "
+        f"{cell(payload, 'strict_prompt_accuracy'):>14} "
+        f"{cell(payload, 'strict_instruction_accuracy'):>12} "
+        f"{cell(payload, 'loose_prompt_accuracy'):>13} "
+        f"{cell(payload, 'loose_instruction_accuracy'):>11}"
+    )
+
+print(f"\n{'方法':<18} {'Multi-IF 平均 prompt':>20} {'平均 inst':>11} {'turn 1':>8} {'turn 2':>8} {'turn 3':>8}")
+for label, name in zip(labels, names):
+    payload = load("multiif", name)
+    turns = [
+        cell(payload, "per_turn", f"turn_{i}", "strict_prompt_accuracy") for i in (1, 2, 3)
+    ]
+    print(
+        f"{label:<18} {cell(payload, 'avg_strict_prompt_accuracy'):>20} "
+        f"{cell(payload, 'avg_strict_instruction_accuracy'):>11} "
+        f"{turns[0]:>8} {turns[1]:>8} {turns[2]:>8}"
+    )
+
+print(f"\n{'方法':<18} {'Commonsense 留出集 val loss':>28}")
+for label, name in zip(labels, names):
+    payload = load("commonsense", name)
+    loss = f"{payload['val_loss']:.5f}" if payload and "val_loss" in payload else "  --  "
+    print(f"{label:<18} {loss:>28}")
+
+print()
+print("历史参照（第一、四章，单位 %）: ")
+print("  Base    (RWTH)                   IFEval strict prompt 66.54   Multi-IF 平均 prompt 49.47")
+print("  Vanilla (RWTH)                                        55.08                        31.47")
+print("  uniform C_if (RWTH, 旧实现)                           66.17                        47.06")
+print("  balanced C_if(Hopper, regonce)                        64.88                        46.73")
+print()
+print("只对比 balanced C_if 与 C_mix 这两行：同集群、同 regonce 实现、同 seed，")
+print("唯一变量是 --cov_path。前三行来自 RWTH，只能粗比（第四章记录集群+实现两处")
+print("差异合计约 1.3pp），所以本作业不重跑它们。")
+PY
+
+echo "========================================================================"
+echo "产物:"
+echo "  ${RESULTS_ROOT}/{ifeval,multiif,commonsense}/<run_name>/summary.json"
+echo "  ${RESULTS_ROOT}/{ifeval,multiif}_summary.csv （append，跨作业混排，看上表即可）"
+echo ""
+echo "怎么读："
+echo "  只比 balanced C_if（64.88 / 46.73）与本次的 C_mix。若差距在噪声内（IFEval 541"
+echo "  条上 1 条 prompt = 0.18pp，第四章记录的经验噪声底约 1.3pp），说明把一半质量换"
+echo "  成数学语料不影响 IF 保护，印证第四章 4.4 的分层结论；若 C_mix 明显更差，则 C"
+echo "  的领域特异性首次在行为上可见，比 4.3 的静态 overlap=0.4869 更有说服力。"
+echo "  标尺：vanilla 相对 base 掉了 IFEval −11.46pp / Multi-IF −18.00pp（RWTH）。"
+echo "Job finished at: $(date)"
