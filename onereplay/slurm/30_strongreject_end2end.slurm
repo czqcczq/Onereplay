@@ -32,7 +32,8 @@ set -x
 #   生成结果写到独立的 SR_ROOT，避免覆盖 A/B/C 的 responses.jsonl。
 #   先在有网节点用 scripts/download_safety_data.py 下好：
 #     - strongreject_dataset.csv（ungated raw GitHub）
-#     - StrongREJECT grader 模型 qylu4156/strongreject-15k-v1（源自 gated Gemma）
+#     - StrongREJECT grader adapter qylu4156/strongreject-15k-v1（LoRA，ungated）
+#     - 它的 base google/gemma-2b（gated，需接受授权；缓存进 HF cache 供离线解析）
 # =============================================================================
 
 GCC_MODULE="${GCC_MODULE:-GCC}"
@@ -79,6 +80,9 @@ SAFETY_MAX_NEW_TOKENS="${SAFETY_MAX_NEW_TOKENS:-256}"
 SR_MODEL_DIR="${SR_MODEL_DIR:-/hpcwork/xsz96350/Chen_logs/checkpoints/}"
 SR_MODEL_NAME="${SR_MODEL_NAME:-strongreject-grader}"
 SR_BATCH="${SR_BATCH:-16}"
+# grader 的 base 权重位置。留空 = 用 adapter_config.json 里的 google/gemma-2b，
+# 靠 HF cache 离线解析；若 cache 里没有，就设成本地 base 模型目录。
+SR_BASE="${SR_BASE:-}"
 
 # ---- 生成结果与评分/分析输出（独立目录，避免覆盖 A/B/C）----
 SR_ROOT="${SR_ROOT:-${RESULTS_ROOT}/strongreject}"
@@ -90,9 +94,12 @@ FORCE_GEN="${FORCE_GEN:-0}"     # 1 = 即使已有 responses 也重新生成
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
 [[ -f "${STRONGREJECT_CSV}" ]] || { echo "缺 StrongREJECT CSV: ${STRONGREJECT_CSV}"; exit 1; }
-# 查实际模型文件（config.json），而不仅仅是目录——空目录会让 offline 加载假通过后报错。
-[[ -f "${SR_MODEL_DIR}/${SR_MODEL_NAME}/config.json" ]] || {
-  echo "缺 grader 模型文件: ${SR_MODEL_DIR}/${SR_MODEL_NAME}/config.json"
+# 查实际权重文件而不仅仅是目录——空目录会让 offline 加载假通过后报错。
+# grader（qylu4156/strongreject-15k-v1）是 LoRA adapter，只有 adapter_model.safetensors，
+# 没有 config.json；它的 base（gated google/gemma-2b）要单独缓存好，由 judge 脚本报错兜底。
+SR_GRADER_DIR="${SR_MODEL_DIR}/${SR_MODEL_NAME}"
+[[ -f "${SR_GRADER_DIR}/adapter_model.safetensors" || -f "${SR_GRADER_DIR}/config.json" ]] || {
+  echo "缺 grader 权重: ${SR_GRADER_DIR}/(adapter_model.safetensors|config.json)"
   echo "先在有网节点下好（接受 Gemma 授权 + 登录后）:"
   echo "  python -m onereplay.scripts.download_safety_data --only_sr 1"
   exit 1
@@ -148,9 +155,12 @@ done
 
 # ---- 阶段 2：StrongREJECT grader 一次性评分本次生成的所有 run ----
 echo "==== strongreject grade: ${RESP_LIST} ===="
+base_arg=()
+if [[ -n "${SR_BASE}" ]]; then base_arg=(--judge_base "${SR_BASE}"); fi
 python -m onereplay.scripts.judge_strongreject \
   --responses "${RESP_LIST}" \
   --judge_model_dir "${SR_MODEL_DIR}" --judge_model_name "${SR_MODEL_NAME}" \
+  "${base_arg[@]}" \
   --out_dir "${SR_JUDGE_OUT}" \
   --batch_size "${SR_BATCH}"
 

@@ -17,8 +17,9 @@ The forbidden prompt fed to the grader is the ORIGINAL harmful instruction
 (``base_behavior``), never the jailbreak-wrapped prompt: the grader judges
 whether the response helps accomplish the underlying objective.
 
-The grader model needs downloading on a networked node first (it derives from
-gated Gemma); run offline here.
+The grader ships LoRA weights ONLY -- the frozen 2B base lives in the separate,
+gated ``google/gemma-2b`` repo. Both have to be fetched on a networked node
+first (see scripts/download_safety_data.py); this script runs offline.
 """
 
 from __future__ import annotations
@@ -31,6 +32,8 @@ from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from onereplay.core.modeling import attach_adapter, is_lora_adapter_dir
 
 # Exact fine-tuned-grader prompt from strong_reject/eval_files/judge_templates.json
 # ("strongreject_finetuned"). The trailing "### Answer: " cue makes the next
@@ -77,6 +80,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--judge_model_dir", type=str, required=True)
     parser.add_argument("--judge_model_name", type=str, default="strongreject-grader")
+    # Where the grader's frozen base weights live. Empty = trust the hub id
+    # recorded in adapter_config.json, which offline needs a populated HF cache.
+    parser.add_argument("--judge_base", type=str, default="")
     parser.add_argument("--out_dir", type=str, required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--use_bf16", type=int, default=1)
@@ -104,20 +110,63 @@ def resolve_inputs(spec: str) -> list[Path]:
     return [path for path in unique if path.exists()]
 
 
+def load_causal_lm(path: str, dtype) -> Any:
+    """Load a causal LM at dtype, falling back to default dtype like the reference."""
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype)
+    except Exception:  # noqa: BLE001 -- fall back to default dtype like the reference
+        return AutoModelForCausalLM.from_pretrained(path)
+
+
+def resolve_base_path(grader_dir: Path, override: str) -> str:
+    """Return where the grader's frozen base weights live; override wins.
+
+    The published adapter records its base as the hub id "google/gemma-2b",
+    which only resolves under HF_HUB_OFFLINE if that repo is already cached.
+    """
+
+    if override:
+        return override
+    config_path = grader_dir / "adapter_config.json"
+    base = json.loads(config_path.read_text(encoding="utf-8")).get("base_model_name_or_path")
+    if not base:
+        raise SystemExit(f"no base_model_name_or_path in {config_path}")
+    return str(base)
+
+
+def load_grader_weights(grader_dir: Path, args: argparse.Namespace, dtype) -> Any:
+    """Load full grader weights, or the frozen base with the LoRA adapter on top."""
+
+    if not is_lora_adapter_dir(str(grader_dir)):
+        return load_causal_lm(str(grader_dir), dtype)
+
+    base_path = resolve_base_path(grader_dir, args.judge_base)
+    try:
+        base_model = load_causal_lm(base_path, dtype)
+    except Exception as error:  # noqa: BLE001 -- turn a cache miss into actionable advice
+        raise SystemExit(
+            f"could not load grader base {base_path!r}: {error}\n"
+            "The StrongREJECT grader ships LoRA weights only; its base is gated Gemma. "
+            "On a networked node accept https://huggingface.co/google/gemma-2b, log in, "
+            "then run: python -m onereplay.scripts.download_safety_data --only_sr 1\n"
+            "Alternatively point --judge_base at a local base-model directory."
+        )
+    return attach_adapter(base_model, str(grader_dir))
+
+
 def load_grader(args: argparse.Namespace):
     """Load the fine-tuned grader; left padding/truncation like the reference."""
 
     dtype = torch.bfloat16 if args.use_bf16 else torch.float32
-    model_path = str(Path(args.judge_model_dir) / args.judge_model_name)
+    grader_dir = Path(args.judge_model_dir) / args.judge_model_name
+    # The adapter repo carries its own tokenizer, so this works either way.
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path, padding_side="left", truncation_side="left"
+        str(grader_dir), padding_side="left", truncation_side="left"
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
-    except Exception:  # noqa: BLE001 -- fall back to default dtype like the reference
-        model = AutoModelForCausalLM.from_pretrained(model_path)
+    model = load_grader_weights(grader_dir, args, dtype)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()

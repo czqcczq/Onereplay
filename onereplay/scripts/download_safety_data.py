@@ -9,13 +9,16 @@ so scripts/prepare_safety_data.py works with its defaults:
   - XSTest prompts (HF)                 -> <out_dir>/xstest.csv
   - StrongREJECT forbidden prompts (raw)-> <out_dir>/strongreject_dataset.csv
   - WildGuard judge model (gated HF)    -> <model_dir>/<model_name>/
-  - StrongREJECT grader model (HF)      -> <model_dir>/<sr_model_name>/
+  - StrongREJECT grader adapter (HF)    -> <model_dir>/<sr_model_name>/
+  - StrongREJECT grader base (gated HF) -> HF cache (resolved by repo id)
 
 WildGuard is gated: accept the license at
 https://huggingface.co/allenai/wildguard and authenticate first
 (`huggingface-cli login` or `export HF_TOKEN=...`) before using --with_model.
-The StrongREJECT grader (qylu4156/strongreject-15k-v1) derives from gated Gemma;
-accept https://huggingface.co/google/gemma-2b and authenticate the same way.
+The StrongREJECT grader (qylu4156/strongreject-15k-v1) is a LoRA adapter, not a
+standalone model: it is ungated, but the frozen base it needs (google/gemma-2b)
+is gated. Accept https://huggingface.co/google/gemma-2b and authenticate the
+same way, otherwise only the adapter downloads and scoring fails later.
 
 Do NOT set HF_HUB_OFFLINE / HF_DATASETS_OFFLINE when running this; it needs net.
 """
@@ -41,6 +44,10 @@ STRONGREJECT_URL = (
     "strongreject_dataset/strongreject_dataset.csv"
 )
 
+# The grader is a LoRA adapter, so its frozen base has to be fetched separately.
+# Weights + configs only: the Gemma repo also ships a 10GB .gguf we never load.
+SR_BASE_ALLOW_PATTERNS = ["*.json", "*.model", "*.safetensors"]
+
 
 def parse_args() -> argparse.Namespace:
     """Parse output locations and which assets to fetch."""
@@ -60,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--judge_repo", type=str, default="allenai/wildguard")
     parser.add_argument("--sr_model_name", type=str, default="strongreject-grader")
     parser.add_argument("--sr_judge_repo", type=str, default="qylu4156/strongreject-15k-v1")
+    parser.add_argument("--sr_base_repo", type=str, default="google/gemma-2b")
     parser.add_argument("--strongreject_url", type=str, default=STRONGREJECT_URL)
     parser.add_argument("--itw_repo", type=str, default="TrustAIRLab/in-the-wild-jailbreak-prompts")
     parser.add_argument("--itw_config", type=str, default="jailbreak_2023_12_25")
@@ -150,8 +158,33 @@ def download_model(args: argparse.Namespace) -> None:
     print(f"[judge] done -> {target}")
 
 
+def download_sr_base(args: argparse.Namespace) -> None:
+    """Cache the grader's frozen base model so it resolves offline by repo id.
+
+    Deliberately no local_dir: the adapter records its base as the hub id
+    "google/gemma-2b", which under HF_HUB_OFFLINE is only resolvable from the
+    shared HF cache. This repo is gated, so it needs an authenticated login.
+    """
+
+    from huggingface_hub import snapshot_download
+
+    print(f"[sr-base] snapshot {args.sr_base_repo} -> HF cache")
+    try:
+        snapshot_download(
+            repo_id=args.sr_base_repo, allow_patterns=SR_BASE_ALLOW_PATTERNS
+        )
+    except Exception as error:  # noqa: BLE001
+        raise SystemExit(
+            f"[sr-base] failed: {error}\n"
+            f"{args.sr_base_repo} is gated: accept the license at "
+            f"https://huggingface.co/{args.sr_base_repo} and run "
+            "`huggingface-cli login` (or export HF_TOKEN) first."
+        )
+    print(f"[sr-base] done -> HF cache ({args.sr_base_repo})")
+
+
 def download_sr_model(args: argparse.Namespace) -> None:
-    """Snapshot the StrongREJECT grader into <model_dir>/<sr_model_name>."""
+    """Snapshot the StrongREJECT grader adapter plus its frozen base model."""
 
     from huggingface_hub import snapshot_download
 
@@ -161,13 +194,9 @@ def download_sr_model(args: argparse.Namespace) -> None:
     try:
         snapshot_download(repo_id=args.sr_judge_repo, local_dir=str(target))
     except Exception as error:  # noqa: BLE001
-        raise SystemExit(
-            f"[sr-grader] failed: {error}\n"
-            "The StrongREJECT grader derives from gated Gemma: accept "
-            "https://huggingface.co/google/gemma-2b and run "
-            "`huggingface-cli login` (or export HF_TOKEN) first."
-        )
+        raise SystemExit(f"[sr-grader] failed: {error}")
     print(f"[sr-grader] done -> {target}")
+    download_sr_base(args)
 
 
 def main() -> None:
