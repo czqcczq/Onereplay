@@ -211,23 +211,36 @@ def report_metric(metric: str, runs: list[str], root: Path, baseline: str, cap: 
         )
 
     # 3. extraction health -------------------------------------------------
-    print("\n-- 抽取健康度（no-answer 越高说明分数越受格式影响）")
-    print(f"{'run':<50} {'n':>5} {'no-answer':>13} {'no-marker':>13} {'hit-cap':>13} {'tokP50/P90/P99/max':>24}")
+    # Truncation is counted against each run's OWN longest response, not against
+    # --cap: runs evaluated under different MATH_MAX_NEW_TOKENS end up in the
+    # same directory, and measuring a cap=1792 run against cap=4096 reports 0%
+    # truncation for a run that is in fact truncating. A run that never hits its
+    # budget shows one or two items at its own max; a truncating run shows a
+    # cluster there, and its max is the budget itself.
+    print("\n-- 抽取健康度（trunc@max 是顶到本 run 自身最长回复的题数；成簇即截断）")
+    print(f"{'run':<50} {'n':>5} {'no-answer':>13} {'no-marker':>13} {'trunc@max':>13} {'tokP50/P90/P99/max':>24}")
+    own_max: dict[str, int] = {}
     for run, rows in loaded.items():
         n = len(rows)
         no_answer = sum(spec["production"](row.get("response", "")) in (None, "") for row in rows)
         no_marker = sum(spec["marker"] not in row.get("response", "") for row in rows)
         if tokenizer is not None:
             lengths = sorted(token_lengths(rows, tokenizer))
-            hit_cap = sum(length >= cap - 8 for length in lengths)
-            cap_str = f"{hit_cap} ({hit_cap / n:.1%})"
+            own_max[run] = lengths[-1]
+            trunc = sum(length >= lengths[-1] - 8 for length in lengths)
+            trunc_str = f"{trunc} ({trunc / n:.1%})"
             len_str = f"{percentile(lengths, 50)}/{percentile(lengths, 90)}/{percentile(lengths, 99)}/{lengths[-1]}"
         else:
-            cap_str = "n/a"
+            trunc_str = "n/a"
             len_str = "n/a (给 --model_path)"
         print(
             f"{run:<50} {n:>5} {no_answer:>5} ({no_answer / n:>5.1%}) "
-            f"{no_marker:>5} ({no_marker / n:>5.1%}) {cap_str:>13} {len_str:>24}"
+            f"{no_marker:>5} ({no_marker / n:>5.1%}) {trunc_str:>13} {len_str:>24}"
+        )
+    if len(set(own_max.values())) > 1:
+        print(
+            f"   !! 各 run 的 token max 不一致 {sorted(set(own_max.values()))}，"
+            f"多半是 MATH_MAX_NEW_TOKENS 不同，跨 run 比较前先补评"
         )
 
     # 4. re-scoring under three extractors ---------------------------------
@@ -285,6 +298,52 @@ def report_metric(metric: str, runs: list[str], root: Path, baseline: str, cap: 
         "\n   b = 该 run 对而 baseline 错的题数，c = 反之。p 是双侧精确检验。\n"
         "   最后一列是 b 里 baseline 压根没抽出答案的比例：越高，说明这个\n"
         "   '提升' 越是格式服从度而不是解题能力。"
+    )
+
+    # 6. is the accuracy gain just format collapse leaking through? ---------
+    # GSM8K falls back to the last number anywhere in the response, so a run
+    # that stopped emitting '####' still scores -- but worse, because the
+    # fallback picks up an intermediate number. Splitting the items by whether
+    # the baseline emitted the marker separates "the run does more math" from
+    # "the run kept the output format". If the whole gap sits in the no-marker
+    # partition, the accuracy result is the IFEval result wearing a math costume.
+    print(f"\n-- 增益来源分解：按 {baseline} 是否写出 {spec['marker']!r} 切开")
+    has_marker = [spec["marker"] in row.get("response", "") for row in base_rows]
+    n_total = len(base_rows)
+    for run, run_scores in scores.items():
+        if run == baseline:
+            continue
+        print(f"\n   {run}")
+        print(
+            f"   {'分区':<26} {'题数':>6} {'baseline':>10} {'该 run':>10} "
+            f"{'b':>5} {'c':>5} {'净':>6} {'占总Δ':>8} {'p':>9}"
+        )
+        net_total = sum(run_scores) - sum(base_scores)
+        for label, keep in (
+            (f"baseline 有 {spec['marker']}", True),
+            (f"baseline 无 {spec['marker']}", False),
+        ):
+            idx = [i for i in range(n_total) if has_marker[i] == keep]
+            if not idx:
+                continue
+            b = sum(1 for i in idx if run_scores[i] and not base_scores[i])
+            c = sum(1 for i in idx if base_scores[i] and not run_scores[i])
+            base_acc = sum(base_scores[i] for i in idx) / len(idx)
+            run_acc = sum(run_scores[i] for i in idx) / len(idx)
+            share = (b - c) / net_total if net_total else 0.0
+            print(
+                f"   {label:<26} {len(idx):>6} {base_acc:>9.1%} {run_acc:>9.1%} "
+                f"{b:>5} {c:>5} {b - c:>+6} {share:>7.0%} {mcnemar_exact(b, c):>9.4f}"
+            )
+        n_bad = sum(1 for m in has_marker if not m)
+        print(
+            f"   总净差 {net_total:+d} 题（{net_total / n_total:+.2%}），"
+            f"其中 baseline 格式失效的那 {n_bad} 题（{n_bad / n_total:.1%}）贡献了上表最后一行。"
+        )
+    print(
+        "\n   读法：若「占总Δ」在无 marker 那一行接近 100%，则该 run 的准确率优势\n"
+        "   完全来自 baseline 丢失输出格式后兜底抓错数字，属于指令跟随的结果，\n"
+        "   不能作为该任务能力被保住的独立证据。两行都有贡献才说明能力也保住了。"
     )
 
 
