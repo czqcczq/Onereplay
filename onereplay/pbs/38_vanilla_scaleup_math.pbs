@@ -1,0 +1,344 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_vscale
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper: 放大 LoRA 的 vanilla 筛查 —— 这个配置到底能不能打坏数学？
+#   只训 vanilla，只评 math500 + gsm8k。不涉及 C，不涉及 OneReplay。
+#
+# -----------------------------------------------------------------------------
+# 为什么只训 vanilla
+#   vanilla **不需要协方差**，所以 target_modules 完全自由，这一步可以立刻开跑，
+#   不用先等 C 重采。而它回答的正是那个决定性的问题：
+#
+#     现在这套 r=8 / q_proj,v_proj / 0.093% 参数的配置，把格式和终止行为砸得很惨
+#     （IFEval −11.46pp、Multi-IF −18.00pp、GSM8K 缺 '####' 从 0.2% 涨到 22.4%），
+#     却**完全没碰到算术**（base 正常作答的 1316 题上 77.3% vs 75.5%，p=0.13）。
+#     这是容量不够，还是伤害本来就打不到数学？
+#
+#   判据（必须高于量程，事先定死）:
+#     GSM8K   (1319 题) 配对可分辨下限 2.26pp -> 遗忘 >= 8pp  才算这条路走得通
+#     MATH-500 (500 题) 配对可分辨下限 3.51pp -> 遗忘 >= 10pp
+#
+#   够不到 => 问题不在参数量，而在 Commonsense170k 的梯度里没有破坏算术的成分，
+#            该换的是新任务。这个否定结论同样值这一趟，而且省下了 C 的重采。
+#   够得到 => 用同一套配置采 C，再训 OneReplay。**注意 C 必须覆盖同一组模块**：
+#            正则对没有 C 的模块是静默跳过的（只计入 missing_layers），拿现成的
+#            _qv 版 C 去训 all-linear，等于只约束 q/v、其余自由漂移。
+#            down_proj 的输入是 intermediate_size(6144) 不是 hidden(2048)，单层 C
+#            是别人的 9 倍，all-linear 全套约 7 GB（现在 qv 版是 0.875 GiB）。
+#
+# -----------------------------------------------------------------------------
+# 为什么是扩模块而不是提 rank
+#   r=8 已经把新任务学穿了（val loss 12.815 -> 0.04494），**没有剩余梯度压力去
+#   驱动新增容量**，提 rank 多半只是让曲线重合。扩模块不是量的变化，是换承受伤害
+#   的部位：q/v 决定注意力往哪看（路由与风格），而算术这类过程性计算主要落在 MLP
+#   里。现在观察到的"格式全塌、算术不动"正好和这个吻合。
+#
+# 这是**筛查**不是受控消融：三个旋钮一起推（模块 + rank + lr），先看有没有效应。
+#   有效应再回头做归因（只改 target_modules 重跑一次即可分离出主因）；
+#   没效应就是个很强的否定结论，不需要归因。
+#
+# 旋钮阶梯（当前默认已经是第 2 档；还不够就往下走）:
+#   1  q,k,v,o                        C 便宜（全 2048²，约 1.9 GB）
+#   2  + gate,up,down = all linear    默认。C 约 7 GB
+#   3  再把 LR 提到 5e-4              注意发散风险，见下
+#   4  换新任务（代码 / 长文对话 / 跨语言）
+#
+# -----------------------------------------------------------------------------
+# 用法:
+#   qsub onereplay/pbs/38_vanilla_scaleup_math.pbs
+#
+#   先快筛（gsm8k 只评前 400 题，约 45 分钟就能看出有没有效应）:  LIMIT=400
+#     LIMIT>0 时输出会自动落到 ${OUT_DIR}_limit<N>，不会污染正式结果目录。
+#   只训不评 / 只评不训:      DO_EVAL=0  /  DO_TRAIN=0
+#   退回第 1 档:              TARGET_MODULES="q_proj,k_proj,v_proj,o_proj"
+#   再加大梯度:               LR=5e-4
+#   只看配置不跑:             DRY_RUN=1
+#
+# 前置条件:
+#   1) ${CS_DATASET} = ${REPO_ROOT}/datasets/commonsense_170k_hf
+#   2) 数学数据 ${MATH_DATA_DIR}/{math500,gsm8k}_test.jsonl
+#   3) base 的 math500/gsm8k 结果已在 ${RESULTS_ROOT} 下（作为对照，本作业不重评）
+#   4) mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 预计耗时: 训练约 2-3 h（all-linear r=32 比 qv r=8 慢），gsm8k 约 2.5 h，
+#   math500 约 4 h。若模型退化成大段跑题，评测会显著变慢——所以 gsm8k 排在前面，
+#   它先出结果就够下结论了，可以直接 qdel 掉后面的 math500。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/38_vanilla_scaleup_math.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：起容器，然后把脚本自身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT CS_DATASET MATH_DATA_DIR OUT_DIR
+    SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
+    TARGET_MODULES LORA_RANK LORA_ALPHA LORA_DROPOUT RUN
+    MATH_MAX_NEW_TOKENS LIMIT
+    DO_TRAIN DO_EVAL DO_DIAG FORCE_TRAIN FORCE_EVAL DRY_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层
+# =============================================================================
+set -x
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ---- 路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+
+# ---- 训练超参：与生产 run 的差异只有 TARGET_MODULES / LORA_RANK / LR ----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-2e-4}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+LORA_RANK="${LORA_RANK:-32}"
+LORA_ALPHA="${LORA_ALPHA:-64}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.1}"
+
+# run 名把配置编进去：和 cs_vanilla_seed1 不能撞，事后也要看得出是哪一档
+MOD_TAG="$(echo "${TARGET_MODULES}" | tr -d ' ' | sed 's/_proj//g; s/,//g')"
+RUN="${RUN:-cs_vanilla_${MOD_TAG}_r${LORA_RANK}_lr${LR}_seed${SEED}}"
+
+# ---- 评测 ----
+MATH500_FILE="${MATH_DATA_DIR}/math500_test.jsonl"
+GSM8K_FILE="${MATH_DATA_DIR}/gsm8k_test.jsonl"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+LIMIT="${LIMIT:-0}"
+
+# LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"summary.json 已存在就跳过"的
+# 逻辑当成完整结果挡住后续正式评测 —— GSM8K 那次 1792/4096 就是这么埋进去的。
+# 所以快筛自动改道到独立目录。
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+  echo "!! LIMIT=${LIMIT} 快筛模式：结果写到 ${OUT_DIR}，不与正式结果混放。"
+  echo "!! 对照的 base 也必须用同一个 LIMIT 重评才可比（见文末）。"
+fi
+
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+DO_DIAG="${DO_DIAG:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}"
+
+# gsm8k 排前面：短、快，先出结果就够下结论
+ALL_METRICS=""
+if [[ -f "${GSM8K_FILE}" ]]; then ALL_METRICS="${ALL_METRICS} gsm8k"; else echo "跳过 gsm8k：缺 ${GSM8K_FILE}"; fi
+if [[ -f "${MATH500_FILE}" ]]; then ALL_METRICS="${ALL_METRICS} math500"; else echo "跳过 math500：缺 ${MATH500_FILE}"; fi
+ALL_METRICS="${ALL_METRICS# }"
+
+set +x
+echo "========================================================================"
+echo "vanilla 放大筛查"
+echo "  run            : ${RUN}"
+echo "  target_modules : ${TARGET_MODULES}"
+echo "  lora_rank      : ${LORA_RANK}   alpha=${LORA_ALPHA}  dropout=${LORA_DROPOUT}"
+echo "  lr             : ${LR}   epochs=${EPOCHS}  batch=${BATCH}  accum=${ACCUM}"
+echo "  对照 (r=8/qv)  : cs_vanilla_seed1，lr=1e-4，0.093% 参数"
+echo "  评测           : ${ALL_METRICS}  cap=${MATH_MAX_NEW_TOKENS}  limit=${LIMIT}"
+echo "  输出           : ${OUT_DIR}"
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置，不训练不评测。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+set -x
+
+# ---------------------------------------------------------------------------
+# 训练：vanilla = 不加载 C、不算正则
+#   measure_replay_when_lambda_zero=0 很重要：置 1 的话即使 lambda=0 也会每步
+#   加载 C 并求值，计时被污染，而且这里根本没有 C 可加载。
+#   （cs_vanilla_seed1 当年就踩了这个，它的墙钟至今不可用。）
+# ---------------------------------------------------------------------------
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  if [[ "${FORCE_TRAIN}" != "1" && -d "${ADAPTERS}/${RUN}" ]]; then
+    echo "跳过训练 ${RUN}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+  else
+    [[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+    mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
+    echo "==== train vanilla: ${RUN} ===="
+    python -m onereplay.scripts.train --paradigm sft \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+      --dataset_path "${CS_DATASET}" \
+      --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+      --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+      --target_modules "${TARGET_MODULES}" \
+      --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
+      --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+      --save 1 --save_path "${ADAPTERS}/${RUN}" \
+      --metrics_path "${RESULTS_ROOT}/metrics/${RUN}.jsonl"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 评测
+# ---------------------------------------------------------------------------
+if [[ "${DO_EVAL}" == "1" && -n "${ALL_METRICS}" ]]; then
+  [[ -d "${ADAPTERS}/${RUN}" ]] || { echo "缺 adapter ${ADAPTERS}/${RUN}，无法评测"; exit 1; }
+
+  PENDING=""
+  for m in ${ALL_METRICS}; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/${m}/${RUN}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${RUN}"
+      continue
+    fi
+    PENDING="${PENDING},${m}"
+  done
+  PENDING="${PENDING#,}"
+
+  if [[ -n "${PENDING}" ]]; then
+    echo "==== eval math: ${RUN} (${PENDING}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${ADAPTERS}/${RUN}" --run_name "${RUN}" \
+      --metrics "${PENDING}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" --limit "${LIMIT}" \
+      --math500_data_path "${MATH500_FILE}" \
+      --gsm8k_data_path "${GSM8K_FILE}"
+  else
+    echo "所有指标都已有结果"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 诊断：与 base、以及旧的 r=8/qv vanilla 三方并排
+# ---------------------------------------------------------------------------
+if [[ "${DO_DIAG}" == "1" && -n "${ALL_METRICS}" ]]; then
+  DIAG_RUNS="base,cs_vanilla_seed${SEED},${RUN}"
+  python -m onereplay.scripts.diagnose_math_pairs \
+    --results_root "${OUT_DIR}" --metrics "${ALL_METRICS// /,}" \
+    --runs "${DIAG_RUNS}" --baseline "base" \
+    --cap "${MATH_MAX_NEW_TOKENS}" --model_path "${MODEL_DIR}/${MODEL_NAME}" || true
+fi
+
+set +x
+echo "========================================================================"
+echo "怎么下结论 —— 看诊断里 ${RUN} 相对 base 的 Δacc 与 p:"
+echo "  GSM8K   遗忘 >= 8pp  且显著 => 这条路走得通"
+echo "  MATH-500 遗忘 >= 10pp 且显著 => 同上"
+echo "  都够不到（量程 2.26pp / 3.51pp）=> 不是参数量的问题，换新任务"
+echo ""
+echo "同时看这三样，它们能区分'数学坏了'和'又只是格式坏了':"
+echo "  no-marker   r=8/qv 的 vanilla 是 22.4%（base 0.2%）。只有这个涨、accuracy"
+echo "              不动，就还是格式崩溃，和之前一个结论。"
+echo "  trunc@max   r=8/qv 的 vanilla 是 16 题（1.2%），base 5 题（0.4%）。"
+echo "  strict 口径 r=8/qv 的 vanilla 是 45.41%（base 76.27%）。"
+echo "  真正的新结果长这样：production 口径也掉了 8pp 以上，且增益来源分解里"
+echo "  'baseline 有 ####' 那一档也显著 —— 那才是数学本身被打坏了。"
+echo ""
+echo "也要看训练日志的 val_loss：对照是 ep1/2/3 = 0.06039 / 0.05133 / 0.04494。"
+echo "若明显更高或出现 NaN，说明 LR=${LR} 在这个模块集上发散了，降回 1e-4 重跑。"
+if [[ "${LIMIT}" != "0" ]]; then
+  echo ""
+  echo "!! 快筛模式：${OUT_DIR} 里目前只有本 run 的结果，base 与旧 vanilla 都不在，"
+  echo "!! 诊断表会显示缺行。要对照就用同一个 LIMIT 补评它们:"
+  echo "   MODELS 见 33 号；或直接 evaluate --adapter_path '' --run_name base \\"
+  echo "     --out_dir ${OUT_DIR} --limit ${LIMIT} --metrics gsm8k ..."
+fi
+echo "产物: adapter=${ADAPTERS}/${RUN}  评测=${OUT_DIR}/{gsm8k,math500}/${RUN}/"
+echo "Job finished at: $(date)"
