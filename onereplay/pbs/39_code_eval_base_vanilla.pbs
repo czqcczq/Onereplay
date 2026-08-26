@@ -1,0 +1,334 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_codeval
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper: 代码侧筛查 —— base vs vanilla 的 HumanEval / MBPP
+#   只评测，不训练，不涉及 C。两个 checkpoint 都已存在。
+#
+# -----------------------------------------------------------------------------
+# 为什么先跑这个
+#   数学线证明了当前配置**没有**损害数学能力，被摧毁的是格式与终止行为。代码生成
+#   要求的正是长的、结构化的输出 —— 也就是被摧毁的那一项。所以在花任何力气采
+#   C_code 之前，先确认代码这边到底有没有伤害可保护。
+#
+#   两个 checkpoint 现成，一趟作业就能定，这和数学那边"先只训 vanilla"是同一个逻辑。
+#
+# -----------------------------------------------------------------------------
+# !! 三个必须先知道的判分特性（都在 onereplay/eval/code_exec.py 里）
+#
+# 1) cleanup_completion 在第一个 '\ndef ' 处截断。模型写
+#      "Here is the solution:\n\ndef f(...)"
+#    时，留下的只有那句话，代码全被砍掉，判 0 分 —— 哪怕代码完全正确。
+#    **这条专门惩罚话多的模型**，而 vanilla 恰恰是被训得爱加废话/不收尾的那个。
+#
+# 2) has_dangerous_code 拦掉任何含 'import os' / 'open(' / 'pathlib' / 'socket'
+#    等字样的完成，包括正当用法。所以**绝对分数会低于该模型公开报告的数值**。
+#    它对每个 run 一视同仁，所以对比有效，绝对值不可外引。
+#
+# 3) MBPP 的 split 默认是 validation（只有 90 题）。本脚本显式传 test（500 题），
+#    否则量程差三倍。
+#
+#   => 结论：pass@1 掉了不等于"不会写代码了"。所以评完会跑
+#      analyze_code_failures，按 error 字段把失败分桶：
+#        语法错误暴涨、断言失败不变  => 又是格式崩溃，和 IFEval 同一件事
+#        断言失败占比上升            => 代码写得出来但是错的，才是能力退化
+#
+# -----------------------------------------------------------------------------
+# 前置：数据要在**登录节点**先下好（计算节点 HF_HUB_OFFLINE=1，本站点联网会卡死）
+#   python -m onereplay.scripts.download_code_data \
+#     --out_dir /scratch/weiliu87/student/czq/Onereplay/datasets/code
+#   产出: humaneval_test.parquet（164 条）、mbpp_full/（test 500 条）
+#
+# 用法:
+#   qsub onereplay/pbs/39_code_eval_base_vanilla.pbs
+#
+#   **强烈建议先冒烟**（每个指标前 20 题，十几分钟）: LIMIT=20
+#     判分要在子进程里 exec 生成的代码，这条链路在本集群从没跑过，先确认它通了。
+#     LIMIT>0 时输出自动改道到 ${OUT_DIR}_limit<N>，不会污染正式结果。
+#   只看配置:      DRY_RUN=1
+#   加评 cmix:     MODELS="base vanilla cmix"
+#
+# 预计耗时: (164+500) 题 × 2 个模型，512 token 预算，约 2-3 h。若 vanilla 退化成
+#   大段跑题会更慢。walltime 给 8 h。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/39_code_eval_base_vanilla.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT CODE_DATA_DIR OUT_DIR
+    MODELS VANILLA_RUN MIX_RUN SEED
+    CODE_MAX_NEW_TOKENS TIMEOUT LIMIT MBPP_SPLIT MBPP_CONFIG
+    FORCE_EVAL DRY_RUN DO_ANALYZE
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层
+# =============================================================================
+set -x
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+
+SEED="${SEED:-1}"
+VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
+MIX_RUN="${MIX_RUN:-cs_onereplay_ifmath_lam3e-2_seed${SEED}_regonce}"
+MODELS="${MODELS:-base vanilla}"
+
+MBPP_CONFIG="${MBPP_CONFIG:-full}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"       # 见文件头：默认的 validation 只有 90 题
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
+TIMEOUT="${TIMEOUT:-10}"
+LIMIT="${LIMIT:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_ANALYZE="${DO_ANALYZE:-1}"
+
+HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
+MBPP_DIR="${CODE_DATA_DIR}/mbpp_${MBPP_CONFIG}"
+
+# LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"的逻辑
+# 当成完整结果挡住后续正式评测。GSM8K 那次就是这么埋进去的，这里自动改道。
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${OUT_DIR}"
+
+ALL_METRICS=""
+if [[ -f "${HUMANEVAL_FILE}" ]]; then
+  ALL_METRICS="${ALL_METRICS} humaneval"
+else
+  echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}（先在登录节点跑 download_code_data）"
+fi
+if [[ -d "${MBPP_DIR}" ]]; then
+  ALL_METRICS="${ALL_METRICS} mbpp"
+else
+  echo "跳过 mbpp：缺 ${MBPP_DIR}（先在登录节点跑 download_code_data）"
+fi
+ALL_METRICS="${ALL_METRICS# }"
+[[ -n "${ALL_METRICS}" ]] || { echo "两份代码数据都不在，先下载"; exit 1; }
+
+resolve_path () {
+  case "$1" in
+    base)    echo "" ;;
+    vanilla) echo "${ADAPTERS}/${VANILLA_RUN}" ;;
+    cmix)    echo "${ADAPTERS}/${MIX_RUN}" ;;
+    *)       echo "" ;;
+  esac
+}
+resolve_name () {
+  case "$1" in
+    base)    echo "base" ;;
+    vanilla) echo "${VANILLA_RUN}" ;;
+    cmix)    echo "${MIX_RUN}" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+set +x
+echo "========================================================================"
+echo "代码侧筛查  METRICS=${ALL_METRICS}"
+echo "  MBPP     : ${MBPP_DIR}  split=${MBPP_SPLIT}"
+echo "  HumanEval: ${HUMANEVAL_FILE}"
+echo "  预算     : ${CODE_MAX_NEW_TOKENS} token   判分超时 ${TIMEOUT}s   limit=${LIMIT}"
+echo "  输出     : ${OUT_DIR}"
+printf "%-10s %-46s %s\n" "short" "run_name" "待评 / 跳过原因"
+for short in ${MODELS}; do
+  name="$(resolve_name "${short}")"
+  path="$(resolve_path "${short}")"
+  if [[ -n "${path}" && ! -d "${path}" ]]; then
+    printf "%-10s %-46s %s\n" "${short}" "${name}" "!! 缺 adapter ${path}"
+    continue
+  fi
+  todo=""
+  for m in ${ALL_METRICS}; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then continue; fi
+    todo="${todo},${m}"
+  done
+  printf "%-10s %-46s %s\n" "${short}" "${name}" "${todo:-全部已有结果，跳过}"
+done
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+set -x
+
+# ---------------------------------------------------------------------------
+# 判分链路自检：这套 exec-in-subprocess 的沙箱在本集群从没跑过，先用一段已知
+# 正确的代码走一遍。它要是不通，整个作业跑完只会得到一片 0 分，很难看出是模型
+# 差还是判分坏了。
+# ---------------------------------------------------------------------------
+python - <<'PY'
+from onereplay.eval.code_exec import evaluate_assert_program, evaluate_entry_point_program
+
+ok, err = evaluate_assert_program("def add(a, b):\n    return a + b\n", ["assert add(1, 2) == 3"], 5.0)
+print(f"自检 MBPP 路径      : passed={ok} error={err!r}")
+program = "def add(a, b):\n    return a + b\n"
+test = "def check(candidate):\n    assert candidate(1, 2) == 3\n"
+ok2, err2 = evaluate_entry_point_program(program, "add", test, 5.0)
+print(f"自检 HumanEval 路径 : passed={ok2} error={err2!r}")
+if not (ok and ok2):
+    raise SystemExit("判分沙箱不通（多半是容器里 multiprocessing 起不来），先修这个再评测")
+print("判分链路 OK")
+PY
+
+# ---------------------------------------------------------------------------
+# 评测
+# ---------------------------------------------------------------------------
+eval_one () {
+  local short=$1
+  local name path metrics m
+  name="$(resolve_name "${short}")"
+  path="$(resolve_path "${short}")"
+  if [[ -n "${path}" && ! -d "${path}" ]]; then
+    echo "跳过 ${short}：缺 ${path}"; return 0
+  fi
+  metrics=""
+  for m in ${ALL_METRICS}; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${name}"; continue
+    fi
+    metrics="${metrics},${m}"
+  done
+  metrics="${metrics#,}"
+  [[ -n "${metrics}" ]] || { echo "跳过 ${name}：全部已有结果"; return 0; }
+
+  echo "==== eval code: ${name} (${metrics}) ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${path}" --run_name "${name}" \
+    --metrics "${metrics}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+    --limit "${LIMIT}" \
+    --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}" --timeout "${TIMEOUT}" \
+    --humaneval_data_file "${HUMANEVAL_FILE}" \
+    --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
+    --cache_dir "${JOB_TMPDIR}/hf_datasets"
+}
+
+for short in ${MODELS}; do
+  eval_one "${short}"
+done
+
+# ---------------------------------------------------------------------------
+# 失败原因分桶 + 配对检验
+# ---------------------------------------------------------------------------
+if [[ "${DO_ANALYZE}" == "1" ]]; then
+  DIAG_RUNS=""
+  for short in ${MODELS}; do
+    DIAG_RUNS="${DIAG_RUNS},$(resolve_name "${short}")"
+  done
+  python -m onereplay.scripts.analyze_code_failures \
+    --results_root "${OUT_DIR}" --metrics "${ALL_METRICS// /,}" \
+    --runs "${DIAG_RUNS#,}" --baseline base || true
+fi
+
+set +x
+echo "========================================================================"
+echo "怎么读："
+echo "  1) vanilla 的 pass@1 相对 base 掉了多少、显不显著。HumanEval 只有 164 题，"
+echo "     只读得出十几个点以上的差异；MBPP test 500 题好一些。"
+echo "  2) **更要紧的是失败原因分布。** 语法错误占比暴涨而断言失败没怎么变，说明"
+echo "     模型是不肯好好输出代码了（和 GSM8K 丢 '####' 是同一件事），那 OneReplay"
+echo "     保住的又会是格式。断言失败占比上升才是代码能力真的退化。"
+echo "  3) 绝对分数会低于公开报告值（判分器有 import/open 黑名单，且会在第一个"
+echo "     '\\ndef ' 处截断），对比有效，绝对值不要外引。"
+echo ""
+echo "有伤害可保护 => 再选 C_code 语料。选 prompt 风格贴近 HumanEval/MBPP 的"
+echo "  （CodeAlpaca-20k / Magicoder OSS-Instruct），不建议 TACO（竞赛题面太长，"
+echo "  分布也不匹配，而且它的测试用例和解答在自蒸馏流程里根本用不上）。"
+echo "产物: ${OUT_DIR}/{humaneval,mbpp}/<run_name>/{summary.json,responses.jsonl}"
+echo "Job finished at: $(date)"
