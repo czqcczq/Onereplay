@@ -1,0 +1,453 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_gsm8kre
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 把 GSM8K 的 base / vanilla 补评到 cap=4096
+#
+# 为什么需要这个脚本
+#   33 号在 MATH_MAX_NEW_TOKENS 还是 1792 的时候评过 base / vanilla 的 gsm8k；
+#   32 号后来把默认值提到 4096，评了 cmix。于是 results/gsm8k/ 下混着两个预算:
+#     base   token max = 1792   顶到上限约 5 题
+#     vanilla token max = 1792  顶到上限 16 题（1.2%）
+#     cmix   token max = 4096   顶到上限 3 题（0.2%）
+#   被截断的回复写不出结尾的 '#### <数字>'，判分退回"取全文最后一个数字"的兜底，
+#   基本必错。所以 vanilla 比 cmix 多丢的那约 13 题（0.99pp）是纯预算伪影，而且
+#   它们全部落在「vanilla 未写 ####」那个分区里 —— 那正是当前唯一显著的分区
+#   （+21 题，p=0.0111）。最坏情况下剔掉这 16 题，p 退回 0.5 量级。
+#   => 不补评就不能引用那个显著性。详见 results_log/08-25_math_结果.md 第 2、5 节。
+#
+#   MATH-500 不受影响：三个 run 的 token max 都是 4096，已经可比，本脚本不碰它。
+#
+# -----------------------------------------------------------------------------
+# 流程（每一步都可重复执行，超时后原样再投即可续跑）
+#   0) 前置：对 base / vanilla / cmix 逐个统计 responses.jsonl 的 token 长度，
+#      判断谁真的需要重评。判据是"**顶到自身最大长度的题数 >= CLUSTER_MIN**
+#      且该最大长度 < 目标 cap"：只有发生过截断，预算才可能改变结果；一个从没
+#      顶到上限的 run 在任何更大的预算下逐字相同，重评纯属浪费卡时。
+#   1) 归档：把需要重评的 run 的旧目录整体移到 ${ARCHIVE_ROOT}/<run>/，不删除。
+#      已存在同名归档就跳过（防止二次提交把刚跑出的 4096 结果覆盖进归档）。
+#   2) 评测：只跑 gsm8k 这一个指标，MATH_MAX_NEW_TOKENS=4096。
+#      归档之后 summary.json 不在了，evaluate 的"已有结果就跳过"逻辑自然会重跑。
+#   3) 重建 ${RESULTS_ROOT}/gsm8k_summary.csv：从各 run 的 summary.json 全量重写，
+#      而不是 append。evaluate 每次都往 CSV 追加一行，重评会留下同名重复行且新旧
+#      预算混排；以 summary.json 为准重建可以一劳永逸。旧 CSV 会先备份。
+#   4) 后置：跑 diagnose_math_pairs 确认三个 run 的 token max 已经一致，并重新出
+#      McNemar 与增益来源分解。
+#
+# -----------------------------------------------------------------------------
+# 用法（本站点不从 qsub 命令行传变量，要改就改下方默认值）:
+#   qsub onereplay/pbs/34_gsm8k_reeval_cap4096.pbs
+#
+#   冒烟测试（每个 run 只评前 20 题，几分钟）:  LIMIT=20 DRY_RUN=0
+#   只看前置判断不动任何文件:                   DRY_RUN=1
+#   强制重评（跳过 needs-reeval 判据）:         FORCE_REEVAL=1
+#
+# 前置条件:
+#   1) ${REPO_ROOT}/datasets/math/gsm8k_test.jsonl（1319 行）
+#   2) ${RESULTS_ROOT}/adapters/cs_vanilla_seed1
+#   3) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
+#      故意放仓库外：仓库是 rsync 目标，运行中的作业握着日志 fd，rsync 覆盖会换
+#      inode 把作业打成 ESTALE。
+#
+# 预计耗时: GSM8K 回复很短（base P50=123 token），1319 题 × 2 个模型约 3-5 h。
+#   vanilla 有 22.4% 的题会跑题变长，但 1792 下真正顶到上限的只有 16 题，放到
+#   4096 的额外开销只有这 16 题 × 约 2300 token，可以忽略。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/34_gsm8k_reeval_cap4096.pbs}"
+
+# NGC PyTorch 镜像（ubuntu22.04 + python3.10，与 venv 解释器版本一致）。
+# 提交前确认: grep version ${REPO_ROOT}/.venv/pyvenv.cfg
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+# 只在没继承到时才算：内层是被转发进来的，重算会得到另一个名字，于是内层用一个
+# 目录、外层的 cleanup 删另一个，白白泄漏一份临时数据。
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  # 只删本次作业自己建的那一个目录，且必须匹配前缀，避免手滑清掉共享缓存。
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的这个 shell 不一定是 login shell，module 可能还没被定义；
+  # set -e 下那会让作业在第一步就静默挂掉，所以先兜一层初始化。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT MATH_DATA_DIR
+    GSM8K_FILE MATH_MAX_NEW_TOKENS LIMIT SEED
+    MODELS VANILLA_ADAPTER CMIX_RUN ARCHIVE_ROOT
+    CLUSTER_MIN DRY_RUN FORCE_REEVAL DO_DIAG
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的补评。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用（本站点联网会卡死）
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+VANILLA_ADAPTER="${VANILLA_ADAPTER:-${ADAPTERS}/cs_vanilla_seed1}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+
+# 只用于后置诊断的第三个 run（已经是 4096，不参与重评）
+CMIX_RUN="${CMIX_RUN:-cs_onereplay_ifmath_lam3e-2_seed1_regonce}"
+
+# 旧结果的归档位置，与 math500_cap1792 的命名保持一致
+ARCHIVE_ROOT="${ARCHIVE_ROOT:-${RESULTS_ROOT}/gsm8k_cap1792}"
+
+# ---- 评测参数 ----
+SEED="${SEED:-1}"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+LIMIT="${LIMIT:-0}"                  # >0 时只评前 N 题（冒烟用；注意会写坏正式结果）
+MODELS="${MODELS:-base vanilla}"
+CLUSTER_MIN="${CLUSTER_MIN:-3}"      # 顶到自身 max 的题数 >= 这个值才算发生过截断
+DRY_RUN="${DRY_RUN:-0}"              # 1 = 只做前置判断，不归档不评测
+FORCE_REEVAL="${FORCE_REEVAL:-0}"    # 1 = 跳过 needs-reeval 判据，无条件重评
+DO_DIAG="${DO_DIAG:-1}"              # 1 = 评完跑 diagnose_math_pairs
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -f "${GSM8K_FILE}" ]] || { echo "缺数据: ${GSM8K_FILE}"; exit 1; }
+mkdir -p "${RESULTS_ROOT}"
+
+if [[ "${LIMIT}" != "0" ]]; then
+  echo "!! LIMIT=${LIMIT}：这是冒烟模式，产出的 summary.json 只覆盖前 ${LIMIT} 题，"
+  echo "!! 不要把它当正式结果，验证完请把这批目录删掉再用 LIMIT=0 重跑。"
+fi
+
+resolve_adapter () {
+  case "$1" in
+    base)    echo "" ;;
+    vanilla) echo "${VANILLA_ADAPTER}" ;;
+    *)       echo "" ;;
+  esac
+}
+
+resolve_name () {
+  case "$1" in
+    base)    echo "base" ;;
+    vanilla) echo "$(basename "${VANILLA_ADAPTER}")" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# 0. 前置：谁真的需要重评
+#
+# 判据不是"token max 小于目标 cap"——一个回复天然就短的 run，max 本来就远低于
+# cap，重评它毫无意义。真正的判据是**发生过截断**：只有成簇地顶在自身 max 上，
+# 才说明那个 max 是预算而不是模型自己停下来的位置。没截断过的 run，在任何更大
+# 的预算下都会生成逐字相同的回复。
+# ---------------------------------------------------------------------------
+length_stats () {
+  # 打印: <max> <顶到max的题数> <总题数>
+  python - "${MODEL_DIR}/${MODEL_NAME}" "$1" <<'PY'
+import json
+import sys
+
+from transformers import AutoTokenizer
+
+model_path, path = sys.argv[1], sys.argv[2]
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+rows = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+lengths = [
+    len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+    for row in rows
+]
+top = max(lengths)
+print(top, sum(1 for x in lengths if x >= top - 8), len(lengths))
+PY
+}
+
+set +x
+echo "========================================================================"
+echo "前置检查：gsm8k 各 run 当前的解码预算（目标 cap=${MATH_MAX_NEW_TOKENS}）"
+printf "%-46s %10s %12s %8s %s\n" "run" "token_max" "顶到max" "n" "判定"
+NEED_REEVAL=()
+for short in ${MODELS} __cmix__; do
+  if [[ "${short}" == "__cmix__" ]]; then
+    name="${CMIX_RUN}"
+  else
+    name="$(resolve_name "${short}")"
+  fi
+  resp="${RESULTS_ROOT}/gsm8k/${name}/responses.jsonl"
+
+  if [[ ! -f "${resp}" ]]; then
+    if [[ "${short}" == "__cmix__" ]]; then
+      printf "%-46s %10s %12s %8s %s\n" "${name}" "-" "-" "-" "无结果（本脚本不评它，仅供对照）"
+    else
+      printf "%-46s %10s %12s %8s %s\n" "${name}" "-" "-" "-" "无结果 => 需要评测"
+      NEED_REEVAL+=("${short}")
+    fi
+    continue
+  fi
+
+  # 只取最后一行：transformers 偶尔会往 stdout 吐加载提示。
+  stats="$(length_stats "${resp}" | tail -n 1)"
+  read -r tmax tcluster tn <<<"${stats}"
+  if [[ ! "${tmax}" =~ ^[0-9]+$ || ! "${tcluster}" =~ ^[0-9]+$ ]]; then
+    printf "%-46s %10s %12s %8s %s\n" "${name}" "?" "?" "?" "长度统计失败，请手查：${stats}"
+    continue
+  fi
+
+  verdict="已是 ${MATH_MAX_NEW_TOKENS}，跳过"
+  if [[ "${FORCE_REEVAL}" == "1" ]]; then
+    verdict="FORCE_REEVAL=1 => 重评"
+    [[ "${short}" == "__cmix__" ]] || NEED_REEVAL+=("${short}")
+  elif (( tmax < MATH_MAX_NEW_TOKENS - 8 )) && (( tcluster >= CLUSTER_MIN )); then
+    verdict="截断于 ${tmax} => 需要重评"
+    [[ "${short}" == "__cmix__" ]] || NEED_REEVAL+=("${short}")
+  elif (( tmax < MATH_MAX_NEW_TOKENS - 8 )); then
+    verdict="从未顶到上限，与 ${MATH_MAX_NEW_TOKENS} 下逐字相同，跳过"
+  fi
+  printf "%-46s %10s %12s %8s %s\n" "${name}" "${tmax}" "${tcluster}" "${tn}" "${verdict}"
+done
+echo "需要重评: ${NEED_REEVAL[*]:-（无）}"
+echo "========================================================================"
+set -x
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置判断，不归档、不评测、不改任何文件。"
+  exit 0
+fi
+
+if [[ ${#NEED_REEVAL[@]} -eq 0 ]]; then
+  echo "所有 run 的预算都已一致，无需补评。"
+  DO_ARCHIVE=0
+else
+  DO_ARCHIVE=1
+fi
+
+# ---------------------------------------------------------------------------
+# 1. 归档旧结果
+#
+# 不删除，整体移到 ARCHIVE_ROOT。归档目标已存在就跳过：二次提交时 gsm8k/<run>
+# 下装的已经是刚跑出来的 4096 结果，再归档一次会把它盖进归档、把好数据弄丢。
+# ---------------------------------------------------------------------------
+if [[ "${DO_ARCHIVE}" == "1" ]]; then
+  mkdir -p "${ARCHIVE_ROOT}"
+  for short in "${NEED_REEVAL[@]}"; do
+    name="$(resolve_name "${short}")"
+    src="${RESULTS_ROOT}/gsm8k/${name}"
+    dst="${ARCHIVE_ROOT}/${name}"
+    if [[ ! -d "${src}" ]]; then
+      echo "归档跳过 ${name}：源目录不存在（本来就没有结果）"
+      continue
+    fi
+    if [[ -e "${dst}" ]]; then
+      echo "归档跳过 ${name}：${dst} 已存在（上一次已归档过，不覆盖）"
+      continue
+    fi
+    mv "${src}" "${dst}"
+    echo "已归档 ${src} -> ${dst}"
+  done
+
+  # CSV 只备份不删：第 3 步会从各 summary.json 全量重建，备份是为了出事能回滚。
+  CSV="${RESULTS_ROOT}/gsm8k_summary.csv"
+  if [[ -f "${CSV}" && ! -f "${CSV}.bak" ]]; then
+    cp "${CSV}" "${CSV}.bak"
+    echo "已备份 ${CSV} -> ${CSV}.bak"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 2. 评测：只跑 gsm8k
+#
+# 归档之后 summary.json 不在了，evaluate 的"已有结果就跳过"逻辑自然会重跑；
+# 作业超时后原样再投，已经跑完的那个 run 会被跳过，续跑安全。
+# ---------------------------------------------------------------------------
+eval_one () {
+  local short=$1
+  local name adapter
+  name="$(resolve_name "${short}")"
+  adapter="$(resolve_adapter "${short}")"
+
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    echo "跳过评测 ${short}：缺 adapter ${adapter}"
+    return 0
+  fi
+  if [[ -f "${RESULTS_ROOT}/gsm8k/${name}/summary.json" ]]; then
+    echo "跳过评测 ${name}：summary.json 已存在（本次或上次已完成）"
+    return 0
+  fi
+
+  echo "==== eval gsm8k: ${name} (cap=${MATH_MAX_NEW_TOKENS}) ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter}" --run_name "${name}" \
+    --metrics gsm8k --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" --limit "${LIMIT}" \
+    --gsm8k_data_path "${GSM8K_FILE}"
+}
+
+if [[ ${#NEED_REEVAL[@]} -gt 0 ]]; then
+  for short in "${NEED_REEVAL[@]}"; do
+    eval_one "${short}"
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# 3. 重建 gsm8k_summary.csv
+#
+# evaluate 每次都往 CSV 追加一行，重评会留下同名重复行，而且新旧预算混排在一起
+# 无法分辨。以各 run 的 summary.json 为唯一真相重建，重复提交也不会累积垃圾。
+# ---------------------------------------------------------------------------
+python - "${RESULTS_ROOT}" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+metric_dir = root / "gsm8k"
+fields = [
+    "run_name", "adapter_path", "data_path",
+    "num_examples", "num_scored", "correct", "accuracy", "output_dir",
+]
+rows = []
+for summary_path in sorted(metric_dir.glob("*/summary.json")):
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    rows.append({key: payload.get(key, "") for key in fields})
+
+out = root / "gsm8k_summary.csv"
+with out.open("w", newline="", encoding="utf-8") as file:
+    writer = csv.DictWriter(file, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"重建 {out}：{len(rows)} 行")
+for row in rows:
+    print(f"  {row['run_name']:<50} {float(row['accuracy']):.4f}  ({row['correct']}/{row['num_scored']})")
+PY
+
+# ---------------------------------------------------------------------------
+# 4. 后置诊断：确认预算已经一致，并重新出配对检验与增益来源分解
+# ---------------------------------------------------------------------------
+if [[ "${DO_DIAG}" == "1" ]]; then
+  BASE_NAME="base"
+  VAN_NAME="$(resolve_name vanilla)"
+  RUNS="${BASE_NAME},${VAN_NAME},${CMIX_RUN}"
+
+  echo "==== 诊断 A：以 base 为基准 ===="
+  python -m onereplay.scripts.diagnose_math_pairs \
+    --results_root "${RESULTS_ROOT}" --metrics gsm8k \
+    --runs "${RUNS}" --baseline "${BASE_NAME}" \
+    --cap "${MATH_MAX_NEW_TOKENS}" --model_path "${MODEL_DIR}/${MODEL_NAME}"
+
+  echo "==== 诊断 B：以 vanilla 为基准（增益来源分解看这个）===="
+  python -m onereplay.scripts.diagnose_math_pairs \
+    --results_root "${RESULTS_ROOT}" --metrics gsm8k \
+    --runs "${VAN_NAME},${CMIX_RUN}" --baseline "${VAN_NAME}" \
+    --cap "${MATH_MAX_NEW_TOKENS}" --model_path "${MODEL_DIR}/${MODEL_NAME}"
+fi
+
+set +x
+echo "========================================================================"
+echo "补评完成。"
+echo "  新结果  : ${RESULTS_ROOT}/gsm8k/<run_name>/{summary.json,responses.jsonl}"
+echo "  旧结果  : ${ARCHIVE_ROOT}/<run_name>/（cap=1792，保留不删）"
+echo "  汇总 CSV: ${RESULTS_ROOT}/gsm8k_summary.csv（已按 summary.json 全量重建）"
+echo "  CSV 备份: ${RESULTS_ROOT}/gsm8k_summary.csv.bak"
+echo ""
+echo "验收标准：诊断 A 的「抽取健康度」里三个 run 的 token max 应当全部是"
+echo "${MATH_MAX_NEW_TOKENS}，且不再出现 '各 run 的 token max 不一致' 的警告。"
+echo "然后把诊断 B 的增益来源分解更新进 results_log/08-25_math_结果.md 第 5 节。"
+echo "Job finished at: $(date)"
