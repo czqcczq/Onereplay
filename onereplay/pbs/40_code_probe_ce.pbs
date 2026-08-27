@@ -37,10 +37,14 @@
 #   21 倍、断言失败没动"是关于同一个集合的陈述。
 #
 # -----------------------------------------------------------------------------
-# 免费红利：cif / cmix 是数学/IF 侧的正则 checkpoint，这里没有 C_code。
+# 免费红利：cif / cmix 是数学/IF 侧的正则 checkpoint，采它们时还没有 C_code。
 #   把它们也在代码探针上跑一遍 = 跨领域泛化的数据点：
 #     它们若对代码也有可观保护  => C 的主导方向共享得比第四章估计的还多
 #     基本没用                  => 正好证明 C_code 是必要的，是 C_code 实验的动机铺垫
+#
+#   cifcode（41/42 号产出的 C_if + C_code 等权混合）也在默认 MODELS 里。adapter 还
+#   不存在时只会打一行「跳过」，训完重投就自动带上。最关键的一对比较是
+#   cif vs cifcode —— bootstrap 会给出它的配对差与双侧 p 值。
 #
 # -----------------------------------------------------------------------------
 # 口径与 37 号 / 训练期探针完全一致（score_probe_ce 没有重写任何 loss）
@@ -112,8 +116,14 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   trap cleanup EXIT INT TERM
 
   if ! command -v module >/dev/null 2>&1; then
+    # 写成 if 而不是 `[[ -f x ]] && source x && break`：后者在第一个候选不存在时
+    # 整条 && 列表返回 1，set -e 会当场把作业干掉（坑 #18）。既有 31/32/37/39 号
+    # 沿用的是旧写法，只因 Hopper 上 module 一直是已定义的、这段从没真正执行过。
     for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
-      [[ -f "${_init}" ]] && source "${_init}" && break
+      if [[ -f "${_init}" ]]; then
+        source "${_init}"
+        break
+      fi
     done
   fi
   module load singularity
@@ -121,7 +131,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME RESULTS_ROOT PROBE_DIR CODE_DATA_DIR
-    MODELS VANILLA_RUN IF_RUN MIX_RUN SEED
+    MODELS VANILLA_RUN IF_RUN MIX_RUN CODE_MIX_RUN SEED
     MBPP_SPLIT MAX_LEN PROBE_BATCH PROBE_SIZE CAP
     ROW_BATCH VERIFY_AGG BOOT_REPS BOOT_COMPARE
     SKIP_BUILD SKIP_SCORE DO_BOOTSTRAP
@@ -192,7 +202,10 @@ SEED="${SEED:-1}"
 VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
 IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam3e-2_seed${SEED}_regonce}"
 MIX_RUN="${MIX_RUN:-cs_onereplay_ifmath_lam3e-2_seed${SEED}_regonce}"
-MODELS="${MODELS:-base vanilla cif cmix}"
+# 42 号训出来的 C_if + C_code 混合。列在默认 MODELS 里是有意的：adapter 还不存在时
+# 下面的循环只打一行「跳过」，一旦 42 号训完，重投本作业就自动把它带上，不用手改。
+CODE_MIX_RUN="${CODE_MIX_RUN:-cs_onereplay_ifcode_lam3e-2_seed${SEED}_regonce}"
+MODELS="${MODELS:-base vanilla cif cmix cifcode}"
 
 # ---- 探针参数（所有 run 必须一致）----
 MAX_LEN="${MAX_LEN:-2048}"
@@ -256,6 +269,7 @@ resolve_path () {
     vanilla) echo "${ADAPTERS}/${VANILLA_RUN}" ;;
     cif)     echo "${ADAPTERS}/${IF_RUN}" ;;
     cmix)    echo "${ADAPTERS}/${MIX_RUN}" ;;
+    cifcode) echo "${ADAPTERS}/${CODE_MIX_RUN}" ;;
     *)       echo "" ;;
   esac
 }
@@ -266,6 +280,7 @@ resolve_name () {
     vanilla) echo "${VANILLA_RUN}" ;;
     cif)     echo "${IF_RUN}" ;;
     cmix)    echo "${MIX_RUN}" ;;
+    cifcode) echo "${CODE_MIX_RUN}" ;;
     *)       echo "$1" ;;
   esac
 }
@@ -322,7 +337,10 @@ fi
 #   作差就抵消了。纯 CPU，几十秒。
 # ---------------------------------------------------------------------------
 if [[ "${DO_BOOTSTRAP}" == "1" ]]; then
-  BOOT_COMPARE="${BOOT_COMPARE:-${IF_RUN},${MIX_RUN}}"
+  # bootstrap_probe_ce 会报这个列表里**每一个有序对**的配对差与双侧 p 值。
+  # 代码线最关键的那一对是 cif vs cifcode：它决定「C_code 是否必要」。
+  # 列表里不存在的 run 会被自动忽略（它按 per_row 目录里实际有的文件求交集）。
+  BOOT_COMPARE="${BOOT_COMPARE:-${IF_RUN},${MIX_RUN},${CODE_MIX_RUN}}"
   python -m onereplay.scripts.bootstrap_probe_ce \
     --per_row_dir "${PER_ROW_DIR}" \
     --base base --vanilla "${VANILLA_RUN}" \
