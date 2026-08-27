@@ -1,3 +1,10 @@
 *.slurm text eol=lf
 *.pbs text eol=lf
 *.sh text eol=lf
+
+# 迁移 adapter 权重用：强制按二进制原样存取，禁止任何换行/编码转换，
+# 否则 Windows 上 git 可能把 .safetensors 改坏，Hopper 加载即报错。
+*.safetensors binary
+*.bin binary
+*.pt binary
+*.jsonl text eol=lf

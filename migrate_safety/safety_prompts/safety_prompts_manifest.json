@@ -1,0 +1,16 @@
+{
+  "output_path": "/hpcwork/xsz96350/Chen_logs/onereplay/results/safety_prompts/strongreject_prompts.jsonl",
+  "num_behaviors": 0,
+  "num_strongreject": 313,
+  "jailbreak_templates": [
+    "itw_1",
+    "itw_2",
+    "itw_3",
+    "prefix_injection",
+    "refusal_suppression"
+  ],
+  "num_records": 1878,
+  "counts_by_track": {
+    "SR": 1878
+  }
+}
