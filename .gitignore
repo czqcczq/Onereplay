@@ -75,3 +75,5 @@ datasets_cache/
 huggingface/
 .transformers/
 .torch/
+
+migrate_safety/adapters/
