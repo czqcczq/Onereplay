@@ -67,15 +67,22 @@
 # MAXLEN 一致性：自蒸馏(Step1)与采 C(Step2)必须用同一个 MAXLEN，本脚本用同一个变量贯穿。
 #
 # -----------------------------------------------------------------------------
-# 用法:
-#   **先跑长度诊断**（100 条小样本，约十几分钟）:  DIAG=1
-#     打 prompt/target/合计 的 P50/P90/P99 + 截断率 + 预算建议，再据此定 MAXLEN /
-#     MAX_NEW_TOKENS。数学线的 2048/1792 就是这么定出来的。20k 条全量自蒸馏要
-#     15~20 小时，半小时的诊断换掉一次可能的整轮返工。
+# 用法（与 31 号同：**本站点 qsub 不吃命令行变量**，所有开关靠直接改「阶段开关」
+#       那一段的默认值。PBS 默认也不导出提交时的 shell 环境，所以 `DIAG=1 qsub ...`
+#       同样无效 —— 那只设在你的交互 shell 里，进不了作业。）
 #
-#   qsub onereplay/pbs/41_code_data_cov.pbs      # 诊断满意后跑全链
-#   只重建池:   SKIP_GEN=1 SKIP_COV=1 SKIP_MIX=1
-#   只补混合:   SKIP_PREP=1 SKIP_GEN=1 SKIP_COV=1
+#   提交命令永远是这一句:
+#     qsub onereplay/pbs/41_code_data_cov.pbs
+#
+#   跑什么由「阶段开关」那段决定:
+#     DIAG=1                  只建池 + 100 条自蒸馏 + 长度诊断，然后退出（当前默认）
+#     DIAG=0                  跑全链（建池 -> 全量自蒸馏 -> 采 C_code -> 混合）
+#     SKIP_GEN/COV/MIX=1      只重建池
+#     SKIP_PREP/GEN/COV=1     只补混合
+#
+#   为什么先诊断：打 prompt/target/合计 的 P50/P90/P99 + 截断率 + 预算建议，据此定
+#   MAXLEN / MAX_NEW_TOKENS。数学线的 2048/1792 就是这么定出来的。20k 条全量自蒸馏
+#   要 15~20 小时，半小时的诊断换掉一次可能的整轮返工。
 #
 # 前置条件:
 #   1) 登录节点下好 Magicoder:
@@ -237,7 +244,10 @@ COV_BATCH="${COV_BATCH:-1}"
 DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-1}"
 
 # ---- 阶段开关 ----
-DIAG="${DIAG:-0}"
+# >>>>>> 本站点 qsub 不吃命令行变量，阶段切换靠直接改这一行 <<<<<<
+# 当前 = 1：只跑「建池 + DIAG_SAMPLES 条自蒸馏 + 长度诊断」，打完诊断就 exit 0。
+# **诊断满意后必须改回 0**，否则全量自蒸馏（Step1 之后的整条链）根本不会启动。
+DIAG="${DIAG:-1}"
 DIAG_SAMPLES="${DIAG_SAMPLES:-100}"
 SKIP_PREP="${SKIP_PREP:-0}"
 SKIP_GEN="${SKIP_GEN:-0}"
@@ -399,7 +409,8 @@ if [[ "${DIAG}" == "1" ]]; then
   self_distill "${DIAG_SAMPLES}" "${diag_file}"
   analyze_lengths "${diag_file}"
   set +x
-  echo "DIAG 完成：据上面 P99/截断率定 MAXLEN 与 MAX_NEW_TOKENS，再不带 DIAG 跑全链。"
+  echo "DIAG 完成：据上面 P99/截断率定 MAXLEN 与 MAX_NEW_TOKENS，然后把本脚本"
+  echo "「阶段开关」段的 DIAG 默认值改回 0，重投一次就跑全链。"
   echo "截断率高的话有两条路：调大 MAXLEN，或调小 prepare 的 --max_prompt_tokens"
   echo "（后者不动预算，但会削掉长题面那一档分布）。"
   echo "Job finished at: $(date)"
