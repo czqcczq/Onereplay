@@ -216,6 +216,23 @@ class BaseTrainer:
         # every micro-batch, at 1/accumulation_steps of the cost.
         reg_once = self.reg_once_per_update == 1
         reg_scale = 1.0 if reg_once else 1.0 / accumulation_steps
+        # The analytic path writes dR/dW into .grad itself, so the penalty never
+        # enters the loss and there is nothing for backward to traverse. Since the
+        # weights do not move inside a window, DeltaW is the same at either end of
+        # it and the injection could go anywhere -- but not with the same result in
+        # bf16. Full fine-tuning keeps parameters in bf16, so .grad is bf16 too,
+        # with 8 mantissa bits. Injected last, the penalty gradient would land on a
+        # buffer already holding all accumulation_steps micro-batches of task
+        # gradient; at the ~1% relative size the penalty runs at, that is only ~2x
+        # the buffer's resolution and most of it would quantize away. Injected
+        # first, it lands on an empty buffer, which is exactly where autograd puts
+        # it today (reg_once adds lambda*R to the first micro-batch's loss). Same
+        # position, same rounding, so the only difference left between the two
+        # implementations is the matmul precision this test is about.
+        inject_reg = self.regularizer is not None and getattr(
+            self.regularizer, "injects_grad", False
+        )
+        reg_stats: dict[str, float] = {}
         total_steps = len(train_loader)
         if self.max_steps > 0:
             total_steps = min(total_steps, self.max_steps)
@@ -245,8 +262,17 @@ class BaseTrainer:
             num_samples = batch["input_ids"].shape[0] if "input_ids" in batch else 1
             if "attention_mask" in batch:
                 total_tokens += int(batch["attention_mask"].sum())
-            reg_due = not reg_once or (step - 1) % accumulation_steps == 0
+            window_open = (step - 1) % accumulation_steps == 0
+            if inject_reg and window_open:
+                with self.timer.track("replay_reg"):
+                    window_reg, reg_stats = self.regularizer.accumulate_grad(
+                        self.model, self.replay_lambda
+                    )
+            reg_due = not inject_reg and (not reg_once or window_open)
             task_loss, reg, stats = self.training_step(batch, with_reg=reg_due)
+            if inject_reg:
+                stats["replay_reg"] = window_reg
+                stats.update(reg_stats)
             loss = task_loss / accumulation_steps
             if reg is not None:
                 loss = loss + self.replay_lambda * reg_scale * reg
@@ -263,10 +289,10 @@ class BaseTrainer:
             total_replay_reg += window_reg * num_samples
             total_samples += num_samples
             done_steps = step
-            if step == 1:
+            if step == 1 and "used_layers" in stats:
                 print(
-                    f"regularizer covers {int(stats.get('used_layers', 0.0))} layers; "
-                    f"no penalty matrix for {int(stats.get('missing_layers', 0.0))} layers"
+                    f"regularizer covers {int(stats['used_layers'])} layers; "
+                    f"no penalty matrix for {int(stats['missing_layers'])} layers"
                 )
             if self.log_every > 0 and (step % self.log_every == 0 or step == total_steps):
                 now = time.time()

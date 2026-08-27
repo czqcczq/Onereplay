@@ -1,0 +1,473 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_regimpl
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=06:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# 全参数正则实现的开销与等价性验证（Hopper / PBS + Singularity）
+#
+# 【问题】
+# 08-16 那轮全参数 OneReplay 的单步是 150.1 ms，vanilla 是 95.1 ms（+57.8%），
+# 3 epoch 2.64 h，比 replay r=0.10 的 1.94 h 还贵。追下去发现 439.8 ms/update 里
+# 没有浪费在 Python 或数据搬运上——它真的在算 17.3 TFLOP 的 fp32 矩阵乘：
+#
+#   sum((delta @ C) * delta) 的前向是 Σ 2·d_out·d_in² = 8.66 TFLOP（197 层）；
+#   挂在 autograd 图上，反向再算一次 grad_delta = grad_dc @ Cᵀ，又是 8.66 TFLOP；
+#   全程 fp32，H100 的 FP32 非张量核峰值只有 67 TFLOPS，理论下限 258 ms。
+#   实测 439.8 ms = 峰值的 59%，是正常的 GEMM 效率。
+#
+# 【改法】--reg_impl analytic，两件事：
+#   1. 反向那一半不必算。dR/dΔW = 2·ΔW·C 有闭式解，而 ΔW·C 前向刚算完。直接写进
+#      .grad，省一半算术，同时不再需要 autograd 图钉住 197 个 fp32 delta
+#      （那就是日志里"约 7.3 GiB 临时开销"的全部来源）。
+#   2. TF32。C 仍以 fp32 常驻，只有张量核内部把输入截到 11 位尾数，H100 上 494
+#      对 67 TFLOPS。
+# 两项相乘约 14.8 倍，预期 439.8 → 约 30 ms/update，摊销后 +3~4% 而不是 +57.8%。
+#
+# 【为什么不能用 24 号那套噪声地板判据】
+# 25_bench_reg_cost.slurm 记过：本项目训练在同 seed 下逐位可复现，A2 与 A1 噪声底
+# 为 0，所以任何非逐位复现的新实现都永远拿不到 EQUIVALENT。这里换成 fp64 真值臂：
+# 不问"新旧是否相同"，而问"谁更接近正确答案"。若 B 比 A 更接近 fp64，讨论结束。
+#
+# 【六条 arm，必须同一作业同一节点】
+#   warmup   200 步，丢弃。不让第一条背冷启动（那会抬高分母、把开销算小）
+#   van      λ=0 且 measure=0，ms/step 的分母
+#   A        --reg_impl autograd   现有实现，--save 1（顺带产出梯度检查用的 ckpt）
+#   B        --reg_impl analytic   TF32，待验证
+#   G        --reg_impl analytic --reg_compute_dtype fp64 --reg_allow_tf32 0  真值轨迹
+#   rep05    λ=0 + --replay_per_batch 4，把 2×2 表里"全参数 + replay@0.5"那格填上
+#
+# 【前置】197 层的 C 必须存在。Hopper 的 01 默认只采 qv：
+#   ls -lh ${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt   # 约 6.58 GiB
+#   没有就先: qsub -v COV_SCOPE=full onereplay/pbs/01_collect_cov.pbs   (约 1h49min)
+# rep05 还要自蒸馏回放语料（13_replay_selfdistill 的产物）；不在就自动跳过这一格，
+# 其余五条照跑。
+#
+# 【用法】
+#   mkdir -p /scratch/weiliu87/logs/onereplay
+#   qsub onereplay/pbs/43_full_reg_impl.pbs
+#
+#   只做前置检查与合成恒等式（几分钟，不训练）:
+#     qsub -v PREFLIGHT_ONLY=1 onereplay/pbs/43_full_reg_impl.pbs
+#   冒烟（约 15 分钟，确认链路通）:
+#     qsub -v STEPS=200,LOG_EVERY=50 onereplay/pbs/43_full_reg_impl.pbs
+#   只跑某几条 arm:
+#     qsub -v ARMS='van A B' onereplay/pbs/43_full_reg_impl.pbs
+#
+# 【成本】STEPS=3000 时约 37 min 计算，含加载与验证约 1.5 h。walltime 给 6 h。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/43_full_reg_impl.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  if [[ ! -f "${SELF_PATH}" ]]; then
+    echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"
+    exit 1
+  fi
+  if [[ ! -f "${IMAGE}" ]]; then
+    echo "找不到容器镜像: ${IMAGE}"
+    exit 1
+  fi
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      if [[ -f "${_init}" ]]; then
+        source "${_init}"
+        break
+      fi
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE CS_DATASET
+    COV_PATH TM_FULL LR_FULL LAMBDA SEED
+    STEPS LOG_EVERY WARMUP_STEPS PROFILE_STEPS BATCH ACCUM MAXLEN
+    VAL_FRAC MAXVAL ARMS PREFLIGHT_ONLY KEEP_CKPT
+    REPLAY_PER_BATCH REPLAY_ACCUM SELF_DISTILL_FILE POOL_SIZE SAMPLE_SEED
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 全参数那档的超参：与 25_bench_reg_cost.slurm 逐字一致 ----
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt}"
+TM_FULL="${TM_FULL:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+LR_FULL="${LR_FULL:-1e-5}"
+LAMBDA="${LAMBDA:-3e-2}"
+SEED="${SEED:-1}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+
+# ---- 计时口径 ----
+# LOG_EVERY=100 让 3000 步给出 30 个 win= 窗口。用默认 500 只有 6 个，
+# results_log 的口径文档说过窗口太少时 25 分位会退化成最小值。
+STEPS="${STEPS:-3000}"
+LOG_EVERY="${LOG_EVERY:-100}"
+WARMUP_STEPS="${WARMUP_STEPS:-200}"
+PROFILE_STEPS="${PROFILE_STEPS:-200}"
+
+# ---- replay@0.5 那格：4 new + 4 replay，accum 翻倍以保持每次更新的新任务行数 ----
+# 文件名的拼法与 18_sweep_replay_batchmix.slurm 逐字一致，POOL_SIZE / SAMPLE_SEED
+# 必须和 13 生成时、以及 01 采 C 时用的值相同，否则 replay 池和 C 不是同一批数据，
+# 这一格就不再是"同语料的两种用法"，跟 OneReplay 也就不可比了。
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
+REPLAY_ACCUM="${REPLAY_ACCUM:-128}"
+POOL_SIZE="${POOL_SIZE:-20000}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+SELF_DISTILL_FILE="${SELF_DISTILL_FILE:-${RESULTS_ROOT}/replay/flan_selfdistill_${POOL_SIZE}_seed${SAMPLE_SEED}.jsonl}"
+
+ARMS="${ARMS:-van A B G rep05}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+KEEP_CKPT="${KEEP_CKPT:-1}"
+
+OUT_DIR="${RESULTS_ROOT}/regimpl/${PBS_JOBID:-local}"
+# profile 的 run 每阶段都 synchronize，墙钟被整体拖慢，不能和上面的 arm 放进同一张
+# 表里比。summarize_cost 是按 metrics_dir 里的 *.jsonl 全收的，所以物理隔开。
+PROF_DIR="${OUT_DIR}/profile"
+CKPT_A="${RESULTS_ROOT}/checkpoints/full/regimpl_A_step${STEPS}_seed${SEED}"
+MAP_CACHE="${RESULTS_ROOT}/map_cache/regimpl"
+
+cd "${REPO_ROOT}"
+mkdir -p "${OUT_DIR}" "${PROF_DIR}" "${MAP_CACHE}" "${RESULTS_ROOT}/checkpoints/full"
+
+# ---------------------------------------------------------------------------
+# Step 0: 前置检查。任何一条不过就没必要烧 GPU 小时。
+# ---------------------------------------------------------------------------
+echo "==== Step 0: 前置检查 ===="
+if [[ ! -d "${MODEL_DIR}/${MODEL_NAME}" ]]; then
+  echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"
+  exit 1
+fi
+if [[ ! -d "${CS_DATASET}" ]]; then
+  echo "缺 commonsense_170k: ${CS_DATASET}"
+  exit 1
+fi
+if [[ ! -f "${COV_PATH}" ]]; then
+  echo "缺 197 层的 C: ${COV_PATH}"
+  echo "先跑: qsub -v COV_SCOPE=full onereplay/pbs/01_collect_cov.pbs   (约 1h49min)"
+  exit 1
+fi
+ls -lh "${COV_PATH}"
+# 用旧代码跑会报 unrecognized arguments，显式检查给出更有用的提示。
+if ! grep -q "reg_impl" onereplay/scripts/train.py; then
+  echo "train.py 里没有 --reg_impl，代码没同步到最新"
+  exit 1
+fi
+
+echo "==== Step 0b: 合成恒等式检查（CPU，秒级）===="
+# 验的是公式而非精度：2·ΔW·C 是不是 sum((ΔW C)*ΔW) 的梯度、W=W0 时是否严格为 0、
+# 注入的梯度是否严格线性于 scale。不过就停，别往下走。
+python -m onereplay.scripts.verify_reg_precision
+
+echo "==== Step 0c: 全路径覆盖检查（197 层是否都配到 C）===="
+python -m onereplay.scripts.verify_full_regularizer \
+  --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --cov_path "${COV_PATH}"
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：前置检查通过，不训练。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Step 1: 六条 arm。同一作业同一节点，否则 ms/step 不可比
+# （§1.2 踩过这个坑：cs_vanilla_seed1 的墙钟被污染，得出过 vanilla 比 OneReplay
+#  还慢这种不成立的结论）。
+# ---------------------------------------------------------------------------
+train_arm () {
+  local tag="$1" steps="$2" profile="$3" dir="$4"
+  shift 4
+  echo ""
+  echo "========================================================================"
+  echo "arm=${tag} steps=${steps} profile=${profile}"
+  echo "========================================================================"
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs 1 --lr "${LR_FULL}" --batch_size "${BATCH}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TM_FULL}" \
+    --map_cache_dir "${MAP_CACHE}" \
+    --cov_path "${COV_PATH}" --identity_cov 0 --reg_once_per_update 1 \
+    --max_steps "${steps}" --log_every "${LOG_EVERY}" --profile "${profile}" \
+    --metrics_path "${dir}/${tag}.jsonl" \
+    "$@" 2>&1 | tee "${dir}/${tag}.log" || true
+  # || true：全参数那档 peak 接近 50 GiB，单条 OOM 不该掐死后面所有 arm
+  # （15_bench_batch_scale 曾因此丢掉后续全部 run）。
+}
+
+# warmup：只为把 GPU 时钟和 page cache 拉起来，产物丢弃。
+train_arm warmup "${WARMUP_STEPS}" 0 "${PROF_DIR}" \
+  --accumulation_size "${ACCUM}" --replay_lambda 0 \
+  --measure_replay_when_lambda_zero 0 --save 0
+rm -f "${PROF_DIR}/warmup.log" "${PROF_DIR}/warmup.jsonl"
+
+for arm in ${ARMS}; do
+  case "${arm}" in
+    van)
+      # measure_replay_when_lambda_zero 0 是关键：λ=0 但仍加载 C 并求值的 run 付的
+      # 是全额正则开销，当分母会把开销算掉一半（OPD 那次踩过）。
+      train_arm van "${STEPS}" 0 "${OUT_DIR}" \
+        --accumulation_size "${ACCUM}" --replay_lambda 0 \
+        --measure_replay_when_lambda_zero 0 --save 0
+      ;;
+    A)
+      train_arm A "${STEPS}" 0 "${OUT_DIR}" \
+        --accumulation_size "${ACCUM}" --replay_lambda "${LAMBDA}" \
+        --reg_impl autograd \
+        --save 1 --save_path "${CKPT_A}"
+      ;;
+    B)
+      train_arm B "${STEPS}" 0 "${OUT_DIR}" \
+        --accumulation_size "${ACCUM}" --replay_lambda "${LAMBDA}" \
+        --reg_impl analytic --reg_allow_tf32 1 --reg_compute_dtype fp32 \
+        --save 0
+      ;;
+    G)
+      # fp64 真值臂。约 129 ms/update 额外开销，3000 步只多约 48 s，
+      # 但它是唯一能回答"A 和 B 谁更接近正确梯度"的 arm。
+      train_arm G "${STEPS}" 0 "${OUT_DIR}" \
+        --accumulation_size "${ACCUM}" --replay_lambda "${LAMBDA}" \
+        --reg_impl analytic --reg_allow_tf32 0 --reg_compute_dtype fp64 \
+        --save 0
+      ;;
+    rep05)
+      # 这格和上面几条不同源（多了 replay 行）。ACCUM 翻到 128 让每次更新的新任务
+      # 行数仍是 64，所以 hours/epoch 可以和 van 比；但单步时间不能和 A/B 比，
+      # 它每步过的 token 是别人的两倍。
+      if [[ ! -f "${SELF_DISTILL_FILE}" ]]; then
+        echo "跳过 rep05：缺自蒸馏回放语料 ${SELF_DISTILL_FILE}"
+        echo "  Hopper 上这份文件是 13_replay_selfdistill 生成的，若没搬过来就先跑它，"
+        echo "  或者 qsub -v SELF_DISTILL_FILE=/绝对/路径.jsonl 指过去。"
+        continue
+      fi
+      train_arm rep05 "${STEPS}" 0 "${OUT_DIR}" \
+        --accumulation_size "${REPLAY_ACCUM}" --replay_lambda 0 \
+        --measure_replay_when_lambda_zero 0 \
+        --replay_per_batch "${REPLAY_PER_BATCH}" \
+        --replay_self_distill_file "${SELF_DISTILL_FILE}" \
+        --replay_drop_truncated 1 \
+        --replay_cache_dir "${DATASET_CACHE}" \
+        --save 0
+      ;;
+    *)
+      echo "未知 arm: ${arm}（可选 van A B G rep05）"
+      ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Step 2: profile run，只为把"单次正则求值多少毫秒"直接量出来。
+# 这两条每个阶段都做 cuda synchronize，整体被拖慢，所以墙钟不进对比表，只读
+# time_replay_reg_sec 的占比。
+# ---------------------------------------------------------------------------
+echo ""
+echo "==== Step 2: 分阶段耗时（profile，墙钟不可外报）===="
+train_arm A_profile "${PROFILE_STEPS}" 1 "${PROF_DIR}" \
+  --accumulation_size "${ACCUM}" --replay_lambda "${LAMBDA}" \
+  --reg_impl autograd --save 0
+train_arm B_profile "${PROFILE_STEPS}" 1 "${PROF_DIR}" \
+  --accumulation_size "${ACCUM}" --replay_lambda "${LAMBDA}" \
+  --reg_impl analytic --reg_allow_tf32 1 --save 0
+
+# ---------------------------------------------------------------------------
+# Step 3: 梯度级三路对比。用 A 臂刚存下的 ckpt 当真实 ΔW，再用合成 ΔW 在
+# 3-epoch 的量级（reg=0.14009）上做一次保守上界。
+# ---------------------------------------------------------------------------
+echo ""
+echo "==== Step 3: 梯度精度（真实 ΔW）===="
+if [[ -d "${CKPT_A}" ]]; then
+  python -m onereplay.scripts.verify_reg_precision \
+    --base_model_dir "${MODEL_DIR}/${MODEL_NAME}" \
+    --trained_model_dir "${CKPT_A}" \
+    --cov_path "${COV_PATH}" --replay_lambda "${LAMBDA}" || true
+else
+  echo "缺 ${CKPT_A}，跳过真实 ΔW 那一档"
+fi
+
+echo ""
+echo "==== Step 3b: 梯度精度（合成 ΔW，训练末期量级，保守上界）===="
+# 随机 ΔW 与 C 的前几个主方向近乎正交（有效秩只有 8.5、top-1 占 trace 34.6%），
+# 惩罚几乎全部由小特征值贡献，正是相对舍入误差最不利的区域。这里过了，真 ΔW 必过。
+python -m onereplay.scripts.verify_reg_precision \
+  --base_model_dir "${MODEL_DIR}/${MODEL_NAME}" \
+  --cov_path "${COV_PATH}" --target_reg 0.14009 --replay_lambda "${LAMBDA}" || true
+
+# ---------------------------------------------------------------------------
+# Step 4: 汇总。开销表用现成脚本，轨迹对比在这里直接列出来。
+# ---------------------------------------------------------------------------
+echo ""
+echo "==== Step 4: 开销表（墙钟，可外报）===="
+python -m onereplay.scripts.summarize_cost \
+  --metrics_dir "${OUT_DIR}" --baseline van \
+  --out "${OUT_DIR}/cost.md" || true
+
+echo ""
+echo "==== Step 4a: 分阶段占比（来自 profile，仅看 replay_reg 那一列）===="
+python -m onereplay.scripts.summarize_cost \
+  --metrics_dir "${PROF_DIR}" \
+  --out "${PROF_DIR}/phases.md" || true
+
+echo ""
+echo "==== Step 4b: 轨迹对比（A/B/G 的逐步 task_loss 与 replay_reg）===="
+python - "${OUT_DIR}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+pattern = re.compile(r"step (\d+)/\d+ task_loss=(\S+) replay_reg=(\S+)")
+
+
+def series(tag):
+    path = out / f"{tag}.log"
+    if not path.is_file():
+        return {}, {}
+    loss, reg = {}, {}
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = pattern.search(line)
+            if match:
+                loss[int(match.group(1))] = float(match.group(2))
+                reg[int(match.group(1))] = float(match.group(3))
+    return loss, reg
+
+
+def final(tag, key):
+    path = out / f"{tag}.jsonl"
+    if not path.is_file():
+        return None
+    records = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    epochs = [r for r in records if r.get("record_type", "epoch") == "epoch"]
+    return epochs[-1].get(key) if epochs else None
+
+
+loss_g, reg_g = series("G")
+if not loss_g:
+    print("缺 G 臂的日志，无法做 fp64 参照对比")
+    raise SystemExit(0)
+
+print(f"{'arm':>4} {'val_loss':>14} {'train_reg':>14} {'vs G: loss rel':>16} {'reg rel':>12} {'grow':>8}")
+for tag in ("A", "B"):
+    loss_x, reg_x = series(tag)
+    if not loss_x:
+        print(f"{tag:>4}  缺日志")
+        continue
+    shared = sorted(set(loss_x) & set(loss_g))
+    rels = [abs(loss_x[s] - loss_g[s]) / max(abs(loss_g[s]), 1e-12) for s in shared]
+    quarter = max(len(rels) // 4, 1)
+    head = sum(rels[:quarter]) / quarter
+    tail = sum(rels[-quarter:]) / quarter
+    reg_rel = max(
+        abs(reg_x[s] - reg_g[s]) / max(abs(reg_g[s]), 1e-12) for s in shared if reg_g[s] != 0.0
+    )
+    print(
+        f"{tag:>4} {str(final(tag, 'val_loss')):>14} {str(final(tag, 'train_replay_reg')):>14} "
+        f"{max(rels):>16.3e} {reg_rel:>12.3e} {tail / max(head, 1e-30):>8.1f}x"
+    )
+
+print()
+print("判据：|B−G| 应当不大于 |A−G|——即新实现不比现有实现更远离 fp64 真值。")
+print("grow 是尾部四分之一与头部四分之一的平均相对差之比：舍入误差应当是平的，")
+print("超过 10x 说明轨迹真的在分叉，不是舍入。")
+PY
+
+if [[ "${KEEP_CKPT}" != "1" ]]; then
+  echo "KEEP_CKPT=0：删掉 ${CKPT_A}"
+  rm -rf "${CKPT_A:?}"
+fi
+
+echo ""
+echo "结果目录: ${OUT_DIR}"
+echo "开销表  : ${OUT_DIR}/cost.md"
+echo "Job finished at: $(date)"

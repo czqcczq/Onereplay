@@ -237,7 +237,7 @@ SAMPLE_SEED="${SAMPLE_SEED:-1}"
 GEN_BATCH="${GEN_BATCH:-16}"
 THINKING="${THINKING:-0}"          # 与 31 号一致：non-thinking，更贴近评测模式
 MAXLEN="${MAXLEN:-2048}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"   # 题面已被限到 <=1024，留足答案空间；DIAG 确认
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1280}"   # 首轮 DIAG 有 2% 答案顶到 1024；加到 1280 后复测
 MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-16}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"   # 见文件头第 4 点，别改
 COV_BATCH="${COV_BATCH:-1}"

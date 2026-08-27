@@ -210,6 +210,97 @@ def full_covariance_regularizer(
     return total_reg, stats
 
 
+def resolve_full_layers(
+    model: nn.Module,
+    covariances: dict[str, torch.Tensor],
+    reference_weights: dict[str, torch.Tensor],
+) -> tuple[list[tuple[str, nn.Parameter, torch.Tensor, torch.Tensor]], list[str]]:
+    """Pair every regularized Linear with its C and its frozen W0, once.
+
+    full_covariance_regularizer re-walks named_modules() and re-runs the suffix
+    matching in lookup_covariance on every call. That is a few milliseconds of
+    Python per optimizer step, invisible next to the fp32 matmuls it precedes but
+    not next to the analytic path, which is an order of magnitude cheaper. The
+    pairing cannot change during a run -- C is frozen, W0 is frozen, and the
+    module tree is fixed once the model is built -- so it is resolved once here
+    and reused.
+    """
+
+    layers: list[tuple[str, nn.Parameter, torch.Tensor, torch.Tensor]] = []
+    missing: list[str] = []
+    for module_name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        reference = reference_weights.get(module_name)
+        if reference is None:
+            continue
+        _, covariance = lookup_covariance(covariances, module_name)
+        if covariance is None:
+            missing.append(module_name)
+            continue
+        weight = module.weight
+        layers.append(
+            (
+                module_name,
+                weight,
+                covariance.to(device=weight.device, dtype=torch.float32),
+                reference.to(device=weight.device, dtype=torch.float32),
+            )
+        )
+    return layers, missing
+
+
+@torch.no_grad()
+def full_covariance_grad_(
+    layers: list[tuple[str, nn.Parameter, torch.Tensor, torch.Tensor]],
+    scale: float,
+    allow_tf32: bool = True,
+    compute_dtype: torch.dtype = torch.float32,
+) -> float:
+    """Add scale * dR/dW straight into .grad and return the un-normalized R.
+
+    R = sum_l tr(DeltaW_l C_l DeltaW_l^T) has an analytic gradient,
+
+        dR/dDeltaW = DeltaW (C + C^T) = 2 DeltaW C    for symmetric C,
+
+    and DeltaW C is exactly the product the forward pass already forms. Letting
+    autograd rediscover it costs a second matmul of the same size, and keeps every
+    layer's fp32 DeltaW alive in the graph until backward returns -- on Qwen3-1.7B
+    that is 6.9 GB of temporaries for the 197 covered layers. Writing the gradient
+    directly halves the arithmetic and lets each layer's temporaries die
+    immediately, so the peak is one layer instead of all of them.
+
+    R reads only weights, and weights are frozen across a gradient-accumulation
+    window, so injecting once per window accumulates the same gradient as adding
+    lambda*R to any single micro-batch's loss. The caller injects at the start of
+    the window, matching where the autograd path adds it; see accumulate_grad for
+    why that position is not free in bf16.
+
+    C is stored fp32 and is not modified; allow_tf32 only lets the matmul round its
+    inputs to 11 mantissa bits inside the tensor core. That is a ~5e-4 relative
+    perturbation of C against a 7x throughput difference on H100, and it sits an
+    order of magnitude below the 5e-3 penalty-ratio gap that two different
+    sampling strategies of the *same* replay corpus already produce.
+    """
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+    total = 0.0
+    try:
+        for _, weight, covariance, reference in layers:
+            delta = weight.to(compute_dtype) - reference.to(compute_dtype)
+            delta_c = delta @ covariance.to(compute_dtype)
+            total += float((delta_c * delta).sum())
+            if scale != 0.0:
+                if weight.grad is None:
+                    weight.grad = torch.zeros_like(weight)
+                weight.grad.add_(delta_c.to(weight.grad.dtype), alpha=2.0 * scale)
+            del delta, delta_c
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    return total
+
+
 def _check_fisher_shape(module_name: str, fisher: torch.Tensor, delta: torch.Tensor) -> None:
     """Fail loudly when a covariance file was handed to the EWC path.
 
@@ -354,11 +445,24 @@ class ReplayRegularizer:
         adapter_name: str = "default",
         normalize_by_layers: bool = True,
         reference_weights: dict[str, torch.Tensor] | None = None,
+        reg_impl: str = "autograd",
+        allow_tf32: bool = True,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> None:
         self.covariances = covariances
         self.adapter_name = adapter_name
         self.normalize_by_layers = normalize_by_layers
         self.reference_weights = reference_weights
+        # "autograd" builds the penalty into the loss graph and lets backward
+        # derive dR/dW; "analytic" writes 2*lambda*DeltaW C into .grad itself.
+        # Both are the same penalty. The flag exists so the equivalence check can
+        # flip one argument instead of one git version, the same reason
+        # --reg_once_per_update kept its 0 branch.
+        self.reg_impl = reg_impl
+        self.allow_tf32 = allow_tf32
+        self.compute_dtype = compute_dtype
+        self._layers: list[tuple[str, nn.Parameter, torch.Tensor, torch.Tensor]] | None = None
+        self._missing: list[str] = []
 
     @classmethod
     def from_path(
@@ -369,6 +473,9 @@ class ReplayRegularizer:
         normalize_by_layers: bool = True,
         adapter_name: str = "default",
         dtype: torch.dtype = torch.float32,
+        reg_impl: str = "autograd",
+        allow_tf32: bool = True,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> "ReplayRegularizer":
         from onereplay.core.covariance import (
             load_covariance_file,
@@ -384,12 +491,61 @@ class ReplayRegularizer:
             covariances=covariances,
             adapter_name=adapter_name,
             normalize_by_layers=normalize_by_layers,
+            reg_impl=reg_impl,
+            allow_tf32=allow_tf32,
+            compute_dtype=compute_dtype,
         )
 
     def set_reference_weights(self, reference_weights: dict[str, torch.Tensor]) -> None:
         """Switch to the full fine-tuning path using a frozen W0 snapshot."""
 
         self.reference_weights = reference_weights
+        self._layers = None
+
+    @property
+    def injects_grad(self) -> bool:
+        """Whether the trainer must call accumulate_grad instead of adding to the loss.
+
+        Only the full fine-tuning path is covered. The LoRA path already collapses
+        to rank x rank matrices and costs ~11 ms per update, 1.6% of a step, so
+        there is nothing there worth a second code path.
+        """
+
+        return self.reg_impl == "analytic" and self.reference_weights is not None
+
+    def accumulate_grad(self, model: nn.Module, replay_lambda: float) -> tuple[float, dict]:
+        """Add lambda * dR/dW into .grad and return the reported R.
+
+        Call this once per optimizer step, at the *start* of the accumulation
+        window, before the first micro-batch's backward. Anywhere in the window
+        gives the same DeltaW, but .grad is bf16 under full fine-tuning and only an
+        empty buffer preserves a term running at ~1% of the task gradient. That is
+        also where the autograd path adds it, which keeps the two comparable.
+
+        The returned value is normalized the same way the autograd path normalizes
+        it, so the logged replay_reg stays comparable across implementations.
+        """
+
+        if self._layers is None:
+            self._layers, self._missing = resolve_full_layers(
+                model, self.covariances, self.reference_weights or {}
+            )
+            print(
+                f"analytic regularizer resolved {len(self._layers)} layers; "
+                f"no penalty matrix for {len(self._missing)} layers; "
+                f"tf32={int(self.allow_tf32)} dtype={self.compute_dtype}"
+            )
+
+        used = len(self._layers)
+        divisor = used if (self.normalize_by_layers and used > 0) else 1
+        total = full_covariance_grad_(
+            self._layers,
+            scale=replay_lambda / divisor,
+            allow_tf32=self.allow_tf32,
+            compute_dtype=self.compute_dtype,
+        )
+        stats = {"used_layers": float(used), "missing_layers": float(len(self._missing))}
+        return total / divisor, stats
 
     def layer_keys(self) -> dict[str, torch.Tensor]:
         """Per-layer matrices, used as the definition of the penalty's coverage.

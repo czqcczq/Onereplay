@@ -41,6 +41,8 @@ from onereplay.data.replay import build_replay_dataset, mix_replay_into_train  #
 from onereplay.trainers.opd import OPDTrainer  # noqa: E402
 from onereplay.trainers.sft import SFTTrainer  # noqa: E402
 
+REG_DTYPES = {"fp32": torch.float32, "fp64": torch.float64, "bf16": torch.bfloat16}
+
 
 def parse_args() -> argparse.Namespace:
     """Parse model, dataset, LoRA, OneReplay, paradigm, and saving settings."""
@@ -162,6 +164,48 @@ def parse_args() -> argparse.Namespace:
             "old per-micro-batch behavior; only useful for reproducing the timing "
             "of runs made before this flag existed, or as the control arm of the "
             "equivalence check."
+        ),
+    )
+    parser.add_argument(
+        "--reg_impl",
+        type=str,
+        choices=["autograd", "analytic"],
+        default="autograd",
+        help=(
+            "How dR/dW is obtained on the full fine-tuning path. autograd builds "
+            "sum((DeltaW C) * DeltaW) into the loss and lets backward derive the "
+            "gradient, which costs a second matmul of the same size and holds every "
+            "layer's fp32 DeltaW in the graph until backward returns. analytic uses "
+            "dR/dDeltaW = 2 DeltaW C, which the forward pass already computed, and "
+            "writes it into .grad before optimizer.step(); same penalty, half the "
+            "arithmetic, and per-layer temporaries instead of all-layers. No effect on "
+            "the LoRA path, which is already rank x rank and costs ~1.6% of a step."
+        ),
+    )
+    parser.add_argument(
+        "--reg_allow_tf32",
+        type=int,
+        default=1,
+        help=(
+            "1 lets the penalty's matmul use TF32 tensor cores (11 mantissa bits) "
+            "instead of the FP32 pipeline (24 bits). C stays fp32 in memory; only the "
+            "tensor core's inputs are rounded. On H100 that is ~7x throughput for a "
+            "~5e-4 relative perturbation of C, an order of magnitude below the 5e-3 "
+            "penalty-ratio gap between two sampling strategies of the same corpus. "
+            "The flag is scoped to the penalty and restored afterwards, so the rest of "
+            "the process is unaffected. Only read by --reg_impl analytic."
+        ),
+    )
+    parser.add_argument(
+        "--reg_compute_dtype",
+        type=str,
+        choices=["fp32", "fp64", "bf16"],
+        default="fp32",
+        help=(
+            "Precision the penalty's matmul runs in. fp64 is the ground-truth arm of "
+            "the precision check: it is ~15x slower than fp32 but exact enough to say "
+            "which of the other arms is closer to the true gradient, which comparing "
+            "them against each other cannot. Only read by --reg_impl analytic."
         ),
     )
     parser.add_argument(
@@ -386,6 +430,9 @@ def build_regularizer(args: argparse.Namespace, device) -> ReplayRegularizer | E
             device=device,
             identity=args.identity_cov == 1,
             normalize_by_layers=bool(args.normalize_replay_by_layers),
+            reg_impl=args.reg_impl,
+            allow_tf32=bool(args.reg_allow_tf32),
+            compute_dtype=REG_DTYPES[args.reg_compute_dtype],
         )
         if args.identity_cov == 1:
             print(
@@ -451,6 +498,19 @@ def main() -> None:
 
     print("loading and tokenizing Commonsense170k")
     train_dataset, valid_dataset = load_and_prepare_dataset(args, tokenizer)
+    if args.reg_impl == "analytic":
+        if args.reg_once_per_update != 1:
+            raise ValueError(
+                "--reg_impl analytic always injects one penalty gradient per optimizer "
+                "step, so --reg_once_per_update 0 cannot be honored. Use "
+                "--reg_impl autograd for the per-micro-batch control arm."
+            )
+        if args.full_finetune != 1:
+            print(
+                "warning: --reg_impl analytic only changes the full fine-tuning path. "
+                "This is a LoRA run, so the rank x rank autograd shortcut is used and "
+                "the flag has no effect beyond being recorded in the metrics."
+            )
     if args.replay_per_batch > 0 and args.replay_ratio > 0:
         raise ValueError(
             "--replay_per_batch (batch-level) and --replay_ratio (data-level) are two "
@@ -578,6 +638,10 @@ def main() -> None:
             "identity_cov": args.identity_cov,
             # Timing is only comparable across runs that share this setting.
             "reg_once_per_update": args.reg_once_per_update,
+            # And so is any claim about the penalty's cost or its numerics.
+            "reg_impl": args.reg_impl,
+            "reg_allow_tf32": args.reg_allow_tf32,
+            "reg_compute_dtype": args.reg_compute_dtype,
             "batch_size": args.batch_size,
             "accumulation_size": args.accumulation_size,
             "replay_ratio": args.replay_ratio,
