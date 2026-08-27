@@ -38,7 +38,7 @@
 # 【怎么验】collect_cov 会打印 `Stage 1: pool rows=... fingerprint=...`，
 #   这是选中的 20000 行 (inputs, targets) 的 sha256。在旧集群上取出旧值:
 #
-#     python -c "import torch; m=torch.load('<旧>/cov_flan_chat_20k_qv.pt', \
+#     python -c "import torch; m=torch.load('<旧>/cov_flan_chat_20k_full.pt', \
 #       map_location='cpu')['metadata']; print(m['pool_rows'], m['pool_fingerprint'])"
 #
 #   然后带着它提交，脚本会硬比对，不一致直接失败而不是悄悄产出一份错的 C:
@@ -46,7 +46,7 @@
 #     qsub -v EXPECT_FINGERPRINT=<那串 sha256> onereplay/pbs/01_collect_cov.pbs
 #
 #   如果旧的 .pt 本身也传到了新集群，还可以让脚本直接逐层比矩阵:
-#     qsub -v REF_COV=/scratch/.../cov_flan_chat_20k_qv.pt onereplay/pbs/01_collect_cov.pbs
+#     qsub -v REF_COV=/scratch/.../cov_flan_chat_20k_full.pt onereplay/pbs/01_collect_cov.pbs
 #
 # -----------------------------------------------------------------------------
 # COV_SCOPE 决定覆盖哪些层，其余参数（采样种子、样本数、chat 模板）两种 scope
@@ -58,18 +58,19 @@
 # 全量下 embed_tokens 不会被选中（它是 nn.Embedding 不是 nn.Linear），tied 权重
 # 因此只通过 lm_head 被约束一次，无需额外去重。
 #
-# 注意：Slurm 版的 COV_SCOPE 默认是 full，这里默认改成 qv，因为 31/32 号数学实验
-# 消费的是 cov_flan_chat_20k_qv.pt。要 full 那份就显式传 COV_SCOPE=full。
-# 两种 scope 的 20k 子集完全一样（fingerprint 相同），只是记录的层不同。
+# 本脚本现在默认生成 43_full_reg_impl.pbs 所需的 uniform + full 文件：
+#   results/cov/cov_flan_chat_20k_full.pt
+# qv 仍可显式选择。两种 scope 的 20k 子集完全一样（fingerprint 相同），只是记录的
+# 层不同；balanced 则是另一种抽样，文件名会带 _balanced，不能代替这份复现文件。
 #
 # -----------------------------------------------------------------------------
 # 用法（PBS 默认不带入提交环境，覆盖变量必须走 qsub -v）:
-#   qsub onereplay/pbs/01_collect_cov.pbs                        # 默认 qv，随机 20k（复现旧 C_if）
-#   qsub -v COV_SCOPE=full onereplay/pbs/01_collect_cov.pbs      # 全量八类层
+#   qsub onereplay/pbs/01_collect_cov.pbs                        # 默认 full + uniform，生成目标文件
+#   qsub -v COV_SCOPE=qv onereplay/pbs/01_collect_cov.pbs        # 只采 q_proj/v_proj
 #   qsub -v EXPECT_FINGERPRINT=<sha256> onereplay/pbs/01_collect_cov.pbs
 #   qsub -v PREFLIGHT_ONLY=1 onereplay/pbs/01_collect_cov.pbs    # 只查语料，不上 GPU
 #   qsub -v SAMPLE_STRATEGY=balanced onereplay/pbs/01_collect_cov.pbs
-#                     # 任务平衡 20k，输出到 cov_flan_chat_20k_balanced_qv.pt（不覆盖随机版）
+#                     # 任务平衡 20k，输出到 cov_flan_chat_20k_balanced_full.pt（不覆盖随机版）
 #                     # 建议先本地预览分布再提交:
 #                     #   python -m onereplay.scripts.analyze_flan_task_balance \
 #                     #     --data_files ".../flan/train/*.jsonl" --cache_dir .../dataset_cache \
@@ -253,7 +254,7 @@ case "${SAMPLE_STRATEGY}" in
 esac
 
 # ---- 覆盖范围预设。显式给 TARGET_MODULES / COV_PATH 可覆盖预设值 ----
-COV_SCOPE="${COV_SCOPE:-qv}"
+COV_SCOPE="${COV_SCOPE:-full}"
 case "${COV_SCOPE}" in
   qv)
     TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
