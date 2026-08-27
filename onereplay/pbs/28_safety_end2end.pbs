@@ -1,0 +1,342 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_safety
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 问题 1 安全性评测（生成 + 判分 + 配对统计）
+#
+# 由 onereplay/slurm/28_safety_end2end.slurm 迁移而来。评测算法与 RWTH 版逐字
+# 一致，改动只在集群层（照 pbs/33、pbs/42）：
+#   1) PBS 指令替代 SBATCH；提交用 qsub。
+#   2) 计算在 Singularity 容器里跑，venv 在容器内激活；脚本把自己在容器里再跑
+#      一遍（外层 module load singularity + singularity exec，内层做真正评测）。
+#   3) zsh -> bash：`read -rA` 改 `read -ra`，去掉 zsh 专有写法。
+#   4) 路径迁到 /scratch，且用独立的 results_safety 树，与 Hopper 自训的
+#      results/adapters 隔离，保证用的是从 RWTH 搬来的那份权重。
+#
+# -----------------------------------------------------------------------------
+# 这次在 Hopper 上只补 EWC(λ=3e2) 和 Replay(4n4r) 两条：
+#   base / vanilla / onereplay 三条已在 RWTH 定稿（2026-08-18，作业 3049367），其
+#   summary.json + judged.jsonl 已随迁移搬进 results_safety/，脚本据此跳过它们的
+#   生成与判分，只补新增的两条。断点续跑：已有 summary.json 跳过生成，已有
+#   judged.jsonl 跳过判分（FORCE_GEN=1 / FORCE_JUDGE=1 可强制重跑）。
+#
+#   判定生成完成看 summary.json 而非 responses.jsonl（后者边生成边追加，被墙时会
+#   留半截文件）。判分脚本每次只把本次判的 run 写进 safety_all_runs.json，判完后
+#   本脚本从各 run 的 safety_summary.json 重建汇总，跳过的 run 不会掉。
+#
+# -----------------------------------------------------------------------------
+# 迁移前置（都已在登录节点 / 迁移步骤里备好，这里只列出脚本依赖的落点）:
+#   base 模型     ${MODEL_DIR}/${MODEL_NAME}                 = models/Qwen3-1.7B
+#   4 个 adapter  ${RESULTS_ROOT}/adapters/cs_*              = results_safety/adapters/
+#   prompts       ${RESULTS_ROOT}/safety_prompts/*.jsonl     （已搬，缺失才重建）
+#   已定稿结果    ${RESULTS_ROOT}/{safety,safety_judged}/{base,vanilla_seed1,onereplay_lam3e-2_seed1}
+#   判别器        ${JUDGE_MODEL_DIR}/${JUDGE_MODEL_NAME}     = models/wildguard（gated，HF 直下）
+#   安全 CSV      ${SAFETY_RAW}/*.csv                        （prompts 已在则非必需）
+#
+# 用法:
+#   mkdir -p /scratch/weiliu87/logs/onereplay      # qsub 前必须存在，且在仓库外
+#   qsub onereplay/pbs/28_safety_end2end.pbs
+#   只做前置检查、不真跑:  改下方 DRY_RUN 默认值为 1 再 qsub
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/28_safety_end2end.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的 shell 不一定是 login shell，module 可能未定义；set -e 下会静默挂掉，
+  # 所以先兜一层初始化（写成 if 而非 && 链，避免第一个候选不存在时整条返回 1）。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      if [[ -f "${_init}" ]]; then
+        source "${_init}"
+        break
+      fi
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT SEED
+    SAFETY_RAW HARMBENCH_CSV ITW_PATH XSTEST_PATH SAFETY_PROMPTS
+    NUM_BEHAVIORS NUM_ITW_TEMPLATES SAFETY_MAX_NEW_TOKENS
+    JUDGE_MODEL_DIR JUDGE_MODEL_NAME JUDGE_BATCH JUDGE_OUT SAFETY_REPORT
+    RUNS FORCE_GEN FORCE_JUDGE DO_ANALYZE DRY_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用（本站点联网会卡死）。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_safety}"
+SEED="${SEED:-1}"
+
+# ---- 安全数据原始文件（prompts 已搬时非必需）----
+SAFETY_RAW="${SAFETY_RAW:-${REPO_ROOT}/datasets/safety}"
+HARMBENCH_CSV="${HARMBENCH_CSV:-${SAFETY_RAW}/harmbench_behaviors_text_all.csv}"
+ITW_PATH="${ITW_PATH:-${SAFETY_RAW}/in_the_wild_jailbreak.csv}"
+XSTEST_PATH="${XSTEST_PATH:-${SAFETY_RAW}/xstest.csv}"
+SAFETY_PROMPTS="${SAFETY_PROMPTS:-${RESULTS_ROOT}/safety_prompts/safety_prompts.jsonl}"
+NUM_BEHAVIORS="${NUM_BEHAVIORS:-200}"
+NUM_ITW_TEMPLATES="${NUM_ITW_TEMPLATES:-3}"
+SAFETY_MAX_NEW_TOKENS="${SAFETY_MAX_NEW_TOKENS:-256}"
+
+# ---- judge 模型（wildguard，gated，登录节点 HF 直下）----
+JUDGE_MODEL_DIR="${JUDGE_MODEL_DIR:-${MODEL_DIR}}"
+JUDGE_MODEL_NAME="${JUDGE_MODEL_NAME:-wildguard}"
+JUDGE_BATCH="${JUDGE_BATCH:-16}"
+JUDGE_OUT="${JUDGE_OUT:-${RESULTS_ROOT}/safety_judged}"
+SAFETY_REPORT="${SAFETY_REPORT:-${JUDGE_OUT}/safety_analysis.json}"
+
+FORCE_GEN="${FORCE_GEN:-0}"       # 1 = 即使已有 responses 也重新生成
+FORCE_JUDGE="${FORCE_JUDGE:-0}"   # 1 = 即使已有 judged.jsonl 也重新判分
+DO_ANALYZE="${DO_ANALYZE:-1}"     # 判分后跑 McNemar / bootstrap / 退化诊断
+DRY_RUN="${DRY_RUN:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${JUDGE_MODEL_DIR}/${JUDGE_MODEL_NAME}" ]] || {
+  echo "缺 judge 模型: ${JUDGE_MODEL_DIR}/${JUDGE_MODEL_NAME}（先在登录节点下 allenai/wildguard）"; exit 1;
+}
+# HarmBench CSV 只有在需要重建 prompts 时才必须；prompts 已搬来的话就不强求。
+if [[ ! -f "${SAFETY_PROMPTS}" ]]; then
+  [[ -f "${HARMBENCH_CSV}" ]] || { echo "缺 HarmBench CSV 且无现成 prompts: ${HARMBENCH_CSV}"; exit 1; }
+fi
+
+# ---- 构建统一 prompts 文件（缺失时才生成）----
+if [[ ! -f "${SAFETY_PROMPTS}" ]]; then
+  echo "==== build safety prompts -> ${SAFETY_PROMPTS} ===="
+  itw_arg=(); [[ -f "${ITW_PATH}" ]] && itw_arg=(--itw_path "${ITW_PATH}")
+  xstest_arg=(); [[ -f "${XSTEST_PATH}" ]] && xstest_arg=(--xstest_path "${XSTEST_PATH}")
+  python -m onereplay.scripts.prepare_safety_data \
+    --harmbench_csv "${HARMBENCH_CSV}" \
+    "${itw_arg[@]}" "${xstest_arg[@]}" \
+    --num_behaviors "${NUM_BEHAVIORS}" \
+    --num_itw_templates "${NUM_ITW_TEMPLATES}" \
+    --output_path "${SAFETY_PROMPTS}"
+else
+  echo "已有 prompts，跳过构建: ${SAFETY_PROMPTS}"
+fi
+
+# ---- 待评模型（run_name;adapter_path，adapter 为空即 base）----
+#   顺序即报告顺序，base 第一位。EWC 的 λ=3e2、Replay 的 4n4r 是与 RWTH 定稿同名
+#   的两条；adapter 从 results_safety/adapters 解析（迁移搬来的 RWTH 权重）。
+RUNS="${RUNS:-base;|vanilla_seed${SEED};${RESULTS_ROOT}/adapters/cs_vanilla_seed${SEED}|ewc_lam3e2_seed${SEED};${RESULTS_ROOT}/adapters/cs_ewc_lam3e2_seed${SEED}|replaymix_4n4r_seed${SEED};${RESULTS_ROOT}/adapters/cs_replaymix_4n4r_seed${SEED}|onereplay_lam3e-2_seed${SEED};${RESULTS_ROOT}/adapters/cs_onereplay_lam3e-2_seed${SEED}_regonce}"
+
+IFS='|' read -ra run_specs <<< "${RUNS}"
+
+# ---------------------------------------------------------------------------
+# 前置检查：adapter 目录名 + 各 run 已完成到哪一步
+# ---------------------------------------------------------------------------
+echo "========================================================================"
+echo "现有 adapter（${RESULTS_ROOT}/adapters）:"
+ls -1 "${RESULTS_ROOT}/adapters" 2>/dev/null || echo "  (目录不存在)"
+echo ""
+printf "%-30s %-8s %-8s %s\n" "run_name" "生成" "判分" "adapter"
+missing_adapter=0
+for spec in "${run_specs[@]}"; do
+  name="${spec%%;*}"
+  adapter="${spec#*;}"
+  gen_state="待跑"
+  if [[ "${FORCE_GEN}" != "1" && -f "${RESULTS_ROOT}/safety/${name}/summary.json" ]]; then
+    gen_state="已有"
+  fi
+  judge_state="待跑"
+  if [[ "${FORCE_JUDGE}" != "1" && -s "${JUDGE_OUT}/${name}/judged.jsonl" ]]; then
+    judge_state="已有"
+  fi
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    printf "%-30s %-8s %-8s %s\n" "${name}" "${gen_state}" "${judge_state}" "!! 缺 ${adapter}"
+    missing_adapter=1
+  else
+    printf "%-30s %-8s %-8s %s\n" "${name}" "${gen_state}" "${judge_state}" "${adapter:-<裸 base>}"
+  fi
+done
+echo "========================================================================"
+
+if [[ "${missing_adapter}" == "1" ]]; then
+  echo "有 adapter 目录不存在。核对 run 名后用 RUNS=... 覆盖，或确认迁移是否漏搬。"
+  exit 1
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查，不生成也不判分。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+run_safety () {
+  local name=$1
+  local adapter=$2
+  local -a adapter_arg=()
+  if [[ -n "${adapter}" ]]; then adapter_arg=(--adapter_path "${adapter}"); fi
+
+  # 完成标记用 summary.json（只在跑完所有 prompt 后写），不用边写边追加的
+  # responses.jsonl，否则被砍掉的半截结果会被当成完成。
+  local done_marker="${RESULTS_ROOT}/safety/${name}/summary.json"
+  if [[ "${FORCE_GEN}" != "1" && -f "${done_marker}" ]]; then
+    echo "==== safety gen: ${name} (跳过，已有 ${done_marker}) ===="
+    return 0
+  fi
+
+  echo "==== safety gen: ${name} ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    "${adapter_arg[@]}" --run_name "${name}" \
+    --metrics safety --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --safety_prompts "${SAFETY_PROMPTS}" \
+    --safety_max_new_tokens "${SAFETY_MAX_NEW_TOKENS}"
+}
+
+# ---- 阶段 1：逐模型生成；只把还没判分的 run 收进判分清单 ----
+JUDGE_LIST=""
+RUN_NAMES=""
+for spec in "${run_specs[@]}"; do
+  name="${spec%%;*}"
+  adapter="${spec#*;}"
+  run_safety "${name}" "${adapter}"
+  if [[ -z "${RUN_NAMES}" ]]; then RUN_NAMES="${name}"; else RUN_NAMES="${RUN_NAMES},${name}"; fi
+  if [[ "${FORCE_JUDGE}" != "1" && -s "${JUDGE_OUT}/${name}/judged.jsonl" ]]; then
+    echo "已有判分结果，跳过 judge: ${name}"
+    continue
+  fi
+  resp="${RESULTS_ROOT}/safety/${name}/responses.jsonl"
+  if [[ -z "${JUDGE_LIST}" ]]; then JUDGE_LIST="${resp}"; else JUDGE_LIST="${JUDGE_LIST},${resp}"; fi
+done
+
+# ---- 阶段 2：WildGuard 一次性判分待判的所有 run（约 5 min/run）----
+if [[ -n "${JUDGE_LIST}" ]]; then
+  echo "==== safety judge: ${JUDGE_LIST} ===="
+  python -m onereplay.scripts.judge_safety \
+    --responses "${JUDGE_LIST}" \
+    --judge_model_dir "${JUDGE_MODEL_DIR}" --judge_model_name "${JUDGE_MODEL_NAME}" \
+    --out_dir "${JUDGE_OUT}" \
+    --batch_size "${JUDGE_BATCH}"
+else
+  echo "==== safety judge: 所有 run 都已判分，跳过（FORCE_JUDGE=1 可强制重判）===="
+fi
+
+# ---- 阶段 2b：从各 run 的 summary 重建总汇总（judge 只写本次判的那几个）----
+echo "==== rebuild ${JUDGE_OUT}/safety_all_runs.json ===="
+python - "${JUDGE_OUT}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+overall = {}
+for summary_path in sorted(root.glob("*/safety_summary.json")):
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    overall[summary.get("run_name", summary_path.parent.name)] = summary["per_track"]
+(root / "safety_all_runs.json").write_text(
+    json.dumps(overall, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+print(f"汇总了 {len(overall)} 个 run: {sorted(overall)}")
+PY
+
+# ---- 阶段 3：配对统计（McNemar 精确检验 + bootstrap CI + 退化 / 净率诊断）----
+if [[ "${DO_ANALYZE}" == "1" ]]; then
+  echo "==== safety analyze -> ${SAFETY_REPORT} ===="
+  python -m onereplay.scripts.analyze_safety \
+    --judged "${JUDGE_OUT}/*/judged.jsonl" \
+    --runs "${RUN_NAMES}" \
+    --out_path "${SAFETY_REPORT}" || true
+fi
+
+set +x
+echo "产物: ${RESULTS_ROOT}/safety/<run>/{summary.json,responses.jsonl}"
+echo "      ${JUDGE_OUT}/<run>/judged.jsonl、${JUDGE_OUT}/safety_all_runs.json"
+echo "      配对统计: ${SAFETY_REPORT}"
+echo "Job finished at: $(date)"
