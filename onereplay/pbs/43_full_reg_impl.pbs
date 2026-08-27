@@ -41,6 +41,7 @@
 #   B        --reg_impl analytic   TF32，待验证
 #   G        --reg_impl analytic --reg_compute_dtype fp64 --reg_allow_tf32 0  真值轨迹
 #   rep05    λ=0 + --replay_per_batch 4，把 2×2 表里"全参数 + replay@0.5"那格填上
+#            步数是 REP05_STEPS（默认 2*STEPS），因为它每步只有 4 行新任务
 #
 # 【前置】197 层的 C 必须存在。Hopper 的 01 默认只采 qv：
 #   ls -lh ${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt   # 约 6.58 GiB
@@ -59,7 +60,19 @@
 #   只跑某几条 arm:
 #     qsub -v ARMS='van A B' onereplay/pbs/43_full_reg_impl.pbs
 #
-# 【成本】STEPS=3000 时约 37 min 计算，含加载与验证约 1.5 h。walltime 给 6 h。
+#   只要 OneReplay vs replay@0.5 的初步效率结论（不验证实现等价性，约 35 min）:
+#     qsub -v ARMS='van B rep05',STEPS=1500 onereplay/pbs/43_full_reg_impl.pbs
+#     A 和 G 是给"解析实现是否等于 autograd"用的，跟这个问题无关；不跑它们时
+#     Step 3 和 4b 会自己跳过。读 Step 4c 那张表的 ms/新任务行。
+#
+# 【效率怎么算才公平】
+# 两种方法要达成的是同一件事：把 commonsense 学完。replay 行和惩罚项都是为此付出
+# 的代价，不是产出。所以分母只能是新任务行数，不能是步数——rep05 每步只有 4 行新
+# 任务，用 ms/step 比会把它一半的工作量当成便宜。Step 4c 按新任务行归一化，rep05
+# 的步数也相应翻倍，两边全程都过 STEPS*BATCH 行新任务。
+#
+# 【成本】STEPS=3000 时约 37 min 计算，含加载与验证约 1.5 h（rep05 步数翻倍已计入）。
+# walltime 给 6 h。
 # =============================================================================
 
 set -euo pipefail
@@ -124,6 +137,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     STEPS LOG_EVERY WARMUP_STEPS PROFILE_STEPS BATCH ACCUM MAXLEN
     VAL_FRAC MAXVAL ARMS PREFLIGHT_ONLY KEEP_CKPT
     REPLAY_PER_BATCH REPLAY_ACCUM SELF_DISTILL_FILE POOL_SIZE SAMPLE_SEED
+    REP05_STEPS EPOCH_NEW_ROWS
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -204,6 +218,16 @@ REPLAY_ACCUM="${REPLAY_ACCUM:-128}"
 POOL_SIZE="${POOL_SIZE:-20000}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
 SELF_DISTILL_FILE="${SELF_DISTILL_FILE:-${RESULTS_ROOT}/replay/flan_selfdistill_${POOL_SIZE}_seed${SAMPLE_SEED}.jsonl}"
+
+# rep05 的每个 micro-batch 只有 BATCH-REPLAY_PER_BATCH 行是新任务，跑同样 STEPS 步
+# 就只过了别人一半的新任务数据。效率问的是"学完同样多的新任务要多久"，所以步数按
+# 新任务行数对齐：3000 步 x 8 行 = 6000 步 x 4 行 = 24000 行。不对齐就会把 replay
+# 的一半工作量当成便宜，这正是 2026-08-03 汇总里那条注记的意思——replay 的总时长
+# 翻倍，一半来自单步变慢，一半来自步数从 21090 涨到 42178。
+REP05_STEPS="${REP05_STEPS:-$(( STEPS * BATCH / (BATCH - REPLAY_PER_BATCH) ))}"
+# 只用来把 ms/新任务行外推成 h/epoch。两条 arm 用同一个常数，所以外推值的比值就是
+# 实测比值。168715 = commonsense_170k 扣掉 1% 验证集后的 21090 步 x 8 行。
+EPOCH_NEW_ROWS="${EPOCH_NEW_ROWS:-168715}"
 
 ARMS="${ARMS:-van A B G rep05}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
@@ -322,15 +346,16 @@ for arm in ${ARMS}; do
       ;;
     rep05)
       # 这格和上面几条不同源（多了 replay 行）。ACCUM 翻到 128 让每次更新的新任务
-      # 行数仍是 64，所以 hours/epoch 可以和 van 比；但单步时间不能和 A/B 比，
-      # 它每步过的 token 是别人的两倍。
+      # 行数仍是 64，步数翻到 REP05_STEPS 让全程的新任务行数也相同。单步时间仍然
+      # 不能和 A/B 并排读——它每步过的 token 是别人的两倍——能比的是 Step 4c 那张
+      # 表里的 ms/新任务行。
       if [[ ! -f "${SELF_DISTILL_FILE}" ]]; then
         echo "跳过 rep05：缺自蒸馏回放语料 ${SELF_DISTILL_FILE}"
         echo "  Hopper 上这份文件是 13_replay_selfdistill 生成的，若没搬过来就先跑它，"
         echo "  或者 qsub -v SELF_DISTILL_FILE=/绝对/路径.jsonl 指过去。"
         continue
       fi
-      train_arm rep05 "${STEPS}" 0 "${OUT_DIR}" \
+      train_arm rep05 "${REP05_STEPS}" 0 "${OUT_DIR}" \
         --accumulation_size "${REPLAY_ACCUM}" --replay_lambda 0 \
         --measure_replay_when_lambda_zero 0 \
         --replay_per_batch "${REPLAY_PER_BATCH}" \
@@ -396,6 +421,117 @@ echo "==== Step 4a: 分阶段占比（来自 profile，仅看 replay_reg 那一�
 python -m onereplay.scripts.summarize_cost \
   --metrics_dir "${PROF_DIR}" \
   --out "${PROF_DIR}/phases.md" || true
+
+echo ""
+echo "==== Step 4c: 效率对比（归一化到每条新任务行）===="
+# cost.md 的 ms/step 在这里不能用：rep05 每步只有 4 行新任务，同样的 ms/step 意味着
+# 它做的有用功只有一半。唯一可比的分母是新任务行数——两种方法要达成的目标都是"把
+# commonsense 学完"，replay 行和惩罚项都是为此付出的代价，不是产出。
+python - "${OUT_DIR}" "${EPOCH_NEW_ROWS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+epoch_rows = int(sys.argv[2])
+
+
+def last_cost_record(path):
+    """The final epoch record. Probe records carry no train_sec, so they drop out."""
+
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+    priced = [record for record in records if record.get("train_sec") is not None]
+    return priced[-1] if priced else None
+
+
+rows = {}
+for path in sorted(out.glob("*.jsonl")):
+    record = last_cost_record(path)
+    if record is None:
+        continue
+    batch = record.get("batch_size") or 0
+    # replay_per_batch is 0 on every arm that does no batch-level mixing, so this
+    # is just batch_size there.
+    new_per_step = batch - (record.get("replay_per_batch") or 0)
+    steps = record.get("train_steps") or 0
+    seconds = record.get("train_sec") or 0.0
+    if new_per_step <= 0 or steps <= 0 or seconds <= 0.0:
+        continue
+    new_rows = steps * new_per_step
+    rows[path.stem] = {
+        "steps": steps,
+        "new_per_step": new_per_step,
+        "new_rows": new_rows,
+        "seconds": seconds,
+        "ms_per_row": seconds * 1000.0 / new_rows,
+        "hours_per_epoch": seconds / new_rows * epoch_rows / 3600.0,
+        "peak": record.get("peak_memory_allocated_gb") or 0.0,
+        "cov": record.get("covariance_memory_gb") or 0.0,
+    }
+
+if not rows:
+    print("没有可用的 metrics")
+    raise SystemExit(0)
+
+order = [name for name in ("van", "B", "A", "G", "rep05") if name in rows]
+order += [name for name in sorted(rows) if name not in order]
+
+print(
+    f"{'arm':>6} {'steps':>7} {'new/step':>9} {'new rows':>9} {'wall(s)':>9} "
+    f"{'ms/new row':>11} {'h/epoch*':>9} {'peak GiB':>9} {'C GiB':>7}"
+)
+for name in order:
+    row = rows[name]
+    print(
+        f"{name:>6} {row['steps']:>7} {row['new_per_step']:>9} {row['new_rows']:>9} "
+        f"{row['seconds']:>9.1f} {row['ms_per_row']:>11.3f} {row['hours_per_epoch']:>9.2f} "
+        f"{row['peak']:>9.2f} {row['cov']:>7.3f}"
+    )
+
+print()
+print(f"* h/epoch 按 {epoch_rows:,} 条新任务行外推，不是实测。所有 arm 用同一个常数，")
+print("  所以外推值之间的比值等于实测比值，可以直接比大小。")
+
+if len({row["new_rows"] for row in rows.values()}) > 1:
+    print()
+    print("注意：各 arm 的新任务行数不完全相同（见 new rows 列）。ms/new row 已经归一化，")
+    print("但 wall(s) 和 peak 不能直接并排读。")
+
+baseline = rows.get("van")
+# Prefer B: that is the implementation that would actually ship. A only stands in
+# for it if the analytic arm did not run.
+onereplay = rows.get("B") or rows.get("A")
+replay = rows.get("rep05")
+
+if onereplay is None or replay is None:
+    missing = "OneReplay(B/A)" if onereplay is None else "replay@0.5(rep05)"
+    print(f"\n缺 {missing}，无法做 OneReplay vs replay@0.5 的对比。")
+    raise SystemExit(0)
+
+print()
+print("== OneReplay vs replay@0.5，同样多的新任务行 ==")
+for label, row in (("OneReplay", onereplay), ("replay@0.5", replay)):
+    tail = ""
+    if baseline is not None:
+        overhead = 100.0 * (row["ms_per_row"] / baseline["ms_per_row"] - 1.0)
+        tail = f"，比 vanilla 贵 {overhead:+.1f}%"
+    print(f"  {label:<11} {row['ms_per_row']:.3f} ms/新任务行{tail}")
+
+ratio = replay["ms_per_row"] / onereplay["ms_per_row"]
+if ratio >= 1.0:
+    print(f"  -> OneReplay 更便宜，replay@0.5 是它的 {ratio:.2f} 倍")
+else:
+    print(f"  -> replay@0.5 更便宜，OneReplay 是它的 {1.0 / ratio:.2f} 倍")
+
+print()
+print("这只是计算开销。replay 还有一次性的自蒸馏语料生成（约 39 min），OneReplay 有")
+print("一次性的采 C（full 档约 1h49min）和常驻的 C 显存（见 C GiB 列），要不要计入")
+print("取决于摊销到多少次训练。效果侧的结论不在这张表里。")
+PY
 
 echo ""
 echo "==== Step 4b: 轨迹对比（A/B/G 的逐步 task_loss 与 replay_reg）===="
