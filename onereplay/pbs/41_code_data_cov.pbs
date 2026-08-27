@@ -245,9 +245,11 @@ DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-1}"
 
 # ---- 阶段开关 ----
 # >>>>>> 本站点 qsub 不吃命令行变量，阶段切换靠直接改这一行 <<<<<<
-# 当前 = 1：只跑「建池 + DIAG_SAMPLES 条自蒸馏 + 长度诊断」，打完诊断就 exit 0。
-# **诊断满意后必须改回 0**，否则全量自蒸馏（Step1 之后的整条链）根本不会启动。
-DIAG="${DIAG:-1}"
+# 当前 = 0：跑全链（建池 -> 20k 自蒸馏 -> 采 C_code -> 混合）。
+# 诊断已通过（MAX_NEW=1280 下截断率 0）。若要再做一次长度诊断，临时改回 1。
+# 注意：DIAG=1 也是 exit 0，串 afterok 时会被当成功而放行 42，但那时 C 还没生成——
+# 所以用作业依赖前，这一行必须是 0。
+DIAG="${DIAG:-0}"
 DIAG_SAMPLES="${DIAG_SAMPLES:-100}"
 SKIP_PREP="${SKIP_PREP:-0}"
 SKIP_GEN="${SKIP_GEN:-0}"

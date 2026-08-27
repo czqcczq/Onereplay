@@ -223,7 +223,10 @@ VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
 IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam${LAMBDA}_seed${SEED}_regonce}"
 CODE_RUN="${CODE_RUN:-cs_onereplay_code_lam${LAMBDA}_seed${SEED}_regonce}"
 CODE_MIX_RUN="${CODE_MIX_RUN:-cs_onereplay_ifcode_lam${LAMBDA}_seed${SEED}_regonce}"
-MODELS="${MODELS:-base vanilla cif cifcode}"
+# base/vanilla 已在 39 号出过代码结果，且 OUT_DIR 同目录会被 pending_metrics 自动跳过，
+# 这里直接不列。cif 在 39 号没跑过代码，且 cif vs cifcode 是「C_code 是否必要」的核心
+# pass@1 对照，必须留；cifcode 是本作业新训的那份。要再加纯 C_code 控制就 MODELS="cif ccode cifcode"。
+MODELS="${MODELS:-cif cifcode}"
 
 # ---- 代码评测参数（与 39 号一致，所有 run 必须同预算才可比）----
 MBPP_CONFIG="${MBPP_CONFIG:-full}"
