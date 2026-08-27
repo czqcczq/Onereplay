@@ -23,6 +23,21 @@ def load_humaneval(data_file: str, cache_dir: str, limit: int) -> list[dict[str,
     return rows
 
 
+def build_prompt(function_prompt: str) -> str:
+    """Wrap a HumanEval signature+docstring as the user turn.
+
+    Module level so the CE probe feeds the model the byte-identical string this
+    metric fed it; math500/gsm8k/aime expose build_prompt for the same reason.
+    """
+
+    return (
+        "Complete the following Python function. "
+        "Return only valid Python code for the function body or continuation; "
+        "do not include markdown fences.\n\n"
+        f"{function_prompt}"
+    )
+
+
 class HumanEvalMetric:
     name = "humaneval"
 
@@ -42,12 +57,7 @@ class HumanEvalMetric:
         with response_path.open("w", encoding="utf-8") as file:
             for idx, example in enumerate(rows, start=1):
                 prompt = example["prompt"]
-                user_prompt = (
-                    "Complete the following Python function. "
-                    "Return only valid Python code for the function body or continuation; "
-                    "do not include markdown fences.\n\n"
-                    f"{prompt}"
-                )
+                user_prompt = build_prompt(prompt)
                 raw = generate_response(model, tokenizer, user_prompt, device, max_new_tokens)
                 completion = cleanup_completion(raw)
                 program = prompt + completion

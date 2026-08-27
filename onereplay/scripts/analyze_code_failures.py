@@ -54,6 +54,38 @@ BUCKETS = (
 )
 
 
+PY_TOKENS = ("def ", "return", "import ", "for ", "while ", "lambda", "class ", " = ")
+
+
+def classify_syntax_failure(completion: str) -> str:
+    """Why is this completion not valid Python?
+
+    'SyntaxError' collapses two opposite findings. Either the model produced
+    broken Python -- a real coding regression -- or it produced fine Python
+    wrapped in prose and cleanup_completion, which truncates at the first
+    '\\ndef ', kept the prose and discarded the code. The second case says
+    nothing about whether the model can code.
+
+    The completion is saved verbatim, so the question is answerable from disk
+    with no GPU at all.
+    """
+
+    text = completion.strip()
+    if not text:
+        return "空输出"
+    has_def = "def " in text
+    has_py = any(token in text for token in PY_TOKENS)
+    if "```" in text:
+        return "残留 markdown 围栏"
+    if not has_py:
+        return "纯散文，无代码（判分器吃掉了代码）"
+    if not has_def and text.count("\n") <= 1:
+        return "只剩单行片段"
+    if not has_def:
+        return "有代码但无函数定义"
+    return "有函数定义但语法坏了（真的写错）"
+
+
 def bucket(error: str) -> str:
     if not error:
         return "其他"
@@ -86,7 +118,7 @@ def load_rows(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in file if line.strip()]
 
 
-def report(metric: str, runs: list[str], root: Path, baseline: str) -> None:
+def report(metric: str, runs: list[str], root: Path, baseline: str, inspect: int = 0) -> None:
     loaded: dict[str, list[dict[str, Any]]] = {}
     for run in runs:
         path = root / metric / run / "responses.jsonl"
@@ -130,6 +162,50 @@ def report(metric: str, runs: list[str], root: Path, baseline: str) -> None:
         "   断言失败占比上升 => 代码写得出来但是错的，那才是能力退化。"
     )
 
+    # -- syntax-error forensics -------------------------------------------
+    # The decisive question the bucket table cannot answer: is a syntax error
+    # the model failing to write Python, or the harness discarding good Python?
+    syntax_rows = {
+        run: [
+            row
+            for row in rows
+            if not row.get("passed")
+            and re.search(r"SyntaxError|IndentationError", str(row.get("error", "")))
+        ]
+        for run, rows in loaded.items()
+    }
+    if any(syntax_rows.values()):
+        print("\n-- 语法错误的成因（只看语法错误那些题）")
+        reasons = [
+            "纯散文，无代码（判分器吃掉了代码）",
+            "残留 markdown 围栏",
+            "只剩单行片段",
+            "有代码但无函数定义",
+            "有函数定义但语法坏了（真的写错）",
+            "空输出",
+        ]
+        print(f"{'run':<40} {'语法错误题数':>12}" + "".join(f"{r[:12]:>14}" for r in reasons))
+        for run, rows in syntax_rows.items():
+            counts = {reason: 0 for reason in reasons}
+            for row in rows:
+                counts[classify_syntax_failure(str(row.get("completion", "")))] += 1
+            line = f"{run:<40} {len(rows):>12}"
+            for reason in reasons:
+                line += f"{counts[reason]:>14}"
+            print(line)
+        print(
+            "\n   落在前四类 => 代码本身可能是好的，丢的是'只输出代码'这条指令的服从度，\n"
+            "   属于输出结构而非算法内容。落在'真的写错'一类 => 编码能力确实退化了。"
+        )
+        if inspect > 0:
+            for run, rows in syntax_rows.items():
+                if run == baseline or not rows:
+                    continue
+                print(f"\n   {run} 的语法错误样本（前 {inspect} 条，每条截 240 字符）:")
+                for row in rows[:inspect]:
+                    text = str(row.get("completion", "")).strip().replace("\n", "\\n")
+                    print(f"     [{row.get('task_id')}] {text[:240]}")
+
     if baseline not in scores:
         return
     print(f"\n-- 配对 McNemar（vs {baseline}）")
@@ -162,12 +238,20 @@ def main() -> None:
     parser.add_argument("--metrics", default="humaneval,mbpp")
     parser.add_argument("--runs", required=True)
     parser.add_argument("--baseline", default="base")
+    parser.add_argument(
+        "--inspect",
+        type=int,
+        default=0,
+        help="Print this many raw syntax-error completions per non-baseline run. "
+        "The classifier buckets them, but reading a few is the only way to be sure "
+        "which bucket is right.",
+    )
     args = parser.parse_args()
 
     root = Path(args.results_root)
     runs = [r.strip() for r in args.runs.split(",") if r.strip()]
     for metric in (m.strip() for m in args.metrics.split(",") if m.strip()):
-        report(metric, runs, root, args.baseline)
+        report(metric, runs, root, args.baseline, args.inspect)
 
 
 if __name__ == "__main__":

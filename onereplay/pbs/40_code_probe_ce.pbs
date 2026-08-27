@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N or_probece
+#PBS -N or_codeprobece
 #PBS -j oe
 #PBS -k oed
 #PBS -q auto
@@ -9,60 +9,49 @@
 #PBS -o /scratch/weiliu87/logs/onereplay/
 #
 # =============================================================================
-# NUS Hopper (PBS + Singularity): 数学侧的 held-out CE 探针
+# NUS Hopper (PBS + Singularity): 代码侧的 held-out CE 探针
 #   对已有 checkpoint 在固定语料上算交叉熵。只做前向，不生成，全程约 20-40 分钟。
+#   这是 37 号（数学探针）的代码孪生版，口径、脚本、bootstrap 全部复用。
 #
 # -----------------------------------------------------------------------------
-# 为什么要这个
-#   准确率是个粗量具。MATH-500 上配对可分辨下限是 3.5pp，而要测的遗忘量是
-#   0.8pp——不是"结果不显著"，是这个量具根本读不出来（要 80% 功效需要约 20000
-#   题）。第三章那条 FLAN 曲线说明 CE 灵敏得多：vanilla 的池外 CE 从 base 的
-#   0.1231 涨到 0.4742，动了 285%，同期 IFEval 只掉 11.5pp。
+# 为什么要这个（和 37 号同一个理由，方向相反）
+#   39 号已经拿到代码侧唯一一处显著结果：MBPP vanilla 掉 3.80pp（p=0.0319）。但
+#   失败分桶显示这 3.8pp 全是语法错误暴涨 21 倍扛下来的，断言失败纹丝不动——也就是
+#   "格式坏了、算法没坏"。pass@1 只有 500 题，配对量程 3.30pp，若 OneReplay 消除
+#   60% 只救回约 2.28pp，低于量程，根本测不出保护效果（要 80% 功效需约 2100 题）。
 #
-#   于是这个探针能区分两种在 accuracy 上完全一样、含义却相反的情况:
-#     CE ~= 1.0x base  数学表征根本没动，"没有遗忘"是字面意义上的
-#     CE ~= 2x   base  动了，但没动到翻转答案 —— 漂移存在，只是没有行为后果
-#   这两个结论都能写，而 accuracy 一个都给不出来。
-#
-#   而且它在全参微调那边（36 号 slurm）的两种结局下都有用：数学真掉了，它就是
-#   后面那一轮要用的灵敏量具；数学没掉，它给出上面那个二选一。
+#   CE 探针把这件事从"勉强能发现伤害"升级成"能测量保护"：它在数学侧把 1.67pp 的
+#   不显著差异变成了 7.5 倍的清晰漂移，纯 CPU/GPU 前向，几十分钟一趟。
 #
 # -----------------------------------------------------------------------------
-# 探针语料从哪来：不生成，复用已有产物
-#   Step0 把 ${RESULTS_ROOT}/{math500,gsm8k}/base/responses.jsonl 直接转成
-#   {inputs, targets} 的自蒸馏格式 —— 那本来就是 base 对评测题的贪心回答，重新
-#   生成一遍要花掉和评测一样的几个小时。
+# 探针语料从哪来：不生成，复用 39 号的产物 + 源数据集重建 prompt
+#   代码的 responses.jsonl 只存 completion（已过 cleanup_completion 清洗），没有
+#   prompt、没有原始输出。所以 Step0 用 build_code_probe：
+#     * 从 ${CODE_DATA_DIR} 的 humaneval parquet / mbpp save_to_disk 重建 prompt
+#       （用 metric 自己的 build_prompt / build_mbpp_prompt，逐字一致）
+#     * 按 task_id join 回 base 的 completion，用清洗后的 completion 作 target
+#   用清洗后的 completion 作 target 其实更干净（target 是"合法且能解题的代码"，
+#   preamble 和尾部垃圾已剥掉），但要在论文里标明 target 是 post-cleanup。
 #
-#   这样做还额外买到一件事：**探针题目和 benchmark 题目完全相同**，所以
-#   "同一批题上 CE 动了 X%、accuracy 只动了 0.8pp" 是关于同一个集合的陈述，
-#   而不是两个集合各说各话。
-#
-#   第三个语料 probe_metamath_cpool 从 C_math 的自蒸馏池里等距抽 1000 行。它是
-#   第三章池内/池外对照的数学版本：这里没有任何模型在 MetaMath 文本上做过梯度
-#   更新，但 C_math 是从那批激活上采的，锚定在那个分布的正则可能在喂过它的行上
-#   显得更好。Step0 会做 prompt 文本差集自检（第三章就是靠这个抓到 1500 行里有
-#   98 行泄漏回训练池的）。
+#   探针题目和 benchmark 题目完全相同，所以"同一批题上 CE 动了 X 倍、语法错误涨了
+#   21 倍、断言失败没动"是关于同一个集合的陈述。
 #
 # -----------------------------------------------------------------------------
-# 口径与训练期探针完全一致
-#   score_probe_ce 复用 build_self_distilled_probe / build_probe_loader /
-#   SFTTrainer.evaluate_probe 三件套，没有重写任何 loss:
-#     * 只对 assistant token 求 CE（prompt 部分 label = -100）
-#     * **token 加权平均**而不是 batch 平均（数学回答长度从几十到几千，batch
-#       平均会让短回答主导，还会随 batch_size 漂移）
-#     * enable_thinking=False，与自蒸馏生成一致
-#     * shuffle=False，左 padding
-#   所以打出来的数和 metrics jsonl 里的 probe_* 字段可以并排读。
+# 免费红利：cif / cmix 是数学/IF 侧的正则 checkpoint，这里没有 C_code。
+#   把它们也在代码探针上跑一遍 = 跨领域泛化的数据点：
+#     它们若对代码也有可观保护  => C 的主导方向共享得比第四章估计的还多
+#     基本没用                  => 正好证明 C_code 是必要的，是 C_code 实验的动机铺垫
 #
-# MAX_LEN=2048
-#   MATH-500 的回答 P50 就有 528 token、尾部过 4000，Commonsense 用的 512 会把
-#   大部分答案切掉。2048 对齐 31 号自蒸馏的预算。Step0 会打印 target token 的
-#   分位数，Step1 会打印每个语料有多少行顶到 MAX_LEN —— 那个比例高就说明这个值
-#   还不够，CE 只覆盖了答案前缀。**所有 run 必须用同一个值才可比。**
+# -----------------------------------------------------------------------------
+# 口径与 37 号 / 训练期探针完全一致（score_probe_ce 没有重写任何 loss）
+#   只对 assistant token 求 CE、token 加权平均、enable_thinking=False、shuffle=False、
+#   左 padding。所以打出来的数和 37 号、和 metrics jsonl 的 probe_* 字段可并排读。
+#   **所有 run 必须用同一个 MAX_LEN 才可比。** 代码回答比数学短，2048 一般绰绰有余，
+#   Step0 会打印 target token 分位数、Step1 会打印顶到 MAX_LEN 的行数供核对。
 #
 # -----------------------------------------------------------------------------
 # 用法:
-#   qsub onereplay/pbs/37_math_probe_ce.pbs
+#   qsub onereplay/pbs/40_code_probe_ce.pbs
 #
 #   只重建语料不打分:   SKIP_SCORE=1
 #   只打分不重建语料:   SKIP_BUILD=1
@@ -70,9 +59,9 @@
 #   加大 max_len:       MAX_LEN=4096（显存不够就把 PROBE_BATCH 降到 4）
 #
 # 前置条件:
-#   1) ${RESULTS_ROOT}/{math500,gsm8k}/base/responses.jsonl（33/32 号评测产物）
-#   2) ${RESULTS_ROOT}/replay/metamath_cmath_30k_canonical_selfdistill_seed1.jsonl
-#      （31 号产物；缺了就只跳过 cpool 那一条，其余照跑）
+#   1) 39 号产物: ${RESULTS_ROOT}/{humaneval,mbpp}/base/responses.jsonl
+#   2) 代码源数据（登录节点用 download_code_data 下好）:
+#      ${CODE_DATA_DIR}/humaneval_test.parquet、${CODE_DATA_DIR}/mbpp_full/
 #   3) adapter 就位: ${RESULTS_ROOT}/adapters/{cs_vanilla_seed1,
 #      cs_onereplay_balanced_lam3e-2_seed1_regonce,
 #      cs_onereplay_ifmath_lam3e-2_seed1_regonce}
@@ -87,7 +76,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/37_math_probe_ce.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/40_code_probe_ce.pbs}"
 
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
@@ -131,9 +120,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
 
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
-    MODEL_DIR MODEL_NAME RESULTS_ROOT PROBE_DIR CPOOL_FILE
+    MODEL_DIR MODEL_NAME RESULTS_ROOT PROBE_DIR CODE_DATA_DIR
     MODELS VANILLA_RUN IF_RUN MIX_RUN SEED
-    MAX_LEN PROBE_BATCH PROBE_SIZE CPOOL_SIZE CAP
+    MBPP_SPLIT MAX_LEN PROBE_BATCH PROBE_SIZE CAP
     ROW_BATCH VERIFY_AGG BOOT_REPS BOOT_COMPARE
     SKIP_BUILD SKIP_SCORE DO_BOOTSTRAP
   )
@@ -188,12 +177,17 @@ MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
 ADAPTERS="${ADAPTERS:-${RESULTS_ROOT}/adapters}"
-PROBE_DIR="${PROBE_DIR:-${RESULTS_ROOT}/probe_ce}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+# 单开一个目录，别和 37 号的数学探针 scores.jsonl / per_row 混在一起。
+PROBE_DIR="${PROBE_DIR:-${RESULTS_ROOT}/probe_ce_code}"
 CORPUS_DIR="${PROBE_DIR}/corpora"
 SCORES="${PROBE_DIR}/scores.jsonl"
-CPOOL_FILE="${CPOOL_FILE:-${RESULTS_ROOT}/replay/metamath_cmath_30k_canonical_selfdistill_seed1.jsonl}"
 
-# ---- run 名（见 35 号文件头：Hopper 上纯 C_if 是 balanced 那份）----
+HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"       # 见 39 号：默认的 validation 只有 90 题
+MBPP_DIR="${CODE_DATA_DIR}/mbpp_full"
+
+# ---- run 名（见 37/35 号文件头：Hopper 上纯 C_if 是 balanced 那份）----
 SEED="${SEED:-1}"
 VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
 IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam3e-2_seed${SEED}_regonce}"
@@ -204,8 +198,7 @@ MODELS="${MODELS:-base vanilla cif cmix}"
 MAX_LEN="${MAX_LEN:-2048}"
 PROBE_BATCH="${PROBE_BATCH:-8}"
 PROBE_SIZE="${PROBE_SIZE:-0}"     # 0 = 用整个语料
-CPOOL_SIZE="${CPOOL_SIZE:-1000}"
-CAP="${CAP:-4096}"                # responses.jsonl 生成时的 MATH_MAX_NEW_TOKENS
+CAP="${CAP:-512}"                 # responses.jsonl 生成时的 code_max_new_tokens（见 39 号）
 ROW_BATCH="${ROW_BATCH:-4}"       # 逐行那一遍的 batch；vocab 15 万，别调太大
 VERIFY_AGG="${VERIFY_AGG:-1}"     # 1 = 顺带用 evaluate_probe 核对逐行求和是否一致
 BOOT_REPS="${BOOT_REPS:-10000}"
@@ -219,32 +212,37 @@ cd "${REPO_ROOT}"
 mkdir -p "${CORPUS_DIR}"
 
 # ---------------------------------------------------------------------------
-# Step 0: 由已有 responses.jsonl 造探针语料（纯 CPU，几秒）
+# Step 0: 由 39 号的 base/responses.jsonl + 源数据集重建探针语料（纯 CPU，几秒）
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_BUILD}" != "1" ]]; then
-  echo "==== Step0 build probe corpora -> ${CORPUS_DIR} ===="
+  echo "==== Step0 build code probe corpora -> ${CORPUS_DIR} ===="
   BUILD_ARGS=()
-  for m in math500 gsm8k; do
-    resp="${RESULTS_ROOT}/${m}/base/responses.jsonl"
-    if [[ -f "${resp}" ]]; then
-      BUILD_ARGS+=(--responses "${m}=${resp}")
-    else
-      echo "跳过 ${m}：缺 ${resp}"
-    fi
-  done
-  if [[ ${#BUILD_ARGS[@]} -eq 0 ]]; then
-    echo "两个 base responses.jsonl 都不在，无法建语料"; exit 1
-  fi
-  BUILD_ARGS+=(--out_dir "${CORPUS_DIR}" --model_path "${MODEL_DIR}/${MODEL_NAME}" --cap "${CAP}")
+  # humaneval / mbpp 各自的 base responses；缺哪个就跳哪个（其余照跑）。
   # 用 if 而不是 `[[ ... ]] && arr+=(...)`：后者在文件不存在时整条 && 列表返回 1，
-  # set -e 会直接把作业干掉。
-  if [[ -f "${CPOOL_FILE}" ]]; then
-    BUILD_ARGS+=(--cpool "${CPOOL_FILE}" --cpool_size "${CPOOL_SIZE}")
+  # set -e 会直接把作业干掉（19 号踩过）。
+  HE_RESP="${RESULTS_ROOT}/humaneval/base/responses.jsonl"
+  MB_RESP="${RESULTS_ROOT}/mbpp/base/responses.jsonl"
+  if [[ -f "${HE_RESP}" && -f "${HUMANEVAL_FILE}" ]]; then
+    BUILD_ARGS+=(--responses "humaneval=${HE_RESP}")
   else
-    echo "缺 ${CPOOL_FILE}，跳过 cpool 语料（其余照跑）"
+    echo "跳过 humaneval：缺 ${HE_RESP} 或 ${HUMANEVAL_FILE}"
   fi
+  if [[ -f "${MB_RESP}" && -d "${MBPP_DIR}" ]]; then
+    BUILD_ARGS+=(--responses "mbpp=${MB_RESP}")
+  else
+    echo "跳过 mbpp：缺 ${MB_RESP} 或 ${MBPP_DIR}"
+  fi
+  if [[ ${#BUILD_ARGS[@]} -eq 0 ]]; then
+    echo "两个 base responses.jsonl 都不在（或缺源数据），无法建语料"; exit 1
+  fi
+  BUILD_ARGS+=(
+    --humaneval_data_file "${HUMANEVAL_FILE}"
+    --mbpp_dataset_path "${MBPP_DIR}" --mbpp_split "${MBPP_SPLIT}"
+    --out_dir "${CORPUS_DIR}" --model_path "${MODEL_DIR}/${MODEL_NAME}"
+    --cap "${CAP}" --cache_dir "${JOB_TMPDIR}/hf_datasets"
+  )
 
-  python -m onereplay.scripts.build_math_probe "${BUILD_ARGS[@]}"
+  python -m onereplay.scripts.build_code_probe "${BUILD_ARGS[@]}"
 else
   echo "SKIP_BUILD=1：沿用已有语料 ${CORPUS_DIR}"
 fi
@@ -274,7 +272,7 @@ resolve_name () {
 
 if [[ "${SKIP_SCORE}" != "1" ]]; then
   PROBES=""
-  for corpus in probe_math500_base probe_gsm8k_base probe_metamath_cpool; do
+  for corpus in probe_humaneval_base probe_mbpp_base; do
     file="${CORPUS_DIR}/${corpus}.jsonl"
     [[ -f "${file}" ]] || continue
     short="${corpus#probe_}"; short="${short%_base}"
@@ -286,7 +284,7 @@ if [[ "${SKIP_SCORE}" != "1" ]]; then
 
   # 重跑时先挪走旧结果：scores.jsonl 是 append 的，混着两次的行没法读。
   # per_row 也要清：文件名不含 max_len，换了参数重跑会留下口径不同的旧行，
-  # 而 bootstrap 只看行数对不对得上，混进去不会报错。
+  # 而 bootstrap 只看行数对不对得上，混进去不会报错（11 号踩过）。
   if [[ -f "${SCORES}" ]]; then
     STAMP="$(date +%Y%m%d_%H%M%S)"
     mv "${SCORES}" "${SCORES}.${STAMP}.bak"
@@ -318,11 +316,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 1b: 配对 bootstrap
-#   CE 表本身说 C_mix 在三个语料上都比纯 C_if 好 3-5 个点，但没有误差棒就分不清
-#   真实排序和三次同向的抛硬币 —— MATH-500 那一档只有 1% 的相对差。
-#   重采样单位是行，且同一组重采样索引施加到所有 run 上（配对），因为各 run 打的
-#   是同一批行，方差里"这一行本来就难"那部分是共享的，作差就抵消了。
-#   纯 CPU，几十秒。
+#   CE 表本身能说 base->vanilla 漂了多少、cif/cmix 消除了多少，但没有误差棒就分不清
+#   真实排序和几次同向的抛硬币。重采样单位是行，且同一组重采样索引施加到所有 run
+#   上（配对），因为各 run 打的是同一批行，方差里"这一行本来就难"那部分是共享的，
+#   作差就抵消了。纯 CPU，几十秒。
 # ---------------------------------------------------------------------------
 if [[ "${DO_BOOTSTRAP}" == "1" ]]; then
   BOOT_COMPARE="${BOOT_COMPARE:-${IF_RUN},${MIX_RUN}}"
@@ -357,7 +354,7 @@ base = next((r for r in rows if r["run_name"] == "base"), None)
 
 print()
 print("=" * 100)
-print(f"数学侧 held-out CE（max_len={rows[0]['max_len']}，token 加权平均，越低越接近 base）")
+print(f"代码侧 held-out CE（max_len={rows[0]['max_len']}，token 加权平均，越低越接近 base）")
 print("=" * 100)
 
 header = f"{'run':<48}" + "".join(f"{p:>16}" for p in probes)
@@ -388,14 +385,16 @@ for row in rows:
     print(line)
 
 print()
-print("参照：第三章 FLAN 池外，vanilla 相对 base 是 3.85 倍（0.1231 -> 0.4742），")
-print("同期 IFEval strict prompt 掉 11.46pp。数学侧若接近 1.0，说明数学表征确实没动；")
-print("若明显大于 1 而 accuracy 不动，那是'漂移存在但无行为后果'，同样是个结论。")
-print("最后一张表是顶到 max_len 的行数：占比高就说明 MAX_LEN 不够，CE 只覆盖了答案前缀。")
+print("参照：39 号里 MBPP vanilla 相对 base 掉 3.80pp（p=0.0319），全靠语法错误涨 21 倍，")
+print("断言失败纹丝不动。CE 若在 vanilla 上明显大于 1，就把这件'格式坏了、算法没坏'的事")
+print("量化成了连续信号；cif/cmix 若把倍数压回接近 1，说明数学/IF 侧的 C 跨领域也保护了")
+print("代码的输出结构；若没压回，正好证明 C_code 是必要的。")
+print("最后一张表是顶到 max_len 的行数：代码回答短，占比应当很低，高了说明 MAX_LEN 设小了。")
 PY
 
 echo "========================================================================"
 echo "产物:"
 echo "  语料  : ${CORPUS_DIR}/probe_*.jsonl + manifest.json"
 echo "  分数  : ${SCORES}（每个 run 一行）"
+echo "  区间  : ${PROBE_DIR}/bootstrap.json"
 echo "Job finished at: $(date)"
