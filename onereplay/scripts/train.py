@@ -37,7 +37,12 @@ from onereplay.data.chat import build_loader, build_opd_loader  # noqa: E402
 from onereplay.data.commonsense import load_and_prepare_dataset  # noqa: E402
 from onereplay.data.batch_mix import build_batch_mixed_loader  # noqa: E402
 from onereplay.data.probe import build_probe_loaders  # noqa: E402
-from onereplay.data.replay import build_replay_dataset, mix_replay_into_train  # noqa: E402
+from onereplay.data.replay import (  # noqa: E402
+    build_replay_pools,
+    mix_replay_into_train,
+    parse_replay_mix,
+    replay_max_len,
+)
 from onereplay.trainers.opd import OPDTrainer  # noqa: E402
 from onereplay.trainers.sft import SFTTrainer  # noqa: E402
 
@@ -301,6 +306,49 @@ def parse_args() -> argparse.Namespace:
             "teaches the model not to end its turn."
         ),
     )
+    parser.add_argument(
+        "--replay_max_len",
+        type=int,
+        default=0,
+        help=(
+            "Token budget for replay rows only; 0 reuses --max_len. The new "
+            "task must stay at --max_len on every arm or the comparison gains "
+            "a second variable, but old-knowledge corpora have their own "
+            "lengths: FLAN self-distilled rows fit in 512, MetaMath ones reach "
+            "2008. Truncation keeps the last max_len tokens, so an over-long "
+            "row keeps its answer and loses its question; at 512 that happens "
+            "to 16.2% of the MetaMath pool. Set this to match the max_len the "
+            "domain's C was collected at (2048 for C_math), otherwise replay "
+            "sees strictly less old knowledge than the penalty encodes."
+        ),
+    )
+    parser.add_argument(
+        "--replay_mix_files",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated LABEL=PATH self-distilled corpora to draw replay "
+            "rows from, e.g. 'if=/path/flan_selfdistill.jsonl,"
+            "math=/path/metamath_selfdistill.jsonl'. This is the replay-side "
+            "counterpart of C_mix: the OneReplay arm protects two domains "
+            "through w_if * C_if + w_math * C_math, and this arm draws replay "
+            "rows from both corpora instead. Batch-level mixing only "
+            "(--replay_per_batch)."
+        ),
+    )
+    parser.add_argument(
+        "--replay_mix_weights",
+        type=str,
+        default="",
+        help=(
+            "Row shares matching --replay_mix_files, normalized, e.g. "
+            "'0.5,0.5' or '0.8,0.2'. Rows are not the unit the loss averages "
+            "over: with FLAN at 90 supervised tokens per row and MetaMath at "
+            "357, equal rows put ~79% of the replay loss on math, and 0.8/0.2 "
+            "rows is what equalizes supervised tokens. The startup log prints "
+            "both shares; compare them against scripts/stat_replay_pools.py."
+        ),
+    )
 
     # Retention probes. Score fixed old-knowledge sets every N micro-batches so
     # the shape of forgetting is visible during training rather than only at
@@ -516,6 +564,21 @@ def main() -> None:
             "--replay_per_batch (batch-level) and --replay_ratio (data-level) are two "
             "different mixing schemes; set exactly one."
         )
+    replay_mix = parse_replay_mix(args)
+    if replay_mix:
+        if args.replay_self_distill_file:
+            raise ValueError(
+                "--replay_mix_files already names every corpus; passing "
+                "--replay_self_distill_file too leaves it ambiguous which one the single-pool "
+                "path would use. Put the IF corpus in --replay_mix_files as well."
+            )
+        if args.replay_per_batch <= 0:
+            raise ValueError(
+                "--replay_mix_files needs --replay_per_batch: the domain ratio is spent per "
+                "micro-batch by the batch-level scheduler. Data-level mixing (--replay_ratio) "
+                "would only reach the ratio in expectation, and cannot reach 0.5 at all with a "
+                "17k pool."
+            )
     if args.replay_per_batch > 0 and args.paradigm == "opd":
         # OPD replaces the batch's targets with a student rollout scored by the
         # teacher. What that should mean for a replay row is undefined, so
@@ -535,14 +598,15 @@ def main() -> None:
                 f"rows in a --batch_size {args.batch_size} micro-batch; replay_per_batch must "
                 "be smaller than batch_size"
             )
-        replay_dataset = build_replay_dataset(args, tokenizer)
+        replay_pools = build_replay_pools(args, tokenizer)
         train_loader = build_batch_mixed_loader(
             train_dataset,
-            replay_dataset,
+            None,
             tokenizer,
             new_per_batch=new_per_batch,
             replay_per_batch=args.replay_per_batch,
             seed=args.seed,
+            replay_pools=replay_pools,
         )
         print(train_loader.describe(), flush=True)
         print(
@@ -644,6 +708,9 @@ def main() -> None:
             "reg_compute_dtype": args.reg_compute_dtype,
             "batch_size": args.batch_size,
             "accumulation_size": args.accumulation_size,
+            # val_loss averages over batches rather than tokens, so it only
+            # means the same thing across runs that used the same value here.
+            "eval_batch_size": args.eval_batch_size or args.batch_size,
             "replay_ratio": args.replay_ratio,
             "replay_per_batch": args.replay_per_batch,
             # train_samples counts replay rows too, so record the split needed
@@ -660,7 +727,18 @@ def main() -> None:
                 if args.replay_per_batch > 0
                 else args.accumulation_size
             ),
-            "replay_self_distill": int(bool(args.replay_self_distill_file)),
+            "replay_self_distill": int(
+                bool(args.replay_self_distill_file) or bool(replay_mix)
+            ),
+            # Replay rows can be tokenized at a different budget than the new
+            # task, so the effective one has to be recorded rather than inferred
+            # from max_len.
+            "replay_max_len": replay_max_len(args) if args.replay_per_batch > 0 else 0,
+            "replay_mix_files": args.replay_mix_files,
+            "replay_mix_weights": (
+                ",".join(f"{weight:.4f}" for _, _, weight in replay_mix) if replay_mix else ""
+            ),
+            "replay_mix_labels": ",".join(label for label, _, _ in replay_mix),
             "probe_every_updates": args.probe_every_updates,
             "max_train_samples": args.max_train_samples,
             "max_val_samples": args.max_val_samples,

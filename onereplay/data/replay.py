@@ -30,7 +30,32 @@ from pathlib import Path
 
 from datasets import concatenate_datasets, load_dataset, load_from_disk
 
+from onereplay.data.batch_mix import ReplayPool
 from onereplay.data.chat import build_sft_tokenize_fn
+
+
+def replay_max_len(args: argparse.Namespace) -> int:
+    """Token budget for replay rows, independent of the new task's --max_len.
+
+    The new task fixes --max_len across every arm, so vanilla, OneReplay and
+    replay tokenize Commonsense170k identically; raising it for one arm would
+    add a second variable. Old-knowledge rows are a different matter, because
+    each corpus has its own length: FLAN self-distilled answers top out at 503
+    tokens together with their prompt, while MetaMath ones reach 2008. Training
+    truncation keeps the last max_len tokens, so a math row that does not fit
+    keeps its answer and loses its question, which turns a question-answer
+    rehearsal into bare continuation -- at 512 that happens to 16.2% of the
+    MetaMath pool, at 2048 to none of it.
+
+    Sizing this per corpus is also what keeps the comparison against OneReplay
+    honest: C_math was collected at max_len 2048, so a replay arm capped at 512
+    would be protecting from strictly less old knowledge than the penalty
+    encodes. 0 falls back to --max_len, which is what every pre-existing run
+    used.
+    """
+
+    value = int(getattr(args, "replay_max_len", 0) or 0)
+    return value if value > 0 else args.max_len
 
 
 def load_replay_pool(args: argparse.Namespace):
@@ -52,7 +77,7 @@ def load_replay_pool(args: argparse.Namespace):
     )
 
 
-def load_self_distilled_pool(args: argparse.Namespace):
+def load_self_distilled_pool(args: argparse.Namespace, self_distill_file: str = ""):
     """Load base-model answers written by scripts/generate_replay_targets.py.
 
     That script already applied the shuffle, the pool cut and the schema
@@ -64,7 +89,7 @@ def load_self_distilled_pool(args: argparse.Namespace):
 
     dataset = load_dataset(
         "json",
-        data_files=args.replay_self_distill_file,
+        data_files=self_distill_file or args.replay_self_distill_file,
         split="train",
         cache_dir=args.replay_cache_dir or None,
     )
@@ -114,7 +139,13 @@ def to_sft_schema(dataset, args: argparse.Namespace):
     return dataset.filter(lambda example: bool(example["instruction"]) and bool(example["output"]))
 
 
-def build_replay_dataset(args: argparse.Namespace, tokenizer, num_samples: int | None = None):
+def build_replay_dataset(
+    args: argparse.Namespace,
+    tokenizer,
+    num_samples: int | None = None,
+    self_distill_file: str = "",
+    label: str = "",
+):
     """Sample and tokenize old-knowledge rows.
 
     On the gold-target path the pool is shuffled with --replay_sample_seed and
@@ -131,8 +162,8 @@ def build_replay_dataset(args: argparse.Namespace, tokenizer, num_samples: int |
     subset size is decided by the schedule rather than up front.
     """
 
-    if getattr(args, "replay_self_distill_file", ""):
-        pool = load_self_distilled_pool(args)
+    if self_distill_file or getattr(args, "replay_self_distill_file", ""):
+        pool = load_self_distilled_pool(args, self_distill_file)
     else:
         pool = load_replay_pool(args)
         pool = pool.shuffle(seed=args.replay_sample_seed)
@@ -140,8 +171,9 @@ def build_replay_dataset(args: argparse.Namespace, tokenizer, num_samples: int |
             pool = pool.select(range(min(args.replay_pool_size, len(pool))))
 
     dataset = to_sft_schema(pool, args)
+    tag = f"replay pool[{label}]" if label else "replay pool"
     if num_samples is None:
-        print(f"replay pool: {len(dataset)} usable rows (no cut)")
+        print(f"{tag}: {len(dataset)} usable rows (no cut)")
     elif num_samples > len(dataset):
         # Data-level mixing cannot honour a ratio larger than pool/train, and
         # silently training on fewer rows than asked would mislabel the run.
@@ -155,17 +187,91 @@ def build_replay_dataset(args: argparse.Namespace, tokenizer, num_samples: int |
     else:
         dataset = dataset.select(range(num_samples))
 
-    tokenize = build_sft_tokenize_fn(tokenizer, args.max_len)
+    max_len = replay_max_len(args)
+    if max_len != args.max_len:
+        print(f"{tag}: tokenizing at max_len={max_len} (new task stays at {args.max_len})")
+    tokenize = build_sft_tokenize_fn(tokenizer, max_len)
     map_cache_dir = getattr(args, "map_cache_dir", "")
     if map_cache_dir:
         cache_dir = Path(map_cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # One cache file per pool: a shared name would make the second pool read
+        # back the first pool's tokenized rows.
+        suffix = f"_{label}" if label else ""
         return dataset.map(
             tokenize,
             load_from_cache_file=False,
-            cache_file_name=str(cache_dir / "replay_train_tokenized.arrow"),
+            cache_file_name=str(cache_dir / f"replay_train_tokenized{suffix}.arrow"),
         )
     return dataset.map(tokenize)
+
+
+def parse_replay_mix(args: argparse.Namespace) -> list[tuple[str, str, float]]:
+    """Parse --replay_mix_files / --replay_mix_weights into (label, path, weight).
+
+    Spelled the same way mix_covariances.py takes its inputs, so the OneReplay
+    side and the replay side of a multi-domain experiment are configured in
+    parallel: C_mix gets --inputs/--weights over covariance files, the replay
+    arm gets --replay_mix_files/--replay_mix_weights over corpora. Weights are
+    row shares and are normalized, so "0.8,0.2" and "4,1" mean the same thing.
+    """
+
+    spec = getattr(args, "replay_mix_files", "") or ""
+    entries: list[tuple[str, str]] = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"--replay_mix_files expects LABEL=PATH entries, got {item!r}. The label goes "
+                "into the run log so the token shares can be read per domain."
+            )
+        label, path = item.split("=", 1)
+        entries.append((label.strip(), path.strip()))
+    if not entries:
+        return []
+
+    raw = getattr(args, "replay_mix_weights", "") or ""
+    weights = [float(piece) for piece in raw.split(",") if piece.strip()]
+    if not weights:
+        weights = [1.0] * len(entries)
+    if len(weights) != len(entries):
+        raise ValueError(
+            f"--replay_mix_weights has {len(weights)} values for {len(entries)} pools; "
+            "give one row share per pool or leave it empty for equal shares"
+        )
+    if any(weight <= 0 for weight in weights):
+        raise ValueError("--replay_mix_weights must all be > 0")
+    total = sum(weights)
+    return [(label, path, weight / total) for (label, path), weight in zip(entries, weights)]
+
+
+def build_replay_pools(args: argparse.Namespace, tokenizer) -> list[ReplayPool]:
+    """Build every replay pool the flags ask for, tokenized and weighted.
+
+    One pool for the single-corpus arms, several for a multi-domain arm. Each
+    pool keeps all of its usable rows; the ratio lives in the weights and is
+    spent by the loader's scheduler. Encoding the ratio by truncating a corpus
+    instead would change how often its rows repeat, which is a second variable.
+    """
+
+    mix = parse_replay_mix(args)
+    if not mix:
+        return [ReplayPool(label="", dataset=build_replay_dataset(args, tokenizer), weight=1.0)]
+
+    pools: list[ReplayPool] = []
+    for label, path, weight in mix:
+        dataset = build_replay_dataset(args, tokenizer, self_distill_file=path, label=label)
+        pools.append(ReplayPool(label=label, dataset=dataset, weight=weight))
+    print(
+        "replay mix: "
+        + ", ".join(
+            f"{pool.label}={len(pool.dataset)} rows @ row share {pool.weight:.4f}"
+            for pool in pools
+        )
+    )
+    return pools
 
 
 def mix_replay_into_train(args: argparse.Namespace, tokenizer, train_dataset):
