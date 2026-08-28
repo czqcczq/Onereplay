@@ -183,6 +183,42 @@ def main() -> None:
             )
         print(f"  rejected: {name}")
 
+    # ---- 47_if_fisher.pbs Step 2: the same checks, but shaped for F_if ----
+    # F_if is legitimately 512 / right-truncated / 1408 zero-supervision rows, so the
+    # re-collection has to be validated against those values rather than F_math's.
+    if_step2 = [
+        "--expect_max_len", "512",
+        "--expect_truncation_side", "right",
+        "--expect_target_modules", "q_proj,v_proj",
+        "--expect_require_target", "1",
+        "--expect_sample_shuffle", "0",
+        "--expect_use_bf16", "0",
+        "--expect_zero_supervision_rows", "1408",
+        "--expect_mean", "9.98e-2",
+        "--mean_rtol", "0.02",
+        "--strict", "1",
+    ]
+    result = run(["--path", str(if_path), *if_step2])
+    assert result.returncode == 0, f"F_if rejected by its own expectations:\n{result.stdout}"
+    print("\nF_if passes the 47-shaped checks (right truncation, 1408 zero rows, mean 9.98e-2)")
+
+    # A mean that drifted past the tolerance must fail: that is the signal that the
+    # re-collection produced a different F and the old lambda no longer applies.
+    drifted = tmp / "fisher_if_drifted.pt"
+    torch.save(fisher_payload(1.20e-1, 24.1, 512, "right", 1408, 0.127, 20000), drifted)
+    result = run(["--path", str(drifted), *if_step2])
+    assert result.returncode == 1, "a 20% mean drift was accepted"
+    assert "fisher_scale.mean" in result.stdout.split("FAILED:")[1], result.stdout
+    print("  rejected: mean drifted 20% from the reference")
+
+    # Within tolerance must pass, so float-level differences between GPUs do not
+    # block a genuine reproduction.
+    close = tmp / "fisher_if_close.pt"
+    torch.save(fisher_payload(9.99e-2, 24.1, 512, "right", 1408, 0.127, 20000), close)
+    result = run(["--path", str(close), *if_step2])
+    assert result.returncode == 0, f"a 0.1% difference was rejected:\n{result.stdout}"
+    print("  accepted: mean within 0.1%, i.e. float-level reproduction")
+
     # ---- --strict 0 reports without failing the job ----
     torch.save(defects["bf16 collection"][0], tmp / "defect.pt")
     result = run(["--path", str(tmp / "defect.pt"), *step2[:-1], "0"])

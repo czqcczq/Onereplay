@@ -699,6 +699,11 @@ def main() -> None:
             "seed": args.seed,
             "full_finetune": args.full_finetune,
             "regularizer": args.regularizer,
+            # Which matrix file the penalty actually came from. "regularizer: ewc"
+            # alone stops being enough to identify a run once several Fisher
+            # estimates coexist (one per old-knowledge domain, plus their mixes),
+            # and the same holds for C.
+            "penalty_path": args.fisher_path if args.regularizer == "ewc" else args.cov_path,
             "identity_cov": args.identity_cov,
             # Timing is only comparable across runs that share this setting.
             "reg_once_per_update": args.reg_once_per_update,

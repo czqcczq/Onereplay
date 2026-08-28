@@ -74,6 +74,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--expect_mean",
+        type=float,
+        default=0.0,
+        help=(
+            "Expected fisher_scale.mean, checked within --mean_rtol. This is the most "
+            "direct test that a re-collection reproduced an earlier F: the fingerprint "
+            "proves the same rows went in, the mean proves the same numbers came out."
+        ),
+    )
+    parser.add_argument("--mean_rtol", type=float, default=0.02)
+    parser.add_argument(
         "--reference",
         type=str,
         default="",
@@ -192,8 +203,17 @@ def check_expectations(meta: dict, args: argparse.Namespace) -> list[str]:
         if got != args.expect_zero_supervision_rows:
             failures.append(
                 f"zero_supervision_rows={got}, want {args.expect_zero_supervision_rows}. "
-                "Under left truncation the answer's tail always survives, so any such row "
-                "means the truncation side did not take effect."
+                "This count is deterministic once the rows, max_len and truncation side "
+                "are fixed, so a mismatch means one of those three moved."
+            )
+    if args.expect_mean > 0:
+        got_mean = float(meta["fisher_scale"]["mean"])
+        deviation = abs(got_mean - args.expect_mean) / args.expect_mean
+        if deviation > args.mean_rtol:
+            failures.append(
+                f"fisher_scale.mean={got_mean:.6e}, want {args.expect_mean:.6e} "
+                f"(off by {deviation:.1%}, tolerance {args.mean_rtol:.1%}). The lambda that "
+                "was calibrated against the old F does not transfer to this one."
             )
     return failures
 

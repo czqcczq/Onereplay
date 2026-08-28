@@ -1,0 +1,642 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_iffis
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 在 Hopper 上重采 F_if，然后用它重训 EWC 基线
+#   Step 0-2 对应 onereplay/slurm/22_collect_fisher.slurm（RWTH 作业 2944210），
+#   Step 3 对应 onereplay/slurm/23_sweep_ewc_lambda.slurm 的 λ=3e2 那一档。
+#   目的是省掉 0.66 GiB 跨集群传输：F_if 原作业只花 18 min，重采比拖文件快。
+#
+#   换了一份 F 就得有一个对着这份 F 训出来的 EWC checkpoint，后面的评测才站得住，
+#   所以采集和训练放在同一个作业里一次做完（18 min + 约 5.7 h，walltime 给 12 h）。
+#   本脚本只到训练为止，不评测——评测走既有的评测脚本。
+#
+# -----------------------------------------------------------------------------
+# 唯一的要求：产出必须等于 RWTH 那份，而不是「另一份也叫 F_if 的东西」
+#   现有的 EWC IF 线结果（cs_ewc_lam3e2_seed1、λ=3e2）是对着那份 F 调出来的，
+#   C_if 也是对着同一批 20k 行采的。所以这里所有影响数值的参数都从 22 号照抄，
+#   一个都不改，包括那些「看起来该改」的：
+#
+#     --max_len 512                 不是 2048。F_if 就该和 C_if 一样是 512。
+#     不传 --truncation_side        22 号没传，跟随 tokenizer 默认的右截断。
+#                                   这会让 1,408 行（7.04%）因回答被砍光而贡献 0，
+#                                   那是既有 F_if 的既成事实，不是这次要修的 bug。
+#     不传 --require_target         22 号没传，默认 0。
+#     --sample_shuffle 1            注意是 1，不是 F_math 那边的 0。
+#     --max_samples 20000           FLAN 全池 shuffle(seed=1) 后取前 20000。
+#     --use_bf16 0                  梯度先被平方，bf16 的 8 位尾数会留噪声底。
+#
+#   46 号（F_math）用的是 2048 + 左截断 + require_target 1 + shuffle 0，那是为了
+#   对齐 C_math。两套参数不同不是笔误：F_mix 里每一处不对称都精确镜像 C_mix 里
+#   已有的同一处，这样 EWC vs OneReplay 就只差「用哪个矩阵」这一个变量。
+#
+# -----------------------------------------------------------------------------
+# 复现契约：三件事决定新旧两份 F_if 是否相同
+#   1) 参数。就是上面那些，脚本会硬校验，偏离就打醒目警告。
+#   2) 语料。20k 子集来自
+#          load_dataset("json", data_files=FLAN_DIR/train/*.jsonl)  # 原始行序
+#            -> shuffle(seed=1)                                     # 全量置换
+#            -> select(range(20000))
+#      置换是 len(dataset) 的函数，FLAN 多一个文件、少一个文件、或者传残了，
+#      20000 行就整批换人而不是「差不多」。Step 0 的 preflight 先按文件名+字节数
+#      算一个 digest，可直接和 RWTH 比，几秒钟、不上 GPU。
+#   3) datasets 版本。shuffle 的置换实现是库内部行为，requirements.txt 没锁版本。
+#      脚本会打印版本号，但真正的判据是下面的 fingerprint。
+#
+# -----------------------------------------------------------------------------
+# 参考值（已从 RWTH 那份 .pt 的 metadata 读出，下面全部作为默认硬校验值写死）
+#   pool fingerprint       9dd3398adf2cf39532cf85d9150b7c6051403261e8b074acac5a0316eed2feb2
+#   mean magnitude         0.09977994298288705   <- λ=3e2 就是对着这个数调的
+#   zero_supervision_rows  1,408 / 20,000 (7.04%)，512 右截断的必然结果
+#   ESS                    2,546.92 / 20,000 (ratio 0.1273)
+#   耗时 / 体积            18 min / 0.656 GiB（56 层 qv）
+#
+#   取值方式（不用传那 0.66 GiB，登录节点读 metadata 即可）：
+#   python -c "import torch; m=torch.load('/hpcwork/xsz96350/Chen_logs/onereplay/results/fisher/fisher_flan_chat_20k_qv.pt', map_location='cpu')['metadata']; r=m['length_weighting']; print('FP  ', m['pool_fingerprint']); print('MEAN', m['fisher_scale']['mean']); print('ZERO', r['zero_supervision_rows']); print('ESS ', r['effective_sample_size'], r['ess_ratio'])"
+#
+#   所以默认提交就是全套硬校验，不一致直接失败而不是悄悄产出一份错的 F：
+#     指纹   Step 0b 在上 GPU 之前就比，对不上省掉 18 min
+#     mean   Step 2 比，容差 MEAN_RTOL（默认 0.5%）。指纹证明进去的行相同，
+#            mean 证明出来的数相同；同一批行在不同 GPU 上重采只会差到浮点级别，
+#            远小于 0.5%，所以这个容差既不误杀也拦得住「另一份 F」。
+#     1408   zero_supervision_rows 在行集合、max_len、截断方向固定后是确定的，
+#            比指纹更进一步——连 tokenize 结果都对上了。
+#
+#   放开某一项（正常不需要）：
+#     qsub -v EXPECT_FINGERPRINT=skip ...   /  EXPECT_MEAN=0  /  EXPECT_ZERO_ROWS=-1
+#
+#   注意 mean 只对 qv 档有参考值（RWTH 上只有 fisher_flan_chat_20k_qv.pt）。
+#   COV_SCOPE=full 时记录的层不同、mean 也就不同，脚本会自动跳过 mean 校验；
+#   指纹和 1408 与层数无关，两档都照校。
+#
+# 为什么 batch_size 不可配
+#   Fisher 要 per-example 梯度：先平方再累加。梯度累积算的是 (Σg)² 而不是 Σg²，
+#   会静默估成另一个矩阵。collect_fisher.py 把 batch_size 写死为 1。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) ${FLAN_DIR}/train/*.jsonl —— FLAN 原始 dump（gold target，不是自蒸馏那份）。
+#      注意 F_if 要的是 gold FLAN，results/replay/flan_selfdistill_*.jsonl 不能替代。
+#      01_collect_cov.pbs 用的是同一个目录，采过 C_if 就说明它在位。
+#   2) ${MODEL_DIR}/${MODEL_NAME} —— Qwen3-1.7B
+#   3) ${CS_DATASET} —— commonsense_170k_hf（训练集，DO_TRAIN=1 时才需要）
+#   4) mkdir -p /scratch/weiliu87/logs/onereplay   # qsub 之前必须存在，且在仓库外
+#
+# 用法（开关都走 qsub -v，PBS 默认不带入提交环境）
+#   qsub -v PREFLIGHT_ONLY=1 onereplay/pbs/47_if_fisher.pbs   # 只查语料+指纹，几秒钟不上 GPU
+#   qsub onereplay/pbs/47_if_fisher.pbs                       # 采集 + 训练，默认全套硬校验
+#   qsub -v DO_TRAIN=0 onereplay/pbs/47_if_fisher.pbs         # 只采集，不训练
+#   qsub -v DO_COLLECT=0 onereplay/pbs/47_if_fisher.pbs       # F 已就位，只训练
+#   qsub -v MAX_STEPS=300,SAVE=0 onereplay/pbs/47_if_fisher.pbs  # 训练探针短跑，看罚项量级
+#   qsub -v FORCE=1 onereplay/pbs/47_if_fisher.pbs            # F 已存在时强制重采
+#   qsub -v COV_SCOPE=full onereplay/pbs/47_if_fisher.pbs     # 八类层（全量微调线才需要）
+#
+#   建议顺序：先 PREFLIGHT_ONLY=1，它会在不上 GPU 的前提下把指纹算出来和 RWTH 比。
+#   这一步过了，18 min 的采集基本就是稳的；这一步不过，往下走没有意义。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/47_if_fisher.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME FLAN_DIR RESULTS_ROOT DATASET_CACHE
+    COV_SCOPE TARGET_MODULES FISHER_PATH FISHER_DEVICE
+    FLAN_SAMPLES SAMPLE_SHUFFLE SAMPLE_SEED MAXLEN USE_BF16 LOG_EVERY
+    EXPECT_FINGERPRINT EXPECT_MEAN MEAN_RTOL EXPECT_ZERO_ROWS
+    PREFLIGHT_ONLY FORCE DO_COLLECT
+    DO_TRAIN CS_DATASET IF_COV LAMBDA TRAIN_SEED
+    EPOCHS LR BATCH ACCUM EVAL_BATCH VAL_FRAC MAXVAL TRAIN_MODULES
+    SAVE MAX_STEPS PROFILE VANILLA_VAL_LOSS
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的采集。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+# fingerprint 万一和 RWTH 不一致，先看是不是 datasets 换了 shuffle 实现。
+python - <<'PY'
+import datasets
+import torch
+import transformers
+
+print(f"torch        {torch.__version__}  {torch.__file__}")
+print(f"transformers {transformers.__version__}")
+print(f"datasets     {datasets.__version__}  <- shuffle 置换实现来自这里")
+print(f"cuda         available={torch.cuda.is_available()} count={torch.cuda.device_count()}")
+PY
+
+# ---- 项目路径（与 01_collect_cov.pbs 一致）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+FLAN_DIR="${FLAN_DIR:-${REPO_ROOT}/datasets/flan}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 影响数值的参数：逐字照抄 22_collect_fisher.slurm ----
+FLAN_SAMPLES="${FLAN_SAMPLES:-20000}"
+SAMPLE_SHUFFLE="${SAMPLE_SHUFFLE:-1}"   # 注意是 1；F_math 那边才是 0
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+MAXLEN="${MAXLEN:-512}"                 # 不是 2048；要和 C_if 一致
+USE_BF16="${USE_BF16:-0}"
+LOG_EVERY="${LOG_EVERY:-1000}"
+
+# ---- 覆盖范围。qv 是 LoRA 线用的，也是既有 F_if 的档 ----
+# KNOWN_MEAN 只有 qv 有：RWTH 上只存在 fisher_flan_chat_20k_qv.pt。full 档记录的
+# 层不同，mean 也就不同，没有参考值可比，所以那一档跳过 mean 校验。
+COV_SCOPE="${COV_SCOPE:-qv}"
+case "${COV_SCOPE}" in
+  qv)
+    TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+    FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_flan_chat_20k_qv.pt}"
+    FISHER_DEVICE="${FISHER_DEVICE:-cuda}"
+    KNOWN_MEAN="0.09977994298288705"
+    ;;
+  full)
+    TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+    FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_flan_chat_20k_full.pt}"
+    # full 档累加器约 7 GiB，叠上 fp32 模型和它的梯度就吃紧了，落到 cpu。
+    FISHER_DEVICE="${FISHER_DEVICE:-cpu}"
+    KNOWN_MEAN="0"
+    ;;
+  *)
+    echo "未知 COV_SCOPE=${COV_SCOPE}，可选 qv / full"; exit 1
+    ;;
+esac
+echo "COV_SCOPE=${COV_SCOPE} TARGET_MODULES=${TARGET_MODULES} FISHER_DEVICE=${FISHER_DEVICE}"
+
+# ---- 校验期望值：默认全部取 RWTH 那份 .pt 的实测值 ----
+# 指纹与层数无关（选的是同一批行），两档都校。
+EXPECT_FINGERPRINT="${EXPECT_FINGERPRINT:-9dd3398adf2cf39532cf85d9150b7c6051403261e8b074acac5a0316eed2feb2}"
+EXPECT_MEAN="${EXPECT_MEAN:-${KNOWN_MEAN}}"
+# 同一批行在不同 GPU 上重采只差浮点级别，远小于 0.5%；放宽到 2% 以上就拦不住
+# 「另一份 F」了。
+MEAN_RTOL="${MEAN_RTOL:-0.005}"
+EXPECT_ZERO_ROWS="${EXPECT_ZERO_ROWS:-1408}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+FORCE="${FORCE:-0}"
+DO_COLLECT="${DO_COLLECT:-1}"
+
+# ---- Step 3 训练：逐字照抄 23_sweep_ewc_lambda.slurm 的 λ=3e2 那一档 ----
+# 唯一的变量是 --fisher_path 指向本作业新采的那份 F。
+DO_TRAIN="${DO_TRAIN:-1}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+# 只用来核对 F 和 C 是否同池；不参与训练。
+IF_COV="${IF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+LAMBDA="${LAMBDA:-3e2}"
+TRAIN_SEED="${TRAIN_SEED:-${SAMPLE_SEED}}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+# BATCH 是 micro-batch，ACCUM 是「每次 optimizer 更新的行数」。BATCH=16 时每次更新
+# 仍是 64 行，只是 micro-batch 从 8 个变 4 个；要复现旧 run 就保持 8。
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+EVAL_BATCH="${EVAL_BATCH:-8}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TRAIN_MODULES="${TRAIN_MODULES:-q_proj,v_proj}"
+SAVE="${SAVE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"     # >0 且 SAVE=0 时是探针短跑，只看罚项量级
+PROFILE="${PROFILE:-0}"
+# vanilla 的 3-epoch val_loss，用于塑性提示。留空则跳过比较。
+VANILLA_VAL_LOSS="${VANILLA_VAL_LOSS:-}"
+TRAIN_RUN="cs_ewc_lam${LAMBDA}_seed${TRAIN_SEED}"
+
+# 逃生阀：EXPECT_FINGERPRINT=skip 关掉指纹校验（PBS 传不进空串，所以用哨兵值）。
+if [[ "${EXPECT_FINGERPRINT}" == "skip" ]]; then
+  echo "EXPECT_FINGERPRINT=skip：跳过指纹校验"
+  EXPECT_FINGERPRINT=""
+fi
+
+# 任何一个偏离都会换掉那 20000 行或改变前向，产出的 F 不再等于 RWTH 那份。
+if [[ "${FLAN_SAMPLES}" != "20000" || "${SAMPLE_SHUFFLE}" != "1" \
+      || "${SAMPLE_SEED}" != "1" || "${MAXLEN}" != "512" || "${USE_BF16}" != "0" ]]; then
+  echo "########################################################################"
+  echo "WARNING: 参数偏离 RWTH 作业 2944210，产出的 F 不会等于既有 F_if。"
+  echo "  当前: samples=${FLAN_SAMPLES} shuffle=${SAMPLE_SHUFFLE} seed=${SAMPLE_SEED}"
+  echo "        max_len=${MAXLEN} use_bf16=${USE_BF16}"
+  echo "  旧值: samples=20000     shuffle=1           seed=1"
+  echo "        max_len=512       use_bf16=0"
+  echo "  现有 EWC IF 线的 λ=3e2 是对旧 F 调的，换了 F 就得重扫 λ。"
+  echo "########################################################################"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+if [[ ! -d "${FLAN_DIR}/train" ]]; then
+  echo "缺 FLAN JSONL 目录: ${FLAN_DIR}/train"
+  echo "  F_if 要的是 FLAN 原始 dump（gold target），"
+  echo "  results/replay/flan_selfdistill_*.jsonl 是自蒸馏产物，不能替代。"
+  echo "  01_collect_cov.pbs 用的是同一个目录；若那边采过 C_if，检查 FLAN_DIR 是否指对。"
+  exit 1
+fi
+# 训练要的东西也在这里查完。缺 commonsense 的话，等 18 min 采完再报错就太晚了。
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  [[ -d "${CS_DATASET}" ]] || {
+    echo "缺 commonsense_170k: ${CS_DATASET}（给 CS_DATASET 指对路径，或 DO_TRAIN=0 只采集）"
+    exit 1
+  }
+  grep -q "regularizer" onereplay/scripts/train.py || {
+    echo "train.py 里没有 --regularizer，代码没同步到最新"
+    exit 1
+  }
+  if (( ACCUM % BATCH != 0 )); then
+    echo "ACCUM=${ACCUM} 不是 BATCH=${BATCH} 的整数倍，每次更新的行数会被向下取整成"
+    echo "  $(( (ACCUM / BATCH) * BATCH )) 行，与旧 run 的 64 行不一致。"
+    exit 1
+  fi
+fi
+mkdir -p "$(dirname "${FISHER_PATH}")" "${DATASET_CACHE}"
+
+echo "FLAN_DIR     = ${FLAN_DIR}"
+echo "FISHER_PATH  = ${FISHER_PATH}"
+echo "max_len=${MAXLEN} samples=${FLAN_SAMPLES} shuffle=${SAMPLE_SHUFFLE} seed=${SAMPLE_SEED}"
+echo "truncation_side / require_target 都不传，跟随 collect_fisher 默认（右截断 / 0）"
+echo "DO_COLLECT=${DO_COLLECT} DO_TRAIN=${DO_TRAIN}"
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  echo "训练: run=${TRAIN_RUN} lambda=${LAMBDA} batch=${BATCH} accum=${ACCUM}(行/更新)"
+fi
+
+# ===========================================================================
+# Step 0: preflight —— 上 GPU 之前先确认 FLAN 语料和 RWTH 是同一份
+#   shuffle(seed) 的置换是 len(dataset) 的函数，语料多一个文件/传残一个文件，
+#   选中的 20000 行就整批换人。这里只看文件名+字节数（秒级）。
+#   （与 01_collect_cov.pbs 的 preflight 逐字相同，digest 可以横向比。）
+# ===========================================================================
+echo "==== Step 0: FLAN 语料 preflight ===="
+python - "${FLAN_DIR}/train" <<'PY'
+import glob
+import hashlib
+import os
+import sys
+
+directory = sys.argv[1]
+paths = sorted(glob.glob(os.path.join(directory, "*.jsonl")))
+if not paths:
+    raise SystemExit(f"preflight FAILED: {directory} 下没有 .jsonl")
+
+digest = hashlib.sha256()
+total = 0
+print(f"==== FLAN preflight: {len(paths)} files under {directory} ====")
+for path in paths:
+    size = os.path.getsize(path)
+    total += size
+    digest.update(f"{os.path.basename(path)}:{size}\n".encode())
+    print(f"  {os.path.basename(path):<48} {size:>14,} B")
+print(f"total bytes : {total:,}")
+print(f"corpus digest (names+sizes): {digest.hexdigest()}")
+print("在 RWTH 上对同一目录跑这段，digest 一致才说明语料是同一份。")
+PY
+
+# 再算一遍「这些参数会选中哪 20000 行」的指纹。纯 CPU、不加载模型。
+# 这一步在采集之前就能否掉，不用等 18 min 跑完才发现选错了行。
+echo "==== Step 0b: 旧知识池指纹（采集前预检）===="
+POOL_FINGERPRINT=$(python -m onereplay.scripts.check_old_knowledge_pool \
+  --data_files "${FLAN_DIR}/train/*.jsonl" --dataset_split train \
+  --cache_dir "${DATASET_CACHE}" \
+  --max_samples "${FLAN_SAMPLES}" \
+  --sample_shuffle "${SAMPLE_SHUFFLE}" --sample_seed "${SAMPLE_SEED}" \
+  --label pool | tail -n 1)
+echo "${POOL_FINGERPRINT}"
+POOL_HASH="${POOL_FINGERPRINT##*fingerprint=}"
+
+set +x
+if [[ -z "${EXPECT_FINGERPRINT}" ]]; then
+  echo "未校验指纹（EXPECT_FINGERPRINT=skip）。实际 ${POOL_HASH}"
+elif [[ "${POOL_HASH}" == "${EXPECT_FINGERPRINT}" ]]; then
+  echo "OK: 预检指纹与 RWTH 一致，选中的是同一批 ${FLAN_SAMPLES} 行。"
+  echo "  ${POOL_HASH}"
+else
+  echo "FAILED: 预检指纹与 RWTH 不一致，选中的不是同一批行。"
+  echo "  期望 ${EXPECT_FINGERPRINT}"
+  echo "  实际 ${POOL_HASH}"
+  echo "  两种可能：(a) FLAN 语料不是同一份（看上面 preflight 的 digest）；"
+  echo "            (b) datasets 版本不同导致 shuffle 置换不同（看上面版本行）。"
+  echo "  现在停下，省掉一次没意义的 18 min 采集。"
+  echo "  这一步失败时不要用 EXPECT_FINGERPRINT=skip 硬推：换了行集合的 F 与 C_if"
+  echo "  不再同源，既有的 EWC IF 线结果和 λ=3e2 都不能继续用。"
+  exit 1
+fi
+set -x
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：只做语料与指纹预检，不采集。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 采集 F_if
+#   命令行与 22_collect_fisher.slurm 逐字相同：不传 --truncation_side、
+#   不传 --require_target、不传 --input_column/--target_column（都用默认值）。
+# ===========================================================================
+RUN_LOG="${FISHER_PATH%.pt}.collect.log"
+if [[ "${DO_COLLECT}" != "1" ]]; then
+  echo "DO_COLLECT=0：跳过采集，直接用已有 ${FISHER_PATH}"
+  [[ -f "${FISHER_PATH}" ]] || { echo "缺 F: ${FISHER_PATH}（DO_COLLECT=0 时必须已存在）"; exit 1; }
+elif [[ "${FORCE}" != "1" && -f "${FISHER_PATH}" ]]; then
+  echo "跳过采集：${FISHER_PATH} 已存在（FORCE=1 可强制重采）"
+  echo "仍会跑下面的自检。"
+else
+  echo "==== Step 1: collect F_if -> ${FISHER_PATH} ===="
+  python -m onereplay.scripts.collect_fisher \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --use_bf16 "${USE_BF16}" \
+    --data_files "${FLAN_DIR}/train/*.jsonl" --dataset_split train \
+    --cache_dir "${DATASET_CACHE}" \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --max_samples "${FLAN_SAMPLES}" \
+    --sample_shuffle "${SAMPLE_SHUFFLE}" --sample_seed "${SAMPLE_SEED}" \
+    --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --fisher_device "${FISHER_DEVICE}" \
+    --log_every "${LOG_EVERY}" \
+    --seed "${SAMPLE_SEED}" \
+    --output_path "${FISHER_PATH}" 2>&1 | tee "${RUN_LOG}"
+fi
+
+# ===========================================================================
+# Step 2: 自检
+#   把 F 里实际记下的 metadata 逐条比对。这里的 truncation_side 期望是 right、
+#   zero_supervision_rows 期望是 1408——都是「与 RWTH 那份相同」而不是「更干净」。
+#   EXPECT_MEAN 是最直接的一项：指纹证明进去的行相同，mean 证明出来的数相同。
+# ===========================================================================
+echo "==== Step 2: 自检 ===="
+python -m onereplay.scripts.inspect_fisher \
+  --path "${FISHER_PATH}" \
+  --expect_max_len "${MAXLEN}" \
+  --expect_truncation_side right \
+  --expect_target_modules "${TARGET_MODULES}" \
+  --expect_require_target 0 \
+  --expect_sample_shuffle "${SAMPLE_SHUFFLE}" \
+  --expect_use_bf16 "${USE_BF16}" \
+  --expect_zero_supervision_rows "${EXPECT_ZERO_ROWS}" \
+  --expect_pool_fingerprint "${EXPECT_FINGERPRINT}" \
+  --expect_mean "${EXPECT_MEAN}" \
+  --mean_rtol "${MEAN_RTOL}" \
+  --strict 1
+
+set +x
+echo "========================================================================"
+echo "F 采集完成:"
+echo "  FISHER_PATH = ${FISHER_PATH}"
+echo "  RUN_LOG     = ${RUN_LOG}"
+echo "参考值（RWTH 那份 .pt 的 metadata）:"
+echo "  mean 0.09977994298288705 / zero rows 1408 / ESS 2546.92 of 20000 (0.1273)"
+echo "Step 2 已按上述值硬校验通过，可以当作同一份 F_if 用，λ=3e2 继续有效。"
+set -x
+
+if [[ "${DO_TRAIN}" != "1" ]]; then
+  set +x
+  echo "DO_TRAIN=0：只采集，不训练。要用这份 F 重训 EWC 基线："
+  echo "  qsub -v DO_COLLECT=0 onereplay/pbs/47_if_fisher.pbs"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 3: 用这份 F 重训 EWC 基线
+#   罚项 R = (1/L) Σ_l Σ_ij F_l,ij (ΔW_l,ij)²，ΔW = scale · B A
+#   对照 OneReplay 的 R = (1/L) Σ_l tr(ΔW_l C_l ΔW_l^T)。两个矩阵都在冻结的 base
+#   模型上、同一批 FLAN 20k 行上估一次，全程不更新，所以对比里唯一变的就是
+#   「用什么矩阵加权」。
+#
+#   这次训练唯一的变量是 --fisher_path 指向本作业新采的 F，其余超参照抄 23 号。
+# ===========================================================================
+ADAPTERS="${RESULTS_ROOT}/adapters"
+METRICS_DIR="${RESULTS_ROOT}/metrics"
+mkdir -p "${ADAPTERS}" "${METRICS_DIR}" "${RESULTS_ROOT}/map_cache/${TRAIN_RUN}"
+
+# F 和 C 必须出自同一批旧知识行，否则 EWC 与 OneReplay 的对比被数据差异污染。
+# Step 0b/2 已经把 F 的指纹钉到 RWTH 的值上了，这里再确认 Hopper 上的 C_if 也是同一个。
+set +x
+echo "==== Step 3a: 核对 F 与 C_if 同池 ===="
+if [[ -f "${IF_COV}" ]]; then
+  COV_POOL_HASH="$(python -m onereplay.scripts.inspect_fisher \
+    --path "${IF_COV}" --print_meta pool_fingerprint 2>/dev/null || echo "")"
+  FISHER_POOL_HASH="$(python -m onereplay.scripts.inspect_fisher \
+    --path "${FISHER_PATH}" --print_meta pool_fingerprint)"
+  if [[ -z "${COV_POOL_HASH}" ]]; then
+    echo "警告: ${IF_COV} 的 metadata 里没有 pool_fingerprint（在加指纹打印之前采的），"
+    echo "  跳过比对。重跑一次 01_collect_cov.pbs 可以补上。"
+  elif [[ "${COV_POOL_HASH}" == "${FISHER_POOL_HASH}" ]]; then
+    echo "OK: F 与 C_if 同池 ${FISHER_POOL_HASH}"
+  else
+    echo "########################################################################"
+    echo "WARNING: F 与 C_if 的旧知识池不同"
+    echo "  F     ${FISHER_POOL_HASH}"
+    echo "  C_if  ${COV_POOL_HASH}"
+    echo "  这次 EWC 训出来的结果不能与 OneReplay 直接对比。训练照跑，但结论要打折。"
+    echo "########################################################################"
+  fi
+else
+  echo "跳过: 找不到 C_if (${IF_COV})，无法核对同池。"
+fi
+set -x
+
+if [[ -d "${ADAPTERS}/${TRAIN_RUN}" && "${SAVE}" == "1" ]]; then
+  echo "跳过训练 ${TRAIN_RUN}：adapter 已存在（删掉它可强制重训）"
+else
+  echo "==== Step 3: train ${TRAIN_RUN} (ewc, lambda=${LAMBDA}, F=${FISHER_PATH}) ===="
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${TRAIN_SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TRAIN_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${TRAIN_RUN}" \
+    --profile "${PROFILE}" --max_steps "${MAX_STEPS}" \
+    --regularizer ewc --fisher_path "${FISHER_PATH}" \
+    --replay_lambda "${LAMBDA}" \
+    --save "${SAVE}" --save_path "${ADAPTERS}/${TRAIN_RUN}" \
+    --metrics_path "${METRICS_DIR}/${TRAIN_RUN}.jsonl"
+fi
+
+# ===========================================================================
+# Step 4: 训练自检
+#   罚项恒为 0 是这条路上最贵的静默失败：Fisher 的层名一个都没匹配上 LoRA 模块时，
+#   训练会正常跑完 5.7 h 然后交出一个实际上是 vanilla 的 checkpoint。
+# ===========================================================================
+echo "==== Step 4: 训练自检 ===="
+python - "${METRICS_DIR}/${TRAIN_RUN}.jsonl" "${LAMBDA}" "${FISHER_PATH}" \
+        "${ACCUM}" "${VANILLA_VAL_LOSS}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+want_lambda = float(sys.argv[2])
+want_penalty_path = sys.argv[3]
+want_rows_per_update = int(sys.argv[4])
+vanilla_val = sys.argv[5]
+with open(path, encoding="utf-8") as handle:
+    records = [json.loads(line) for line in handle if line.strip()]
+if not records:
+    raise SystemExit(f"{path} 是空的，训练没有写出任何一条 metrics")
+last = records[-1]
+
+reg = last.get("train_replay_reg") or 0.0
+lambda_reg = last.get("train_lambda_reg") or 0.0
+task_loss = last.get("train_task_loss") or 0.0
+share = lambda_reg / task_loss if task_loss else 0.0
+
+print(f"regularizer      = {last.get('regularizer')}")
+print(f"replay_lambda    = {last.get('replay_lambda')} (want {want_lambda})")
+print(f"penalty_path     = {last.get('penalty_path')}")
+print(f"batch/accum      = {last.get('batch_size')} / {last.get('accumulation_size')} (行/更新)")
+print(f"train_replay_reg = {reg:.6e}")
+print(f"lambda * reg     = {lambda_reg:.6e}  ({share:.2%} of task_loss {task_loss:.4f})")
+print(f"val_loss         = {last.get('val_loss')}")
+
+failures = []
+if last.get("regularizer") != "ewc":
+    failures.append(f"regularizer={last.get('regularizer')!r}，应为 'ewc'，这次 run 白跑")
+if float(last.get("replay_lambda") or 0) != want_lambda:
+    failures.append(f"replay_lambda={last.get('replay_lambda')}，应为 {want_lambda}")
+# 这一条是「新 EWC 确实用的是新采的 F」的直接证据。
+got_penalty = last.get("penalty_path")
+if got_penalty is None:
+    print("提示: metrics 里没有 penalty_path（train.py 版本较旧），跳过这一项")
+elif got_penalty != want_penalty_path:
+    failures.append(f"penalty_path={got_penalty!r}，应为 {want_penalty_path!r}")
+# 每次更新的行数决定「一步优化看了多少新任务数据」，和旧 run 不一致就没法比。
+rows_per_update = last.get("accumulation_size")
+if rows_per_update is not None and int(rows_per_update) != want_rows_per_update:
+    failures.append(
+        f"accumulation_size={rows_per_update}，应为 {want_rows_per_update}。"
+        "每次更新的行数变了，与旧 run 不再可比"
+    )
+if reg == 0.0:
+    failures.append(
+        "罚项恒为 0：Fisher 的层名一个都没匹配上 LoRA 模块，或 F 文件本身是空的。"
+        " 看训练日志里 'regularizer covers N layers' 是不是 0。这个 checkpoint 实际是 vanilla。"
+    )
+
+# 罚项占比落在两端说明 λ 与这份 F 的尺度不匹配。λ=3e2 是对 mean(F)=0.0998 调的，
+# Step 2 已经校验过 mean，所以这里出问题更可能是别的地方错了。
+if share and share < 1e-3:
+    print(f"提示: 罚项只占 task_loss 的 {share:.3%}，这一档基本等于 vanilla，λ 偏小")
+elif share > 0.5:
+    print(f"提示: 罚项占 task_loss 的 {share:.1%}，新任务很可能学不动了，λ 偏大")
+
+if vanilla_val:
+    gap = (last.get("val_loss") or 0.0) - float(vanilla_val)
+    print(f"val_loss 相对 vanilla({vanilla_val}) 的差值 = {gap:+.4f}")
+    if gap > 0.05:
+        print(
+            "提示: 新任务明显学得更差。这正是 EWC-LoRA(2602.17559) 观察到的 precomputed"
+            " 固定 Fisher 塑性偏低。写结论时要按等 val_loss 比 IFEval，"
+            "不能直接说 EWC retention 更好。"
+        )
+
+if failures:
+    print("\n自检失败:")
+    for item in failures:
+        print(f"  - {item}")
+    raise SystemExit(1)
+print("\n自检通过")
+PY
+
+set +x
+echo "========================================================================"
+echo "产物:"
+echo "  F        = ${FISHER_PATH}"
+echo "  adapter  = ${ADAPTERS}/${TRAIN_RUN}"
+echo "  metrics  = ${METRICS_DIR}/${TRAIN_RUN}.jsonl"
+echo "本脚本到训练为止，不评测。下一步用既有评测脚本跑 ${TRAIN_RUN} 的 retention 指标。"
+echo "Job finished at: $(date)"

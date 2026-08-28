@@ -55,7 +55,7 @@
 #   train.py 里 accum_steps = ACCUM / BATCH，每次更新的新任务行数 =
 #   accum_steps × (BATCH - REPLAY_PER_BATCH)。
 #       BATCH=8  REPLAY=4  ACCUM=128 -> 16 步 × 4 行 = 64
-#       BATCH=16 REPLAY=8  ACCUM=128 ->  8 步 × 8 行 = 64   （本脚本）
+#       BATCH=16 REPLAY=8  ACCUM=128 ->  8 步 × 8 行 = 64   
 #   所以 micro-batch 翻倍时 ACCUM 不动：每次更新的新任务行数、优化器更新次数
 #   （2,636/epoch）、lr、epoch 数全部不变，与 vanilla / OneReplay 的 64 行/更新
 #   对齐关系也不变；变的只是同样一份数据用一半的 micro-batch 走完，H200 上单步
@@ -228,7 +228,7 @@ ARMS="${ARMS:-rows tokens}"
 SEED="${SEED:-1}"
 EPOCHS="${EPOCHS:-3}"
 LR="${LR:-1e-4}"
-BATCH="${BATCH:-16}"      # micro-batch。相对 32 号翻倍，只为吃满 H200，见文件头
+BATCH="${BATCH:-8}"      # micro-batch。相对 32 号翻倍，只为吃满 H200，见文件头
 ACCUM="${ACCUM:-128}"     # 单位是行：8 步 × 8 行新任务 = 64 行/次更新，与 32 号一致
 EVAL_BATCH="${EVAL_BATCH:-8}"   # 钉在 32 号的值，否则 val_loss 不可比
 MAXLEN="${MAXLEN:-512}"
@@ -243,7 +243,7 @@ if (( ACCUM % BATCH != 0 )); then
 fi
 
 # ---- 回放设定 ----
-REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-8}"     # 8 新 + 8 回放 = 行占比 50%
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"     
 REPLAY_MAX_LEN="${REPLAY_MAX_LEN:-2048}"      # 只作用于回放行；新任务留在 MAXLEN
 SELF_DISTILL_IF="${SELF_DISTILL_IF:-${RESULTS_ROOT}/replay/flan_selfdistill_20000_seed1.jsonl}"
 SELF_DISTILL_MATH="${SELF_DISTILL_MATH:-${RESULTS_ROOT}/replay/metamath_cmath_30k_*_selfdistill_seed1.jsonl}"
