@@ -1,0 +1,724 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_full
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# 全量微调训练 + 评测（Hopper / PBS + Singularity）
+# 对应 onereplay/slurm/11_train_full_baselines.slurm，两处实质改动见下。
+#
+# -----------------------------------------------------------------------------
+# 【改动一：学习率。1e-5 太小，全量在欠训练】
+#
+# 判据不是"全量 loss 好看不好看"，而是它和 LoRA 的相对关系反了：
+#
+#     LoRA  (lr 1e-4, qv adapter)  val loss ep3 = 0.04494
+#     全量  (lr 1e-5, 197 层)      val loss ep3 = 0.07364     <- 大 64%
+#
+# 全量有 1,720,574,976 个可训练参数，LoRA 只有一个 rank-8 的适配器。全量在新任务
+# 上拟合得反而更差，参数量解释不了，只能是没训够。3 个 epoch 的曲线也是这个形状：
+# 0.08297 -> 0.07647 -> 0.07364，每个 epoch 只降 3~8%，还在缓慢下坡而不是收敛。
+#
+# 所以本脚本的 LR 默认从 1e-5 抬到 2e-5，但**建议先用 MODE=lr_sweep 用数据选**，
+# 别直接拍。目标很明确：全量的 ep1 val loss 要压到 LoRA 的 ep1（0.06039）以下。
+#
+# -----------------------------------------------------------------------------
+# 【改动二：λ 必须跟着 LR 重新标定，这是容易漏掉的连锁反应】
+#
+# 惩罚项 R = tr(ΔW C ΔWᵀ) 是 ΔW 的**二次**型。LR 变大，ΔW 按比例变大，R 按平方变大：
+#
+#     LR x2  ->  ΔW 约 x2  ->  R 约 x4  ->  λ·R/task_loss 约 x4
+#
+# 08-16 那轮在 lr=1e-5、λ=3e-2 下测到的比值是 5.63%。直接把 λ=3e-2 搬到 lr=2e-5，
+# 惩罚占比会冲到 20% 上下，正则强度完全不是一回事了，跑出来的 OneReplay 既不能和
+# 08-16 比，也不是这个 LR 下调好的配置。等比缩放的起点是
+#
+#     λ_new ≈ λ_old / (lr_new / lr_old)²      # 1e-5->2e-5 时 3e-2 -> 7.5e-3
+#
+# 但这只是外推，真值要用 MODE=calibrate 在新 LR 下实测 R 再定。所以正确顺序是：
+#
+#     lr_sweep  ->  定 LR  ->  calibrate  ->  定 λ  ->  train
+#
+# -----------------------------------------------------------------------------
+# 【改动三：replay 基线换成自蒸馏 replay@0.5，走批级混合】
+#
+# slurm 版那条是 --replay_ratio 0.10 的 FLAN gold target 回放，两处都不对：08-16
+# 明确写了"replay 一律指自蒸馏版本"，gold 那条没被采纳；而 0.5 这个比例数据级混合
+# 根本做不到——replay_ratio=0.5 要 0.5 x 168,715 = 84,357 条回放行，自蒸馏池只有
+# 约 17,429 条可用，replay.py 会直接抛 ValueError。
+#
+# 所以 replay@0.5 只能走批级混合 --replay_per_batch 4：每个 micro-batch 8 行拆成
+# 4 新 + 4 回放，池子循环复用（一个 epoch 过约 168k 回放行，池子转约 9.7 圈）。
+# 循环复用是有意为之：这个池子恰好就是产出 C 的那批数据，OneReplay 和 replay 因此
+# 看到同一份旧知识，只在"怎么用"上不同。扩池会让 replay 拿到比 C 更多的信息。
+#
+# 两处必须跟着调，否则不是公平对比：
+#   accum 128：16 个 micro-batch x 4 新行 = 64 新行/更新，和 vanilla 的 64 对齐
+#   步数自然翻倍：42,178 步/epoch（168,715 // 4），vanilla 是 21,089
+#
+# 后果是 ms/step **不能**直接并排读：replay 每步只有 4 行新任务，同样的 ms/step
+# 意味着有用功只有一半。脚本末尾按"每条新任务行"另出一张归一化表，那张才可比。
+#
+# -----------------------------------------------------------------------------
+# 【其余与 slurm 版的差异】
+#   - OneReplay 臂加了 --reg_impl analytic：全参数正则的解析梯度实现，开销从
+#     +57.8% 降到 +5.8%，梯度与 autograd 同源（197/197 层比 autograd 更接近 fp64）。
+#   - DO_TRAIN / DO_EVAL 可分开。三臂训练约 7.5 h（vanilla 1.7 + OneReplay 1.8 +
+#     replay@0.5 4.0，replay 贵在步数翻倍），四次评测约 12 h，合计约 19.5 h，塞进
+#     一个 24 h 作业太贴边。先只训练，再单独提交评测。
+#
+# -----------------------------------------------------------------------------
+# 【前置】
+#   ls -lh ${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt    # uniform + full，约 6.58 GiB
+#   注意别用 _balanced_full.pt，那是另一套抽样，效果数字与 08-16 不可比。
+#   ls -lh ${RESULTS_ROOT}/replay/flan_selfdistill_20000_seed1.jsonl   # replay@0.5 用
+#   POOL_SIZE / SAMPLE_SEED 必须和采 C 时一致，否则 replay 池与 C 不是同一批数据，
+#   这一格就不再是"同语料的两种用法"，跟 OneReplay 也就不可比了。
+#
+# 【用法】
+#   mkdir -p /scratch/weiliu87/logs/onereplay
+#
+#   # 1) 选 LR（约 2.5 h）。vanilla 在 4 个 LR 上各跑 1 epoch，对着 LoRA 的 0.06039 比
+#   qsub -v MODE=lr_sweep onereplay/pbs/44_train_full_baselines.pbs
+#
+#   # 2) 在选定的 LR 上标定 λ（约 20 min）
+#   qsub -v MODE=calibrate,LR=2e-5 onereplay/pbs/44_train_full_baselines.pbs
+#
+#   # 3) 正式训练三臂 vanilla / onereplay / replay@0.5（不评测，约 7.5 h）
+#   qsub -v MODE=train,LR=2e-5,LAMBDA=7.5e-3,DO_EVAL=0 onereplay/pbs/44_train_full_baselines.pbs
+#
+#   # 4) 评测（约 12 h，checkpoint 已在盘上）
+#   qsub -v MODE=train,LR=2e-5,LAMBDA=7.5e-3,DO_TRAIN=0 onereplay/pbs/44_train_full_baselines.pbs
+#
+#   # 冒烟：确认三条链路都通、analytic 生效、批级混合比例对（约 25 min）
+#   qsub -v MODE=smoke onereplay/pbs/44_train_full_baselines.pbs
+#
+#   # 只跑某几臂
+#   qsub -v MODE=train,ARMS='vanilla onereplay' onereplay/pbs/44_train_full_baselines.pbs
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/44_train_full_baselines.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT DATASET_CACHE
+    COV_PATH METRICS_DIR CKPT_DIR
+    MODE ARMS DO_TRAIN DO_EVAL SEED EPOCHS LR LAMBDA BATCH ACCUM MAXLEN
+    VAL_FRAC MAXVAL TARGET_MODULES REG_IMPL REG_ALLOW_TF32
+    LR_GRID SWEEP_EPOCHS SWEEP_MAX_STEPS LORA_ANCHOR_EP1
+    PROF_STEPS CALIB_STEPS
+    REPLAY_PER_BATCH REPLAY_ACCUM
+    REPLAY_POOL REPLAY_SAMPLE_SEED SELF_DISTILL_FILE
+    IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT EVAL_LIMIT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+# uniform + full。_balanced_full.pt 是另一套抽样，效果数字与 08-16 不可比。
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_full.pt}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics/full}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints/full}"
+
+# ---- 全量超参 ----
+MODE="${MODE:-calibrate}"
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+# 1e-5 -> 2e-5。理由见文件头；正式跑之前请先用 MODE=lr_sweep 确认。
+LR="${LR:-2e-5}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+# 3e-2 是 lr=1e-5 下标定出来的。LR 抬到 2e-5 后 R 约涨 4 倍，等比缩放到 7.5e-3。
+# 这只是外推的起点，用 MODE=calibrate 实测后再定。
+LAMBDA="${LAMBDA:-7.5e-3}"
+# 全参数正则的解析梯度实现。dR/dΔW = 2·ΔW·C 有闭式解，不必让 autograd 再算一遍
+# 同尺寸的反向 matmul。开销 +57.8% -> +5.8%，梯度与 autograd 同源。
+REG_IMPL="${REG_IMPL:-analytic}"
+REG_ALLOW_TF32="${REG_ALLOW_TF32:-1}"
+
+ARMS="${ARMS:-vanilla onereplay replay}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+
+# ---- LR 搜索 ----
+LR_GRID="${LR_GRID:-1e-5 2e-5 5e-5 1e-4}"
+SWEEP_EPOCHS="${SWEEP_EPOCHS:-1}"
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-0}"
+# LoRA vanilla 的 epoch-1 val loss。全量要压到它以下才算训够。
+LORA_ANCHOR_EP1="${LORA_ANCHOR_EP1:-0.06039}"
+
+PROF_STEPS="${PROF_STEPS:-300}"
+# slurm 版是 300 步。300 步时 ΔW 还极小、R 被严重低估，反推出的 λ 会偏大一个量级。
+# 3000 步（约 1/7 epoch）能让 R 进入有意义的区间，代价只有几分钟。
+CALIB_STEPS="${CALIB_STEPS:-3000}"
+
+# ---- replay@0.5 臂：自蒸馏语料，批级混合 ----
+# BATCH=8 拆成 4 新 + 4 回放，行级占比 0.5。数据级混合（--replay_ratio）到不了 0.5，
+# 池子不够大，见文件头。REPLAY_ACCUM=128 让每次更新的新任务行数仍是 64。
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
+REPLAY_ACCUM="${REPLAY_ACCUM:-128}"
+# 文件名拼法与 13_replay_selfdistill / 43_full_reg_impl 逐字一致
+REPLAY_POOL="${REPLAY_POOL:-20000}"
+REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
+SELF_DISTILL_FILE="${SELF_DISTILL_FILE:-${RESULTS_ROOT}/replay/flan_selfdistill_${REPLAY_POOL}_seed${REPLAY_SAMPLE_SEED}.jsonl}"
+# run 名里要带真实占比，改了 REPLAY_PER_BATCH 而没改名字最容易把两批结果混在一起
+REPLAY_SHARE="$(awk -v a="${REPLAY_PER_BATCH}" -v b="${BATCH}" 'BEGIN{printf "%g", a/b}')"
+if (( REPLAY_PER_BATCH <= 0 || REPLAY_PER_BATCH >= BATCH )); then
+  echo "REPLAY_PER_BATCH=${REPLAY_PER_BATCH} 必须在 1..$((BATCH-1)) 之间"; exit 1
+fi
+
+# ---- 评测 ----
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+[[ -f "${COV_PATH}" ]] || {
+  echo "缺全量协方差文件: ${COV_PATH}"
+  echo "先跑: qsub -v COV_SCOPE=full onereplay/pbs/01_collect_cov.pbs"
+  exit 1
+}
+# 用旧代码跑会报 unrecognized arguments，显式检查给出更有用的提示。
+grep -q "reg_impl" onereplay/scripts/train.py || {
+  echo "train.py 里没有 --reg_impl，代码没同步到最新"; exit 1
+}
+mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${DATASET_CACHE}"
+
+echo "MODE=${MODE} LR=${LR} LAMBDA=${LAMBDA} REG_IMPL=${REG_IMPL}"
+echo "ARMS=${ARMS} DO_TRAIN=${DO_TRAIN} DO_EVAL=${DO_EVAL}"
+echo "COV_PATH=${COV_PATH}"
+echo "replay: share=${REPLAY_SHARE} (${REPLAY_PER_BATCH}/${BATCH}) accum=${REPLAY_ACCUM}"
+echo "        corpus=${SELF_DISTILL_FILE}"
+case "${COV_PATH}" in
+  *_balanced_*) echo "WARNING: 用的是 balanced C，效果数字不能和 08-16(uniform) 并排读" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 一次全量训练。save=0 时只写 metrics，不落完整 checkpoint（约 3.4 GiB/run）。
+#   $1 run 名  $2 profile  $3 max_steps  $4 save  $5 epochs  $6 lr  $7.. 追加参数
+# 调用方可以用 `RUN_ACCUM=128 full_run ...` 单次覆盖梯度累积（replay 臂要用）。
+# ---------------------------------------------------------------------------
+full_run() {
+  local run="$1" profile="$2" max_steps="$3" save="$4" epochs="$5" lr="$6"
+  shift 6
+  local accum="${RUN_ACCUM:-${ACCUM}}"
+
+  echo ""
+  echo "======================================================================"
+  echo "full: ${run}  (lr=${lr} epochs=${epochs} accum=${accum}"
+  echo "      profile=${profile} max_steps=${max_steps} save=${save})"
+  echo "======================================================================"
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${epochs}" --lr "${lr}" \
+    --batch_size "${BATCH}" --accumulation_size "${accum}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --profile "${profile}" --max_steps "${max_steps}" \
+    --save "${save}" --save_path "${CKPT_DIR}/${run}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl" \
+    "$@"
+}
+
+run_eval() {
+  local name="$1" ckpt="$2"
+  local metrics="ifeval"
+  if [[ -f "${MULTIIF_INPUT}" ]]; then
+    metrics="${metrics},multiif"
+  else
+    echo "跳过 Multi-IF：未找到 ${MULTIIF_INPUT}"
+  fi
+  # base 额外跑 commonsense held-out loss，便于和 LoRA 对照
+  if [[ -z "${ckpt}" ]]; then
+    metrics="commonsense,${metrics}"
+  fi
+
+  echo ""
+  echo "==== eval: ${name} (${metrics}) ===="
+  local adapter_arg=()
+  if [[ -n "${ckpt}" ]]; then
+    adapter_arg=(--adapter_path "${ckpt}")
+  fi
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    "${adapter_arg[@]}" --run_name "${name}" \
+    --metrics "${metrics}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --limit "${EVAL_LIMIT}" \
+    --dataset_path "${CS_DATASET}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_full_seed${SEED}" \
+    --ifeval_input "${IFEVAL_INPUT}" \
+    --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+    --multiif_limit "${MULTIIF_LIMIT}" || true
+  # || true：一条评测挂掉（多半是 Multi-IF 超时）不该带走后面所有模型的结果
+}
+
+# ---------------------------------------------------------------------------
+# MODE=smoke：验证全量路径 + analytic 实现能跑通，并采分阶段耗时
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "smoke" ]]; then
+  echo "==== MODE=smoke ===="
+  # vanilla 必须连 C 都不加载，否则测出来的不是 vanilla
+  full_run "full_vanilla_prof_seed${SEED}" 1 "${PROF_STEPS}" 0 1 "${LR}" \
+    --cov_path "${COV_PATH}" --replay_lambda 0 --measure_replay_when_lambda_zero 0
+  full_run "full_onereplay_prof_seed${SEED}" 1 "${PROF_STEPS}" 0 1 "${LR}" \
+    --cov_path "${COV_PATH}" --replay_lambda "${LAMBDA}" --identity_cov 0 \
+    --reg_once_per_update 1 --reg_impl "${REG_IMPL}" --reg_allow_tf32 "${REG_ALLOW_TF32}"
+  if [[ -f "${SELF_DISTILL_FILE}" ]]; then
+    RUN_ACCUM="${REPLAY_ACCUM}" \
+    full_run "full_replay${REPLAY_SHARE}_prof_seed${SEED}" 1 "${PROF_STEPS}" 0 1 "${LR}" \
+      --cov_path "${COV_PATH}" --replay_lambda 0 \
+      --measure_replay_when_lambda_zero 0 \
+      --replay_per_batch "${REPLAY_PER_BATCH}" \
+      --replay_self_distill_file "${SELF_DISTILL_FILE}" \
+      --replay_drop_truncated 1 \
+      --replay_cache_dir "${DATASET_CACHE}"
+  else
+    echo "跳过 replay 冒烟：缺 ${SELF_DISTILL_FILE}"
+  fi
+  echo ""
+  echo "检查点："
+  echo "  1. 'analytic regularizer resolved 197 layers ... tf32=1' 这行必须出现"
+  echo "  2. used_layers=197，missing=0"
+  echo "  3. loss 在下降"
+  echo "  4. replay 那条打印 'batch-level replay: 4 new + 4 replay'，"
+  echo "     replay share of rows=0.5000，42178 steps/epoch，accumulation 16 x 4 = 64"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE=lr_sweep：用数据选 LR，而不是拍一个
+#
+# 只跑 vanilla——LR 是否够大是新任务拟合的问题，和正则无关，加上 OneReplay 只会
+# 多烧一倍卡时还引入第二个变量。判据是全量的 ep1 val loss 能否压到 LoRA 的
+# ep1（0.06039）以下：全量参数量是 LoRA 的几百倍，压不过去就是没训够。
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "==== MODE=lr_sweep: LR_GRID=${LR_GRID} ===="
+  SWEEP_DIR="${METRICS_DIR}/lr_sweep"
+  mkdir -p "${SWEEP_DIR}"
+  for lr in ${LR_GRID}; do
+    # metrics 写到单独目录，否则这些短跑会混进 summarize_cost 的开销表
+    ( METRICS_DIR="${SWEEP_DIR}" \
+      full_run "lr_${lr}" 0 "${SWEEP_MAX_STEPS}" 0 "${SWEEP_EPOCHS}" "${lr}" \
+        --cov_path "${COV_PATH}" --replay_lambda 0 \
+        --measure_replay_when_lambda_zero 0 ) || true
+  done
+
+  echo ""
+  echo "==== LR 对比 ===="
+  python - "${SWEEP_DIR}" "${LORA_ANCHOR_EP1}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sweep_dir = Path(sys.argv[1])
+anchor = float(sys.argv[2])
+
+rows = []
+for path in sorted(sweep_dir.glob("lr_*.jsonl")):
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # jsonl 里除了 epoch 记录还有别的 record_type，val_loss 只有 epoch 记录才有
+    epochs = [
+        r
+        for r in records
+        if r.get("record_type") == "epoch" and r.get("val_loss") is not None
+    ]
+    if not epochs:
+        print(f"{path.name}: 没有 epoch 记录（多半 OOM 或发散了）")
+        continue
+    last = epochs[-1]
+    rows.append(
+        (
+            float(path.stem.split("_", 1)[1]),
+            float(last["val_loss"]),
+            float(last.get("train_task_loss", float("nan"))),
+            float(last.get("sec_per_step", 0.0)) * 1000.0,
+        )
+    )
+
+if not rows:
+    raise SystemExit("没有可用结果")
+
+rows.sort()
+print(f"{'lr':>10} {'val_loss':>10} {'train_loss':>11} {'ms/step':>9}  {'vs LoRA':>9}")
+for lr, val, train, ms in rows:
+    verdict = "OK" if val <= anchor else "偏高"
+    print(f"{lr:>10.1e} {val:>10.5f} {train:>11.5f} {ms:>9.1f}  {verdict:>9}")
+
+print()
+print(f"锚点：LoRA vanilla 的 epoch-1 val loss = {anchor:.5f}")
+print("全量的可训练参数是 LoRA 的几百倍，val_loss 压不到锚点以下就说明还在欠训练。")
+
+best = min(rows, key=lambda row: row[1])
+print(f"本网格最低：lr={best[0]:.1e}，val_loss={best[1]:.5f}")
+if best[0] == rows[-1][0]:
+    print("警告：最优落在网格上边界，真正的最优可能更大，把 LR_GRID 往上延一档再跑。")
+print()
+print("选定 LR 后不要直接开训——R = tr(ΔW C ΔWᵀ) 随 ΔW 平方增长，LR 变了 λ 就得")
+print("重标：qsub -v MODE=calibrate,LR=<选定值> onereplay/pbs/44_train_full_baselines.pbs")
+PY
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE=calibrate：在**当前 LR** 下实测 R，反推 λ
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "calibrate" ]]; then
+  echo "==== MODE=calibrate: lr=${LR}, ${CALIB_STEPS} 步 ===="
+  full_run "full_calib_lr${LR}_seed${SEED}" 0 "${CALIB_STEPS}" 0 1 "${LR}" \
+    --cov_path "${COV_PATH}" --replay_lambda 0 --measure_replay_when_lambda_zero 1
+
+  echo ""
+  echo "---- λ 建议 ----"
+  python - "${METRICS_DIR}/full_calib_lr${LR}_seed${SEED}.jsonl" "${CALIB_STEPS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+steps = int(sys.argv[2])
+if not path.is_file():
+    raise SystemExit(f"missing {path}")
+
+records = [
+    json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+]
+record = records[-1]
+task = float(record["train_task_loss"])
+reg = float(record["train_replay_reg"])
+print(f"task_loss={task:.6f}  replay_reg={reg:.6e}  (在 {steps} 步处)")
+
+if reg <= 0:
+    raise SystemExit("replay_reg 为 0，检查 C 的层覆盖和 W0 快照")
+
+print()
+print("使 λ·R 占 task_loss 各比例所需的 λ：")
+for fraction in (1e-3, 1e-2, 5e-2, 1e-1):
+    print(f"  {fraction:>6.0%} 的 task_loss  ->  λ ≈ {fraction * task / reg:.3e}")
+
+print()
+print(f"08-16 那轮采纳的口径是 λ·R/task_loss = 5.63%，对应上表 5% 那一行。")
+print("注意这是在训练早期测的：R 随 ΔW 增长，到 epoch 3 会明显大于此处的值，")
+print(f"所以上面的 λ 是偏大的上界。08-16 的 R 从 ep1 的 0.1670 走到 ep3 的 0.1401，")
+print("量级内波动，可以按同量级理解，但换了 LR 之后需要用这次的实测重新对齐。")
+PY
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE=train：正式训练（同一节点串行）+ 评测 + 开销表
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" != "train" ]]; then
+  echo "未知 MODE=${MODE}，可选 smoke / lr_sweep / calibrate / train"; exit 1
+fi
+
+if [[ "${LR}" == "1e-5" ]]; then
+  echo "########################################################################"
+  echo "WARNING: LR 还是 1e-5。08-16 那轮就是这个值，全量 val loss(0.07364) 比"
+  echo "  LoRA(0.04494) 差 64%，是欠训练。确认这是你要的再继续。"
+  echo "########################################################################"
+fi
+
+VANILLA_RUN="full_vanilla_lr${LR}_seed${SEED}"
+ONEREPLAY_RUN="full_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}"
+REPLAY_RUN="full_replay${REPLAY_SHARE}_selfdistill_lr${LR}_seed${SEED}"
+
+declare -A RUN_OF=(
+  [vanilla]="${VANILLA_RUN}"
+  [onereplay]="${ONEREPLAY_RUN}"
+  [replay]="${REPLAY_RUN}"
+)
+
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  for arm in ${ARMS}; do
+    case "${arm}" in
+      vanilla)
+        # measure_replay_when_lambda_zero=0：否则 λ=0 也每步在算正则，
+        # 这条就不再是干净的 vanilla 基线，开销表的分母会被抬高。
+        full_run "${VANILLA_RUN}" 0 0 1 "${EPOCHS}" "${LR}" \
+          --cov_path "${COV_PATH}" --replay_lambda 0 \
+          --measure_replay_when_lambda_zero 0
+        ;;
+      onereplay)
+        full_run "${ONEREPLAY_RUN}" 0 0 1 "${EPOCHS}" "${LR}" \
+          --cov_path "${COV_PATH}" --replay_lambda "${LAMBDA}" --identity_cov 0 \
+          --reg_once_per_update 1 \
+          --reg_impl "${REG_IMPL}" --reg_allow_tf32 "${REG_ALLOW_TF32}"
+        ;;
+      replay)
+        # replay@${REPLAY_SHARE}：批级混合，4 新 + 4 回放，accum 128 让每次更新的
+        # 新任务行数仍是 64。步数会自然翻到 42,178/epoch（168,715 // 4），这不是
+        # 浪费而是这个基线的真实代价——它每步只学 4 行新任务。
+        if [[ ! -f "${SELF_DISTILL_FILE}" ]]; then
+          echo "跳过 replay：缺自蒸馏语料 ${SELF_DISTILL_FILE}"
+          echo "  它是 13_replay_selfdistill 的产物；没搬过来就先跑它，"
+          echo "  或传 SELF_DISTILL_FILE=<绝对路径> 指过去。"
+          echo "  注意 --replay_ratio 那条数据级路径到不了 0.5（池子只有约 17k 行），"
+          echo "  所以这里没有退化方案，缺语料就只能跳过这一臂。"
+          continue
+        fi
+        RUN_ACCUM="${REPLAY_ACCUM}" \
+        full_run "${REPLAY_RUN}" 0 0 1 "${EPOCHS}" "${LR}" \
+          --cov_path "${COV_PATH}" --replay_lambda 0 \
+          --measure_replay_when_lambda_zero 0 \
+          --replay_per_batch "${REPLAY_PER_BATCH}" \
+          --replay_self_distill_file "${SELF_DISTILL_FILE}" \
+          --replay_drop_truncated 1 \
+          --replay_cache_dir "${DATASET_CACHE}"
+        ;;
+      *)
+        echo "未知 arm: ${arm}（可选 vanilla onereplay replay）"
+        ;;
+    esac
+  done
+else
+  echo "DO_TRAIN=0：跳过训练，直接用 ${CKPT_DIR} 下已有的 checkpoint"
+fi
+
+if [[ "${DO_EVAL}" == "1" ]]; then
+  run_eval "base" ""
+  for arm in ${ARMS}; do
+    run="${RUN_OF[${arm}]:-}"
+    [[ -n "${run}" ]] || continue
+    if [[ -d "${CKPT_DIR}/${run}" ]]; then
+      run_eval "${run}" "${CKPT_DIR}/${run}"
+    else
+      echo "跳过评测 ${run}：${CKPT_DIR}/${run} 不存在"
+    fi
+  done
+else
+  echo "DO_EVAL=0：跳过评测。之后单独提交："
+  echo "  qsub -v MODE=train,LR=${LR},LAMBDA=${LAMBDA},DO_TRAIN=0 onereplay/pbs/44_train_full_baselines.pbs"
+fi
+
+echo ""
+echo "==== 开销表（epoch 1，取自训练 metrics，不另跑 bench）===="
+python -m onereplay.scripts.summarize_cost \
+  --metrics_dir "${METRICS_DIR}" \
+  --baseline "${VANILLA_RUN}" \
+  --epoch 1 \
+  --out "${METRICS_DIR}/cost_table_full.md" || true
+
+echo ""
+echo "==== 归一化开销：每条新任务行（唯一能和 replay@${REPLAY_SHARE} 并排读的口径）===="
+# 上面那张表的 ms/step 对 replay 是失真的：它每步只有 4 行新任务，同样的 ms/step
+# 意味着有用功只有一半。三种方法要达成的是同一件事——把 commonsense 学完；回放行
+# 和惩罚项都是为此付出的代价，不是产出。所以分母只能是新任务行数。
+python - "${METRICS_DIR}" "${VANILLA_RUN}" "${ONEREPLAY_RUN}" "${REPLAY_RUN}" \
+         "${REPLAY_SHARE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metrics_dir = Path(sys.argv[1])
+labels = [
+    ("vanilla", sys.argv[2]),
+    ("OneReplay", sys.argv[3]),
+    (f"replay@{sys.argv[5]}", sys.argv[4]),
+]
+
+
+def epoch1(run: str):
+    path = metrics_dir / f"{run}.jsonl"
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("record_type") == "epoch" and record.get("epoch") == 1:
+            return record
+    return None
+
+
+rows = []
+for label, run in labels:
+    record = epoch1(run)
+    if record is None:
+        print(f"缺 {label} 的 epoch-1 metrics（{run}.jsonl）")
+        continue
+    batch = record.get("batch_size") or 0
+    # 不做批级混合的 arm 上 replay_per_batch 是 0，这里就等于 batch_size
+    new_per_step = batch - (record.get("replay_per_batch") or 0)
+    steps = record.get("train_steps") or 0
+    seconds = record.get("train_sec") or 0.0
+    if new_per_step <= 0 or steps <= 0 or seconds <= 0.0:
+        print(f"跳过 {label}：metrics 不完整")
+        continue
+    new_rows = steps * new_per_step
+    rows.append(
+        {
+            "label": label,
+            "steps": steps,
+            "new_per_step": new_per_step,
+            "new_rows": new_rows,
+            "sec": seconds,
+            "ms_per_step": 1000.0 * seconds / steps,
+            "ms_per_row": 1000.0 * seconds / new_rows,
+            "peak": record.get("peak_memory_allocated_gb"),
+        }
+    )
+
+if not rows:
+    raise SystemExit(0)
+
+print(
+    f"{'arm':>12} {'steps':>8} {'new/step':>9} {'new rows':>9} {'epoch(s)':>9} "
+    f"{'ms/step':>8} {'ms/new row':>11} {'peak GiB':>9}"
+)
+for row in rows:
+    peak = f"{row['peak']:.2f}" if row["peak"] is not None else "—"
+    print(
+        f"{row['label']:>12} {row['steps']:>8} {row['new_per_step']:>9} "
+        f"{row['new_rows']:>9} {row['sec']:>9.1f} {row['ms_per_step']:>8.1f} "
+        f"{row['ms_per_row']:>11.3f} {peak:>9}"
+    )
+
+by_label = {row["label"]: row for row in rows}
+base = by_label.get("vanilla")
+if base is not None:
+    print()
+    for row in rows:
+        if row["label"] == "vanilla":
+            continue
+        overhead = 100.0 * (row["ms_per_row"] / base["ms_per_row"] - 1.0)
+        print(f"  {row['label']:<12} 比 vanilla 贵 {overhead:+.1f}%（按新任务行）")
+
+one = by_label.get("OneReplay")
+rep = next((row for row in rows if row["label"].startswith("replay@")), None)
+if one is not None and rep is not None:
+    ratio = rep["ms_per_row"] / one["ms_per_row"]
+    print()
+    if ratio >= 1.0:
+        print(f"  -> OneReplay 更便宜，{rep['label']} 是它的 {ratio:.2f} 倍")
+    else:
+        print(f"  -> {rep['label']} 更便宜，OneReplay 是它的 {1.0 / ratio:.2f} 倍")
+    print("     注意 new rows 两边应当基本相等（都约 168,712）；差得多说明步数没对齐，")
+    print("     这个比值就不成立。")
+
+print()
+print("这只是训练计算开销。replay 另有一次性的自蒸馏语料生成（约 39 min），OneReplay")
+print("另有一次性的采 C（full 档约 1h49min）和常驻的 C 显存，要不要计入取决于摊销到")
+print("多少次训练。效果侧的结论不在这张表里。")
+PY
+
+echo ""
+echo "metrics : ${METRICS_DIR}"
+echo "ckpt    : ${CKPT_DIR}"
+echo "Job finished at: $(date)"
