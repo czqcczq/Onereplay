@@ -338,19 +338,22 @@ def check_real_precision(args: argparse.Namespace) -> bool:
             weight_value = reference + deltas[name].to(device)
 
         grads = {}
-        weight = nn.Parameter(weight_value)
 
-        # fp64 reference. The .grad buffer has to be fp64 too, otherwise the
-        # accumulate step rounds the reference gradient back down to fp32 and the
-        # whole arm is pointless.
-        weight.grad = torch.zeros(weight.shape, device=device, dtype=torch.float64)
+        # fp64 reference. PyTorch requires .grad to share the parameter's dtype,
+        # and full_covariance_grad_ creates the buffer as zeros_like(weight), so
+        # the whole arm has to run on an fp64 parameter -- an fp32 weight with an
+        # fp64 grad is rejected outright, and even if it were not, the accumulate
+        # would round the reference gradient straight back down to fp32. Casting
+        # the fp32 inputs up to fp64 is exact, so this stays a faithful fp64
+        # evaluation of the same DeltaW the other two arms see.
+        weight_fp64 = nn.Parameter(weight_value.double())
         reg_total["fp64"] += full_covariance_grad_(
-            [(name, weight, covariance, reference)],
+            [(name, weight_fp64, covariance, reference)],
             scale=1.0,
             allow_tf32=False,
             compute_dtype=torch.float64,
         )
-        grads["fp64"] = weight.grad.clone()
+        grads["fp64"] = weight_fp64.grad.clone()
 
         # Arm A: fp32 + autograd, the expression full_covariance_regularizer
         # evaluates today. autograd's dR/dDelta is what the analytic path returns
@@ -361,15 +364,16 @@ def check_real_precision(args: argparse.Namespace) -> bool:
         grads["A"] = delta.grad.double()
         reg_total["A"] += float(reg_a)
 
-        # Arm B: TF32 + analytic, with an fp32 .grad buffer as in training.
-        weight.grad = torch.zeros(weight.shape, device=device, dtype=torch.float32)
+        # Arm B: TF32 + analytic, on an fp32 parameter so the .grad buffer it
+        # allocates is fp32, exactly as in training.
+        weight_fp32 = nn.Parameter(weight_value)
         reg_total["B"] += full_covariance_grad_(
-            [(name, weight, covariance, reference)],
+            [(name, weight_fp32, covariance, reference)],
             scale=1.0,
             allow_tf32=True,
             compute_dtype=torch.float32,
         )
-        grads["B"] = weight.grad.double()
+        grads["B"] = weight_fp32.grad.double()
 
         norm = grads["fp64"].norm()
         rel_a = float((grads["A"] - grads["fp64"]).norm() / norm)
@@ -381,7 +385,7 @@ def check_real_precision(args: argparse.Namespace) -> bool:
             f"       {name[:44]:<44} {float(norm):>10.3e} {rel_a:>11.3e} {rel_b:>11.3e} "
             f"{(rel_b / rel_a if rel_a > 0 else float('inf')):>7.2f}"
         )
-        del weight, delta, grads
+        del weight_fp64, weight_fp32, delta, grads
 
     divisor = len(names)
     print(
