@@ -51,7 +51,7 @@ Qwen3-1.7B + LoRA（r=8, α=16, `q_proj,v_proj`），新任务 Commonsense170k�
 | vanilla | `cs_vanilla_seed1` | 无 | 两线 |
 | cmix（if+math） | `cs_onereplay_ifmath_lam3e-2_seed1_regonce` | C_mix = 0.5·C_if + 0.5·C_math | 数学线 |
 | cif（纯 C_if） | `cs_onereplay_balanced_lam3e-2_seed1_regonce` | 仅 C_if | 代码线 |
-| cifcode（if+code） | `cs_onereplay_ifcode_lam3e-2_seed1_regonce` | C_mix = C_if + C_code（等权） | 代码线 |
+| cifcode（if+code） | `cs_onereplay_ifcode_lam3e-2_seed1_regonce` | C_mix = 0.5·C_if + 0.5·C_code | 代码线 |
 
 各 C 的来源：
 
@@ -60,10 +60,10 @@ Qwen3-1.7B + LoRA（r=8, α=16, `q_proj,v_proj`），新任务 Commonsense170k�
 | C_if | FLAN 20k | `cov_flan_chat_20k_qv.pt` |
 | C_math | MetaMath 自蒸馏 30k（按 `original_question` 去重、每题一个增广视角） | `cov_math_metamath30k_qv.pt` |
 | C_code | Magicoder OSS-Instruct 20k Python 自蒸馏 | `cov_code_magicoder20k_qv.pt` |
-| C_mix(if+math) | 等权线性混合 | `cov_if_math_..._mix_qv.pt` |
-| C_mix(if+code) | 等权线性混合 | `cov_if_code_magicoder20k_mix_qv.pt` |
+| C_mix(if+math) | 等权凸组合（0.5 / 0.5） | `cov_if_math_..._mix_qv.pt` |
+| C_mix(if+code) | 等权凸组合（0.5 / 0.5） | `cov_if_code_magicoder20k_mix_qv.pt` |
 
-混合走 `onereplay/mix_covariances.py` 做协方差层面的线性组合，**不是把两份语料混在一起重采**。
+混合走 `onereplay/mix_covariances.py` 做协方差层面的线性组合，**不是把两份语料混在一起重采**。两条线的权重都是 `W_IF=0.5` 加 `W_MATH`/`W_CODE=0.5` 且带 `--normalize_weights 1`（31 号 / 41 号作业），所以是**凸组合而非两个矩阵相加**：C_mix 的 trace 是两者的加权平均，λ=3e-2 与纯 C_if 的 run 同强度量级。
 
 C_code 池的构建（`prepare_magicoder_ccode.py`）：Magicoder OSS-Instruct-75K 过滤 Python、要求带 ``` 代码围栏、去重、对 HumanEval/MBPP 做 8-gram 重叠污染剔除、`max_prompt_tokens=1024`，随机抽 20k。自蒸馏用 `MAXLEN=2048 / MAX_NEW_TOKENS=1280`（100 条长度诊断确认截断率 0，target P99=1113、prompt+target max=1504）。
 

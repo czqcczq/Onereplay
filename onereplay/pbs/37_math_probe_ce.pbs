@@ -68,6 +68,7 @@
 #   只打分不重建语料:   SKIP_BUILD=1
 #   换模型集合:         MODELS="base vanilla cmix"
 #   加大 max_len:       MAX_LEN=4096（显存不够就把 PROBE_BATCH 降到 4）
+#   顺带出误差棒:       DO_BOOTSTRAP=1（默认关；也可评完在登录节点单独跑，见文末）
 #
 # 前置条件:
 #   1) ${RESULTS_ROOT}/{math500,gsm8k}/base/responses.jsonl（33/32 号评测产物）
@@ -211,7 +212,7 @@ VERIFY_AGG="${VERIFY_AGG:-1}"     # 1 = 顺带用 evaluate_probe 核对逐行求
 BOOT_REPS="${BOOT_REPS:-10000}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_SCORE="${SKIP_SCORE:-0}"
-DO_BOOTSTRAP="${DO_BOOTSTRAP:-1}"
+DO_BOOTSTRAP="${DO_BOOTSTRAP:-0}"    # 误差棒默认不跑，作业只出 CE 点估计；见文末
 PER_ROW_DIR="${PROBE_DIR}/per_row"
 
 cd "${REPO_ROOT}"
@@ -398,4 +399,13 @@ echo "========================================================================"
 echo "产物:"
 echo "  语料  : ${CORPUS_DIR}/probe_*.jsonl + manifest.json"
 echo "  分数  : ${SCORES}（每个 run 一行）"
+echo "  逐行  : ${PER_ROW_DIR}/<run>__<corpus>.jsonl（bootstrap 的输入，已落盘）"
+echo ""
+echo "本作业只出 CE 点估计（DO_BOOTSTRAP=0）。误差棒与 cif vs cmix 的配对差读的是上面"
+echo "的逐行文件，不上 GPU，纯 CPU 几十秒，在登录节点上补即可："
+echo "  python -m onereplay.scripts.bootstrap_probe_ce \\"
+echo "    --per_row_dir ${PER_ROW_DIR} --base base --vanilla ${VANILLA_RUN} \\"
+echo "    --compare ${IF_RUN},${MIX_RUN} \\"
+echo "    --out ${PROBE_DIR}/bootstrap.json"
+echo "要让本作业自己跑，投递前设 DO_BOOTSTRAP=1。"
 echo "Job finished at: $(date)"

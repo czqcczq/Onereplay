@@ -36,10 +36,11 @@
 #   —— 低于量程，测不出来（要 80% 功效需约 2100 题）。HumanEval 164 题更差。
 #   **所以真正的量具是 40 号那个代码 CE 探针**，本脚本训完后必须去跑它：
 #     qsub onereplay/pbs/40_code_probe_ce.pbs
-#   40 号的 MODELS 默认已含 cifcode，adapter 一就位就会自动带上，并在 bootstrap 里
-#   报 cif vs cifcode 的配对差与 p 值。
+#   40 号的 MODELS 默认已含 cifcode，adapter 一就位就会自动带上；cif vs cifcode 的
+#   配对差与 p 值由 bootstrap 给出（默认关，40 号文末有单独跑的命令）。
 #   本脚本的 pass@1 + 失败分桶是**佐证**：它能显示语法错误那一桶有没有被压回去，
-#   这是 CE 数字之外唯一能给出机制解释的东西。
+#   这是 CE 数字之外唯一能给出机制解释的东西。失败分桶默认也不在本作业里跑，
+#   它只读 responses.jsonl，评完在登录节点上补即可（见 DO_ANALYZE 与文末命令）。
 #
 # -----------------------------------------------------------------------------
 # !! 三个判分特性（都在 onereplay/eval/code_exec.py，与 39 号同）
@@ -57,6 +58,7 @@
 #     只评测:   DO_TRAIN=0
 #   也训纯 C_code 对照:  TRAIN_KINDS="code mix"
 #   只评新 run:          MODELS="cifcode"
+#   顺带出失败分桶:      DO_ANALYZE=1（默认关；也可评完在登录节点单独跑，见文末）
 #   补 IF 侧（确认没为了代码牺牲 IF）: WITH_IF=1 MODELS="cifcode"
 #   用 41 号 trace 建议的 λ: LAMBDA=2e-2（注意 run 名会随之改变）
 #   冒烟（每指标前 20 题，产物自动改道到 _limit20）: LIMIT=20
@@ -192,7 +194,7 @@ DO_TRAIN="${DO_TRAIN:-1}"
 DO_EVAL="${DO_EVAL:-1}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
-DO_ANALYZE="${DO_ANALYZE:-1}"
+DO_ANALYZE="${DO_ANALYZE:-0}"        # 后置分析默认不跑，作业只出 pass@1；见文末
 # 默认只训 mix：主张只需要 cif vs cifcode 这一组对照，纯 C_code 是可选控制。
 TRAIN_KINDS="${TRAIN_KINDS:-mix}"
 
@@ -458,8 +460,8 @@ PY
   echo "  1) **主量具不在这里。** pass@1 的量程不够测保护（MBPP 3.30pp vs 预期救回"
   echo "     2.28pp），训完必须跑 40 号代码 CE 探针，看 cifcode 把漂移倍数压回多少，"
   echo "     以及 bootstrap 里 cif vs cifcode 的配对差是否显著。"
-  echo "  2) 本脚本看失败分桶：vanilla 的语法错误是 base 的 21 倍（MBPP 2 -> 43 题），"
-  echo "     cifcode 若把这一桶压回接近 base，就是「保住了输出结构」的直接机制证据。"
+  echo "  2) 失败分桶要另跑（命令见下）：vanilla 的语法错误是 base 的 21 倍（MBPP 2 -> 43"
+  echo "     题），cifcode 若把这一桶压回接近 base，就是「保住了输出结构」的直接机制证据。"
   echo "     断言失败那一桶本来就持平，它继续持平是预期，不是发现。"
   echo "  3) 若开了 WITH_IF：确认 cifcode 的 IFEval 没比 cif 差 —— C_mix 的主张是"
   echo "     同时保住两边，为代码牺牲 IF 不算成功。"
@@ -468,6 +470,13 @@ PY
   echo ""
   echo "产物: ${OUT_DIR}/{humaneval,mbpp}/<run_name>/{summary.json,responses.jsonl}"
   echo "      ${OUT_DIR}/{humaneval,mbpp}_summary.csv（append，以 summary.json 为唯一真相）"
+  echo ""
+  echo "本作业只出 pass@1（DO_ANALYZE=0）。失败分桶 / 语法错误取证 / 配对 McNemar"
+  echo "读的是上面已落盘的 responses.jsonl，纯 CPU 几秒，在登录节点上补即可："
+  echo "  python -m onereplay.scripts.analyze_code_failures \\"
+  echo "    --results_root ${OUT_DIR} --metrics ${CODE_AVAIL// /,} \\"
+  echo "    --runs <run1,run2,...> --baseline base --inspect 5"
+  echo "要让本作业自己跑，投递前设 DO_ANALYZE=1。"
   set -x
 else
   echo "DO_EVAL=0：跳过评测"

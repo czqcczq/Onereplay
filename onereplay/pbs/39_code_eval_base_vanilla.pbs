@@ -35,8 +35,8 @@
 # 3) MBPP 的 split 默认是 validation（只有 90 题）。本脚本显式传 test（500 题），
 #    否则量程差三倍。
 #
-#   => 结论：pass@1 掉了不等于"不会写代码了"。所以评完会跑
-#      analyze_code_failures，按 error 字段把失败分桶：
+#   => 结论：pass@1 掉了不等于"不会写代码了"。要分辨这两件事，评完另跑
+#      analyze_code_failures（本作业默认不跑，见 DO_ANALYZE），按 error 字段分桶：
 #        语法错误暴涨、断言失败不变  => 又是格式崩溃，和 IFEval 同一件事
 #        断言失败占比上升            => 代码写得出来但是错的，才是能力退化
 #
@@ -54,6 +54,7 @@
 #     LIMIT>0 时输出自动改道到 ${OUT_DIR}_limit<N>，不会污染正式结果。
 #   只看配置:      DRY_RUN=1
 #   加评 cmix:     MODELS="base vanilla cmix"
+#   顺带出失败分桶: DO_ANALYZE=1（默认关；也可评完在登录节点单独跑，见文末）
 #
 # 预计耗时: (164+500) 题 × 2 个模型，512 token 预算，约 2-3 h。若 vanilla 退化成
 #   大段跑题会更慢。walltime 给 8 h。
@@ -170,7 +171,7 @@ TIMEOUT="${TIMEOUT:-10}"
 LIMIT="${LIMIT:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
-DO_ANALYZE="${DO_ANALYZE:-1}"
+DO_ANALYZE="${DO_ANALYZE:-0}"        # 后置分析默认不跑，作业只出 pass@1；见文末
 
 HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
 MBPP_DIR="${CODE_DATA_DIR}/mbpp_${MBPP_CONFIG}"
@@ -321,7 +322,7 @@ echo "========================================================================"
 echo "怎么读："
 echo "  1) vanilla 的 pass@1 相对 base 掉了多少、显不显著。HumanEval 只有 164 题，"
 echo "     只读得出十几个点以上的差异；MBPP test 500 题好一些。"
-echo "  2) **更要紧的是失败原因分布。** 语法错误占比暴涨而断言失败没怎么变，说明"
+echo "  2) **更要紧的是失败原因分布**（要另跑，命令见下）。语法错误占比暴涨而断言失败没怎么变，说明"
 echo "     模型是不肯好好输出代码了（和 GSM8K 丢 '####' 是同一件事），那 OneReplay"
 echo "     保住的又会是格式。断言失败占比上升才是代码能力真的退化。"
 echo "  3) 绝对分数会低于公开报告值（判分器有 import/open 黑名单，且会在第一个"
@@ -331,4 +332,11 @@ echo "有伤害可保护 => 再选 C_code 语料。选 prompt 风格贴近 Human
 echo "  （CodeAlpaca-20k / Magicoder OSS-Instruct），不建议 TACO（竞赛题面太长，"
 echo "  分布也不匹配，而且它的测试用例和解答在自蒸馏流程里根本用不上）。"
 echo "产物: ${OUT_DIR}/{humaneval,mbpp}/<run_name>/{summary.json,responses.jsonl}"
+echo ""
+echo "本作业只出 pass@1（DO_ANALYZE=0）。失败分桶与配对 McNemar 读的是上面已落盘的"
+echo "responses.jsonl，纯 CPU 几秒，在登录节点上补即可："
+echo "  python -m onereplay.scripts.analyze_code_failures \\"
+echo "    --results_root ${OUT_DIR} --metrics ${ALL_METRICS// /,} \\"
+echo "    --runs <run1,run2,...> --baseline base"
+echo "要让本作业自己跑，投递前设 DO_ANALYZE=1。"
 echo "Job finished at: $(date)"

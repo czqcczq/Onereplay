@@ -38,8 +38,8 @@
 #   3) 重建 ${RESULTS_ROOT}/gsm8k_summary.csv：从各 run 的 summary.json 全量重写，
 #      而不是 append。evaluate 每次都往 CSV 追加一行，重评会留下同名重复行且新旧
 #      预算混排；以 summary.json 为准重建可以一劳永逸。旧 CSV 会先备份。
-#   4) 后置：跑 diagnose_math_pairs 确认三个 run 的 token max 已经一致，并重新出
-#      McNemar 与增益来源分解。
+#   4) 后置（默认关，见 DO_DIAG）：跑 diagnose_math_pairs 确认三个 run 的 token max
+#      已经一致，并重新出 McNemar 与增益来源分解。文末给了单独跑的命令。
 #
 # -----------------------------------------------------------------------------
 # 用法（本站点不从 qsub 命令行传变量，要改就改下方默认值）:
@@ -48,6 +48,7 @@
 #   冒烟测试（每个 run 只评前 20 题，几分钟）:  LIMIT=20 DRY_RUN=0
 #   只看前置判断不动任何文件:                   DRY_RUN=1
 #   强制重评（跳过 needs-reeval 判据）:         FORCE_REEVAL=1
+#   顺带出配对检验与增益分解:                   DO_DIAG=1（默认关，见文末命令）
 #
 # 前置条件:
 #   1) ${REPO_ROOT}/datasets/math/gsm8k_test.jsonl（1319 行）
@@ -201,7 +202,7 @@ MODELS="${MODELS:-base vanilla}"
 CLUSTER_MIN="${CLUSTER_MIN:-3}"      # 顶到自身 max 的题数 >= 这个值才算发生过截断
 DRY_RUN="${DRY_RUN:-0}"              # 1 = 只做前置判断，不归档不评测
 FORCE_REEVAL="${FORCE_REEVAL:-0}"    # 1 = 跳过 needs-reeval 判据，无条件重评
-DO_DIAG="${DO_DIAG:-1}"              # 1 = 评完跑 diagnose_math_pairs
+DO_DIAG="${DO_DIAG:-0}"              # 1 = 评完跑 diagnose_math_pairs；默认关，见文末
 
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
@@ -446,6 +447,17 @@ echo "  新结果  : ${RESULTS_ROOT}/gsm8k/<run_name>/{summary.json,responses.js
 echo "  旧结果  : ${ARCHIVE_ROOT}/<run_name>/（cap=1792，保留不删）"
 echo "  汇总 CSV: ${RESULTS_ROOT}/gsm8k_summary.csv（已按 summary.json 全量重建）"
 echo "  CSV 备份: ${RESULTS_ROOT}/gsm8k_summary.csv.bak"
+echo ""
+echo "本作业只做补评（DO_DIAG=0）。抽取健康度、配对检验与增益来源分解读的是上面已落盘"
+echo "的 responses.jsonl，不上 GPU，在登录节点上补即可："
+echo "  # 诊断 A：以 base 为基准，验收看这个"
+echo "  python -m onereplay.scripts.diagnose_math_pairs \\"
+echo "    --results_root ${RESULTS_ROOT} --metrics gsm8k \\"
+echo "    --runs base,<vanilla_run>,${CMIX_RUN} --baseline base \\"
+echo "    --cap ${MATH_MAX_NEW_TOKENS} --model_path ${MODEL_DIR}/${MODEL_NAME}"
+echo "  # 诊断 B：以 vanilla 为基准，增益来源分解看这个"
+echo "  同上，--runs <vanilla_run>,${CMIX_RUN} --baseline <vanilla_run>"
+echo "要让本作业自己跑，投递前设 DO_DIAG=1。"
 echo ""
 echo "验收标准：诊断 A 的「抽取健康度」里三个 run 的 token max 应当全部是"
 echo "${MATH_MAX_NEW_TOKENS}，且不再出现 '各 run 的 token max 不一致' 的警告。"

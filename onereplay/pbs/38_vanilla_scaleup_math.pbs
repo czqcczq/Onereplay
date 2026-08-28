@@ -215,7 +215,7 @@ fi
 
 DO_TRAIN="${DO_TRAIN:-1}"
 DO_EVAL="${DO_EVAL:-1}"
-DO_DIAG="${DO_DIAG:-1}"
+DO_DIAG="${DO_DIAG:-0}"              # 后置诊断默认不跑，作业只出准确率；见文末
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -318,6 +318,13 @@ fi
 
 set +x
 echo "========================================================================"
+echo "本作业只出准确率（DO_DIAG=0）。下面要看的诊断量读的是已落盘的 responses.jsonl，"
+echo "不上 GPU，在登录节点上补即可（要让本作业自己跑，投递前设 DO_DIAG=1）："
+echo "  python -m onereplay.scripts.diagnose_math_pairs \\"
+echo "    --results_root ${OUT_DIR} --metrics ${ALL_METRICS// /,} \\"
+echo "    --runs base,cs_vanilla_seed${SEED},${RUN} --baseline base \\"
+echo "    --cap ${MATH_MAX_NEW_TOKENS} --model_path ${MODEL_DIR}/${MODEL_NAME}"
+echo ""
 echo "怎么下结论 —— 看诊断里 ${RUN} 相对 base 的 Δacc 与 p:"
 echo "  GSM8K   遗忘 >= 8pp  且显著 => 这条路走得通"
 echo "  MATH-500 遗忘 >= 10pp 且显著 => 同上"
