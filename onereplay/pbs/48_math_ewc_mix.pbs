@@ -1,0 +1,735 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_ewcmix
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 数学线的 EWC 基线（F_mix 混合 + λ 扫描 + 评测）
+#   旧知识 = F_if(FLAN gold) + F_math(MetaMath 自蒸馏)，两个变体只差「怎么混」这一个变量：
+#
+#     variant equal : --equalize mean  -> if:math ≈ 0.21:0.79，两域等 Fisher 质量贡献
+#     variant half  : --weights 0.5,0.5 -> 原始等系数，if 按 3.78x 主导（= replay0.5 的类比）
+#
+#   与 45 号（replay@0.5）逐字共用评测口径；与 23/47 号（EWC IF 线）逐字共用训练超参，
+#   唯一区别是 --fisher_path 指向本作业构造的 F_mix，而不是单域的 F_if。
+#
+# -----------------------------------------------------------------------------
+# 为什么是两个变体，而不是随手取 0.5/0.5
+#   F 是 sequence-summed 分数，域间天然差一个尺度：实测 mean(F_if)=9.98e-2、
+#   mean(F_math)=2.64e-2，if 大 3.78x（08-29 inspect_fisher，逐层诊断证实这个比值
+#   在主体各层稳定，尾部几个 q_proj 层是 F 尖峰导致的失衡）。于是：
+#     half  = 直接 0.5·F_if + 0.5·F_math，罚项里 if 拿 3.78x 的份额，和 replay 的
+#             原始等系数混合是同一件事，作为「不做尺度归一」的对照臂。
+#     equal = 各自除以自己的 mean 再 0.5/0.5（等价 1/mean 归一权重 0.21/0.79），
+#             两域在罚项里等量贡献。mix_fishers.py --equalize mean 在运行时读两个
+#             文件的 mean 现算权重，换了重采的 F 会自动更新，不会像硬编码 0.21 那样过期。
+#   两版都跑，最后按结果挑。
+#
+# 【λ 网格必须重新探，别直接拿 IF 线的点当定论】
+#   F_mix 两版 mean 与 F_if 同数量级（equal≈0.042 / half≈0.063 vs 0.0998），所以
+#   23 号围着 3e2 铺的网格（1e2…1e4）大体适用，只是最优点会因 mean 变小而略右移。
+#   两版 mean 不同（half 比 equal 大 1.5x），所以同一个 λ 下两版罚项强度差 1.5x——
+#   不要为此强行对齐幅度（那会改变语义），而是两版共用一个 λ 网格、各自取最优点比。
+#   目标同 23 号：让 λ·R 在训练中期占 task_loss（约 1.1）的 1%–10%。
+#
+#   整组是 2 变体 × |LAMBDAS| × 约 5.7 h，很容易超 24 h。所以：
+#     1) 先探针，只看罚项量级，不保存不评测（每变体几分钟）：
+#          qsub -v PROBE=1 onereplay/pbs/48_math_ewc_mix.pbs
+#        PROBE 等价 SAVE=0 MAX_STEPS=300 DO_EVAL=0，且只取 LAMBDAS 里最小的一档
+#        （λ 给大了 ΔW 被压住、R 跟着变小，会误判成"还要再加大"）。
+#     2) 按探到的中心值改 LAMBDAS，正式整组投；已存在的 adapter 会跳过，超时后原样
+#        再投即续跑。卡时紧就拆投：VARIANTS=equal 先跑一版，或 DO_EVAL=0 先训后评。
+#
+# -----------------------------------------------------------------------------
+# 结果怎么读（照抄 23 号的告诫）
+#   EWC-LoRA (arXiv 2602.17559) 实测 precomputed 固定 Fisher 塑性最低——EWC 很可能
+#   不是"retention 更好"，而是"新任务学不动"。所以别各挑一个 λ 报点，要在相同
+#   commonsense val_loss 处比 math500/gsm8k（和 IF）。训练自检会把 val_loss 和
+#   vanilla 基线比一下并提示。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) ${FISHER_IF}   = results/fisher/fisher_flan_chat_20k_qv.pt      （47 号产物）
+#   2) ${FISHER_MATH} = results/fisher/fisher_math_metamath30k_qv.pt   （46 号产物）
+#   3) ${CS_DATASET}  = datasets/commonsense_170k_hf                   （训练集）
+#   4) 数学评测数据 ${MATH_DATA_DIR}/{math500,gsm8k}_test.jsonl
+#   5) mkdir -p /scratch/weiliu87/logs/onereplay   # qsub 之前必须存在，且在仓库外
+#
+# 用法
+#   qsub -v PROBE=1 onereplay/pbs/48_math_ewc_mix.pbs            # 探针：两版各最小 λ 跑 300 步看罚项
+#   qsub onereplay/pbs/48_math_ewc_mix.pbs                       # 两版 × 全 grid 训练 + 评测
+#   qsub -v VARIANTS=equal onereplay/pbs/48_math_ewc_mix.pbs     # 只跑等贡献版
+#   qsub -v LAMBDAS="3e2 1e3" onereplay/pbs/48_math_ewc_mix.pbs  # 自定网格
+#   qsub -v DO_EVAL=0 onereplay/pbs/48_math_ewc_mix.pbs          # 只训练
+#   qsub -v DO_TRAIN=0 onereplay/pbs/48_math_ewc_mix.pbs         # F_mix 已就位、adapter 已训，只评测
+#   qsub -v FORCE_MIX=1 onereplay/pbs/48_math_ewc_mix.pbs        # 强制重建 F_mix
+#   qsub -v WITH_IF=1 onereplay/pbs/48_math_ewc_mix.pbs          # 顺带评 IF/CS 侧
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/48_math_ewc_mix.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR DATASET_CACHE
+    FISHER_IF FISHER_MATH FISHER_MIX_EQUAL FISHER_MIX_HALF IF_COV MATH_COV
+    DO_MIX FORCE_MIX DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL
+    VARIANTS LAMBDAS PROBE SAVE MAX_STEPS PROFILE VANILLA_VAL_LOSS
+    SEED EPOCHS LR BATCH ACCUM EVAL_BATCH MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    RUN_PREFIX MODELS EXTRA_MODELS
+    MATH500_FILE GSM8K_FILE AMC_FILE AIME_FILE WITH_AMC_AIME
+    MATH_MAX_NEW_TOKENS LIMIT DIAG_LEN
+    WITH_IF IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的混合 + 训练 + 评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 单域 F 输入与 F_mix 输出 ----
+FISHER_IF="${FISHER_IF:-${RESULTS_ROOT}/fisher/fisher_flan_chat_20k_qv.pt}"
+FISHER_MATH="${FISHER_MATH:-${RESULTS_ROOT}/fisher/fisher_math_metamath30k_qv.pt}"
+FISHER_MIX_EQUAL="${FISHER_MIX_EQUAL:-${RESULTS_ROOT}/fisher/fisher_mix_equal_qv.pt}"
+FISHER_MIX_HALF="${FISHER_MIX_HALF:-${RESULTS_ROOT}/fisher/fisher_mix_half_qv.pt}"
+# 可选：对应的协方差，仅用于打印/核对 F_mix 的源池是否与 C 同批（不硬拦）。
+IF_COV="${IF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+MATH_COV="${MATH_COV:-${RESULTS_ROOT}/cov/cov_math_metamath30k_qv.pt}"
+
+# ---- 阶段开关 ----
+DO_MIX="${DO_MIX:-1}"
+FORCE_MIX="${FORCE_MIX:-0}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+
+# ---- 变体与 λ 网格 ----
+VARIANTS="${VARIANTS:-equal half}"
+LAMBDAS="${LAMBDAS:-3e2 1e3 3e3}"
+
+# ---- 探针短跑：只看罚项量级，不保存不评测 ----
+PROBE="${PROBE:-0}"
+SAVE="${SAVE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"
+PROFILE="${PROFILE:-0}"
+VANILLA_VAL_LOSS="${VANILLA_VAL_LOSS:-}"
+if [[ "${PROBE}" == "1" ]]; then
+  SAVE=0
+  MAX_STEPS="${MAX_STEPS:-0}"; [[ "${MAX_STEPS}" == "0" ]] && MAX_STEPS=300
+  DO_EVAL=0
+  # 探针只取网格里最小的一档：λ 给大了 R 反而变小，会误判方向。
+  LAMBDAS="$(printf '%s\n' ${LAMBDAS} | sort -g | head -n 1)"
+  echo "PROBE=1：SAVE=0 MAX_STEPS=${MAX_STEPS} DO_EVAL=0，LAMBDAS 收窄为最小档 ${LAMBDAS}"
+fi
+
+# ---- 训练超参：与 23/47 号逐字相同，唯一变量是 --fisher_path 与 λ ----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+# BATCH 是 micro-batch，ACCUM 是「每次更新的总行数」。EWC 没有回放占位，每次更新的
+# 新任务行数就等于 ACCUM=64，与 23/47 号一致。BATCH=16 只是把它拆成更少的 micro-batch
+# 提高 H200 利用率，不改每次更新的行数；要复现旧 run 就保持 8。
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+EVAL_BATCH="${EVAL_BATCH:-8}"   # 钉住，否则 val_loss 与 32/45 号不可比
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+RUN_PREFIX="${RUN_PREFIX:-cs_ewcmix}"
+
+# ---- 评测（与 45 号同口径）----
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+AMC_FILE="${AMC_FILE:-${MATH_DATA_DIR}/amc_test.jsonl}"
+AIME_FILE="${AIME_FILE:-${MATH_DATA_DIR}/aime_test.jsonl}"
+WITH_AMC_AIME="${WITH_AMC_AIME:-0}"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"   # 必须与 32/45 号同值才可比
+LIMIT="${LIMIT:-0}"
+DIAG_LEN="${DIAG_LEN:-1}"
+
+WITH_IF="${WITH_IF:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+
+MODELS="${MODELS:-}"
+EXTRA_MODELS="${EXTRA_MODELS:-}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+grep -q "regularizer" onereplay/scripts/train.py || {
+  echo "train.py 里没有 --regularizer，代码没同步到最新"; exit 1
+}
+if (( ACCUM % BATCH != 0 )); then
+  echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"; exit 1
+fi
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${RESULTS_ROOT}/fisher" "${DATASET_CACHE}"
+
+# ---- variant -> F_mix 路径 / 混合模式 / run 名 ----
+variant_fisher () {
+  case "$1" in
+    equal) echo "${FISHER_MIX_EQUAL}" ;;
+    half)  echo "${FISHER_MIX_HALF}" ;;
+    *)     echo "" ;;
+  esac
+}
+variant_mix_args () {
+  case "$1" in
+    equal) echo "--equalize mean" ;;
+    half)  echo "--weights 0.5,0.5" ;;
+    *)     echo "" ;;
+  esac
+}
+run_name () {
+  # $1=variant $2=lambda
+  echo "${RUN_PREFIX}_$1_lam$2_seed${SEED}"
+}
+
+echo "VARIANTS=[${VARIANTS}]  LAMBDAS=[${LAMBDAS}]  SEED=${SEED}"
+echo "BATCH=${BATCH} ACCUM=${ACCUM}(行/更新) MAXLEN=${MAXLEN} EVAL_BATCH=${EVAL_BATCH}"
+echo "F_if   = ${FISHER_IF}"
+echo "F_math = ${FISHER_MATH}"
+for v in ${VARIANTS}; do
+  [[ -n "$(variant_fisher "${v}")" ]] || { echo "未知 VARIANT=${v}，可选 equal / half"; exit 1; }
+  echo "  variant ${v}: mix_args='$(variant_mix_args "${v}")' -> $(variant_fisher "${v}")"
+done
+
+# ===========================================================================
+# Step A: 构造 F_mix（两个变体各一份），并逐份自检
+#   自检不走 inspect_fisher 完整模式：mix 产物没有 length_weighting 元数据（那是
+#   采集阶段的估计诊断），只有 fisher_scale。改为直接读 metadata 校验混合语义：
+#     equal -> mode=equalize:mean 且两域 contribution 相等
+#     half  -> mode=explicit 且 weights=[0.5,0.5]
+# ===========================================================================
+if [[ "${DO_MIX}" == "1" ]]; then
+  [[ -f "${FISHER_IF}" ]]   || { echo "缺 F_if: ${FISHER_IF}（47 号产物）"; exit 1; }
+  [[ -f "${FISHER_MATH}" ]] || { echo "缺 F_math: ${FISHER_MATH}（46 号产物）"; exit 1; }
+
+  for v in ${VARIANTS}; do
+    fmix="$(variant_fisher "${v}")"
+    if [[ "${FORCE_MIX}" != "1" && -f "${fmix}" ]]; then
+      echo "跳过混合 ${v}：${fmix} 已存在（FORCE_MIX=1 可强制重建）"
+    else
+      echo "==== Step A: mix ${v} -> ${fmix} ===="
+      # shellcheck disable=SC2046
+      python -m onereplay.mix_fishers \
+        --inputs "${FISHER_IF},${FISHER_MATH}" \
+        $(variant_mix_args "${v}") \
+        --output_path "${fmix}"
+    fi
+
+    echo "==== Step A 自检: ${v} ===="
+    python - "${fmix}" "${v}" "${IF_COV}" "${MATH_COV}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+fmix_path, variant, if_cov, math_cov = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+payload = torch.load(fmix_path, map_location="cpu")
+meta = payload.get("metadata", {})
+
+if meta.get("type") != "weighted_fisher_mix":
+    raise SystemExit(f"{fmix_path} 不是 mix_fishers 产物 (type={meta.get('type')!r})")
+
+weights = meta.get("weights", [])
+means = meta.get("input_means", [])
+contrib = meta.get("input_contributions", [])
+scale = meta.get("fisher_scale", {})
+src_fp = meta.get("source_pool_fingerprints", [])
+print(f"variant          = {variant}")
+print(f"mode             = {meta.get('mode')}")
+print(f"inputs           = {meta.get('inputs')}")
+print(f"weights          = {weights}")
+print(f"input_means      = {means}")
+print(f"contributions    = {contrib}  (w_i * mean_i)")
+print(f"mix mean/max     = {scale.get('mean'):.6e} / {scale.get('max'):.6e}")
+print(f"source pool fps  = {src_fp}")
+
+failures = []
+if len(contrib) != 2:
+    failures.append(f"期望 2 个输入域，实得 {len(contrib)}")
+if variant == "equal":
+    if meta.get("mode") != "equalize:mean":
+        failures.append(f"equal 版 mode 应为 equalize:mean，实得 {meta.get('mode')!r}")
+    # 等贡献：两域 w_i*mean_i 应相等（浮点级）。
+    if len(contrib) == 2:
+        rel = abs(contrib[0] - contrib[1]) / max(abs(contrib[0]), 1e-12)
+        print(f"contribution 相对差 = {rel:.3e}（equal 版应 ~0）")
+        if rel > 1e-6:
+            failures.append(f"equal 版两域贡献不相等，相对差 {rel:.3e}")
+elif variant == "half":
+    if meta.get("mode") != "explicit":
+        failures.append(f"half 版 mode 应为 explicit，实得 {meta.get('mode')!r}")
+    if [round(w, 6) for w in weights] != [0.5, 0.5]:
+        failures.append(f"half 版 weights 应为 [0.5,0.5]，实得 {weights}")
+    # 原始等系数下贡献比应约等于 mean 比（if 主导）。
+    if len(contrib) == 2 and contrib[1]:
+        print(f"contribution 比 if/math = {contrib[0] / contrib[1]:.3f}（half 版应≈mean 比）")
+
+# 源池指纹：仅提示，不硬拦。F_mix 的两个源应分别与 C_if / C_math 同池，
+# 否则 EWC(F_mix) 与 OneReplay(C_mix) 的对比会被数据差异污染。
+def cov_fp(path):
+    if not Path(path).is_file():
+        return None
+    return torch.load(path, map_location="cpu").get("metadata", {}).get("pool_fingerprint")
+
+for label, cov_path, fp in [("C_if", if_cov, src_fp[0] if src_fp else None),
+                            ("C_math", math_cov, src_fp[1] if len(src_fp) > 1 else None)]:
+    cfp = cov_fp(cov_path)
+    if cfp is None:
+        print(f"提示: 找不到 {label}（{cov_path}）或其 metadata 无 pool_fingerprint，跳过源池核对")
+    elif fp is None:
+        print(f"提示: F_mix 未记录该源的 pool_fingerprint，跳过 {label} 核对")
+    elif cfp == fp:
+        print(f"OK: F_mix 的源与 {label} 同池 {fp}")
+    else:
+        print(f"警告: F_mix 源池与 {label} 不同 (F={fp} vs {label}={cfp})，"
+              "EWC(F_mix) 与 OneReplay(C_mix) 对比会被数据差异污染")
+
+if failures:
+    print("\nStep A 自检失败:")
+    for item in failures:
+        print(f"  - {item}")
+    raise SystemExit(1)
+print("\nStep A 自检通过")
+PY
+  done
+else
+  echo "DO_MIX=0：跳过混合，直接用已有 F_mix"
+  for v in ${VARIANTS}; do
+    fmix="$(variant_fisher "${v}")"
+    [[ -f "${fmix}" ]] || { echo "缺 ${v} 的 F_mix: ${fmix}（DO_MIX=0 时必须已存在）"; exit 1; }
+  done
+fi
+
+# ===========================================================================
+# 训练：每个 variant × 每个 λ 一份 EWC adapter
+#   罚项 R = (1/L) Σ_l Σ_ij F_l,ij (ΔW_l,ij)²；唯一变量是 --fisher_path 指向哪份
+#   F_mix 以及 λ。其余超参逐字照抄 23/47 号。
+# ===========================================================================
+check_train () {
+  # $1=metrics $2=lambda $3=fmix $4=accum
+  python - "$1" "$2" "$3" "$4" "${VANILLA_VAL_LOSS}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+want_lambda = float(sys.argv[2])
+want_penalty_path = sys.argv[3]
+want_rows_per_update = int(sys.argv[4])
+vanilla_val = sys.argv[5]
+with open(path, encoding="utf-8") as handle:
+    records = [json.loads(line) for line in handle if line.strip()]
+if not records:
+    raise SystemExit(f"{path} 是空的，训练没有写出任何一条 metrics")
+last = records[-1]
+
+reg = last.get("train_replay_reg") or 0.0
+lambda_reg = last.get("train_lambda_reg") or 0.0
+task_loss = last.get("train_task_loss") or 0.0
+share = lambda_reg / task_loss if task_loss else 0.0
+
+print(f"regularizer      = {last.get('regularizer')}")
+print(f"replay_lambda    = {last.get('replay_lambda')} (want {want_lambda})")
+print(f"penalty_path     = {last.get('penalty_path')}")
+print(f"batch/accum      = {last.get('batch_size')} / {last.get('accumulation_size')} (行/更新)")
+print(f"train_replay_reg = {reg:.6e}")
+print(f"lambda * reg     = {lambda_reg:.6e}  ({share:.2%} of task_loss {task_loss:.4f})")
+print(f"val_loss         = {last.get('val_loss')}")
+
+failures = []
+if last.get("regularizer") != "ewc":
+    failures.append(f"regularizer={last.get('regularizer')!r}，应为 'ewc'，这次 run 白跑")
+if float(last.get("replay_lambda") or 0) != want_lambda:
+    failures.append(f"replay_lambda={last.get('replay_lambda')}，应为 {want_lambda}")
+# 「这份 adapter 确实用的是本 variant 的 F_mix」的直接证据。
+got_penalty = last.get("penalty_path")
+if got_penalty is None:
+    print("提示: metrics 里没有 penalty_path（train.py 版本较旧），跳过这一项")
+elif got_penalty != want_penalty_path:
+    failures.append(f"penalty_path={got_penalty!r}，应为 {want_penalty_path!r}")
+rows_per_update = last.get("accumulation_size")
+if rows_per_update is not None and int(rows_per_update) != want_rows_per_update:
+    failures.append(
+        f"accumulation_size={rows_per_update}，应为 {want_rows_per_update}，与 23/47 号不可比"
+    )
+if reg == 0.0:
+    failures.append(
+        "罚项恒为 0：Fisher 的层名一个都没匹配上 LoRA 模块，或 F 文件本身是空的。"
+        " 看训练日志 'regularizer covers N layers' 是不是 0，这个 checkpoint 实际是 vanilla。"
+    )
+
+if share and share < 1e-3:
+    print(f"提示: 罚项只占 task_loss 的 {share:.3%}，这一档基本等于 vanilla，λ 偏小")
+elif share > 0.5:
+    print(f"提示: 罚项占 task_loss 的 {share:.1%}，新任务很可能学不动了，λ 偏大")
+
+if vanilla_val:
+    gap = (last.get("val_loss") or 0.0) - float(vanilla_val)
+    print(f"val_loss 相对 vanilla({vanilla_val}) 的差值 = {gap:+.4f}")
+    if gap > 0.05:
+        print(
+            "提示: 新任务明显学得更差，符合 EWC-LoRA(2602.17559) 的固定 Fisher 塑性偏低。"
+            "写结论要按等 val_loss 比 math500/gsm8k，不能直接说 EWC retention 更好。"
+        )
+
+if failures:
+    print("\n训练自检失败:")
+    for item in failures:
+        print(f"  - {item}")
+    raise SystemExit(1)
+print("\n训练自检通过")
+PY
+}
+
+train_one () {
+  # $1=variant $2=lambda
+  local variant=$1 lam=$2
+  local fmix run
+  fmix="$(variant_fisher "${variant}")"
+  run="$(run_name "${variant}" "${lam}")"
+
+  if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${ADAPTERS}/${run}" ]]; then
+    echo "跳过训练 ${run}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+    return 0
+  fi
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+
+  echo "==== train ${variant} λ=${lam}: ${run} (F=${fmix}) ===="
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --profile "${PROFILE}" --max_steps "${MAX_STEPS}" \
+    --regularizer ewc --fisher_path "${fmix}" \
+    --replay_lambda "${lam}" \
+    --save "${SAVE}" --save_path "${ADAPTERS}/${run}" \
+    --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
+
+  echo "==== 训练自检: ${run} ===="
+  check_train "${RESULTS_ROOT}/metrics/${run}.jsonl" "${lam}" "${fmix}" "${ACCUM}"
+}
+
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  for v in ${VARIANTS}; do
+    for lam in ${LAMBDAS}; do
+      train_one "${v}" "${lam}"
+    done
+  done
+else
+  echo "DO_TRAIN=0：跳过训练"
+fi
+
+if [[ "${SAVE}" != "1" ]]; then
+  echo "SAVE=0（探针短跑）：不评测。看上面每档的 'lambda * reg' 占 task_loss 的比例，"
+  echo "  目标 1%–10%，据此定 LAMBDAS 再正式投。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# 评测：math500 + gsm8k（+ 可选 amc/aime、IF/CS 侧），与 45 号同口径
+#   已有 summary.json 的 (指标, run) 直接跳过：省卡时，也防止 *_summary.csv 追加重复行。
+# ===========================================================================
+EVAL_SPECS=""
+append_spec () {
+  if [[ -z "${EVAL_SPECS}" ]]; then EVAL_SPECS="$1"; else EVAL_SPECS="${EVAL_SPECS}|$1"; fi
+}
+if [[ -n "${MODELS}" ]]; then
+  for m in ${MODELS}; do append_spec "${m};${ADAPTERS}/${m}"; done
+else
+  for v in ${VARIANTS}; do
+    for lam in ${LAMBDAS}; do
+      run="$(run_name "${v}" "${lam}")"
+      append_spec "${run};${ADAPTERS}/${run}"
+    done
+  done
+fi
+if [[ -n "${EXTRA_MODELS}" ]]; then
+  IFS='|' read -ra extra <<< "${EXTRA_MODELS}"
+  for spec in "${extra[@]}"; do append_spec "${spec}"; done
+fi
+
+pending_metrics () {
+  local name=$1; shift
+  local out="" m
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${name}" >&2
+      continue
+    fi
+    out="${out},${m}"
+  done
+  echo "${out#,}"
+}
+
+eval_one () {
+  local name=$1 adapter=$2
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    echo "跳过评测 ${name}：缺 adapter ${adapter}"
+    return 0
+  fi
+
+  if [[ -n "${MATH_AVAIL}" ]]; then
+    local mp
+    # shellcheck disable=SC2086
+    mp="$(pending_metrics "${name}" ${MATH_AVAIL})"
+    if [[ -n "${mp}" ]]; then
+      echo "==== eval math: ${name} (${mp}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${mp}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" --limit "${LIMIT}" \
+        --math500_data_path "${MATH500_FILE}" \
+        --gsm8k_data_path "${GSM8K_FILE}" \
+        --amc_data_path "${AMC_FILE}" \
+        --aime_data_path "${AIME_FILE}"
+    else
+      echo "跳过数学评测 ${name}：所有数学指标都已有结果"
+    fi
+  fi
+
+  if [[ "${WITH_IF}" == "1" && -n "${IF_AVAIL}" ]]; then
+    local ip
+    # shellcheck disable=SC2086
+    ip="$(pending_metrics "${name}" ${IF_AVAIL})"
+    if [[ -n "${ip}" ]]; then
+      echo "==== eval IF/CS: ${name} (${ip}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${ip}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --dataset_path "${CS_DATASET}" \
+        --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_ewcmix_seed${SEED}" \
+        --ifeval_input "${IFEVAL_INPUT}" \
+        --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+        --multiif_limit "${MULTIIF_LIMIT}"
+    else
+      echo "跳过 IF/CS 评测 ${name}：所有 IF/CS 指标都已有结果"
+    fi
+  fi
+}
+
+if [[ "${DO_EVAL}" == "1" ]]; then
+  mkdir -p "${RESULTS_ROOT}/map_cache/eval_ewcmix_seed${SEED}"
+  MATH_AVAIL=""
+  if [[ -f "${MATH500_FILE}" ]]; then MATH_AVAIL="${MATH_AVAIL} math500"; else echo "跳过 math500：缺 ${MATH500_FILE}"; fi
+  if [[ -f "${GSM8K_FILE}"  ]]; then MATH_AVAIL="${MATH_AVAIL} gsm8k";   else echo "跳过 gsm8k：缺 ${GSM8K_FILE}"; fi
+  if [[ "${WITH_AMC_AIME}" == "1" ]]; then
+    if [[ -f "${AMC_FILE}"  ]]; then MATH_AVAIL="${MATH_AVAIL} amc";  else echo "跳过 amc：缺 ${AMC_FILE}"; fi
+    if [[ -f "${AIME_FILE}" ]]; then MATH_AVAIL="${MATH_AVAIL} aime"; else echo "跳过 aime：缺 ${AIME_FILE}"; fi
+  fi
+  MATH_AVAIL="${MATH_AVAIL# }"
+
+  IF_AVAIL=""
+  if [[ "${WITH_IF}" == "1" ]]; then
+    IF_AVAIL="ifeval commonsense"
+    if [[ -f "${MULTIIF_INPUT}" ]]; then IF_AVAIL="${IF_AVAIL} multiif"; else echo "跳过 multiif：缺 ${MULTIIF_INPUT}"; fi
+  fi
+
+  if [[ -z "${MATH_AVAIL}" && -z "${IF_AVAIL}" ]]; then
+    echo "没有任何可评测指标（数学数据文件都不在，且未开 WITH_IF）"; exit 1
+  fi
+  echo "MATH_AVAIL=[${MATH_AVAIL}]  IF_AVAIL=[${IF_AVAIL}]"
+
+  EVAL_NAMES=()
+  IFS='|' read -ra specs <<< "${EVAL_SPECS}"
+  for spec in "${specs[@]}"; do
+    name="${spec%%;*}"
+    adapter="${spec#*;}"
+    eval_one "${name}" "${adapter}"
+    EVAL_NAMES+=("${name}")
+  done
+
+  # -------------------------------------------------------------------------
+  # 长度/截断诊断：用 responses.jsonl 反查 MATH_MAX_NEW_TOKENS 够不够
+  # -------------------------------------------------------------------------
+  length_diagnostic () {
+    python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, cap, paths = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+print(f"==== response length / truncation diagnostic (cap={cap}) ====")
+for path in paths:
+    file = Path(path)
+    if not file.is_file():
+        continue
+    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+    if not rows:
+        continue
+    lengths = sorted(
+        len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+        for row in rows
+    )
+    missing = sum(row.get("prediction") in (None, "") for row in rows)
+    hit_cap = sum(length >= cap - 8 for length in lengths)
+    label = f"{file.parent.parent.name}/{file.parent.name}"
+    print(
+        f"{label:>52}: n={len(rows)} "
+        f"no-answer={missing} ({missing / len(rows):.1%}) "
+        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
+    )
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则提高 MATH_MAX_NEW_TOKENS 后重评。")
+PY
+  }
+
+  if [[ "${DIAG_LEN}" == "1" && -n "${MATH_AVAIL}" ]]; then
+    DIAG_FILES=()
+    for m in ${MATH_AVAIL}; do
+      for name in "${EVAL_NAMES[@]}"; do
+        DIAG_FILES+=("${RESULTS_ROOT}/${m}/${name}/responses.jsonl")
+      done
+    done
+    if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
+      length_diagnostic "${DIAG_FILES[@]}"
+    fi
+  fi
+
+  set +x
+  echo "========================================================================"
+  echo "评测产物（每个 run 一行，append 进同名 CSV，可直接并排比）:"
+  for m in ${MATH_AVAIL}; do
+    echo "  ${m}: ${RESULTS_ROOT}/${m}_summary.csv"
+  done
+  if [[ "${WITH_IF}" == "1" ]]; then
+    for m in ${IF_AVAIL}; do
+      echo "  ${m}: ${RESULTS_ROOT}/${m}_summary.csv"
+    done
+  fi
+  echo "逐题输出: ${RESULTS_ROOT}/<metric>/<run_name>/responses.jsonl"
+  echo "本次评测 run: ${EVAL_NAMES[*]}"
+  echo "对照: 45 号的 replay@0.5、32/33 号的 vanilla/C_mix 是同一套口径，可直接并排读。"
+  echo "读法: 按等 commonsense val_loss 比 math500/gsm8k，equal vs half 各取最优 λ。"
+  set -x
+else
+  echo "DO_EVAL=0：跳过评测"
+fi
+
+set +x
+echo "Job finished at: $(date)"
