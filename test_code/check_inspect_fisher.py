@@ -233,6 +233,73 @@ def main() -> None:
     assert "scale comparison skipped" in result.stdout, result.stdout
     print("  absent --reference degrades to a skip, not a crash")
 
+    # ---- per-layer diagnostic (compare_layers) ----
+    # Build two Fishers with known per-layer masses so the global ratio and the
+    # spread are checkable by hand rather than trusted.
+    def multilayer(masses: dict[str, float]) -> dict:
+        payload = fisher_payload(sum(masses.values()) / len(masses), 100.0, 2048, "left", 0, 0.5,
+                                 1000)
+        # One 1x1 matrix per layer whose single entry is that layer's mass, so
+        # sum == the number we put in and the ratio is exact.
+        payload["fishers"] = {name: torch.tensor([[mass]]) for name, mass in masses.items()}
+        return payload
+
+    # target/reference chosen so the global ratio is exactly 4.0 (8+4+4 over 1+1+2),
+    # while layer ratios range 2..8 -> a deliberately wide spread.
+    tgt_layers = tmp / "tgt_layers.pt"
+    ref_layers = tmp / "ref_layers.pt"
+    torch.save(multilayer({"l0": 8.0, "l1": 4.0, "l2": 4.0}), tgt_layers)
+    torch.save(multilayer({"l0": 1.0, "l1": 1.0, "l2": 2.0}), ref_layers)
+
+    result = run(["--path", str(tgt_layers), "--reference", str(ref_layers), "--strict", "0"])
+    assert result.returncode == 0, result.stdout
+    print("\n---- per-layer diagnostic output ----")
+    print(result.stdout.split("per-layer mass")[1] if "per-layer mass" in result.stdout
+          else result.stdout)
+    assert "per-layer mass" in result.stdout, "layer diagnostic did not run"
+    # global ratio = (8+4+4)/(1+1+2) = 16/4 = 4.0
+    assert "global mass ratio        : 4.000x" in result.stdout, result.stdout
+    # equal-contribution weight for target = 1/(1+4) = 0.2
+    assert "target=0.2000 reference=0.8000" in result.stdout, result.stdout
+    # layer ratios are 8, 4, 2 -> spread 8/2 = 4.0x, and all three target-dominant
+    assert "target dominates (r_l>1) : 3 / 3 layers" in result.stdout, result.stdout
+    assert "spread (max/min)       : 4.0x" in result.stdout, result.stdout
+    print("  global ratio, equal-contribution weight, dominance count all correct")
+
+    # A genuinely wide spread must trip the "wide" verdict, since that is the whole
+    # point of the per-layer check: one layer 100x, another 1x.
+    torch.save(multilayer({"l0": 100.0, "l1": 1.0}), tgt_layers)
+    torch.save(multilayer({"l0": 1.0, "l1": 1.0}), ref_layers)
+    result = run(["--path", str(tgt_layers), "--reference", str(ref_layers), "--strict", "0"])
+    assert "-> wide" in result.stdout, result.stdout
+    print("  wide spread trips the wide verdict")
+    # restore the balanced pair for later reuse
+    torch.save(multilayer({"l0": 8.0, "l1": 4.0, "l2": 4.0}), tgt_layers)
+    torch.save(multilayer({"l0": 1.0, "l1": 1.0, "l2": 2.0}), ref_layers)
+
+    # --layer_diagnostic 0 must suppress it
+    result = run(["--path", str(tgt_layers), "--reference", str(ref_layers),
+                  "--layer_diagnostic", "0", "--strict", "0"])
+    assert "per-layer mass" not in result.stdout, "layer diagnostic ran despite the 0 flag"
+    print("  --layer_diagnostic 0 suppresses it")
+
+    # It must also work when the reference is a covariance file (trace, not sum).
+    cov_layers = tmp / "cov_layers.pt"
+    torch.save(
+        {"covariances": {"l0": torch.eye(4) * 2.0, "l1": torch.eye(4)},
+         "metadata": {"pool_fingerprint": "x"}},
+        cov_layers,
+    )
+    fish_layers = tmp / "fish_layers.pt"
+    payload = fisher_payload(1.0, 100.0, 2048, "left", 0, 0.5, 1000)
+    payload["fishers"] = {"l0": torch.tensor([[8.0]]), "l1": torch.tensor([[4.0]])}
+    torch.save(payload, fish_layers)
+    result = run(["--path", str(fish_layers), "--reference", str(cov_layers), "--strict", "0"])
+    # target sum masses 8,4 ; reference traces 8,4 -> global ratio 1.0
+    assert "(sum target / trace reference)" in result.stdout, result.stdout
+    assert "global mass ratio        : 1.000x" in result.stdout, result.stdout
+    print("  cov reference uses trace, fisher target uses sum, ratio 1.0 as expected")
+
     # ---- a payload predating the diagnostics must say so, not KeyError ----
     stale = fisher_payload(3.0, 357.1, 2048, "left", 0, 0.42, 25114)
     del stale["metadata"]["length_weighting"]

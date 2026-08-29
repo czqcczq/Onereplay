@@ -25,10 +25,22 @@ and mixing two domains' Fisher matrices with equal coefficients would then weigh
 them unequally by that factor. The covariance path does not have this problem
 because C is a token mean, which is why the C_mix weights cannot be copied over.
 
+The global mean ratio decides equal-contribution weights only if that ratio holds
+layer by layer. F is spiky (max/mean around 1e6), so a single scalar weight that
+balances the two domains on average can still leave individual layers dominated by
+one side. --reference therefore also runs a per-layer diagnostic: it loads both
+files' matrices, computes each layer's mass (the sum of Fisher entries, i.e. the
+layer's weight in sum_ij F_ij dW_ij^2 under a uniform dW), and reports how the
+per-layer ratio spreads around the global one. A tight spread means one scalar
+weight is enough; a wide one means the balance a scalar buys on average is not the
+balance any given layer gets.
+
 Usage:
     python -m onereplay.scripts.inspect_fisher --path F.pt --print_meta pool_fingerprint
     python -m onereplay.scripts.inspect_fisher --path F.pt --expect_max_len 2048 \
         --expect_truncation_side left --reference F_if.pt
+    # per-layer only, skip the metadata checks:
+    python -m onereplay.scripts.inspect_fisher --path F_math.pt --reference F_if.pt
 """
 
 from __future__ import annotations
@@ -41,6 +53,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 
@@ -89,6 +102,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Another Fisher file to compare scales against, e.g. F_if.",
+    )
+    parser.add_argument(
+        "--layer_diagnostic",
+        type=int,
+        default=1,
+        help=(
+            "With --reference, also load both files' matrices and report the per-layer "
+            "mass ratio. 0 skips it (only reads metadata, so it stays fast on the big "
+            "full-scope files)."
+        ),
     )
     parser.add_argument(
         "--strict",
@@ -221,6 +244,13 @@ def check_expectations(meta: dict, args: argparse.Namespace) -> list[str]:
 def compare_scales(meta: dict, reference_path: str) -> None:
     """Report mean(F)/mean(F_ref), which is what the mixing weights have to undo."""
 
+    reference_meta = load_payload(reference_path).get("metadata", {})
+    if "fisher_scale" not in reference_meta or "length_weighting" not in reference_meta:
+        print(
+            "---- scale comparison skipped: reference has no Fisher scale metadata "
+            "(a covariance file, or an F predating the diagnostics) ----"
+        )
+        return
     reference = report_fisher(reference_path, "reference")
     scale = meta["fisher_scale"]["mean"]
     reference_scale = reference["fisher_scale"]["mean"]
@@ -258,6 +288,118 @@ def compare_scales(meta: dict, reference_path: str) -> None:
         )
 
 
+def _matrices_and_kind(payload: dict, path: str) -> tuple[dict, str]:
+    """Return the per-layer matrices and how a layer's penalty mass is measured.
+
+    An elementwise Fisher weights sum_ij F_ij dW_ij^2, so a layer's weight in the
+    penalty is the sum of all its entries. A covariance weights tr(dW C dW^T), so
+    the layer's weight is the trace. Reading the mass the way the matrix is
+    actually applied keeps the ratio faithful to what training will do.
+    """
+
+    if "fishers" in payload:
+        return payload["fishers"], "sum"
+    if "covariances" in payload:
+        return payload["covariances"], "trace"
+    raise SystemExit(f"{path} has neither 'fishers' nor 'covariances'")
+
+
+def _layer_mass(tensor: torch.Tensor, kind: str) -> float:
+    matrix = tensor.double()
+    if kind == "trace" and matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1]:
+        return float(matrix.diagonal().sum())
+    return float(matrix.sum())
+
+
+def _percentiles(values: list[float]) -> str:
+    array = np.asarray(values, dtype=np.float64)
+    p0, p10, p50, p90, p100 = np.percentile(array, [0, 10, 50, 90, 100])
+    return f"min={p0:.3f} P10={p10:.3f} median={p50:.3f} P90={p90:.3f} max={p100:.3f}"
+
+
+def compare_layers(target_path: str, reference_path: str) -> None:
+    """Report the per-layer mass ratio so a scalar mix weight can be sanity-checked.
+
+    The global mean ratio says what one scalar weight would have to be to balance
+    the two domains on average. Whether that scalar actually balances each layer
+    is a separate question, and the answer lives in how the per-layer ratios
+    spread around the global one.
+    """
+
+    target_matrices, target_kind = _matrices_and_kind(load_payload(target_path), target_path)
+    reference_matrices, reference_kind = _matrices_and_kind(
+        load_payload(reference_path), reference_path
+    )
+    shared = sorted(set(target_matrices) & set(reference_matrices))
+    if not shared:
+        print("---- per-layer diagnostic skipped: no shared layers ----")
+        return
+
+    ratios: list[tuple[str, float]] = []
+    total_target = 0.0
+    total_reference = 0.0
+    for key in shared:
+        mass_target = _layer_mass(target_matrices[key], target_kind)
+        mass_reference = _layer_mass(reference_matrices[key], reference_kind)
+        total_target += mass_target
+        total_reference += mass_reference
+        if mass_reference > 0:
+            ratios.append((key, mass_target / mass_reference))
+
+    if not ratios or total_reference <= 0:
+        print("---- per-layer diagnostic skipped: reference mass is zero ----")
+        return
+
+    global_ratio = total_target / total_reference
+    ratio_values = [value for _, value in ratios]
+    dominated = sum(1 for value in ratio_values if value > 1.0)
+    # r_l normalized by the global ratio: 1.0 means the single global weight already
+    # balances that layer, so the spread of this quantity is the whole question.
+    normalized = [value / global_ratio for value in ratio_values]
+
+    target_weight = 1.0 / (1.0 + global_ratio)
+
+    print(f"---- per-layer mass ({target_kind} target / {reference_kind} reference) ----")
+    print(
+        "  layer mass = the layer's weight in the penalty under a uniform dW; "
+        "r_l = mass(target,l) / mass(reference,l)"
+    )
+    print(f"  shared layers            : {len(shared)} ({len(ratio_values)} with nonzero reference)")
+    print(f"  global mass ratio        : {global_ratio:.3f}x  (target / reference)")
+    print(f"  r_l across layers        : {_percentiles(ratio_values)}")
+    print(f"  target dominates (r_l>1) : {dominated} / {len(ratio_values)} layers")
+
+    order = sorted(ratios, key=lambda item: item[1])
+    lows = ", ".join(f"{name.split('.')[-1] if '.' not in name else name}={value:.2f}"
+                     for name, value in order[:3])
+    highs = ", ".join(f"{name}={value:.2f}" for name, value in order[-3:])
+    print(f"  most reference-heavy     : {lows}")
+    print(f"  most target-heavy        : {highs}")
+
+    print(
+        f"  equal-contribution mix   : target={target_weight:.4f} "
+        f"reference={1 - target_weight:.4f}  (bigger matrix gets the smaller coefficient)"
+    )
+    print(
+        "  scalar-weight stability  : n_l = r_l / global_ratio, where 1.0 means the "
+        "global weight already balances that layer"
+    )
+    print(f"    n_l across layers      : {_percentiles(normalized)}")
+    spread = max(normalized) / min(normalized) if min(normalized) > 0 else float("inf")
+    print(f"    spread (max/min)       : {spread:.1f}x")
+    if spread <= 4:
+        print(
+            "    -> tight: one scalar weight balances every layer within ~2x, so the "
+            "global equal-contribution weight is safe to use as-is."
+        )
+    else:
+        print(
+            "    -> wide: the average balance is not what each layer gets. A single "
+            "scalar weight will over-protect some layers and under-protect others; "
+            "consider whether the mix should be judged on retention rather than mass."
+        )
+
+
 def main() -> None:
     args = parse_args()
     if not Path(args.path).is_file():
@@ -277,6 +419,8 @@ def main() -> None:
     if args.reference:
         if Path(args.reference).is_file():
             compare_scales(meta, args.reference)
+            if args.layer_diagnostic == 1:
+                compare_layers(args.path, args.reference)
         else:
             print(f"---- scale comparison skipped: no reference at {args.reference} ----")
 

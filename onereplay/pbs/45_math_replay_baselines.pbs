@@ -228,7 +228,7 @@ ARMS="${ARMS:-rows tokens}"
 SEED="${SEED:-1}"
 EPOCHS="${EPOCHS:-3}"
 LR="${LR:-1e-4}"
-BATCH="${BATCH:-8}"      # micro-batch。相对 32 号翻倍，只为吃满 H200，见文件头
+BATCH="${BATCH:-8}"      
 ACCUM="${ACCUM:-128}"     # 单位是行：8 步 × 8 行新任务 = 64 行/次更新，与 32 号一致
 EVAL_BATCH="${EVAL_BATCH:-8}"   # 钉在 32 号的值，否则 val_loss 不可比
 MAXLEN="${MAXLEN:-512}"

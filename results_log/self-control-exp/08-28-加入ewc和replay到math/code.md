@@ -21,3 +21,9 @@ P99：1,558
 在replay0.5的训练上，我打算if/math：1比1，以及if/math：0.8：0.2都实现跑一次，挑选结果。
 
 注：由于原先的F_IF在rwth上，要传到hopper太慢了，所以我打算重新采集一个F_IF，所以原先EWC的结果可能要更换一下，更换为我在hopper上新采集的F_IF训练得到EWC。
+
+08-29：当前进度：
+完成replay math的job，完成Fif和Fmath的提取，顺便训练得到了hopper集群上的EWC
+
+下一步工作：1、寻找合适的code保护数据集，把code做完。 2、分析合适的EWC权重，完成F math的训练。 3、把当前训练得到的EWC评测一下 4、找一些agentic的数据集，考虑迁移。 5、安全性任务准备重做
+
