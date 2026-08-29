@@ -30,12 +30,26 @@
 #             文件的 mean 现算权重，换了重采的 F 会自动更新，不会像硬编码 0.21 那样过期。
 #   两版都跑，最后按结果挑。
 #
-# 【λ 网格必须重新探，别直接拿 IF 线的点当定论】
-#   F_mix 两版 mean 与 F_if 同数量级（equal≈0.042 / half≈0.063 vs 0.0998），所以
-#   23 号围着 3e2 铺的网格（1e2…1e4）大体适用，只是最优点会因 mean 变小而略右移。
-#   两版 mean 不同（half 比 equal 大 1.5x），所以同一个 λ 下两版罚项强度差 1.5x——
-#   不要为此强行对齐幅度（那会改变语义），而是两版共用一个 λ 网格、各自取最优点比。
-#   目标同 23 号：让 λ·R 在训练中期占 task_loss（约 1.1）的 1%–10%。
+# 【λ 网格：08-29 探针实测，别再照 IF 线的 3e2 猜】
+#   曾按 mean 同量级预估 3e2 附近，实测完全错。300 步短探（SAVE=0）下 λ·R 占 task_loss：
+#       λ      equal (mean≈0.042)     half (mean≈0.063)
+#       0.3        1.6%                  2.5%
+#       1          5.2%                  7.9%     <- 两版都在 1%–10% 目标带内
+#       3         14.1%                 20.3%
+#       10        35.9%                 47.1%
+#       30        64.9%                 75.9%
+#       100       86.9%                 90.3%
+#   注意 EWC 的 λ 与 OneReplay 的 λ 尺度差约 1e5（F 逐元素 vs C 沿 hidden 收缩一次），
+#   所以别拿 OneReplay 的 3e-2 来「对齐」——那对 EWC ≈ 无约束、退回 vanilla。
+#   OneReplay 自己的 λ 扫描（2026-08-09）也证明再往强只会「两头不占」：约束过强把 ΔW
+#   压没，新任务和 retention 一起变差。所以最优大概率在温和端（λ≈1），λ≥10 是强端边界、
+#   30/100 是锁死区（65–90%），纯亏不跑。half 同 λ 占比更高（F 大 1.5x）。
+#
+#   >>> 当前默认 LAMBDAS=1 单点：先把「训练+评测」整条链路和两版差异一次跑出来。
+#       选 1 而不是 3，是因为 λ=1 时 equal(5.2%)/half(7.9%) 都在温和带内，两版强度对齐、
+#       对比只反映 mixing 策略；λ=3 的 half 已 20%，会把强度差混进对比。
+#       要扩成 retention–plasticity 曲线再传 LAMBDAS="0.3 1 3 10"（4×2×5.7h，需拆投）。
+#   不要为两版 mean 不同强行对齐幅度（那会改变语义），两版共用同一 λ、各取最优。
 #
 #   整组是 2 变体 × |LAMBDAS| × 约 5.7 h，很容易超 24 h。所以：
 #     1) 先探针，只看罚项量级，不保存不评测（每变体几分钟）：
@@ -62,9 +76,9 @@
 #
 # 用法
 #   qsub -v PROBE=1 onereplay/pbs/48_math_ewc_mix.pbs            # 探针：两版各最小 λ 跑 300 步看罚项
-#   qsub onereplay/pbs/48_math_ewc_mix.pbs                       # 两版 × 全 grid 训练 + 评测
+#   qsub onereplay/pbs/48_math_ewc_mix.pbs                       # 默认：两版(equal/half) × λ=1 训练 + 评测
 #   qsub -v VARIANTS=equal onereplay/pbs/48_math_ewc_mix.pbs     # 只跑等贡献版
-#   qsub -v LAMBDAS="3e2 1e3" onereplay/pbs/48_math_ewc_mix.pbs  # 自定网格
+#   qsub -v LAMBDAS="0.3 1 3 10" onereplay/pbs/48_math_ewc_mix.pbs  # 扩成曲线（默认单点 1）
 #   qsub -v DO_EVAL=0 onereplay/pbs/48_math_ewc_mix.pbs          # 只训练
 #   qsub -v DO_TRAIN=0 onereplay/pbs/48_math_ewc_mix.pbs         # F_mix 已就位、adapter 已训，只评测
 #   qsub -v FORCE_MIX=1 onereplay/pbs/48_math_ewc_mix.pbs        # 强制重建 F_mix
@@ -209,7 +223,7 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 
 # ---- 变体与 λ 网格 ----
 VARIANTS="${VARIANTS:-equal half}"
-LAMBDAS="${LAMBDAS:-3e2 1e3 3e3}"
+LAMBDAS="${LAMBDAS:-1}"   # 08-29 探针定的温和单点；扩曲线传 LAMBDAS="0.3 1 3 10"，见文件头
 
 # ---- 探针短跑：只看罚项量级，不保存不评测 ----
 PROBE="${PROBE:-0}"

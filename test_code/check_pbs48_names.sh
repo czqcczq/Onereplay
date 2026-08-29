@@ -13,7 +13,7 @@ RESULTS_ROOT="/results"
 FISHER_MIX_EQUAL="${RESULTS_ROOT}/fisher/fisher_mix_equal_qv.pt"
 FISHER_MIX_HALF="${RESULTS_ROOT}/fisher/fisher_mix_half_qv.pt"
 VARIANTS="equal half"
-LAMBDAS="3e2 1e3 3e3"
+LAMBDAS="1 3 10 30"
 MODELS=""
 EXTRA_MODELS=""
 
@@ -52,8 +52,8 @@ echo "variant/lambda names ok: $(run_name equal 3e2) / $(run_name half 1e3)"
 
 # PROBE narrows LAMBDAS to the numerically smallest entry (give-it-big hides R).
 PROBE_LAMBDAS="$(printf '%s\n' ${LAMBDAS} | sort -g | head -n 1)"
-[[ "${PROBE_LAMBDAS}" == "3e2" ]] || { echo "FAIL probe should pick 3e2, got ${PROBE_LAMBDAS}"; exit 1; }
-# also holds when the smallest is not first in the list
+[[ "${PROBE_LAMBDAS}" == "1" ]] || { echo "FAIL probe should pick 1, got ${PROBE_LAMBDAS}"; exit 1; }
+# also holds for exponent notation and when the smallest is not first in the list
 [[ "$(printf '%s\n' 1e3 1e2 3e3 | sort -g | head -n 1)" == "1e2" ]] || { echo "FAIL probe min"; exit 1; }
 echo "PROBE narrows [${LAMBDAS}] -> ${PROBE_LAMBDAS}"
 
@@ -79,14 +79,14 @@ if [[ -n "${EXTRA_MODELS}" ]]; then
 fi
 
 IFS='|' read -ra specs <<< "${EVAL_SPECS}"
-# 2 variants x 3 lambdas + 1 extra = 7
-[[ ${#specs[@]} -eq 7 ]] || { echo "FAIL expected 7 eval specs, got ${#specs[@]}"; exit 1; }
+# 2 variants x 4 lambdas + 1 extra = 9
+[[ ${#specs[@]} -eq 9 ]] || { echo "FAIL expected 9 eval specs, got ${#specs[@]}"; exit 1; }
 for spec in "${specs[@]}"; do
   echo "eval spec  : name=${spec%%;*} adapter=${spec#*;}"
 done
-[[ "${specs[0]}" == "cs_ewcmix_equal_lam3e2_seed1;/adapters/cs_ewcmix_equal_lam3e2_seed1" ]] \
+[[ "${specs[0]}" == "cs_ewcmix_equal_lam1_seed1;/adapters/cs_ewcmix_equal_lam1_seed1" ]] \
   || { echo "FAIL first spec"; exit 1; }
-[[ "${specs[6]}" == "cs_ewc_lam3e2_seed1;/safety/adapters/cs_ewc_lam3e2_seed1" ]] \
+[[ "${specs[8]}" == "cs_ewc_lam3e2_seed1;/safety/adapters/cs_ewc_lam3e2_seed1" ]] \
   || { echo "FAIL EXTRA_MODELS absolute path lost"; exit 1; }
 
 echo "ALL CHECKS PASSED"
