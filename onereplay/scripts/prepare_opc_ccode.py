@@ -47,8 +47,8 @@ from pathlib import Path
 from typing import Any
 
 from onereplay.scripts.prepare_magicoder_ccode import (
-    build_eval_ngrams,
     count_tokens,
+    humaneval_docstrings,
     ngram_hashes,
     normalize,
     percentile,
@@ -324,6 +324,62 @@ def verify_by_execution(
     return evaluate_assert_program(program, tests, timeout)
 
 
+def build_eval_ngrams_by_source(args) -> tuple[dict[str, set[int]], dict[str, int]]:
+    """Eval n-gram sets kept separate by signal, for attributing contamination.
+
+    The union over the returned sets equals what prepare_magicoder_ccode's
+    build_eval_ngrams produces, so the set of removed rows is unchanged -- this
+    only lets the report say how much of a hit came from a specific signature
+    (a HumanEval docstring or an MBPP assert, i.e. real overlap) versus the
+    shared "Write a function to ..." task-description phrasing that MBPP text and
+    educational_instruct have in common (boilerplate, a false-positive source).
+    """
+
+    sources: dict[str, set[int]] = {
+        "humaneval_docstring": set(),
+        "mbpp_assert": set(),
+        "mbpp_text": set(),
+    }
+    counts = {"humaneval_signatures": 0, "mbpp_signatures": 0}
+
+    if args.humaneval_data_file and Path(args.humaneval_data_file).is_file():
+        docstrings = humaneval_docstrings(args.humaneval_data_file, args.cache_dir)
+        counts["humaneval_signatures"] = len(docstrings)
+        for text in docstrings:
+            sources["humaneval_docstring"] |= ngram_hashes(text)
+    else:
+        print("跳过 HumanEval 污染自检：未给 --humaneval_data_file 或文件不存在")
+
+    if args.mbpp_dataset_path and Path(args.mbpp_dataset_path).exists():
+        from datasets import load_from_disk
+
+        dataset_dict = load_from_disk(args.mbpp_dataset_path)
+        dataset = (
+            dataset_dict[args.mbpp_split]
+            if args.mbpp_split in dataset_dict
+            else dataset_dict
+        )
+        signatures = 0
+        for i in range(len(dataset)):
+            row = dict(dataset[i])
+            text = str(row.get("text", ""))
+            if normalize(text):
+                sources["mbpp_text"] |= ngram_hashes(text)
+                signatures += 1
+            tests = row.get("test_list") or []
+            if isinstance(tests, str):
+                tests = [tests]
+            for test in tests:
+                if normalize(str(test)):
+                    sources["mbpp_assert"] |= ngram_hashes(str(test))
+                    signatures += 1
+        counts["mbpp_signatures"] = signatures
+    else:
+        print("跳过 MBPP 污染自检：未给 --mbpp_dataset_path 或路径不存在")
+
+    return sources, counts
+
+
 def main() -> None:
     args = parse_args()
     dataset = load_opc(args)
@@ -375,19 +431,48 @@ def main() -> None:
     print(f"去重: 去掉 {stats['dropped_duplicate']} 条重复题面 -> 剩 {len(deduped)}")
 
     # -- step 3: contamination against the eval sets ------------------------
-    eval_grams, sig_counts = build_eval_ngrams(args)
+    # Removal is unchanged: a row goes if it shares an 8-gram with the union of
+    # all eval signatures. The per-source split is report-only, so the sampled
+    # pool stays byte-identical -- it just tells apart real overlap (a matched
+    # docstring or assert) from shared task-description boilerplate.
+    sources, sig_counts = build_eval_ngrams_by_source(args)
     stats.update(sig_counts)
+    eval_grams: set[int] = set().union(*sources.values()) if sources else set()
+    specific = sources["humaneval_docstring"] | sources["mbpp_assert"]
     if eval_grams:
-        contaminated = [
-            i for i in deduped if ngram_hashes(f"{instructions[i]}\n{codes[i]}") & eval_grams
-        ]
+        per_source = {name: 0 for name in sources}
+        contaminated: list[int] = []
+        specific_hits = 0
+        text_only = 0
+        for i in deduped:
+            grams = ngram_hashes(f"{instructions[i]}\n{codes[i]}")
+            if not (grams & eval_grams):
+                continue
+            contaminated.append(i)
+            for name, gramset in sources.items():
+                if grams & gramset:
+                    per_source[name] += 1
+            if grams & specific:
+                specific_hits += 1
+            else:
+                text_only += 1
         stats["contaminated_hits"] = len(contaminated)
-        verdict = "OK，无重叠" if not contaminated else f"!! {len(contaminated)} 条与评测集共享 8-gram"
-        print(f"污染自检 (HumanEval+MBPP, 8-gram): {verdict}")
+        stats["contaminated_by_humaneval_docstring"] = per_source["humaneval_docstring"]
+        stats["contaminated_by_mbpp_assert"] = per_source["mbpp_assert"]
+        stats["contaminated_by_mbpp_text"] = per_source["mbpp_text"]
+        stats["contaminated_specific"] = specific_hits
+        stats["contaminated_text_only"] = text_only
+        print(f"污染自检 (HumanEval+MBPP, 8-gram): !! {len(contaminated)} 条命中")
+        print(
+            f"  来源拆分（可重叠）: HumanEval docstring={per_source['humaneval_docstring']} "
+            f"MBPP assert={per_source['mbpp_assert']} MBPP 题面={per_source['mbpp_text']}"
+        )
+        print(f"  特异信号命中（docstring 或 assert，真重叠估计）: {specific_hits}")
+        print(f"  仅题面模板命中（boilerplate 假阳性估计）: {text_only}")
         if contaminated and args.drop_contaminated == 1:
             flagged = set(contaminated)
             deduped = [i for i in deduped if i not in flagged]
-            print(f"  已剔除，剩 {len(deduped)} 条")
+            print(f"  为保险全部剔除，剩 {len(deduped)} 条")
     stats["after_decontamination"] = len(deduped)
 
     # -- step 4: prompt length ----------------------------------------------
