@@ -5,53 +5,47 @@
 #PBS -k oed
 #PBS -q auto
 #PBS -l select=1:ngpus=1
-#PBS -l walltime=04:00:00
+#PBS -l walltime=12:00:00
 #PBS -o /scratch/weiliu87/logs/onereplay/
 #
 # =============================================================================
-# NUS Hopper (PBS + Singularity): 只对 cs_onereplay_lam3e-2_seed1_regonce
-#   重跑一次 IFEval（不训练、不评 multiif / commonsense / 数学 / 代码）。
+# NUS Hopper (PBS + Singularity): 只跑 IFEval，不训练，不评其它指标。
+#
+# 默认一次评 7 个 adapter。它们不在同一个 results 树下，但 REPO_ROOT 相同：
+#   results_safety/adapters/  cs_onereplay_lam3e-2_seed1_regonce
+#   results/adapters/         其余 6 个
+# 每个 run 的 summary.json 写回它自己那棵树，互不覆盖。
 #
 # 【这个脚本能回答什么、不能回答什么】
 #   IFEval 用贪心解码（do_sample=False），对同一份 adapter 重评几乎逐位复现。
-#   所以本作业测的是「评测侧 / 跨集群（RWTH→Hopper，不同 GPU、库版本）的复现
-#   差异」，而不是「训练的随机浮动」。要量训练浮动得换 seed 重新训练
-#   （见 02_sweep_lambda.pbs，改 SEED）。跨集群复现差异本身也有意义：第四章
-#   记录过 RWTH↔Hopper 约 1.3pp 的环境差，本作业能把它坐实。
+#   所以本作业测的是「评测侧 / 跨目录」的数字，不是「训练的随机浮动」。
+#   要量训练浮动得换 seed 重新训练。
 #
 # 【默认写到新 run 名，不覆盖原结果】
-#   OUT_NAME 默认 = ${RUN}_rerun，summary.json 落到
-#     ${RESULTS_ROOT}/ifeval/${RUN}_rerun/
-#   原来的 ${RUN} 结果（65.25 那次）原样保留，方便并排对比。
-#   想直接覆盖原结果就传 OUT_NAME=cs_onereplay_lam3e-2_seed1_regonce。
+#   OUT_SUFFIX 默认 _rerun，summary.json 落到
+#     <该 run 所属 results>/ifeval/<run>_rerun/
+#   想直接覆盖原结果:  OUT_SUFFIX=
 #
 # -----------------------------------------------------------------------------
-# !! adapter 名字很容易踩坑
-#   Hopper 上的 adapter 目录不一定叫 cs_onereplay_lam3e-2_seed1_regonce
-#   （那是 RWTH 的命名）。02_sweep_lambda.pbs 在本集群产出的名字带策略词：
-#     uniform  -> cs_onereplay_uniform_lam3e-2_seed1_regonce
-#     balanced -> cs_onereplay_balanced_lam3e-2_seed1_regonce
-#   如果你要复现的正是 RWTH 那次 65.25，得先把它的 adapter 传到 Hopper 的
-#     ${RESULTS_ROOT}/adapters/cs_onereplay_lam3e-2_seed1_regonce
-#   或者直接用 ADAPTER=<绝对路径> 指向已有目录。缺目录时本脚本会明确报错。
-#
-# -----------------------------------------------------------------------------
-# 用法（本站点不从 qsub 命令行传变量，要改就改下方默认值或用 -v）:
+# 用法:
 #   qsub onereplay/pbs/54_ifeval_rerun_regonce.pbs
 #
-#   指定别的 adapter 目录:
-#     qsub -v ADAPTER=/scratch/.../adapters/xxx onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#   只评其中几个:
+#     qsub -v RUNS="cs_onereplay_ifmath_lam3e-2_seed1_regonce cs_vanilla_seed1" \
+#       onereplay/pbs/54_ifeval_rerun_regonce.pbs
 #   覆盖原结果而不是写 _rerun:
-#     qsub -v OUT_NAME=cs_onereplay_lam3e-2_seed1_regonce onereplay/pbs/54_ifeval_rerun_regonce.pbs
-#   冒烟（只评前 20 条，十几分钟）:
+#     qsub -v OUT_SUFFIX= onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#   冒烟（每个模型只评前 20 条）:
 #     qsub -v LIMIT=20 onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#   已有 summary.json 仍强制重评:
+#     qsub -v FORCE_EVAL=1 onereplay/pbs/54_ifeval_rerun_regonce.pbs
 #
 # 前置条件:
-#   1) adapter 就位（见上面的名字说明）
+#   1) adapter 就位（见上方两棵 results 树）
 #   2) IFEval 数据: onereplay/third_party/instruction_following_eval/data/input_data.jsonl
 #   3) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
 #
-# 预计耗时: IFEval 541 条贪心生成，单卡约 40–60 min，walltime 给 4 h。
+# 预计耗时: 每模型约 40–60 min，默认 7 个约 5–7 h，walltime 给 12 h。
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
 
@@ -106,9 +100,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
-    MODEL_DIR MODEL_NAME RESULTS_ROOT
-    SEED RUN ADAPTER OUT_NAME LIMIT MAX_NEW_TOKENS
-    IFEVAL_INPUT FORCE_EVAL
+    MODEL_DIR MODEL_NAME RESULTS_ROOT RESULTS_MAIN RESULTS_SAFETY
+    SEED RUN RUNS ADAPTER OUT_NAME OUT_SUFFIX LIMIT MAX_NEW_TOKENS
+    IFEVAL_INPUT FORCE_EVAL SAFETY_RUNS
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -162,106 +156,232 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
 
 # ---- 项目路径 ----
+# 两棵 results 树同属一个 REPO_ROOT。RESULTS_ROOT 仍接受旧用法（整作业覆写输出根），
+# 默认不设，让每个 run 写回自己那棵树。
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_safety}"
-ADAPTERS="${RESULTS_ROOT}/adapters"
+RESULTS_MAIN="${RESULTS_MAIN:-${REPO_ROOT}/results}"
+RESULTS_SAFETY="${RESULTS_SAFETY:-${REPO_ROOT}/results_safety}"
 
 # ---- 评测参数（与第一章 / 02 号逐字一致，换了就不可比）----
 SEED="${SEED:-1}"
 LIMIT="${LIMIT:-0}"                  # >0 时只评前 N 条（冒烟用）
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-768}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+OUT_SUFFIX="${OUT_SUFFIX:-_rerun}"
 
 # ---- 要评的 run ----
-# RUN     = adapter 目录名（也是被复现的那次训练的名字）
-# ADAPTER = adapter 绝对路径（默认由 RUN 拼出，可整体覆盖指向别处）
-# OUT_NAME= 输出/记录用的 run 名，默认加 _rerun 后缀以免覆盖原结果
-RUN="${RUN:-cs_onereplay_lam3e-2_seed1_regonce}"
-ADAPTER="${ADAPTER:-${ADAPTERS}/${RUN}}"
-OUT_NAME="${OUT_NAME:-${RUN}_rerun}"
-FORCE_EVAL="${FORCE_EVAL:-0}"
+# SAFETY_RUNS 里的名字优先去 results_safety/adapters 找；其余去 results/adapters。
+# 找不到时再在另一棵树里兜底，避免名字记错就整作业挂掉。
+# 旧接口：只传 RUN=xxx（或再传 ADAPTER=/绝对路径）时评那一个。
+SAFETY_RUNS="${SAFETY_RUNS:-cs_onereplay_lam3e-2_seed1_regonce}"
+DEFAULT_RUNS="cs_onereplay_lam3e-2_seed1_regonce cs_onereplay_ifcode_opcedu_lam2e-2_seed1_regonce cs_onereplay_ifmath_lam3e-2_seed1_regonce cs_ewcmix_opcedu_half_lam1_seed1 cs_ewcmix_opcedu_equal_lam1_seed1 cs_replaymix_ifmath_4n4r_rows80-20_seed1 cs_replaymix_ifmath_4n4r_rows50-50_seed1"
+if [[ -n "${RUNS:-}" ]]; then
+  :
+elif [[ -n "${RUN:-}" ]]; then
+  RUNS="${RUN}"
+else
+  RUNS="${DEFAULT_RUNS}"
+fi
 
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
 [[ -f "${IFEVAL_INPUT}" ]] || { echo "缺 IFEval 数据: ${IFEVAL_INPUT}"; exit 1; }
-if [[ ! -d "${ADAPTER}" ]]; then
-  echo "!! 缺 adapter: ${ADAPTER}"
-  echo "   Hopper 上该 run 可能叫 cs_onereplay_{uniform,balanced}_lam3e-2_seed1_regonce，"
-  echo "   或者需要先把 RWTH 的 adapter 传过来。可用 ADAPTER=<绝对路径> 指定。"
-  echo "   现有 adapters:"
-  ls -1 "${ADAPTERS}" 2>/dev/null | sed 's/^/     /' || true
-  exit 1
-fi
-mkdir -p "${RESULTS_ROOT}" "${RESULTS_ROOT}/map_cache/eval_if_seed${SEED}"
+mkdir -p "${RESULTS_MAIN}/map_cache/eval_if_seed${SEED}" "${RESULTS_SAFETY}/map_cache/eval_if_seed${SEED}"
 
 if [[ "${LIMIT}" != "0" ]]; then
   echo "!! LIMIT=${LIMIT}：冒烟模式，产出的 summary.json 只覆盖前若干条，不是正式结果。"
 fi
 
-# 已有结果就跳过（除非 FORCE_EVAL=1），避免 ifeval_summary.csv 追加重复行。
-if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/ifeval/${OUT_NAME}/summary.json" ]]; then
-  echo "已有结果，跳过: ${RESULTS_ROOT}/ifeval/${OUT_NAME}/summary.json"
-  echo "（FORCE_EVAL=1 可强制重评）"
-else
-  echo "==== eval IFEval: adapter=${ADAPTER}  ->  run_name=${OUT_NAME} ===="
-  python -m onereplay.scripts.evaluate \
-    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
-    --adapter_path "${ADAPTER}" --run_name "${OUT_NAME}" \
-    --metrics ifeval --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
-    --limit "${LIMIT}" --max_new_tokens "${MAX_NEW_TOKENS}" \
-    --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_if_seed${SEED}" \
-    --ifeval_input "${IFEVAL_INPUT}"
-fi
+is_safety_run () {
+  local needle=" $1 "
+  local haystack=" ${SAFETY_RUNS} "
+  [[ "${haystack}" == *"${needle}"* ]]
+}
+
+# 返回: 该 run 所属的 results 根目录（输出写这里）。
+resolve_out_root () {
+  local run=$1
+  if [[ -n "${RESULTS_ROOT:-}" ]]; then
+    echo "${RESULTS_ROOT}"
+    return
+  fi
+  if is_safety_run "${run}"; then
+    echo "${RESULTS_SAFETY}"
+  else
+    echo "${RESULTS_MAIN}"
+  fi
+}
+
+# 返回: adapter 绝对路径；找不到则返回空。
+# 单 run 且显式传了 ADAPTER 时，整表都用这个路径（旧接口）。
+resolve_adapter () {
+  local run=$1
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${ADAPTER:-}" && "${n}" -eq 1 ]]; then
+    echo "${ADAPTER}"
+    return
+  fi
+
+  local primary secondary
+  if is_safety_run "${run}"; then
+    primary="${RESULTS_SAFETY}/adapters/${run}"
+    secondary="${RESULTS_MAIN}/adapters/${run}"
+  else
+    primary="${RESULTS_MAIN}/adapters/${run}"
+    secondary="${RESULTS_SAFETY}/adapters/${run}"
+  fi
+  if [[ -d "${primary}" ]]; then
+    echo "${primary}"
+  elif [[ -d "${secondary}" ]]; then
+    echo "${secondary}"
+  else
+    echo ""
+  fi
+}
+
+resolve_out_name () {
+  local run=$1
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${OUT_NAME:-}" && "${n}" -eq 1 ]]; then
+    echo "${OUT_NAME}"
+    return
+  fi
+  echo "${run}${OUT_SUFFIX}"
+}
 
 # ---------------------------------------------------------------------------
-# 后置：把重跑结果与原结果并排打出来，直接看有没有漂。
+# 前置：谁会跑、谁会跳过、为什么跳过。缺 adapter 只跳过这一行，不整作业退出。
 # ---------------------------------------------------------------------------
 set +x
-python - "${RESULTS_ROOT}" "${RUN}" "${OUT_NAME}" <<'PY'
+echo "========================================================================"
+echo "前置检查（只评 ifeval）"
+printf "%-52s %-14s %s\n" "run" "tree" "状态"
+PENDING_ANY=0
+MISSING_ANY=0
+for run in ${RUNS}; do
+  adapter="$(resolve_adapter "${run}")"
+  out_root="$(resolve_out_root "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+  tree="$(basename "${out_root}")"
+  if [[ -z "${adapter}" ]]; then
+    printf "%-52s %-14s %s\n" "${run}" "${tree}" "!! 缺 adapter（results 与 results_safety 都没有）"
+    MISSING_ANY=1
+    continue
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${out_root}/ifeval/${out_name}/summary.json" ]]; then
+    printf "%-52s %-14s %s\n" "${run}" "${tree}" "已有 ${out_name}，跳过"
+  else
+    printf "%-52s %-14s %s\n" "${run}" "${tree}" "待评 -> ${out_name}"
+    echo "         adapter: ${adapter}"
+    PENDING_ANY=1
+  fi
+done
+echo "========================================================================"
+set -x
+
+# ---------------------------------------------------------------------------
+# 评测
+# ---------------------------------------------------------------------------
+eval_one () {
+  local run=$1
+  local adapter out_root out_name
+  adapter="$(resolve_adapter "${run}")"
+  out_root="$(resolve_out_root "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+
+  if [[ -z "${adapter}" || ! -d "${adapter}" ]]; then
+    echo "跳过 ${run}：缺 adapter"
+    return 0
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${out_root}/ifeval/${out_name}/summary.json" ]]; then
+    echo "已有结果，跳过: ${out_root}/ifeval/${out_name}/summary.json"
+    return 0
+  fi
+
+  echo "==== eval IFEval: adapter=${adapter}  ->  ${out_root}/ifeval/${out_name} ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter}" --run_name "${out_name}" \
+    --metrics ifeval --out_dir "${out_root}" --seed "${SEED}" \
+    --limit "${LIMIT}" --max_new_tokens "${MAX_NEW_TOKENS}" \
+    --map_cache_dir "${out_root}/map_cache/eval_if_seed${SEED}" \
+    --ifeval_input "${IFEVAL_INPUT}"
+}
+
+for run in ${RUNS}; do
+  eval_one "${run}"
+done
+
+# ---------------------------------------------------------------------------
+# 后置：每个 run 一行，原结果 vs 本次写出的 run 名。
+# ---------------------------------------------------------------------------
+set +x
+python - "${RESULTS_MAIN}" "${RESULTS_SAFETY}" "${OUT_SUFFIX}" ${RUNS} <<'PY'
 import json
 import sys
 from pathlib import Path
 
-root, orig, rerun = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+main_root = Path(sys.argv[1])
+safety_root = Path(sys.argv[2])
+suffix = sys.argv[3]
+runs = sys.argv[4:]
+roots = [main_root, safety_root]
 
 
 def load(name):
-    path = root / "ifeval" / name / "summary.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    for root in roots:
+        path = root / "ifeval" / name / "summary.json"
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8")), root.name
+    return None, ""
 
 
 def cell(payload, key):
     return f"{payload[key] * 100:6.2f}" if payload and key in payload else "  --  "
 
 
-keys = [
-    ("strict_prompt_accuracy", "strict prompt"),
-    ("strict_instruction_accuracy", "strict inst"),
-    ("loose_prompt_accuracy", "loose prompt"),
-    ("loose_instruction_accuracy", "loose inst"),
-]
-a, b = load(orig), load(rerun)
-
 print()
-print("=" * 78)
-print("IFEval 复现对比（%）。贪心解码，同一 adapter 重评差异应极小；跨集群/库版本")
-print("可能有几分之一到约 1pp 的漂移。差异远大于此才值得深究。")
-print("=" * 78)
-print(f"{'指标':<16}{'原结果':>12}{'重跑':>12}{'差(pp)':>12}")
-for k, label in keys:
-    if a and b and k in a and k in b:
-        diff = f"{(b[k] - a[k]) * 100:+.2f}"
+print("=" * 118)
+print("IFEval（%）。贪心解码，同一 adapter 重评差异应极小。")
+print("=" * 118)
+print(f"{'run':<52} {'tree':<16} {'strict p':>9} {'strict i':>9} {'loose p':>9} {'loose i':>9} {'Δsp':>8}")
+for run in runs:
+    orig, _ = load(run)
+    out_name = f"{run}{suffix}" if suffix else run
+    neu, tree = load(out_name)
+    if orig and neu and "strict_prompt_accuracy" in orig and "strict_prompt_accuracy" in neu:
+        delta = f"{(neu['strict_prompt_accuracy'] - orig['strict_prompt_accuracy']) * 100:+.2f}"
     else:
-        diff = "  --  "
-    print(f"{label:<16}{cell(a, k):>12}{cell(b, k):>12}{diff:>12}")
+        delta = "  --  "
+    print(
+        f"{out_name:<52} {tree:<16} "
+        f"{cell(neu, 'strict_prompt_accuracy'):>9} "
+        f"{cell(neu, 'strict_instruction_accuracy'):>9} "
+        f"{cell(neu, 'loose_prompt_accuracy'):>9} "
+        f"{cell(neu, 'loose_instruction_accuracy'):>9} "
+        f"{delta:>8}"
+    )
+    if orig and out_name != run:
+        print(
+            f"{'  原 ' + run:<52} {'':<16} "
+            f"{cell(orig, 'strict_prompt_accuracy'):>9} "
+            f"{cell(orig, 'strict_instruction_accuracy'):>9} "
+            f"{cell(orig, 'loose_prompt_accuracy'):>9} "
+            f"{cell(orig, 'loose_instruction_accuracy'):>9}"
+        )
 print()
-print(f"原结果 run : {orig}   ({'有' if a else '缺'} summary.json)")
-print(f"重跑   run : {rerun}")
-print("541 条 prompt：1pp = 5.41 条。单个准确率二项标准误约 2pp。")
+print("Δsp = 本次 strict prompt − 同名原结果（若有）。541 条：1pp = 5.41 条；二项 SE ≈ 2pp。")
 PY
 
 echo "========================================================================"
-echo "产物: ${RESULTS_ROOT}/ifeval/${OUT_NAME}/summary.json"
-echo "      ${RESULTS_ROOT}/ifeval_summary.csv （append）"
+echo "产物（各写回自己那棵树）:"
+for run in ${RUNS}; do
+  out_root="$(resolve_out_root "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+  echo "  ${out_root}/ifeval/${out_name}/summary.json"
+done
 echo "Job finished at: $(date)"
