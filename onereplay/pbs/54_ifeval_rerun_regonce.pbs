@@ -164,7 +164,7 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 # ---- 项目路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_safety}"
 ADAPTERS="${RESULTS_ROOT}/adapters"
 
 # ---- 评测参数（与第一章 / 02 号逐字一致，换了就不可比）----
