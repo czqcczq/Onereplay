@@ -189,13 +189,26 @@ def main() -> None:
     if args.limit > 0:
         rows = rows[: args.limit]
 
-    # Resume: keep verdicts already on disk, re-judge only the rest.
+    # Resume: keep good verdicts already on disk, but re-judge anything that
+    # previously failed (parse_failure), so a network blip on a few rows during
+    # a 5-model batch is recovered by simply re-running the same command.
     done: dict[str, dict[str, Any]] = {}
     if out_path.exists():
         for record in load_jsonl(out_path):
             done[record["id"]] = record
-    todo = [row for row in rows if row["id"] not in done]
-    print(f"{len(rows)} eligible rows, {len(done)} already judged, {len(todo)} to go")
+    todo = [
+        row
+        for row in rows
+        if row["id"] not in done or done[row["id"]].get("parse_failure", False)
+    ]
+    retry_count = sum(
+        1 for row in rows if row["id"] in done and done[row["id"]].get("parse_failure", False)
+    )
+    good = len(done) - retry_count
+    print(
+        f"{len(rows)} eligible rows, {good} already judged, "
+        f"{len(todo)} to go ({retry_count} of them retries of prior failures)"
+    )
 
     if todo:
         try:
@@ -220,6 +233,14 @@ def main() -> None:
                     completed += 1
                     if completed % 25 == 0:
                         print(f"judged {completed}/{len(todo)}", flush=True)
+
+        # Re-judging a prior failure appended a fresh line next to the stale one,
+        # so collapse the file to one (latest) record per id before anyone reads it.
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as sink:
+            for record in done.values():
+                sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+        tmp_path.replace(out_path)
 
     # Report per-bench ASR straight away so a broken key or drifting judge shows
     # up here rather than three steps later in the analysis.
