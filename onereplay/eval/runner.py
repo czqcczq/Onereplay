@@ -62,6 +62,7 @@ def get_metric(name: str) -> Metric:
         "aime": "onereplay.eval.metrics.aime:AIMEMetric",
         "humaneval": "onereplay.eval.metrics.humaneval:HumanEvalMetric",
         "mbpp": "onereplay.eval.metrics.mbpp:MBPPMetric",
+        "apps": "onereplay.eval.metrics.apps:APPSMetric",
         "safety": "onereplay.eval.metrics.safety:SafetyMetric",
         "math500": "onereplay.eval.metrics.math500:MATH500Metric",
         "amc": "onereplay.eval.metrics.math500:AMCMetric",

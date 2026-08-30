@@ -77,3 +77,6 @@ huggingface/
 .torch/
 
 migrate_safety/adapters/
+
+# APPS dataset
+apps_ref/
