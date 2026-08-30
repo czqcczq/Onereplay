@@ -21,19 +21,24 @@
 #   两个 checkpoint 现成，一趟作业就能定，这和数学那边"先只训 vanilla"是同一个逻辑。
 #
 # -----------------------------------------------------------------------------
-# !! 三个必须先知道的判分特性（都在 onereplay/eval/code_exec.py 里）
+# !! 判分口径（都在 onereplay/eval/code_exec.py 里）——2026-08-31 修掉两个判错 bug
 #
-# 1) cleanup_completion 在第一个 '\ndef ' 处截断。模型写
-#      "Here is the solution:\n\ndef f(...)"
-#    时，留下的只有那句话，代码全被砍掉，判 0 分 —— 哪怕代码完全正确。
-#    **这条专门惩罚话多的模型**，而 vanilla 恰恰是被训得爱加废话/不收尾的那个。
+# 1) 清洗现在按题型分流。MBPP 走 AST 白名单（保留 import 与所有顶层 def，只丢尾部
+#    print / __main__ / 模型自造 assert）；HumanEval 保留函数体缩进，装配时按"哪种
+#    缩进能编译"归一化。
+#    旧口径两处都反了：在第一个 '\ndef ' 处截断，于是 "import math\ndef f(...)" 只
+#    剩 import，正确代码判 0；strip() 吃掉函数体首行缩进，于是老实只返回函数体的
+#    完成变成 'return' outside function。实测 MBPP 腰斩率 10-31%、HumanEval 去缩进
+#    致死率 0.6-16%，且与 run 强相关（不是一视同仁的偏置），足以翻转结论符号。
 #
-# 2) has_dangerous_code 拦掉任何含 'import os' / 'open(' / 'pathlib' / 'socket'
-#    等字样的完成，包括正当用法。所以**绝对分数会低于该模型公开报告的数值**。
-#    它对每个 run 一视同仁，所以对比有效，绝对值不可外引。
+# 2) 黑名单只拦文件/进程/网络：os、subprocess、socket、requests、urllib、shutil、
+#    open(、exec(、eval(、__import__。sys / pathlib / pickle 已放开——执行本身在带
+#    超时的子进程里，这三个不构成真实风险。绝对分数仍略低于公开报告值，不可外引。
 #
 # 3) MBPP 的 split 默认是 validation（只有 90 题）。本脚本显式传 test（500 题），
 #    否则量程差三倍。
+#
+# !! 本脚本此前跑出的 base / vanilla 代码结果是旧口径，必须重跑后才能与新结果比。
 #
 #   => 结论：pass@1 掉了不等于"不会写代码了"。要分辨这两件事，评完另跑
 #      analyze_code_failures（本作业默认不跑，见 DO_ANALYZE），按 error 字段分桶：

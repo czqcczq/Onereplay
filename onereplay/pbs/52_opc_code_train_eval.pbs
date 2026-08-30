@@ -48,11 +48,20 @@
 #   那一桶被压回多少，是 CE 之外唯一能给机制解释的证据。
 #
 # -----------------------------------------------------------------------------
-# !! 三个判分特性（都在 onereplay/eval/code_exec.py，与 39/42 号同）
-#   1) cleanup_completion 在第一个 '\ndef ' 处截断 —— 专门惩罚话多的模型。
-#   2) has_dangerous_code 拦掉含 'import os' / 'open(' 等字样的完成，包括正当用法。
-#      **绝对分数会低于公开报告值**，对比有效、绝对值不可外引。
+# !! 判分口径（都在 onereplay/eval/code_exec.py）——2026-08-31 修掉两个判错 bug
+#   1) 清洗按题型分流。MBPP 走 AST 白名单（保留 import 与所有顶层 def，只丢尾部
+#      print / __main__ / 模型自造 assert）；HumanEval 保留函数体缩进，装配时按
+#      "哪种缩进能编译"归一化。旧口径两处都反了：在第一个 '\ndef ' 处截断，把以
+#      import 开头的 MBPP 程序腰斩；strip() 吃掉函数体首行缩进，把 HumanEval 正解
+#      变成 'return' outside function。实测 MBPP 腰斩率 10-31%、HumanEval 去缩进
+#      致死率 0.6-16%，足以翻转结论符号。
+#   2) 黑名单只拦文件/进程/网络：os、subprocess、socket、requests、urllib、shutil、
+#      open(、exec(、eval(、__import__。sys / pathlib / pickle 已放开——执行本身
+#      在带超时的子进程里，这三个不构成真实风险。绝对分数仍略低于公开报告值。
 #   3) MBPP split 默认 validation（90 题），本脚本显式传 test（500 题）。
+#   !! 修复前后的代码结果不可混用。旧 run 用 onereplay/scripts/rejudge_code_eval.py
+#      重判：HumanEval 可精确复原（损伤只是首行缩进），MBPP 被腰斩的正文已永久丢失，
+#      必须重新生成。修后 responses.jsonl 会同时存 raw，以后改判分不必再重跑。
 #
 # -----------------------------------------------------------------------------
 # 用法（推荐两阶段）:

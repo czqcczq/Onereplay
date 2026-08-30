@@ -37,8 +37,14 @@ def generate_from_text(
     text: str,
     device,
     max_new_tokens: int,
+    strip: bool = True,
 ) -> str:
-    """Greedy-decode one continuation for already chat-rendered text."""
+    """Greedy-decode one continuation for already chat-rendered text.
+
+    Pass ``strip=False`` when leading whitespace carries meaning. HumanEval
+    completions are appended to a function stub, so stripping the first line's
+    indentation turns a correct body into ``'return' outside function``.
+    """
 
     inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False).to(device)
     with torch.no_grad():
@@ -50,7 +56,8 @@ def generate_from_text(
             eos_token_id=tokenizer.eos_token_id,
         )
     new_tokens = output_ids[0, inputs["input_ids"].shape[1] :]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    decoded = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return decoded.strip() if strip else decoded
 
 
 def generate_response(
@@ -59,11 +66,17 @@ def generate_response(
     prompt: str,
     device,
     max_new_tokens: int,
+    strip: bool = True,
 ) -> str:
     """Greedy-decode one assistant response for a single-turn prompt."""
 
     return generate_from_text(
-        model, tokenizer, render_user_prompt(tokenizer, prompt), device, max_new_tokens
+        model,
+        tokenizer,
+        render_user_prompt(tokenizer, prompt),
+        device,
+        max_new_tokens,
+        strip=strip,
     )
 
 

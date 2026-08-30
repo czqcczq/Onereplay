@@ -19,15 +19,19 @@ in the `error` field their harness already writes:
     blocked                         the harness' own safety blocklist fired,
                                     which is a scorer artifact, not the model
 
-Two caveats worth carrying into any writeup, both from onereplay/eval/code_exec.py:
+Both of the judge bugs this tool was built to detect were fixed on 2026-08-31
+in onereplay/eval/code_exec.py, so which caveats apply depends on when the run
+was scored:
 
-  * cleanup_completion truncates at the first '\\ndef ', so a model that writes
-    "Here is the solution:\\n\\ndef f(...)" keeps only the prose and scores 0
-    with perfectly good code. This penalizes chatty models specifically.
-  * has_dangerous_code rejects any completion containing 'import os', 'open(',
-    'pathlib' and friends, including legitimate uses. Absolute pass@1 will sit
-    below published numbers for the same model. It applies equally to every
-    run, so comparisons stay valid; the absolute value does not.
+  * Runs scored before the fix carry two artifacts. cleanup_completion truncated
+    at the first '\\ndef ', beheading any MBPP program that opened with an
+    import, and strip() ate the leading indentation of HumanEval bodies, turning
+    correct answers into "'return' outside function". Neither was uniform across
+    runs -- measured 10-31% and 0.6-16% -- so they do not cancel in a comparison.
+    Re-score with onereplay/scripts/rejudge_code_eval.py before reading them.
+  * Runs scored after the fix only carry the blocklist, now narrowed to file,
+    process and network access. Absolute pass@1 still sits somewhat below
+    published numbers; comparisons are valid, the absolute value is not.
 
     python -m onereplay.scripts.analyze_code_failures \\
         --results_root /path/results --metrics humaneval,mbpp \\
@@ -61,10 +65,10 @@ def classify_syntax_failure(completion: str) -> str:
     """Why is this completion not valid Python?
 
     'SyntaxError' collapses two opposite findings. Either the model produced
-    broken Python -- a real coding regression -- or it produced fine Python
-    wrapped in prose and cleanup_completion, which truncates at the first
-    '\\ndef ', kept the prose and discarded the code. The second case says
-    nothing about whether the model can code.
+    broken Python -- a real coding regression -- or it produced fine Python that
+    the pre-2026-08-31 judge mangled, by keeping only the prose ahead of the
+    first '\\ndef ' or by stripping a function body's indentation. The second
+    case says nothing about whether the model can code.
 
     The completion is saved verbatim, so the question is answerable from disk
     with no GPU at all.

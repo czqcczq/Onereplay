@@ -88,11 +88,16 @@
 #   若 OneReplay 在等 val_loss 处优于 EWC，那就是"C 比固定 Fisher 更划算"的直接证据。
 #
 # -----------------------------------------------------------------------------
-# !! 三个判分特性（都在 onereplay/eval/code_exec.py，与 39/42/52 号同）
-#   1) cleanup_completion 在第一个 '\ndef ' 处截断 —— 专门惩罚话多的模型。
-#   2) has_dangerous_code 拦掉含 'import os' / 'open(' 等字样的完成，包括正当用法。
-#      **绝对分数会低于公开报告值**，对比有效、绝对值不可外引。
+# !! 判分口径（都在 onereplay/eval/code_exec.py）——2026-08-31 修掉两个判错 bug
+#   1) 清洗按题型分流。MBPP 走 AST 白名单（保留 import 与所有顶层 def）；HumanEval
+#      保留函数体缩进并在装配时归一化。旧口径在第一个 '\ndef ' 处截断（腰斩以 import
+#      开头的 MBPP 程序），且 strip() 吃掉函数体首行缩进（把 HumanEval 正解变成
+#      'return' outside function）。详见 52 号头部的实测数字。
+#   2) 黑名单只拦文件/进程/网络（os、subprocess、socket、requests、urllib、shutil、
+#      open(、exec(、eval(、__import__）；sys / pathlib / pickle 已放开。
 #   3) MBPP split 默认 validation（90 题），本脚本显式传 test（500 题）。
+#   !! 修复前后的代码结果不可混用；旧 run 用 onereplay/scripts/rejudge_code_eval.py
+#      重判（HumanEval 可精确复原，MBPP 必须重新生成）。
 #
 # -----------------------------------------------------------------------------
 # 前置条件
@@ -108,7 +113,7 @@
 #   qsub -v PROBE=1 onereplay/pbs/55_opc_code_ewc_mix.pbs        # 探针：两版最小 λ 跑 300 步看罚项
 #   qsub onereplay/pbs/55_opc_code_ewc_mix.pbs                   # 默认：两版(equal/half) × λ=1 训练 + 评测
 #   qsub -v VARIANTS=equal onereplay/pbs/55_opc_code_ewc_mix.pbs # 只跑等贡献版
-#   qsub -v LAMBDAS=0.3,1,3 onereplay/pbs/55_opc_code_ewc_mix.pbs # 扩成曲线（逗号分隔，默认单点 1）
+#   qsub -v 'LAMBDAS=0.3 1 3' onereplay/pbs/55_opc_code_ewc_mix.pbs  # 扩成曲线（默认单点 1）
 #   qsub -v DO_EVAL=0 onereplay/pbs/55_opc_code_ewc_mix.pbs      # 只训练
 #   qsub -v DO_TRAIN=0 onereplay/pbs/55_opc_code_ewc_mix.pbs     # F_mix 已就位、adapter 已训，只评测
 #   qsub -v FORCE_MIX=1 onereplay/pbs/55_opc_code_ewc_mix.pbs    # 强制重建 F_mix
@@ -255,8 +260,10 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 # ---- 变体与 λ 网格 ----
 VARIANTS="${VARIANTS:-equal half}"
 LAMBDAS="${LAMBDAS:-1}"   # 48 号探针定的温和单点；扩曲线见文件头
-# qsub -v 里带空格的值容易被 PBS 切开，所以两个网格都接受逗号分隔：
-#   -v LAMBDAS=0.3,1,3  等价于  -v 'LAMBDAS=0.3 1 3'，前者不用操心引号。
+# PBS 的 -v 用**逗号**分隔变量，值里的空格必须靠整体加单引号保住，见 52 号的写法：
+#   qsub -v 'VARIANTS=equal,LAMBDAS=0.3 1 3' ...
+# 所以千万别写 -v LAMBDAS=0.3,1,3 —— PBS 会拆成 LAMBDAS=0.3 外加两个名叫 1 和 3 的变量。
+# 下面两行只是容错：直接在 shell 里 export 时用逗号也能work，走 qsub 时轮不到它。
 LAMBDAS="${LAMBDAS//,/ }"
 VARIANTS="${VARIANTS//,/ }"
 

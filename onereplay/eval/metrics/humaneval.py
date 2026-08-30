@@ -9,7 +9,11 @@ from typing import Any
 
 from datasets import load_dataset
 
-from onereplay.eval.code_exec import cleanup_completion, evaluate_entry_point_program
+from onereplay.eval.code_exec import (
+    assemble_entry_point_program,
+    cleanup_body_completion,
+    evaluate_entry_point_program,
+)
 from onereplay.eval.generation import generate_response
 
 
@@ -58,9 +62,11 @@ class HumanEvalMetric:
             for idx, example in enumerate(rows, start=1):
                 prompt = example["prompt"]
                 user_prompt = build_prompt(prompt)
-                raw = generate_response(model, tokenizer, user_prompt, device, max_new_tokens)
-                completion = cleanup_completion(raw)
-                program = prompt + completion
+                raw = generate_response(
+                    model, tokenizer, user_prompt, device, max_new_tokens, strip=False
+                )
+                completion = cleanup_body_completion(raw)
+                program = assemble_entry_point_program(prompt, completion)
                 ok, error = evaluate_entry_point_program(
                     program, example["entry_point"], example["test"], timeout
                 )
@@ -73,6 +79,7 @@ class HumanEvalMetric:
                             "passed": ok,
                             "error": error,
                             "completion": completion,
+                            "raw": raw,
                         },
                         ensure_ascii=False,
                     )

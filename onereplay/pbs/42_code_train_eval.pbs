@@ -43,11 +43,15 @@
 #   它只读 responses.jsonl，评完在登录节点上补即可（见 DO_ANALYZE 与文末命令）。
 #
 # -----------------------------------------------------------------------------
-# !! 三个判分特性（都在 onereplay/eval/code_exec.py，与 39 号同）
-#   1) cleanup_completion 在第一个 '\ndef ' 处截断 —— 专门惩罚话多的模型。
-#   2) has_dangerous_code 拦掉含 'import os' / 'open(' 等字样的完成，包括正当用法。
-#      **绝对分数会低于公开报告值**，对比有效、绝对值不可外引。
+# !! 判分口径（都在 onereplay/eval/code_exec.py）——2026-08-31 修掉两个判错 bug
+#   1) 清洗按题型分流。MBPP 走 AST 白名单（保留 import 与所有顶层 def）；HumanEval
+#      保留函数体缩进并在装配时归一化。旧口径在第一个 '\ndef ' 处截断（腰斩以 import
+#      开头的 MBPP 程序），且 strip() 吃掉函数体首行缩进（把 HumanEval 正解变成
+#      'return' outside function）。详见 52 号头部的实测数字。
+#   2) 黑名单只拦文件/进程/网络（os、subprocess、socket、requests、urllib、shutil、
+#      open(、exec(、eval(、__import__）；sys / pathlib / pickle 已放开。
 #   3) MBPP split 默认是 validation（90 题），本脚本显式传 test（500 题）。
+#   !! 本脚本此前跑出的结果是旧口径，不可与修复后的混用。
 #
 # -----------------------------------------------------------------------------
 # 用法:

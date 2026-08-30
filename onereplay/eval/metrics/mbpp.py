@@ -9,7 +9,7 @@ from typing import Any
 
 from datasets import load_dataset, load_from_disk
 
-from onereplay.eval.code_exec import cleanup_completion, evaluate_assert_program
+from onereplay.eval.code_exec import cleanup_program_completion, evaluate_assert_program
 from onereplay.eval.generation import generate_response
 
 
@@ -67,7 +67,7 @@ class MBPPMetric:
                 raw = generate_response(
                     model, tokenizer, build_mbpp_prompt(example), device, max_new_tokens
                 )
-                completion = cleanup_completion(raw)
+                completion = cleanup_program_completion(raw)
                 tests = example.get("test_list") or example.get("tests") or []
                 if isinstance(tests, str):
                     tests = [tests]
@@ -80,6 +80,7 @@ class MBPPMetric:
                             "passed": ok,
                             "error": error,
                             "completion": completion,
+                            "raw": raw,
                         },
                         ensure_ascii=False,
                     )
