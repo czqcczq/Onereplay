@@ -1,0 +1,299 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_ewcctrl
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): EWC 对照评测（eval-only，两件事一次跑完）
+#
+#   任务1: EWC-IF（cs_ewc_lam3e2_seed1，零 math 保护）在 math 上（math500 + gsm8k）
+#          -> 检验 math 的"保住"到底靠不靠 math 保护。commonsense 本就几乎不遗忘
+#             math（vanilla 相对 base 仅 -0.8pp/math500），若 IF-only 也不掉，说明
+#             EWC-half 的 math 优势不来自 math 保护，而是强度/塑性/IF 保护副作用。
+#   任务2: EWC-half / EWC-equal 在 ifeval 上
+#          -> half 偏 IF，若 ifeval 也赢 equal，则"half>equal"本质是 IF 侧效应，与
+#             math 无关。
+#
+#   与 32 号逐字共用集群层（容器 / venv / 离线 / 临时目录），只把训练换成 eval-only。
+#   结果 append 进 ${RESULTS_ROOT}/{math500,gsm8k,ifeval}_summary.csv，与已有
+#   base/vanilla/cmix 行并排可读。已有 summary.json 的自动跳过（幂等、可续跑）。
+#
+# -----------------------------------------------------------------------------
+# 用法（本集群 qsub 默认不带入提交环境；若支持 -v，FORWARD_VARS 里的变量可从命令行传）:
+#   mkdir -p /scratch/weiliu87/logs/onereplay      # qsub 前必须存在，且在仓库外
+#   qsub onereplay/pbs/49_eval_ewc_controls.pbs                 # 两件都跑
+#   qsub -v TASKS=math   onereplay/pbs/49_eval_ewc_controls.pbs # 只跑任务1
+#   qsub -v TASKS=ifeval onereplay/pbs/49_eval_ewc_controls.pbs # 只跑任务2
+#   qsub -v FORCE_EVAL=1 onereplay/pbs/49_eval_ewc_controls.pbs # 强制重评
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/49_eval_ewc_controls.pbs}"
+
+# NGC PyTorch 镜像（ubuntu22.04 + python3.10，与 venv 解释器版本一致）。
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTERS MATH_DATA_DIR IFEVAL_INPUT
+    SEED MATH_MAX_NEW_TOKENS FORCE_EVAL TASKS
+    EWC_IF_RUN EWC_HALF_RUN EWC_EQUAL_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用（本站点联网会卡死）。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+ADAPTERS="${ADAPTERS:-${RESULTS_ROOT}/adapters}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+
+# ---- 评测参数 ----
+SEED="${SEED:-1}"
+# 必须与 base/vanilla/cmix 的 math500 一致（4096），改了就不可比。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+TASKS="${TASKS:-math ifeval}"
+
+# ---- run 名 ----
+EWC_IF_RUN="${EWC_IF_RUN:-cs_ewc_lam3e2_seed1}"
+EWC_HALF_RUN="${EWC_HALF_RUN:-cs_ewcmix_half_lam1_seed1}"
+EWC_EQUAL_RUN="${EWC_EQUAL_RUN:-cs_ewcmix_equal_lam1_seed1}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${RESULTS_ROOT}/metrics"
+
+echo "TASKS=${TASKS}  SEED=${SEED}  MATH_MAX_NEW_TOKENS=${MATH_MAX_NEW_TOKENS}  FORCE_EVAL=${FORCE_EVAL}"
+
+check_adapter () {
+  [[ -d "${ADAPTERS}/$1" ]] || { echo "缺 adapter: ${ADAPTERS}/$1"; exit 1; }
+}
+
+# 已有 summary.json 就跳过（幂等，可续跑；FORCE_EVAL=1 强制重评）。
+done_already () {
+  [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/$1/$2/summary.json" ]]
+}
+
+# ===========================================================================
+# 任务1: EWC-IF 在 math（math500 + gsm8k）
+# ===========================================================================
+if [[ " ${TASKS} " == *" math "* ]]; then
+  check_adapter "${EWC_IF_RUN}"
+  [[ -f "${MATH_DATA_DIR}/math500_test.jsonl" ]] || { echo "缺 math500_test.jsonl"; exit 1; }
+
+  metrics=""
+  if done_already math500 "${EWC_IF_RUN}"; then echo "跳过 math500/${EWC_IF_RUN}（已有）"; else metrics="${metrics},math500"; fi
+  if [[ -f "${MATH_DATA_DIR}/gsm8k_test.jsonl" ]]; then
+    if done_already gsm8k "${EWC_IF_RUN}"; then echo "跳过 gsm8k/${EWC_IF_RUN}（已有）"; else metrics="${metrics},gsm8k"; fi
+  else
+    echo "缺 gsm8k_test.jsonl：只评 math500"
+  fi
+  metrics="${metrics#,}"
+
+  if [[ -n "${metrics}" ]]; then
+    echo "==== 任务1 eval math: ${EWC_IF_RUN} (${metrics}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${ADAPTERS}/${EWC_IF_RUN}" \
+      --run_name "${EWC_IF_RUN}" \
+      --metrics "${metrics}" \
+      --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+      --math500_data_path "${MATH_DATA_DIR}/math500_test.jsonl" \
+      --gsm8k_data_path "${MATH_DATA_DIR}/gsm8k_test.jsonl"
+  else
+    echo "任务1：math 指标都已有，跳过"
+  fi
+fi
+
+# ===========================================================================
+# 任务2: EWC-half / EWC-equal 在 ifeval
+# ===========================================================================
+if [[ " ${TASKS} " == *" ifeval "* ]]; then
+  [[ -f "${IFEVAL_INPUT}" ]] || { echo "缺 ifeval 输入: ${IFEVAL_INPUT}"; exit 1; }
+
+  for run in "${EWC_HALF_RUN}" "${EWC_EQUAL_RUN}"; do
+    check_adapter "${run}"
+    if done_already ifeval "${run}"; then
+      echo "跳过 ifeval/${run}（已有）"
+      continue
+    fi
+    echo "==== 任务2 eval ifeval: ${run} ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${ADAPTERS}/${run}" \
+      --run_name "${run}" \
+      --metrics ifeval \
+      --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --ifeval_input "${IFEVAL_INPUT}"
+  done
+fi
+
+# ===========================================================================
+# 汇总：把本次相关 run 的关键数打成一张表（含已有 base/vanilla 作参照）
+# ===========================================================================
+set +x
+echo
+echo "=========================================================================="
+echo "汇总（缺的行说明还没评）"
+echo "=========================================================================="
+python - "${RESULTS_ROOT}" "${EWC_IF_RUN}" "${EWC_HALF_RUN}" "${EWC_EQUAL_RUN}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results_root = Path(sys.argv[1])
+ewc_if, ewc_half, ewc_equal = sys.argv[2:5]
+
+
+def load(metric, run):
+    path = results_root / metric / run / "summary.json"
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def num(summary, *keys):
+    if not summary:
+        return "  --  "
+    for key in keys:
+        if key in summary and isinstance(summary[key], (int, float)):
+            value = summary[key]
+            return f"{value * 100:6.2f}" if value <= 1 else f"{value:6.2f}"
+    return "  --  "
+
+
+print("\n-- math retention（math500 / gsm8k accuracy %，全部需 4096 才可比）--")
+print(f"{'run':<44} {'math500':>8} {'gsm8k':>8}")
+for run in ("base", "cs_vanilla_seed1", "cs_onereplay_ifmath_lam3e-2_seed1_regonce", ewc_if):
+    print(f"{run:<44} {num(load('math500', run), 'accuracy'):>8} "
+          f"{num(load('gsm8k', run), 'accuracy'):>8}")
+
+print("\n-- IF retention（ifeval strict prompt / instruction %）--")
+print(f"{'run':<44} {'prompt':>8} {'instr':>8}")
+for run in ("base", "cs_vanilla_seed1", ewc_half, ewc_equal):
+    s = load("ifeval", run)
+    print(f"{run:<44} "
+          f"{num(s, 'strict_prompt_accuracy', 'prompt_accuracy'):>8} "
+          f"{num(s, 'strict_instruction_accuracy', 'instruction_accuracy'):>8}")
+
+print("\n判读:")
+print("  任务1 -> EWC-IF 的 math500 若与 base/vanilla 持平，说明 math 不靠 math 保护，")
+print("           EWC-half 的 math 优势另有来源（强度/塑性/IF 保护副作用）。")
+print("  任务2 -> half 的 ifeval 若高于 equal，说明 half>equal 本质是 IF 侧效应。")
+print("  注: EWC-IF 是 λ=3e2、mix 是 λ=1，非同强度；GSM8K base/vanilla 若仍是 1792，")
+print("      与本次 4096 不可比，只认 math500。")
+PY
+
+echo
+echo "产物 CSV（每 run 一行，可直接并排）:"
+echo "  ${RESULTS_ROOT}/math500_summary.csv"
+echo "  ${RESULTS_ROOT}/gsm8k_summary.csv"
+echo "  ${RESULTS_ROOT}/ifeval_summary.csv"
+echo "逐题输出: ${RESULTS_ROOT}/<metric>/<run_name>/responses.jsonl"
