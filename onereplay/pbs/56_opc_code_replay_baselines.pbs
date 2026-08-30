@@ -1,0 +1,670 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_opcrep
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): OPC 代码线的 replay@0.5 基线（训练 + 评测）
+#   旧知识 = FLAN 自蒸馏 + OPC educational_instruct 自蒸馏，两臂只差「域配比」这一个变量。
+#
+#   arm rows   : 行数等权     IF:code = 0.5 : 0.5
+#   arm tokens : token 等权   IF:code = 0.82 : 0.18
+#
+# 与 52 号（vanilla + OneReplay/C_mix，λ=2e-2）逐字共用新任务侧的全部超参，唯一区别是
+# 这里不加正则（--replay_lambda 0），改成把旧知识当数据回放。于是四向对比成立：
+#   vanilla / OneReplay(C_mix) / EWC(F_mix, 55 号) / replay@0.5（本脚本），同评测口径。
+#
+# -----------------------------------------------------------------------------
+# 为什么是两个配比，而不是随手取 1:1
+#   loss 是按 supervised token 平均的，行数不是它的单位。两个池的实测：
+#       FLAN 自蒸馏  17,429 行可用，每行  90.0 个 supervised token
+#       OPC  自蒸馏  19,823 行可用，每行 405.2 个（max_len 2048 下，取自 51 号
+#                    inspect_fisher 的 tokens mean；19,823 = 20,000 减去 177 行
+#                    空/截断 target，与 F_code 的 rows 完全一致）
+#   于是 1:1 的行数配比 = 18% / 82% 的 token 配比，code 直接主导；要让两域在
+#   优化目标里等权，行数得是 0.82 : 0.18（= 长度的倒数比 90.0⁻¹ : 405.2⁻¹）。
+#   这两个数和数学线的 21/79、0.8:0.2 几乎一样，纯属巧合，但方便：两条线共用叙事。
+#   两种读法都能自洽地叫「等权」，所以两个都跑，按结果和论文口径挑：
+#     rows   = 标准的「每域回放同样多样本」，报告时必须附上 18/82 的 token 占比
+#     tokens = 与 OneReplay 的 C_mix = 0.5·C_if + 0.5·C_code 对齐的那一个
+#              （C 是按 token 取的二阶矩，等权指的是 token 分布等权）
+#   Step 0 的 stat_replay_pools 会把上面这些数现算一遍并打出来，与本注释不符就
+#   按打印的数改 W_*_TOKENS，别照抄注释。
+#
+# -----------------------------------------------------------------------------
+# 为什么 REPLAY_MAX_LEN=2048 而新任务仍是 512
+#   训练期截断保留的是**最后** max_len 个 token（tokenizer_to_ids 切 [-max_len:]），
+#   所以超长行保住的是答案结尾和 EOS，丢掉的是题目。OPC 池的长度分布（50 号 Step 3）：
+#       prompt P50=52 P90≈98 P99≈212 max≈997
+#       target P50≈372 P90≈634 P99≈1163 max=1280（生成上限）
+#   即 prompt+target 的 P90 已经约 730、P99 约 1170，卡在 512 会让相当一部分行只剩
+#   代码结尾、题面全丢 —— 退化成无题干的代码续写，回放的语义就变了。
+#   而且 C_code / F_code 都是在 max_len=2048、truncation_side=left 下采的，回放若卡在
+#   512，等于这一臂看到的旧知识严格少于 OneReplay 罚项里编码的那份，对比不成立。
+#   新任务侧必须留在 512：那是 vanilla / OneReplay / EWC / replay 四臂唯一必须一致的
+#   地方，动它就多出一个变量。--replay_max_len 只作用于回放行，FLAN 侧 prompt+target
+#   最大 503，设 2048 对它逐字无影响。
+#   Step 0 会打出 512/1024/2048 三档的截断率与「题面存活率」，按那张表确认再跑。
+#   显存的峰值由 batch 里最长那一行决定（collator 按最长行 padding）：OPC 池最长行
+#   （约 997+1280 ≈ 2.3k，2048 处会被切到 2048）比 MetaMath 的 2008 同级，BATCH=16 时
+#   峰值约 16×2048 ≈ 33k token，H200 141 GB 装得下。OOM 时的退档顺序是
+#   REPLAY_MAX_LEN 1024（峰值砍半）-> BATCH 8 / REPLAY_PER_BATCH 4（ACCUM 不动）。
+#
+# BATCH=16 / REPLAY_PER_BATCH=8 / ACCUM=128：为什么翻倍是免费的
+#   ACCUM 的单位是**行**（每次更新喂进去的总行数），不是 micro-batch 数：
+#   train.py 里 accum_steps = ACCUM / BATCH，每次更新的新任务行数 =
+#   accum_steps × (BATCH - REPLAY_PER_BATCH)。
+#       BATCH=8  REPLAY=4  ACCUM=128 -> 16 步 × 4 行 = 64
+#       BATCH=16 REPLAY=8  ACCUM=128 ->  8 步 × 8 行 = 64   
+#   所以 micro-batch 翻倍时 ACCUM 不动：每次更新的新任务行数、优化器更新次数
+#   （2,636/epoch）、lr、epoch 数全部不变，与 vanilla / OneReplay 的 64 行/更新
+#   对齐关系也不变；变的只是同样一份数据用一半的 micro-batch 走完，H200 上单步
+#   利用率更高。约束只有一条：ACCUM 必须被 BATCH 整除。
+#   唯一的二阶差异：HF 的 loss 在 micro-batch 内按 token 平均、窗口内按步平均，
+#   所以放大 micro-batch 会轻微改变窗口内各行的相对权重。量级与换 seed 重排同级，
+#   但它确实意味着本脚本的 per-step 时间/显存不再能和 IF 线 batch=8 的成本表并排，
+#   代码线不报成本表，可以接受。
+#
+# EVAL_BATCH=8（必须钉住，不跟 BATCH 一起翻倍）
+#   val_loss 是按 batch 平均而不是按 token 平均的，batch 一改这个数就会平移。
+#   52/55 号的 vanilla / C_mix / EWC 都是 batch=8 跑的，钉在 8 才能和它们并排读。
+#   代码评测那边同理：generate 的 batch 会改变 padding，贪心解码可能翻掉个别
+#   token，所以评测一律沿用 evaluate.py 的默认（39/42/52 号也是这个默认），
+#   本脚本不传 --batch_size。
+#
+# -----------------------------------------------------------------------------
+# !! 三个判分特性（都在 onereplay/eval/code_exec.py，与 39/42/52/55 号同）
+#   1) cleanup_completion 在第一个 '\ndef ' 处截断 —— 专门惩罚话多的模型。
+#   2) has_dangerous_code 拦掉含 'import os' / 'open(' 等字样的完成，包括正当用法。
+#      **绝对分数会低于公开报告值**，对比有效、绝对值不可外引。
+#   3) MBPP split 默认 validation（90 题），本脚本显式传 test（500 题）。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) ${SELF_DISTILL_IF}   = results/replay/flan_selfdistill_20000_seed1.jsonl
+#      （13 号 slurm 的产物；若没搬过来，本脚本会在 Step 0 直接停下）
+#   2) ${SELF_DISTILL_CODE} = results/replay/opc_edu_ccode_20k_selfdistill_seed1.jsonl
+#      （50 号产物，与 C_code / F_code 同一份池）
+#   3) ${CS_DATASET} = datasets/commonsense_170k_hf
+#   4) 代码评测数据 ${CODE_DATA_DIR}/humaneval_test.parquet、mbpp_full/
+#   5) mkdir -p /scratch/weiliu87/logs/onereplay   # qsub 之前必须存在，且在仓库外
+#
+# 用法
+#   qsub onereplay/pbs/56_opc_code_replay_baselines.pbs   # 两臂训练 + 评测
+#   只做前置检查（几分钟、纯 CPU）:   qsub -v DRY_RUN=1 ...
+#   拆两次投（各自可续跑）:           DO_EVAL=0 先训；再 DO_TRAIN=0 只评
+#   只跑一臂:                         ARMS=rows   或   ARMS=tokens
+#   顺带评 IF 侧:                     WITH_IF=1
+#   顺带出失败分桶:                   DO_ANALYZE=1
+#   冒烟（每指标前 20 题，产物自动改道 _limit20）: qsub -v LIMIT=20 ...
+#
+# 预算（参照：IF 线 replay@0.5 在 batch=8 / max_len=512 下实测 109 ms/step、3 epoch 3.84 h）
+#   本脚本一个 epoch 是 21,089 个 micro-batch（batch=8 时是 42,178）。回放行的
+#   supervised token 是 FLAN 的 4.5 倍，单步变重但步数少一半，且 micro-batch 翻倍后
+#   H200 利用率更高，单臂 3 epoch 估 5-8 h，两臂加评测大概率超 24 h。
+#   所以建议先 ARMS=rows DO_EVAL=0 投一次，拿到真实 sec_per_step 再决定第二臂要不要
+#   和评测放同一个作业。已存在的 adapter 会被跳过，所以超时后原样再投就是续跑。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/56_opc_code_replay_baselines.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT CODE_DATA_DIR DATASET_CACHE OUT_DIR
+    DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL DRY_RUN ARMS DO_ANALYZE
+    SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    EVAL_BATCH REPLAY_PER_BATCH REPLAY_MAX_LEN SELF_DISTILL_IF SELF_DISTILL_CODE
+    W_IF_ROWS W_CODE_ROWS W_IF_TOKENS W_CODE_TOKENS
+    RUN_PREFIX MODELS EXTRA_MODELS
+    CODE_MAX_NEW_TOKENS TIMEOUT LIMIT MBPP_SPLIT MBPP_CONFIG
+    WITH_IF IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的训练+评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+ARMS="${ARMS:-rows tokens}"
+
+# ---- 训练超参：新任务侧与 52 号逐字一致，ACCUM 除外（原因见文件头）----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+BATCH="${BATCH:-8}"      
+ACCUM="${ACCUM:-128}"     # 单位是行：16 步 × 4 行新任务 = 64 行/次更新，与 52 号一致
+EVAL_BATCH="${EVAL_BATCH:-8}"   # 钉在 52/55 号的值，否则 val_loss 不可比
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+
+# ACCUM 必须被 BATCH 整除，否则 accum_steps 取整会静默改掉每次更新的行数。
+if (( ACCUM % BATCH != 0 )); then
+  echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"
+  exit 1
+fi
+
+# ---- 回放设定 ----
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"     
+REPLAY_MAX_LEN="${REPLAY_MAX_LEN:-2048}"      # 只作用于回放行；新任务留在 MAXLEN
+SELF_DISTILL_IF="${SELF_DISTILL_IF:-${RESULTS_ROOT}/replay/flan_selfdistill_20000_seed1.jsonl}"
+SELF_DISTILL_CODE="${SELF_DISTILL_CODE:-${RESULTS_ROOT}/replay/opc_edu_ccode_20k_selfdistill_seed1.jsonl}"
+W_IF_ROWS="${W_IF_ROWS:-0.5}";      W_CODE_ROWS="${W_CODE_ROWS:-0.5}"
+# token 等权：权重取每行 supervised token 的倒数比，90.0⁻¹ : 405.2⁻¹ = 0.818 : 0.182。
+# Step 0 会把实测值打出来，与此不符就按打印的改。
+W_IF_TOKENS="${W_IF_TOKENS:-0.82}"; W_CODE_TOKENS="${W_CODE_TOKENS:-0.18}"
+
+# ---- run 名：把域配比写进名字，改了权重没改名字最容易把两批结果混在一起 ----
+RUN_PREFIX="${RUN_PREFIX:-cs_replaymix_ifcode_opcedu}"
+NEW_PER_BATCH=$(( BATCH - REPLAY_PER_BATCH ))
+SHARE_TAG="${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r"
+
+# 每次更新的新任务行数必须是 64，否则这一臂和 vanilla / OneReplay 走的不是同一条
+# 优化轨迹。放在训练前算一遍：训练后的自检要等 8 小时才会报同一件事。
+NEW_PER_UPDATE=$(( (ACCUM / BATCH) * NEW_PER_BATCH ))
+echo "micro-batch=${BATCH} (${NEW_PER_BATCH} 新 + ${REPLAY_PER_BATCH} 回放), " \
+     "accum_steps=$(( ACCUM / BATCH )), 新任务行/更新=${NEW_PER_UPDATE}"
+if (( NEW_PER_UPDATE != 64 )); then
+  echo "新任务行/更新=${NEW_PER_UPDATE}，与 52 号的 64 不符；调 ACCUM 或 REPLAY_PER_BATCH"
+  exit 1
+fi
+arm_weights () {
+  case "$1" in
+    rows)   echo "${W_IF_ROWS},${W_CODE_ROWS}" ;;
+    tokens) echo "${W_IF_TOKENS},${W_CODE_TOKENS}" ;;
+    *)      echo "" ;;
+  esac
+}
+# 归一化成整数百分比再进名字：既避开目录名里的小数点，也保证「改了权重必然改名」，
+# 不会出现两批不同配比的结果落进同一个 adapter / summary 行。
+weight_tag () {
+  awk -F, -v spec="$1" 'BEGIN{
+    n = split(spec, w, ",")
+    s = 0
+    for (i = 1; i <= n; i++) s += w[i]
+    out = ""
+    for (i = 1; i <= n; i++) out = out (i > 1 ? "-" : "") sprintf("%d", w[i] / s * 100 + 0.5)
+    print out
+  }'
+}
+run_name () {
+  local weights
+  weights="$(arm_weights "$1")"
+  [[ -n "${weights}" ]] || { echo ""; return; }
+  echo "${RUN_PREFIX}_${SHARE_TAG}_rows$(weight_tag "${weights}")_seed${SEED}"
+}
+
+# ---- 评测：与 39/42/52/55 号同口径，所有 run 必须同预算才可比 ----
+MBPP_CONFIG="${MBPP_CONFIG:-full}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
+TIMEOUT="${TIMEOUT:-10}"
+LIMIT="${LIMIT:-0}"
+DO_ANALYZE="${DO_ANALYZE:-0}"        # 失败分桶默认不跑，只读 responses.jsonl，可事后补
+
+HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
+MBPP_DIR="${CODE_DATA_DIR}/mbpp_${MBPP_CONFIG}"
+
+# LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"的逻辑
+# 当成完整结果挡住后续正式评测。这里自动改道。
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+fi
+
+WITH_IF="${WITH_IF:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+
+# 默认只评本脚本训出来的两臂。要并排读别的结果树里训好的 adapter（路径不在
+# ${ADAPTERS} 下面），用 EXTRA_MODELS 传 "简称;adapter绝对路径" 的分号对，
+# 多个用 | 分隔。
+MODELS="${MODELS:-}"
+EXTRA_MODELS="${EXTRA_MODELS:-}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${DATASET_CACHE}" \
+  "${RESULTS_ROOT}/replay" "${RESULTS_ROOT}/map_cache/eval_opcrep_seed${SEED}"
+
+echo "ARMS=${ARMS}  SEED=${SEED}  BATCH=${BATCH} ACCUM=${ACCUM} MAXLEN=${MAXLEN}"
+echo "REPLAY_PER_BATCH=${REPLAY_PER_BATCH}  REPLAY_MAX_LEN=${REPLAY_MAX_LEN}"
+echo "评测: MBPP split=${MBPP_SPLIT}(config=${MBPP_CONFIG}) CODE_MAX_NEW=${CODE_MAX_NEW_TOKENS} TIMEOUT=${TIMEOUT} LIMIT=${LIMIT}"
+echo "OUT_DIR=${OUT_DIR}"
+echo "IF   corpus: ${SELF_DISTILL_IF}"
+echo "CODE corpus: ${SELF_DISTILL_CODE}"
+for arm in ${ARMS}; do
+  echo "  arm ${arm}: weights=$(arm_weights "${arm}") run=$(run_name "${arm}")"
+done
+
+# ===========================================================================
+# Step 0: 前置检查
+#   语料在不在、行数/长度分布、以及调度器的配比是否精确。全是 CPU，几分钟。
+#   两个检查都会在配置错的时候直接停下，而不是烧掉几小时卡时之后才发现。
+# ===========================================================================
+echo "==== Step 0: 前置检查 ===="
+[[ -f "${SELF_DISTILL_IF}" ]] || {
+  echo "缺 IF 自蒸馏语料: ${SELF_DISTILL_IF}"
+  echo "  它是 13_replay_selfdistill 的产物。没搬过来就先补生成（约 39 min GPU），"
+  echo "  或传 SELF_DISTILL_IF=<绝对路径> 指过去。"
+  exit 1
+}
+# glob 要留给 python 展开，这里只确认至少匹配到一个文件。
+# shellcheck disable=SC2086
+if ! compgen -G "${SELF_DISTILL_CODE}" > /dev/null; then
+  echo "缺 OPC 自蒸馏语料: ${SELF_DISTILL_CODE}（50 号产物，与 C_code/F_code 同一份池）"
+  exit 1
+fi
+
+# 这一步会打三样东西，都要看：
+#   1) 两池的行数与每行 supervised token 数 -> 决定 tokens 臂的权重（预期 90.0 / 405.2）
+#   2) 512/1024/2048 三档的截断率与题面存活率 -> 确认 REPLAY_MAX_LEN=2048 是必要的
+#   3) 给定 BATCH/REPLAY_PER_BATCH/ACCUM 下每域实际的行/token 占比
+python -m onereplay.scripts.stat_replay_pools \
+  --pool "if=${SELF_DISTILL_IF}" \
+  --pool "code=${SELF_DISTILL_CODE}" \
+  --max_lens "512,1024,${REPLAY_MAX_LEN}" \
+  --mix_at "${REPLAY_MAX_LEN}" \
+  --batch_size "${BATCH}" --replay_per_batch "${REPLAY_PER_BATCH}" \
+  --accumulation_size "${ACCUM}" \
+  --json_out "${RESULTS_ROOT}/replay/pool_stats_ifcode_opcedu.json"
+
+python -m onereplay.scripts.verify_batch_mix
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查，不训练不评测"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# 训练
+#   --replay_lambda 0 且 --measure_replay_when_lambda_zero 0：这一臂没有罚项，
+#   连协方差都不该加载（否则会白付一份显存和每步的计算，成本表就不再是 replay
+#   自己的成本）。
+# ===========================================================================
+train_arm () {
+  local arm=$1
+  local run weights
+  run="$(run_name "${arm}")"
+  weights="$(arm_weights "${arm}")"
+  [[ -n "${run}" ]] || { echo "未知 ARM=${arm}，可选 rows / tokens"; return 1; }
+
+  if [[ "${FORCE_TRAIN}" != "1" && -d "${ADAPTERS}/${run}" ]]; then
+    echo "跳过训练 ${run}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+    return 0
+  fi
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+
+  echo "==== train ${arm}: ${run} (IF:code 行权重 ${weights}) ===="
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --replay_per_batch "${REPLAY_PER_BATCH}" \
+    --replay_max_len "${REPLAY_MAX_LEN}" \
+    --replay_mix_files "if=${SELF_DISTILL_IF},code=${SELF_DISTILL_CODE}" \
+    --replay_mix_weights "${weights}" \
+    --replay_drop_truncated 1 \
+    --replay_cache_dir "${DATASET_CACHE}" \
+    --save 1 --save_path "${ADAPTERS}/${run}" \
+    --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
+
+  # 训练日志里 describe() 打的两个 share 必须和 Step 0 那张表对得上；对不上说明
+  # 权重或语料被改过，这一臂的名字就名不副实了。
+  echo "自检: 比对 metrics 里的域配比与 Step 0 的预测"
+  python - "${RESULTS_ROOT}/metrics/${run}.jsonl" "${weights}" "${REPLAY_MAX_LEN}" <<'PY'
+import json
+import sys
+
+path, want_weights, want_max_len = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(path, encoding="utf-8") as handle:
+    records = [json.loads(line) for line in handle if line.strip()]
+# The file also holds probe records when probes are on, and those carry none of
+# the settings checked below.
+epochs = [row for row in records if row.get("record_type") == "epoch"]
+if not epochs:
+    raise SystemExit(f"{path} 里没有 epoch 记录，训练没有跑完一个 epoch")
+last = epochs[-1]
+
+print(f"replay_mix_labels  = {last.get('replay_mix_labels')}")
+print(f"replay_mix_weights = {last.get('replay_mix_weights')} (want {want_weights})")
+print(f"replay_max_len     = {last.get('replay_max_len')} (want {want_max_len})")
+print(f"batch_size         = {last.get('batch_size')} (micro-batch)")
+print(f"eval_batch_size    = {last.get('eval_batch_size')} (want 8, 见文件头)")
+print(f"new_per_update     = {last.get('new_per_update')} (want 64)")
+print(f"val_loss           = {last.get('val_loss')}")
+
+if last.get("replay_max_len") != want_max_len:
+    raise SystemExit("replay_max_len 不是预期值，这一臂的回放语料被截断到了别的长度")
+if int(last.get("new_per_update") or 0) != 64:
+    raise SystemExit(
+        "每次更新的新任务行数不是 64，与 vanilla / OneReplay 不可比；检查 ACCUM"
+    )
+if float(last.get("replay_lambda") or 0.0) != 0.0:
+    raise SystemExit("replay_lambda 不为 0，这一臂混进了正则项")
+got = [float(piece) for piece in (last.get("replay_mix_weights") or "").split(",") if piece]
+asked = [float(piece) for piece in want_weights.split(",") if piece]
+asked = [weight / sum(asked) for weight in asked] if asked else []
+if len(got) != len(asked) or any(abs(a - b) > 1e-3 for a, b in zip(got, asked)):
+    raise SystemExit(f"记录的域配比 {got} 与本臂要求的 {asked} 不一致")
+print("自检通过")
+PY
+}
+
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  for arm in ${ARMS}; do
+    train_arm "${arm}"
+  done
+else
+  echo "DO_TRAIN=0：跳过训练"
+fi
+
+# ===========================================================================
+# 评测：HumanEval + MBPP（+ 可选 IF/CS 侧），与 39/42/52/55 号同口径
+#   已有 summary.json 的 (指标, run) 直接跳过：既省卡时，也防止往 *_summary.csv
+#   里追加重复行。超时后原样再投能接着跑。
+#
+#   本脚本只评自己训的两臂。对照不重复评：base/vanilla 是 39 号产物、
+#   OneReplay C_mix 是 52 号、EWC F_mix 是 55 号，都 append 进同一份 CSV。
+# ===========================================================================
+# 待评清单：ARMS 各自的 run（adapter 在 ${ADAPTERS} 下）+ EXTRA_MODELS 的绝对路径对
+EVAL_SPECS=""
+append_spec () {
+  if [[ -z "${EVAL_SPECS}" ]]; then EVAL_SPECS="$1"; else EVAL_SPECS="${EVAL_SPECS}|$1"; fi
+}
+if [[ -n "${MODELS}" ]]; then
+  for m in ${MODELS}; do append_spec "${m};${ADAPTERS}/${m}"; done
+else
+  for arm in ${ARMS}; do
+    run="$(run_name "${arm}")"
+    append_spec "${run};${ADAPTERS}/${run}"
+  done
+fi
+if [[ -n "${EXTRA_MODELS}" ]]; then
+  IFS='|' read -ra extra <<< "${EXTRA_MODELS}"
+  for spec in "${extra[@]}"; do append_spec "${spec}"; done
+fi
+
+pending_metrics () {
+  local name=$1; shift
+  local out="" m
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${name}" >&2
+      continue
+    fi
+    out="${out},${m}"
+  done
+  echo "${out#,}"
+}
+
+eval_one () {
+  local name=$1 adapter=$2
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    echo "跳过评测 ${name}：缺 adapter ${adapter}"
+    return 0
+  fi
+
+  if [[ -n "${CODE_AVAIL}" ]]; then
+    local cp
+    # shellcheck disable=SC2086
+    cp="$(pending_metrics "${name}" ${CODE_AVAIL})"
+    if [[ -n "${cp}" ]]; then
+      echo "==== eval code: ${name} (${cp}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${cp}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+        --limit "${LIMIT}" \
+        --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}" --timeout "${TIMEOUT}" \
+        --humaneval_data_file "${HUMANEVAL_FILE}" \
+        --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
+        --cache_dir "${JOB_TMPDIR}/hf_datasets"
+    else
+      echo "跳过代码评测 ${name}：所有代码指标都已有结果"
+    fi
+  fi
+
+  if [[ "${WITH_IF}" == "1" && -n "${IF_AVAIL}" ]]; then
+    local ip
+    # shellcheck disable=SC2086
+    ip="$(pending_metrics "${name}" ${IF_AVAIL})"
+    if [[ -n "${ip}" ]]; then
+      echo "==== eval IF/CS: ${name} (${ip}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${ip}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+        --dataset_path "${CS_DATASET}" \
+        --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_opcrep_seed${SEED}" \
+        --ifeval_input "${IFEVAL_INPUT}" \
+        --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+        --multiif_limit "${MULTIIF_LIMIT}"
+    else
+      echo "跳过 IF/CS 评测 ${name}：所有 IF/CS 指标都已有结果"
+    fi
+  fi
+}
+
+if [[ "${DO_EVAL}" == "1" ]]; then
+  CODE_AVAIL=""
+  if [[ -f "${HUMANEVAL_FILE}" ]]; then
+    CODE_AVAIL="${CODE_AVAIL} humaneval"
+  else
+    echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}（先在登录节点跑 download_code_data）"
+  fi
+  if [[ -d "${MBPP_DIR}" ]]; then
+    CODE_AVAIL="${CODE_AVAIL} mbpp"
+  else
+    echo "跳过 mbpp：缺 ${MBPP_DIR}（先在登录节点跑 download_code_data）"
+  fi
+  CODE_AVAIL="${CODE_AVAIL# }"
+
+  IF_AVAIL=""
+  if [[ "${WITH_IF}" == "1" ]]; then
+    IF_AVAIL="ifeval commonsense"
+    if [[ -f "${MULTIIF_INPUT}" ]]; then IF_AVAIL="${IF_AVAIL} multiif"; else echo "跳过 multiif：缺 ${MULTIIF_INPUT}"; fi
+  fi
+
+  if [[ -z "${CODE_AVAIL}" && -z "${IF_AVAIL}" ]]; then
+    echo "没有任何可评测指标（两份代码数据都不在，且未开 WITH_IF）"; exit 1
+  fi
+  echo "CODE_AVAIL=[${CODE_AVAIL}]  IF_AVAIL=[${IF_AVAIL}]"
+
+  # -------------------------------------------------------------------------
+  # 判分链路自检：沙箱不通的话整个作业跑完只会得到一片 0 分。39 号加的，照搬。
+  # -------------------------------------------------------------------------
+  if [[ -n "${CODE_AVAIL}" ]]; then
+    python - <<'PY'
+from onereplay.eval.code_exec import evaluate_assert_program, evaluate_entry_point_program
+
+ok, err = evaluate_assert_program("def add(a, b):\n    return a + b\n", ["assert add(1, 2) == 3"], 5.0)
+print(f"自检 MBPP 路径      : passed={ok} error={err!r}")
+program = "def add(a, b):\n    return a + b\n"
+test = "def check(candidate):\n    assert candidate(1, 2) == 3\n"
+ok2, err2 = evaluate_entry_point_program(program, "add", test, 5.0)
+print(f"自检 HumanEval 路径 : passed={ok2} error={err2!r}")
+if not (ok and ok2):
+    raise SystemExit("判分沙箱不通（多半是容器里 multiprocessing 起不来），先修这个再评测")
+print("判分链路 OK")
+PY
+  fi
+
+  EVAL_NAMES=()
+  IFS='|' read -ra specs <<< "${EVAL_SPECS}"
+  for spec in "${specs[@]}"; do
+    name="${spec%%;*}"
+    adapter="${spec#*;}"
+    eval_one "${name}" "${adapter}"
+    EVAL_NAMES+=("${name}")
+  done
+
+  # -------------------------------------------------------------------------
+  # 失败原因分桶 + 语法错误成因取证 + 配对 McNemar
+  #   只读上面落盘的 responses.jsonl，纯 CPU 几秒。默认关，可事后在登录节点补。
+  # -------------------------------------------------------------------------
+  if [[ "${DO_ANALYZE}" == "1" && -n "${CODE_AVAIL}" && ${#EVAL_NAMES[@]} -gt 0 ]]; then
+    ANALYZE_RUNS="$(IFS=,; echo "${EVAL_NAMES[*]}")"
+    python -m onereplay.scripts.analyze_code_failures \
+      --results_root "${OUT_DIR}" --metrics "${CODE_AVAIL// /,}" \
+      --runs "${ANALYZE_RUNS}" --baseline base --inspect 5 || true
+  fi
+
+  set +x
+  echo "========================================================================"
+  echo "评测产物（每个 run 一行，append 进同名 CSV，可直接并排比）:"
+  for m in ${CODE_AVAIL}; do
+    echo "  ${m}: ${OUT_DIR}/${m}_summary.csv"
+  done
+  if [[ "${WITH_IF}" == "1" ]]; then
+    for m in ${IF_AVAIL}; do
+      echo "  ${m}: ${OUT_DIR}/${m}_summary.csv"
+    done
+  fi
+  echo "逐题输出: ${OUT_DIR}/<metric>/<run_name>/responses.jsonl"
+  echo "本次评测 run: ${EVAL_NAMES[*]}"
+  echo ""
+  echo "怎么读："
+  echo "  1) 同一份 CSV 里的四向对照（都同口径，不用重评）："
+  echo "       base / vanilla                              <- 39 号"
+  echo "       cs_onereplay_ifcode_opcedu_lam2e-2_*        <- 52 号（主方法 C_mix）"
+  echo "       cs_ewcmix_opcedu_{equal,half}_lam1_*        <- 55 号（EWC F_mix）"
+  echo "       cs_replaymix_ifcode_opcedu_*_rows{50-50,82-18}_* <- 本作业"
+  echo "  2) replay 是**最强的基线**：它直接看真实旧数据，而 OneReplay 只看二阶矩。"
+  echo "     所以论文要的不是「打赢 replay」，而是「用 O(1) 的存储逼近 replay」。"
+  echo "     报告时必须同时给出两臂的 token 占比（rows 臂是 18/82，不是 50/50）。"
+  echo "  3) 按等 commonsense val_loss 比代码分，别各挑最优点报。"
+  echo "  4) 绝对分数低于公开报告值（判分器有黑名单且会在第一个 '\\ndef ' 处截断）。"
+  echo ""
+  echo "失败分桶（DO_ANALYZE=0 时不跑）纯 CPU，登录节点上补即可："
+  echo "  python -m onereplay.scripts.analyze_code_failures \\"
+  echo "    --results_root ${OUT_DIR} --metrics ${CODE_AVAIL// /,} \\"
+  echo "    --runs <run1,run2,...> --baseline base --inspect 5"
+  set -x
+else
+  echo "DO_EVAL=0：跳过评测"
+fi
+
+set +x
+echo "Job finished at: $(date)"
