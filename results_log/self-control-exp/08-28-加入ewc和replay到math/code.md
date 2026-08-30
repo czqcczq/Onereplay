@@ -428,195 +428,250 @@ TYPE : str
 ----------------------------------------------------------------------------------------------------
 has_close_elements
 
-所以我的结论是，这两个数据集的样例本身是有差别的，mbpp是先用自然语言给一道问题，然后给出解题代码，并附上测试样例。humaneval则是直接给出代码的题头，然后附上答案，并且也有测试样例。所以我如果想找和humaneval相似的数据集，那么原则就是，同样是只有代码，没有自然语言提问，并且也有测试样例。
-
-APPS：
 ####################################################################################################
-APPS TEST SAMPLE 5 | index=1828
+HumanEval Sample 1
 ####################################################################################################
 
-[PROBLEM ID]
-None
+----------------------------------------------------------------------------------------------------
+FIELD: task_id
+TYPE : str
+----------------------------------------------------------------------------------------------------
+HumanEval/1
 
-[DIFFICULTY]
-interview
-
-[QUESTION]
-Maria participates in a bicycle race.
-
-The speedway takes place on the shores of Lake Lucerne, just repeating its contour. As you know, the lake shore consists only of straight sections, directed to the north, south, east or west.
-
-Let's introduce a system of coordinates, directing the Ox axis from west to east, and the Oy axis from south to north. As a starting position of the race the southernmost point of the track is selected (and if there are several such points, the most western among them). The participants start the race, moving to the north. At all straight sections of the track, the participants travel in one of the four directions (north, south, east or west) and change the direction of movement only in bends between the straight sections. The participants, of course, never turn back, that is, they do not change the direction of movement from north to south or from east to west (or vice versa).
-
-Maria is still young, so she does not feel confident at some turns. Namely, Maria feels insecure if at a failed or untimely turn, she gets into the water. In other words, Maria considers the turn dangerous if she immediately gets into the water if it is ignored.
-
-Help Maria get ready for the competition — determine the number of dangerous turns on the track.
+----------------------------------------------------------------------------------------------------
+FIELD: prompt
+TYPE : str
+----------------------------------------------------------------------------------------------------
+from typing import List
 
 
------Input-----
-
-The first line of the input contains an integer n (4 ≤ n ≤ 1000) — the number of straight sections of the track.
-
-The following (n + 1)-th line contains pairs of integers (x_{i}, y_{i}) ( - 10 000 ≤ x_{i}, y_{i} ≤ 10 000). The first of these points is the starting position. The i-th straight section of the track begins at the point (x_{i}, y_{i}) and ends at the point (x_{i} + 1, y_{i} + 1).
-
-It is guaranteed that:
-
-  the first straight section is directed to the north;  the southernmost (and if there are several, then the most western of among them) point of the track is the first point;  the last point coincides with the first one (i.e., the start position);  any pair of straight sections of the track has no shared points (except for the neighboring ones, they share exactly one point);  no pair of points (except for the first and last one) is the same;  no two adjacent straight sections are directed in the same direction or in opposite directions. 
-
-
------Output-----
-
-Print a single integer — the number of dangerous turns on the track.
+def separate_paren_groups(paren_string: str) -> List[str]:
+    """ Input to this function is a string containing multiple groups of nested parentheses. Your goal is to
+    separate those group into separate strings and return the list of those.
+    Separate groups are balanced (each open brace is properly closed) and not nested within each other
+    Ignore any spaces in the input string.
+    >>> separate_paren_groups('( ) (( )) (( )( ))')
+    ['()', '(())', '(()())']
+    """
 
 
------Examples-----
-Input
-6
-0 0
-0 1
-1 1
-1 2
-2 2
-2 0
-0 0
+----------------------------------------------------------------------------------------------------
+FIELD: canonical_solution
+TYPE : str
+----------------------------------------------------------------------------------------------------
+    result = []
+    current_string = []
+    current_depth = 0
 
-Output
-1
+    for c in paren_string:
+        if c == '(':
+            current_depth += 1
+            current_string.append(c)
+        elif c == ')':
+            current_depth -= 1
+            current_string.append(c)
 
-Input
-16
-1 1
-1 5
-3 5
-3 7
-2 7
-2 9
-6 9
-6 7
-5 7
-5 3
-4 3
-4 4
-3 4
-3 2
-5 2
-5 1
-1 1
+            if current_depth == 0:
+                result.append(''.join(current_string))
+                current_string.clear()
 
-Output
-6
+    return result
 
 
-
------Note-----
-
-The first sample corresponds to the picture:
-
- [Image] 
-
-The picture shows that you can get in the water under unfortunate circumstances only at turn at the point (1, 1). Thus, the answer is 1.
-
-[STARTER CODE]
+----------------------------------------------------------------------------------------------------
+FIELD: test
+TYPE : str
+----------------------------------------------------------------------------------------------------
 
 
-[INPUT / OUTPUT TESTS]
-{
-  "inputs": [
-    "6\n0 0\n0 1\n1 1\n1 2\n2 2\n2 0\n0 0\n",
-    "16\n1 1\n1 5\n3 5\n3 7\n2 7\n2 9\n6 9\n6 7\n5 7\n5 3\n4 3\n4 4\n3 4\n3 2\n5 2\n5 1\n1 1\n",
-    "4\n-10000 -10000\n-10000 10000\n10000 10000\n10000 -10000\n-10000 -10000\n",
-    "4\n6 8\n6 9\n7 9\n7 8\n6 8\n",
-    "8\n-10000 -10000\n-10000 5000\n0 5000\n0 10000\n10000 10000\n10000 0\n0 0\n0 -10000\n-10000 -10000\n",
-    "20\n-4286 -10000\n-4286 -7778\n-7143 -7778\n-7143 -3334\n-10000 -3334\n-10000 1110\n-4286 1110\n-4286 -3334\n4285 -3334\n4285 -1112\n7142 -1112\n7142 3332\n4285 3332\n4285 9998\n9999 9998\n9999 -3334\n7142 -3334\n7142 -5556\n-1429 -5556\n-1429 -10000\n-4286 -10000\n",
-    "24\n-10000 -10000\n-10000 9998\n9998 9998\n9998 -10000\n-6364 -10000\n-6364 6362\n6362 6362\n6362 -6364\n-2728 -6364\n-2728 2726\n2726 2726\n2726 -910\n908 -910\n908 908\n-910 908\n-910 -4546\n4544 -4546\n4544 4544\n-4546 4544\n-4546 -8182\n8180 -8182\n8180 8180\n-8182 8180\n-8182 -10000\n-10000 -10000\n",
-    "12\n-10000 -10000\n-10000 10000\n10000 10000\n10000 6000\n-6000 6000\n-6000 2000\n10000 2000\n10000 -2000\n-6000 -2000\n-6000 -6000\n10000 -6000\n10000 -10000\n-10000 -10000\n",
-    "12\n-10000 -10000\n-10000 10000\n10000 10000\n10000 6000\n-9800 6000\n-9800 2000\n10000 2000\n10000 -2000\n-9800 -2000\n-9800 -6000\n10000 -6000\n10000 -10000\n-10000 -10000\n",
-    "4\n0 0\n0 10000\n10000 10000\n10000 0\n0 0\n",
-    "4\n-10000 -10000\n-10000 10000\n10000 10000\n10000 -10000\n-10000 -10000\n"
-  ],
-  "outputs": [
-    "1\n",
-    "6\n",
-    "0\n",
-    "0\n",
-    "2\n",
-    "8\n",
-    "10\n",
-    "4\n",
-    "4\n",
-    "0\n",
-    "0\n"
-  ]
+METADATA = {
+    'author': 'jt',
+    'dataset': 'test'
 }
 
-[SOLUTIONS]
-Number of reference solutions: 25
 
-----------------------------------------------------------------------------------------------------
-SOLUTION 0
-----------------------------------------------------------------------------------------------------
-#!/usr/bin/env python3
-
-try:
-    while True:
-        n = int(input())
-        prev_x, prev_y = list(map(int, input().split()))
-        prev_d = 0
-        result = 0
-        for i in range(n):
-            x, y = list(map(int, input().split()))
-            if y > prev_y:
-                d = 0
-            elif x > prev_x:
-                d = 1
-            elif y < prev_y:
-                d = 2
-            else:
-                d = 3
-            if ((d + 1) & 0x3) == prev_d:
-                result += 1
-            prev_x, prev_y = x, y
-            prev_d = d
-        print(result)
-
-except EOFError:
-    pass
+def check(candidate):
+    assert candidate('(()()) ((())) () ((())()())') == [
+        '(()())', '((()))', '()', '((())()())'
+    ]
+    assert candidate('() (()) ((())) (((())))') == [
+        '()', '(())', '((()))', '(((())))'
+    ]
+    assert candidate('(()(())((())))') == [
+        '(()(())((())))'
+    ]
+    assert candidate('( ) (( )) (( )( ))') == ['()', '(())', '(()())']
 
 
 ----------------------------------------------------------------------------------------------------
-SOLUTION 1
+FIELD: entry_point
+TYPE : str
 ----------------------------------------------------------------------------------------------------
-def isLeft(x1, y1, x2, y2, x3, y3):
-    return (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1) < 0
+separate_paren_groups
 
 
-def isMn(s):
-    return not (True in s and False in s)
 
-def pr():
-    for i in range(1, n - 1):
-        s.append(isLeft(x[i - 1], y[i - 1], x[i], y[i], x[i + 1], y[i + 1]))
-    s.append(isLeft(x[-1], y[-1], x[0], y[0], x[1], y[1]))
-    s.append(isLeft(x[-2], y[-2], x[-1], y[-1], x[0], y[0]))
+####################################################################################################
+HumanEval Sample 2
+####################################################################################################
 
+----------------------------------------------------------------------------------------------------
+FIELD: task_id
+TYPE : str
+----------------------------------------------------------------------------------------------------
+HumanEval/2
 
-n = int(input())
-x = []
-y = []
-for i in range(n):
-    a, b = map(int, input().split())
-    x.append(a)
-    y.append(b)
-s = []
-pr()
-ans = 0
-for i in range(len(s)):
-    if not s[i]:
-        ans += 1
-print(min(ans, len(s) - ans))
-
-[SOURCE URL]
-https://codeforces.com/problemset/problem/659/D
+----------------------------------------------------------------------------------------------------
+FIELD: prompt
+TYPE : str
+----------------------------------------------------------------------------------------------------
 
 
-image.png
+def truncate_number(number: float) -> float:
+    """ Given a positive floating point number, it can be decomposed into
+    and integer part (largest integer smaller than given number) and decimals
+    (leftover part always smaller than 1).
+
+    Return the decimal part of the number.
+    >>> truncate_number(3.5)
+    0.5
+    """
+
+
+----------------------------------------------------------------------------------------------------
+FIELD: canonical_solution
+TYPE : str
+----------------------------------------------------------------------------------------------------
+    return number % 1.0
+
+
+----------------------------------------------------------------------------------------------------
+FIELD: test
+TYPE : str
+----------------------------------------------------------------------------------------------------
+
+
+METADATA = {
+    'author': 'jt',
+    'dataset': 'test'
+}
+
+
+def check(candidate):
+    assert candidate(3.5) == 0.5
+    assert abs(candidate(1.33) - 0.33) < 1e-6
+    assert abs(candidate(123.456) - 0.456) < 1e-6
+
+
+----------------------------------------------------------------------------------------------------
+FIELD: entry_point
+TYPE : str
+----------------------------------------------------------------------------------------------------
+truncate_number
+
+
+
+####################################################################################################
+HumanEval Sample 3
+####################################################################################################
+
+----------------------------------------------------------------------------------------------------
+FIELD: task_id
+TYPE : str
+----------------------------------------------------------------------------------------------------
+HumanEval/3
+
+----------------------------------------------------------------------------------------------------
+FIELD: prompt
+TYPE : str
+----------------------------------------------------------------------------------------------------
+from typing import List
+
+
+def below_zero(operations: List[int]) -> bool:
+    """ You're given a list of deposit and withdrawal operations on a bank account that starts with
+    zero balance. Your task is to detect if at any point the balance of account fallls below zero, and
+    at that point function should return True. Otherwise it should return False.
+    >>> below_zero([1, 2, 3])
+    False
+    >>> below_zero([1, 2, -4, 5])
+    True
+    """
+
+
+----------------------------------------------------------------------------------------------------
+FIELD: canonical_solution
+TYPE : str
+----------------------------------------------------------------------------------------------------
+    balance = 0
+
+    for op in operations:
+        balance += op
+        if balance < 0:
+            return True
+
+    return False
+
+
+----------------------------------------------------------------------------------------------------
+FIELD: test
+TYPE : str
+----------------------------------------------------------------------------------------------------
+
+
+METADATA = {
+    'author': 'jt',
+    'dataset': 'test'
+}
+
+
+def check(candidate):
+    assert candidate([]) == False
+    assert candidate([1, 2, -3, 1, 2, -3]) == False
+    assert candidate([1, 2, -4, 5, 6]) == True
+    assert candidate([1, -1, 2, -2, 5, -5, 4, -4]) == False
+    assert candidate([1, -1, 2, -2, 5, -5, 4, -5]) == True
+    assert candidate([1, -2, 2, -2, 5, -5, 4, -4]) == True
+
+
+----------------------------------------------------------------------------------------------------
+FIELD: entry_point
+TYPE : str
+----------------------------------------------------------------------------------------------------
+below_zero
+
+
+
+
+所以我的结论是，这两个数据集的样例本身是有差别的，mbpp是先用自然语言给一道问题，然后给出解题代码，并附上测试样例。humaneval则是直接给出代码的题头，然后附上答案，并且也有测试样例。所以我如果想找和humaneval相似的数据集，那么原则就是，同样是只有代码，没有自然语言提问，并且也有测试样例。
+
+  {
+    "_config": "educational_instruct",
+    "_index": 83810,
+    "seq_id": 23198760143,
+    "instruction": "Write a python function to find the smallest unique number in a list.",
+    "output": "Here is the code to solve this problem: \n```python\ndef smallestUniqueNumber(nums):\n    ## create a dictionary\n    dic = {}\n    ## add all element: frequency to dictionary\n    for i in nums:\n        if i not in dic: \n            dic[i] = 1\n        else:\n            dic[i] += 1\n    ## sort the dictionary base of dictionary key (element)\n    sortedDic = dict(sorted(dic.items()))\n    ## finds the first occurrence of the smallest key that only occurred once\n    for j in sortedDic:\n        if (sortedDic[j]  > 1):\n            continue\n        else:\n            ans = j\n            break\n    return ans\n```",
+    "code": "def smallestUniqueNumber(nums):\n    ## create a dictionary\n    dic = {}\n    ## add all element: frequency to dictionary\n    for i in nums:\n        if i not in dic: \n            dic[i] = 1\n        else:\n            dic[i] += 1\n    ## sort the dictionary base of dictionary key (element)\n    sortedDic = dict(sorted(dic.items()))\n    ## finds the first occurrence of the smallest key that only occurred once\n    for j in sortedDic:\n        if (sortedDic[j]  > 1):\n            continue\n        else:\n            ans = j\n            break\n    return ans",
+    "entry_point": "smallestUniqueNumber",
+    "testcase": [
+      "assert smallestUniqueNumber([9,10,11,10,9,12])==11",
+      "assert smallestUniqueNumber([5,5,6,6,7,8,8])==7",
+      "assert smallestUniqueNumber([1,2,3,2,1])==3"
+    ]
+  },
+  {
+    "_config": "educational_instruct",
+    "_index": 14592,
+    "seq_id": 71015581795,
+    "instruction": "Write a function to find the length of the longest strictly decreasing subsequence in a list. A strictly decreasing subsequence is a subset of the elements of the list that are in strictly decreasing order, and not necessarily contiguous or unique.",
+    "output": "Here is the code to solve this problem: \n```python\nimport bisect\n\ndef longest_decreasing_subsequence(nums):\n    dp = []\n    for num in reversed(nums):\n        pos = bisect.bisect_left(dp, num)\n        if pos >= len(dp):\n            dp.append(num)\n        else:\n            dp[pos] = num\n    return len(dp)\n```",
+    "code": "import bisect\n\ndef longest_decreasing_subsequence(nums):\n    dp = []\n    for num in reversed(nums):\n        pos = bisect.bisect_left(dp, num)\n        if pos >= len(dp):\n            dp.append(num)\n        else:\n            dp[pos] = num\n    return len(dp)",
+    "entry_point": "longest_decreasing_subsequence",
+    "testcase": [
+      "assert longest_decreasing_subsequence([3, 2, 1])==3",
+      "assert longest_decreasing_subsequence([10, 9, 2, 5, 3, 7, 101, 18])==4",
+      "assert longest_decreasing_subsequence([1, 2, 3])==1",
+      "assert longest_decreasing_subsequence([1,2,3,4,5,6,7,8,9,10])==1",
+      "assert longest_decreasing_subsequence([10,9,8,7,6,5,4,3,2,1])==10"
+    ]
+  },

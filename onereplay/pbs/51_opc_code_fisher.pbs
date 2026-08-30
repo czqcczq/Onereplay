@@ -1,0 +1,443 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_codefis
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 采集 F_code（代码域的对角经验 Fisher）
+#   EWC 代码线的第一步。本脚本**只**采 F_code，不混合、不训练、不扫 λ。
+#   结构与 46 号（F_math）逐字对应，只换语料与产物名。
+#
+# -----------------------------------------------------------------------------
+# 为什么不采 F_if
+#   ${IF_FISHER} 已经存在，就是跑出 IF 线 cs_ewc_lam3e2_seed1 的那一份：20,000 行，
+#   mean magnitude 9.98e-2，池指纹与 C_if 一致。复用它不是为了省时间，是为了可比性。
+#   C_mix 的构成是
+#       C_if  : FLAN 20k gold target, max_len 512,  右截断
+#       C_code: OPC 自蒸馏,            max_len 2048, 左截断
+#   只要 F_mix 用「现有 F_if + 本脚本的 F_code」，F_mix 里每一处不对称都精确镜像
+#   C_mix 里已有的同一处，EWC vs OneReplay 就只差「哪个矩阵」这一个变量。
+#   反之把 F_if 重采成 512 左截断，它会比 C_if 更「干净」，差异里就混进了协议差。
+#
+# -----------------------------------------------------------------------------
+# 采集参数必须逐字对齐 50 号 Step2 的 collect_cov，不只是 max_len
+#   collect_fisher 有三个默认值与 50 号不同，且都不会报错：
+#     --truncation_side   50 号 left        默认空（跟随 tokenizer = 右）
+#     --require_target    50 号 1           默认 0
+#     --sample_shuffle    50 号 0           默认 1
+#   本脚本把三个都显式传上。其余对齐项：自蒸馏文件（不是原始 OPC 池）、
+#   inputs/targets 列名、chat template、max_samples 0（全池）、q_proj,v_proj、
+#   use_bf16 0。
+#
+#   thinking：collect_fisher 没有 --enable_thinking / --concat_prompt_target，但
+#   example_to_prompt_text 用的是 getattr(args, "enable_thinking", 0) == 1，缺参数
+#   时等于 0，与 50 号定稿的 THINKING=0 一致。
+#
+# -----------------------------------------------------------------------------
+# 本脚本与 46 号（F_math）唯一的科学差异：池里有两种题面形态
+#   50 号的池一半是 bare（instruction 原文），一半是 heval（签名 + docstring 的
+#   stub）。两种形态的 prompt/target 长度分布不同，所以 ESS 和 zero-supervision
+#   诊断要**分档读**，合在一起看会把问题藏起来。Step 2 之后额外打印一段按 style
+#   分组的统计。
+#
+# -----------------------------------------------------------------------------
+# 为什么 batch_size 不可配（也不出现在下面）
+#   Fisher 要 per-example 梯度：先平方再累加。梯度累积算的是 (Σg)² 而不是 Σg²，
+#   会静默估成另一个矩阵。collect_fisher.py 把 batch_size 写死为 1。
+#
+# 成本
+#   F_if 实测 55 ms/条、平均总长约 110 token；F_math 25,114 行、平均 425 token 用了
+#   约 2 h。本池 20,000 行，长度介于两者之间，外推 **约 1-2 h**。显存不紧张：
+#   select_target_weights 已把非目标参数的 requires_grad 关掉，qv 档累加器 0.66 GiB
+#   放 GPU，fp32 模型 6.9 GB。collect_fisher 不支持断点续跑，walltime 给到 8 h。
+#
+# 采完要看的三个诊断（Step 2 会打印并断言）
+#   zero_supervision_rows  必须是 0。F_if 有 1,408 行（7.04%）因右截断吃掉回答而
+#                          贡献 0；F_code 在 2048 左截断下不该有任何一行如此。
+#                          这一项非 0 基本等于 truncation_side 没传上。
+#   ess_ratio              F_if 只有 2,547/20,000 = 0.127，即那份 F 实际只靠 ~2.5k
+#                          条样本。两域 ESS 不对等这件事要写进结果。
+#   prompt_prefix_mismatches  Qwen3 模板在 add_generation_prompt=True 时会插入空的
+#                          <think></think>，若与完整渲染对不上，mask 会退化成更短的
+#                          前缀，导致部分 prompt token 被当成 supervised、F 虚高。
+#                          应接近 0。**heval 那一半尤其要盯**：它的 prompt 本身以
+#                          未闭合的函数体结尾，是这个池里最不常规的渲染形态。
+#
+#   还会打印 mean(F_code)/mean(F_if) 的实测比值。F 是序列求和（reduction="sum"），
+#   mean(F) ∝ T^a、a∈[1,2]，这个数决定后面 F_mix 的权重怎么定——C 是 token 均值
+#   所以裸的 0.5/0.5 就是等权，F 不是，必须先按尺度归一。本脚本只测不混。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) ${DISTILL_FILE} = results/replay/opc_edu_ccode_20k_selfdistill_seed1.jsonl
+#      （50 号 Step1 的产物，**必须是 DIAG=0 的全量跑**，不是 _diag100 那份）
+#   2) ${CODE_COV} = results/cov/cov_code_opcedu20k_qv.pt
+#      （50 号 Step2 的产物；只用来读它 metadata 里的池指纹做校验）
+#   3) mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 用法（开关都走 qsub -v，不用改文件；外层会转发进容器）
+#   qsub onereplay/pbs/51_opc_code_fisher.pbs                    # 全量采集
+#   qsub -v DRY_RUN=1 onereplay/pbs/51_opc_code_fisher.pbs       # 只跑 Step 0，几十秒纯 CPU
+#   qsub -v SMOKE_ROWS=200 onereplay/pbs/51_opc_code_fisher.pbs  # 冒烟：约 1 min，产物另存
+#                                                                # _smoke200 后缀，不覆盖正式文件
+#   qsub -v FORCE=1 onereplay/pbs/51_opc_code_fisher.pbs         # 正式产物已存在时强制重采
+#   默认行为：产物已存在则跳过采集，但仍跑 Step 2 自检
+#
+#   建议顺序：先 DRY_RUN=1 确认指纹与 C_code 对得上（这一步失败就不用往下走了），
+#   再 SMOKE_ROWS=200 确认模型能加载、诊断字段都在，最后交全量。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/51_opc_code_fisher.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE
+    DRY_RUN FORCE SMOKE_ROWS
+    SEED SAMPLE_SEED FISHER_MAXLEN TARGET_MODULES FISHER_DEVICE USE_BF16 LOG_EVERY
+    VIEW_DIR VIEW_PREFIX DISTILL_DIR DISTILL_FILE
+    CODE_COV CODE_FISHER IF_FISHER
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的采集。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 开关 ----
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
+# >0 只取前 N 行做冒烟测试。产物另存 _smoke 后缀，且指纹不匹配只警告不中断
+# （截了行的池当然和 C_code 的指纹不同）。
+SMOKE_ROWS="${SMOKE_ROWS:-0}"
+
+# ---- 采集参数：与 50 号 Step2 的 collect_cov 逐字对齐 ----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+FISHER_MAXLEN="${FISHER_MAXLEN:-2048}"     # 必须等于 50 号的 MAXLEN
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+USE_BF16="${USE_BF16:-0}"                  # fp32：梯度先被平方，bf16 的 8 位尾数会留下噪声底
+FISHER_DEVICE="${FISHER_DEVICE:-cuda}"     # qv 档累加器 0.66 GiB，放 GPU
+LOG_EVERY="${LOG_EVERY:-1000}"
+
+# ---- 语料与产物 ----
+VIEW_DIR="${VIEW_DIR:-${REPO_ROOT}/datasets/OPC_views}"
+VIEW_PREFIX="${VIEW_PREFIX:-opc_edu_ccode_20k}"
+POOL_FILE="${VIEW_DIR}/${VIEW_PREFIX}_python.jsonl"
+DISTILL_DIR="${DISTILL_DIR:-${RESULTS_ROOT}/replay}"
+DISTILL_FILE="${DISTILL_FILE:-${DISTILL_DIR}/${VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}.jsonl}"
+CODE_COV="${CODE_COV:-${RESULTS_ROOT}/cov/cov_code_opcedu20k_qv.pt}"
+CODE_FISHER="${CODE_FISHER:-${RESULTS_ROOT}/fisher/fisher_code_opcedu20k_qv.pt}"
+IF_FISHER="${IF_FISHER:-${RESULTS_ROOT}/fisher/fisher_flan_chat_20k_qv.pt}"
+
+# 冒烟产物换名，避免把 200 行的 F 写成正式文件
+MAX_SAMPLES=0
+if (( SMOKE_ROWS > 0 )); then
+  MAX_SAMPLES="${SMOKE_ROWS}"
+  CODE_FISHER="${CODE_FISHER%.pt}_smoke${SMOKE_ROWS}.pt"
+  echo "SMOKE_ROWS=${SMOKE_ROWS}：只采前 ${SMOKE_ROWS} 行，产物 -> ${CODE_FISHER}"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "$(dirname "${CODE_FISHER}")" "${DATASET_CACHE}"
+
+echo "DISTILL_FILE = ${DISTILL_FILE}"
+echo "CODE_COV     = ${CODE_COV}"
+echo "CODE_FISHER  = ${CODE_FISHER}"
+echo "IF_FISHER    = ${IF_FISHER}"
+echo "max_len=${FISHER_MAXLEN} modules=${TARGET_MODULES} use_bf16=${USE_BF16} max_samples=${MAX_SAMPLES}"
+
+# ===========================================================================
+# Step 0: 前置检查（纯 CPU，几十秒）
+#   语料在不在，以及本脚本选出的行是否与 C_code 看到的行逐字相同。
+#   指纹对不上就说明 F 和 C 消费的旧知识不同，EWC vs OneReplay 的对比不成立，
+#   所以这里直接停下，而不是烧掉两小时之后才发现。
+# ===========================================================================
+echo "==== Step 0: 前置检查 ===="
+if [[ ! -f "${DISTILL_FILE}" ]]; then
+  echo "缺 OPC 自蒸馏语料: ${DISTILL_FILE}（50 号 Step1 的产物）"
+  echo "  若只跑过 DIAG，那份是 ${DISTILL_DIR}/${VIEW_PREFIX}_diag100.jsonl，不能用来采 F。"
+  exit 1
+fi
+echo "  语料: ${DISTILL_FILE}"
+
+FISHER_FINGERPRINT=$(python -m onereplay.scripts.check_old_knowledge_pool \
+  --data_files "${DISTILL_FILE}" --dataset_split train \
+  --cache_dir "${DATASET_CACHE}" \
+  --input_column inputs --target_column targets \
+  --require_target 1 \
+  --max_samples "${MAX_SAMPLES}" --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+  --label fisher_code | tail -n 1)
+echo "${FISHER_FINGERPRINT}"
+# 输出形如 "fisher_code rows=20000 fingerprint=abc..."
+FISHER_HASH="${FISHER_FINGERPRINT##*fingerprint=}"
+
+# 传给 Step 2 的期望指纹。留空 = 不校验（没有 C_code 或冒烟模式）。
+EXPECT_FINGERPRINT=""
+
+if [[ -f "${CODE_COV}" ]]; then
+  COV_HASH="$(python -m onereplay.scripts.inspect_fisher \
+    --path "${CODE_COV}" --print_meta pool_fingerprint)"
+  for key in pool_rows max_len truncation_side require_target target_modules; do
+    echo "  C_code ${key} = $(python -m onereplay.scripts.inspect_fisher \
+      --path "${CODE_COV}" --print_meta "${key}" 2>/dev/null || echo '<未记录>')"
+  done
+  echo "C_code pool fingerprint = ${COV_HASH}"
+  if [[ "${FISHER_HASH}" != "${COV_HASH}" ]]; then
+    echo "指纹不一致:"
+    echo "  fisher ${FISHER_HASH}"
+    echo "  cov    ${COV_HASH}"
+    if (( SMOKE_ROWS > 0 )); then
+      echo "SMOKE_ROWS>0：截了行的池当然和全池指纹不同，冒烟模式下只警告。"
+    else
+      echo "F 与 C 必须消费同一批旧知识，否则 EWC vs OneReplay 的对比被数据差异污染。"
+      echo "检查 DISTILL_FILE / require_target / sample_shuffle / max_samples 是否与 50 号一致。"
+      exit 1
+    fi
+  else
+    echo "指纹一致: ${FISHER_HASH}"
+    # Step 0 证明的是「选出来的行」一致；Step 2 再拿它比一次 F_code 里实际记下的
+    # 指纹，把「采集器消费的行」也钉住。
+    EXPECT_FINGERPRINT="${COV_HASH}"
+  fi
+else
+  echo "警告: 找不到 C_code (${CODE_COV})，跳过指纹校验。"
+  echo "  没有这一步就无法证明 F_code 和 C_code 看的是同一批行，出结果前要补上。"
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查，不采集"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+if [[ "${FORCE}" != "1" && -f "${CODE_FISHER}" ]]; then
+  echo "跳过采集：${CODE_FISHER} 已存在（FORCE=1 可强制重采）"
+  echo "仍会跑下面的自检。"
+else
+  # =========================================================================
+  # Step 1: 采集 F_code
+  #   三个显式传上的参数就是 collect_fisher 默认值与 50 号不同的那三个：
+  #   truncation_side / require_target / sample_shuffle。
+  # =========================================================================
+  echo "==== Step 1: collect F_code -> ${CODE_FISHER} ===="
+  python -m onereplay.scripts.collect_fisher \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --seed "${SAMPLE_SEED}" \
+    --use_bf16 "${USE_BF16}" \
+    --data_files "${DISTILL_FILE}" --dataset_split train \
+    --cache_dir "${DATASET_CACHE}" \
+    --input_column inputs --target_column targets \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --require_target 1 \
+    --max_samples "${MAX_SAMPLES}" \
+    --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+    --max_len "${FISHER_MAXLEN}" \
+    --truncation_side left \
+    --target_modules "${TARGET_MODULES}" \
+    --fisher_device "${FISHER_DEVICE}" \
+    --log_every "${LOG_EVERY}" \
+    --output_path "${CODE_FISHER}"
+fi
+
+# ===========================================================================
+# Step 2: 自检
+#   把上面那些「传错了也不报错」的参数逐条比对 F_code 里实际记下的 metadata，
+#   顺带打印要写进结果的诊断。
+#   --expect_zero_supervision_rows 0 是最该盯的一条：左截断保住的是回答结尾，
+#     所以不该有任何一行没有 supervised token，非 0 基本等于 truncation_side 没传上。
+#   --expect_pool_fingerprint 把 Step 0 的结论钉到采集器实际消费的行上。
+#   --reference 顺带打印 mean(F_code)/mean(F_if)，那个比值决定 F_mix 的权重，
+#     但本脚本只测不混。
+# ===========================================================================
+echo "==== Step 2: 自检 ===="
+python -m onereplay.scripts.inspect_fisher \
+  --path "${CODE_FISHER}" \
+  --expect_max_len "${FISHER_MAXLEN}" \
+  --expect_truncation_side left \
+  --expect_target_modules "${TARGET_MODULES}" \
+  --expect_require_target 1 \
+  --expect_sample_shuffle 0 \
+  --expect_use_bf16 "${USE_BF16}" \
+  --expect_zero_supervision_rows 0 \
+  --expect_pool_fingerprint "${EXPECT_FINGERPRINT}" \
+  --reference "${IF_FISHER}" \
+  --strict 1
+
+# ===========================================================================
+# Step 3: 按题面形态分档看长度
+#   这个池一半 bare 一半 heval，两种形态的 prompt/target 长度分布不同。上面的
+#   ESS 和 zero-supervision 是全池汇总值，分档看才知道某一档是不是单独出了问题。
+#   纯读 jsonl，不碰 GPU。
+# ===========================================================================
+if [[ -f "${POOL_FILE}" ]]; then
+  echo "==== Step 3: 按 style 分档的语料长度 ===="
+  python - "${DISTILL_FILE}" "${POOL_FILE}" "${FISHER_MAXLEN}" <<'PY'
+import json
+import sys
+
+distill_path, pool_path, max_len = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+# generate_replay_targets writes a fixed schema and does not carry the pool's
+# extra columns through, but its `index` is the row position in the pool file.
+styles = []
+with open(pool_path, encoding="utf-8") as f:
+    for line in f:
+        if line.strip():
+            styles.append(json.loads(line).get("style", "?"))
+
+groups = {}
+with open(distill_path, encoding="utf-8") as f:
+    for line in f:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        position = row.get("index")
+        style = styles[position] if isinstance(position, int) and 0 <= position < len(styles) else "?"
+        bucket = groups.setdefault(style, {"prompt": [], "target": [], "trunc": 0, "empty": 0})
+        bucket["prompt"].append(int(row.get("prompt_tokens", 0)))
+        bucket["target"].append(int(row.get("target_tokens", 0)))
+        if row.get("truncated"):
+            bucket["trunc"] += 1
+        if not str(row.get("targets", "")).strip():
+            bucket["empty"] += 1
+
+
+def pct(values, q):
+    if not values:
+        return 0
+    s = sorted(values)
+    return s[min(len(s) - 1, int(round(q / 100 * (len(s) - 1))))]
+
+
+for style in sorted(groups):
+    bucket = groups[style]
+    n = len(bucket["prompt"])
+    print(f"-- style={style}  n={n}")
+    for label in ("prompt", "target"):
+        values = bucket[label]
+        print(
+            f"{label:>10}: P50={pct(values,50)} P90={pct(values,90)} "
+            f"P99={pct(values,99)} max={max(values) if values else 0}"
+        )
+    print(f"{'truncated':>10}: {bucket['trunc']}/{n}   空 target: {bucket['empty']}/{n}")
+
+print(
+    "\nF 是序列求和，mean(F) 随 supervised token 数增长，所以两档 target 长度差得多的话，"
+    "F_code 实际上会被长的那一档主导。这个数要和上面的 ESS 一起写进结果。"
+)
+PY
+else
+  echo "跳过 style 分档统计：找不到池文件 ${POOL_FILE}"
+fi
+
+set +x
+echo "========================================================================"
+echo "产物: ${CODE_FISHER}"
+echo "下一步（本脚本不做）:"
+echo "  1) 按上面 mean(F_code)/mean(F_if) 的实测比值定 F_mix 的权重"
+echo "     （C 是 token 均值，裸的 0.5/0.5 即等权；F 不是，必须先按尺度归一）"
+echo "  2) 用 onereplay/mix_fishers.py 生成 F_mix"
+echo "  3) λ 必须重扫：λ=3e2 是对 mean(F_if)=9.98e-2 调的，不能直接搬"
+echo "Job finished at: $(date)"

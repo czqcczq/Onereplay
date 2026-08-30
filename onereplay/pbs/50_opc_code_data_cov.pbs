@@ -1,0 +1,630 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_opccov
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 代码线数据链（OpenCoder 版）
+#   opc-sft-stage2/educational_instruct 池 -> 自蒸馏 -> 采 C_code -> 混合 C_mix(if+code)
+#
+# 取代 41 号（Magicoder 版）。流程、超参、采集协议与 41/31 号逐字一致，只换语料
+# 和题面形态。旧产物不覆盖：TAG 从 magicoder20k 换成 opcedu20k，两套 C 可以并排比。
+#
+# -----------------------------------------------------------------------------
+# 为什么换掉 Magicoder
+#   Magicoder 行是自由形态的 (problem, solution)，与两个评测集的结构都不像。
+#   educational_instruct 是 (instruction, code, entry_point, testcase)，而
+#   MBPP 是 (text, code, test_list)、HumanEval 是 (签名 + docstring)。同一份语料
+#   同时对得上两边，且**来源不相交**——数据卡说它以 OpenCoder 自己的算法语料为种子
+#   生成，不是从 MBPP 派生。所以既拿到格式对齐，又保住「池与评测不同源」这个论述。
+#
+#   这也是为什么不掺 MBPP train：掺了之后 MBPP test 上的收益会被读成「在测试集的
+#   兄弟上做正则」，41 号专门做的 8-gram 去污染就白做了。
+#
+# -----------------------------------------------------------------------------
+# 两种题面形态（--heval_ratio，默认 0.5）
+#   bare   instruction 原文，与 Magicoder 池、与 31 号的 MetaMath 池同约定。
+#          对应 MBPP「给一句话要求，写函数」。
+#   heval  preamble(import + helper) + 从 code 里 ast 解析出的**完整签名** +
+#          用 instruction 生成的 docstring，函数体留空。对应 HumanEval
+#          「给一个写了一半的函数，接着写」。
+#
+#   为什么要有 heval 这一半：文档记录的损伤形态是**输出结构**坏掉——MBPP 语法错误
+#   2 题涨到 43 题，HumanEval 上 cif 的 26 道语法错误里 23 道是「丢了 def 头的裸
+#   函数体」。那正是「函数体续写」这个形态。池里有一半是这个形态，C 才覆盖得到。
+#
+#   签名必须从 code 解析，不能只用 entry_point 拼：形参名、默认值、类型标注、
+#   async、装饰器都在 code 里，拼错了自蒸馏出来的解答就对不上签名。
+#
+# -----------------------------------------------------------------------------
+# !! 五个必须先知道的点
+#
+# 1) **prompt 里没有 assert**，两种形态都没有。而 build_mbpp_prompt 在评测时是会把
+#    test_list 贴进 prompt 的，所以池比评测「少给信息」，这是有意为之：
+#      - C_if / C_math / C_code 三份矩阵必须同协议采集（都采在裸语料 prompt 上，
+#        不带评测 wrapper），否则 trace 配平和等权凸组合失去可比性；
+#      - 坏掉的是输出侧（语法/结构），不是理解题意，所以输入侧少给例子影响有限。
+#    要改的话是 prepare_opc_ccode 的事，本脚本不提供开关——避免半途换协议。
+#
+# 2) testcase 不进 prompt，只在建池时离线跑一次，用来证明 heval 改造没改坏语义：
+#    把原函数体塞回 stub 跑该行自带的 assert。原始 code 自己就不过的单独计数（数据集
+#    缺陷），原始过、重建不过的那些**退回 bare**。所有不确定的情况都退回而不是丢弃，
+#    所以 20k 总量不变，只有 heval 实际占比略低于 50%。
+#
+# 3) 污染自检必须开。educational_instruct 是 11.8 万条 LLM 生成的「Write a function
+#    to...」，MBPP test 是 500 条人工众包的同款句式——**撞题概率比 Magicoder 高**。
+#    41 号那次几乎是 0 命中；这次如果回来几百条，那本身就是要写进结果的信号。
+#    一旦有评测题漏进池子，40 号的代码 CE 探针就从池外证据变成池内自我加分。
+#
+# 4) 长度过滤对 heval 要量两次。--max_prompt_tokens 先量裸 instruction，改造之后
+#    stub 还要再量一次——preamble + 签名会把它撑长，超预算的退回 bare。不这么做的话
+#    超长行会被 generate_replay_targets 写成空 target + truncated=1，然后在采 C 时
+#    丢弃，等于「要 20k、静默拿到远少于 20k」。
+#
+# 5) TARGET_MODULES 必须与 C_if / C_math 完全相同（q_proj,v_proj）。C 只在这两个模块
+#    上采过；扩了模块又不重采，lora_covariance_regularizer 会对没有 C 的模块**静默
+#    跳过**，等于只约束 q/v、其余自由漂移。
+#
+# -----------------------------------------------------------------------------
+# 流程
+#   Step 0  建池       OPC -> 有效性 + 去重 + 污染自检 + 长度过滤 + 随机 20k + 风格改造
+#   Step 1  自蒸馏     base 对每条 prompt 用 non-thinking 贪心生成自己的解答（可 --resume）
+#   Step 2  采 C_code  用 {prompt, 自蒸馏解答} 采二阶矩
+#   Step 3  混合       C_mix = w_if*C_if + w_code*C_code（默认等权 0.5/0.5）
+#
+#   进入 C 的是 **prompt + base 自己生成的解答**。数据集原本的 code 被
+#   generate_replay_targets 挪到 gold_targets，从不进 C。
+#
+# MAXLEN 一致性：自蒸馏(Step1)与采 C(Step2)必须用同一个 MAXLEN，本脚本用同一个变量贯穿。
+#
+# -----------------------------------------------------------------------------
+# 用法（**本站点 qsub 不吃命令行变量**，所有开关靠直接改「阶段开关」那一段的默认值。
+#       PBS 也不导出提交时的 shell 环境，`DIAG=1 qsub ...` 同样无效。）
+#
+#   提交命令永远是这一句:
+#     qsub onereplay/pbs/50_opc_code_data_cov.pbs
+#
+#   跑什么由「阶段开关」那段决定:
+#     DIAG=1                  只建池 + 100 条自蒸馏 + 长度诊断，然后退出（**当前默认**）
+#     DIAG=0                  跑全链（建池 -> 全量自蒸馏 -> 采 C_code -> 混合）
+#     SKIP_GEN/COV/MIX=1      只重建池
+#     SKIP_PREP/GEN/COV=1     只补混合
+#
+#   **DIAG 默认是 1，这是有意的**：池换了，题面分布跟 Magicoder 不同（heval stub 带
+#   preamble 会更长，bare instruction 又更短），41 号定下的 MAXLEN=2048 /
+#   MAX_NEW=1280 不能直接假定还成立。先跑一次诊断看 P99 和截断率，确认后把这一行
+#   改成 0 再投全链。20k 全量自蒸馏要 15~20 小时，半小时诊断换掉一次整轮返工。
+#
+# 前置条件:
+#   1) 登录节点下好数据（计算节点 HF_HUB_OFFLINE=1，下不了）:
+#        python -m onereplay.scripts.download_opc_data \
+#          --out_dir /scratch/weiliu87/student/czq/Onereplay/datasets/code_replay
+#   2) 代码评测数据（污染自检要用）: ${CODE_DATA_DIR}/humaneval_test.parquet 与 mbpp_full/
+#      缺了不会挂，只是跳过自检并告警 —— 但**不要跳过**，见上面第 3 点。
+#   3) C_if 就位: ${IF_COV}（缺了 SKIP_MIX=auto 会自动跳过混合并告警）
+#   4) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# walltime: 20k 条 non-thinking 自蒸馏约 15~20h。超时原样再投，--resume 1 会跳过已完成的 index。
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/50_opc_code_data_cov.pbs}"
+
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE
+    OPC_PATH VIEW_DIR VIEW_PREFIX NUM_SAMPLES HEVAL_RATIO MAX_PROMPT_TOKENS
+    REQUIRE_FENCE DROP_CONTAMINATED VERIFY_EXEC VERIFY_TIMEOUT
+    CODE_DATA_DIR MBPP_SPLIT
+    SEED SAMPLE_SEED GEN_BATCH THINKING MAXLEN MAX_NEW_TOKENS MIN_NEW_TOKENS
+    TARGET_MODULES COV_BATCH DEBUG_EXAMPLES
+    DIAG DIAG_SAMPLES SKIP_PREP SKIP_GEN SKIP_COV SKIP_MIX
+    TAG DISTILL_DIR CODE_COV IF_COV MIX_COV W_IF W_CODE
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的数据链。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- OpenCoder 池 ----
+OPC_PATH="${OPC_PATH:-${REPO_ROOT}/datasets/code_replay/opc_educational_instruct.parquet}"
+VIEW_DIR="${VIEW_DIR:-${REPO_ROOT}/datasets/OPC_views}"
+VIEW_PREFIX="${VIEW_PREFIX:-opc_edu_ccode_20k}"
+NUM_SAMPLES="${NUM_SAMPLES:-20000}"
+HEVAL_RATIO="${HEVAL_RATIO:-0.5}"      # 一半 bare 一半 HumanEval 式；0 = 全 bare
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
+REQUIRE_FENCE="${REQUIRE_FENCE:-1}"
+DROP_CONTAMINATED="${DROP_CONTAMINATED:-1}"
+VERIFY_EXEC="${VERIFY_EXEC:-300}"      # 抽查多少条 heval 改造行；-1 = 全查，0 = 关
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-10}"
+
+# ---- 污染自检要用的评测数据（与 39/40 号同一份）----
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
+MBPP_DIR="${CODE_DATA_DIR}/mbpp_full"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+
+# ---- 自蒸馏 + 采 C 共用（与 41/31 号一致）----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+GEN_BATCH="${GEN_BATCH:-16}"
+THINKING="${THINKING:-0}"          # non-thinking，更贴近评测模式
+MAXLEN="${MAXLEN:-2048}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1280}"   # 沿用 41 号定稿值，但**必须先 DIAG 复核**
+MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-16}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"   # 见文件头第 5 点，别改
+COV_BATCH="${COV_BATCH:-1}"
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"      # 2：bare 和 heval 各看一条渲染结果
+
+# ---- 阶段开关 ----
+# >>>>>> 本站点 qsub 不吃命令行变量，阶段切换靠直接改这一行 <<<<<<
+# 当前 = 1：只建池 + 100 条自蒸馏 + 长度诊断然后退出。池换了语料和题面形态，
+# 41 号的 2048/1280 预算不能直接假定成立，先看 P99 和截断率。
+# 确认后改成 0 再投一次跑全链。
+# 注意：DIAG=1 也是 exit 0，串 afterok 时会被当成功而放行下游——用作业依赖前这一行必须是 0。
+DIAG="${DIAG:-1}"
+DIAG_SAMPLES="${DIAG_SAMPLES:-100}"
+SKIP_PREP="${SKIP_PREP:-0}"
+SKIP_GEN="${SKIP_GEN:-0}"
+SKIP_COV="${SKIP_COV:-0}"
+SKIP_MIX="${SKIP_MIX:-auto}"
+
+# ---- 文件 ----
+if [[ "${THINKING}" == "1" ]]; then THINK_SUFFIX="_think"; else THINK_SUFFIX=""; fi
+TAG="${TAG:-opcedu20k${THINK_SUFFIX}}"
+DISTILL_DIR="${DISTILL_DIR:-${RESULTS_ROOT}/replay}"
+CODE_COV="${CODE_COV:-${RESULTS_ROOT}/cov/cov_code_${TAG}_qv.pt}"
+IF_COV="${IF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_code_${TAG}_mix_qv.pt}"
+W_IF="${W_IF:-0.5}"
+W_CODE="${W_CODE:-0.5}"
+
+POOL_FILE="${VIEW_DIR}/${VIEW_PREFIX}_python.jsonl"
+DISTILL_FILE="${DISTILL_DIR}/${VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}${THINK_SUFFIX}.jsonl"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${DISTILL_DIR}" "$(dirname "${CODE_COV}")" "${DATASET_CACHE}" "${VIEW_DIR}"
+
+if [[ "${SKIP_MIX}" == "auto" ]]; then
+  if [[ -f "${IF_COV}" ]]; then
+    SKIP_MIX=0
+  else
+    SKIP_MIX=1
+    echo "WARNING: 未找到 C_if ${IF_COV}，Step3 混合自动跳过。"
+    echo "         补混合: SKIP_PREP=1 SKIP_GEN=1 SKIP_COV=1 改默认值后重投"
+  fi
+fi
+
+echo "OPC_PATH=${OPC_PATH}"
+echo "POOL_FILE=${POOL_FILE}  NUM_SAMPLES=${NUM_SAMPLES}  HEVAL_RATIO=${HEVAL_RATIO}"
+echo "THINKING=${THINKING} MAXLEN=${MAXLEN} MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "CODE_COV=${CODE_COV}  MIX_COV=${MIX_COV}  weights if=${W_IF} code=${W_CODE}"
+
+# ---------------------------------------------------------------------------
+# 长度诊断分析器：读一份自蒸馏 jsonl，打印 token 分位数 + 截断率 + 预算建议
+#   与 41/31 号逐字相同的逻辑，便于三条线的诊断结果并排读。
+#   多一列：按 style 分组，因为 heval stub 带 preamble，两种形态的长度分布不同，
+#   合在一起看会把问题藏起来。
+# ---------------------------------------------------------------------------
+analyze_lengths () {
+  local jsonl_file="$1"
+  local pool_file="$2"
+  python - "${jsonl_file}" "${MAXLEN}" "${MAX_NEW_TOKENS}" "${pool_file}" <<'PY'
+import json
+import sys
+
+path, max_len, max_new, pool_path = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+
+# style 只存在于池文件里。generate_replay_targets 写的是固定 schema，不透传池里的
+# 额外列，但它的 `index` 就是池文件的行序位置，所以按位置对回去。
+styles = []
+try:
+    with open(pool_path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                styles.append(json.loads(line).get("style", "?"))
+except OSError:
+    pass
+
+
+def style_of(row):
+    position = row.get("index")
+    if isinstance(position, int) and 0 <= position < len(styles):
+        return styles[position]
+    return "?"
+
+groups = {}
+n = 0
+truncated = 0
+with open(path, encoding="utf-8") as f:
+    for line in f:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        n += 1
+        p = int(row.get("prompt_tokens", 0))
+        t = int(row.get("target_tokens", 0))
+        if row.get("truncated"):
+            truncated += 1
+        for key in ("all", style_of(row)):
+            bucket = groups.setdefault(key, {"prompt": [], "target": [], "total": [], "trunc": 0})
+            bucket["prompt"].append(p)
+            bucket["target"].append(t)
+            bucket["total"].append(p + t)
+            if row.get("truncated"):
+                bucket["trunc"] += 1
+
+
+def pct(values, q):
+    if not values:
+        return 0
+    s = sorted(values)
+    return s[min(len(s) - 1, int(round(q / 100 * (len(s) - 1))))]
+
+
+print(f"==== length diagnostic on {n} rows (MAXLEN={max_len} MAX_NEW={max_new}) ====")
+for key in sorted(groups, key=lambda k: (k != "all", k)):
+    bucket = groups[key]
+    count = len(bucket["total"])
+    print(f"-- style={key}  n={count}")
+    for label in ("prompt", "target", "total"):
+        values = bucket[label]
+        print(
+            f"{label:>14}: P50={pct(values,50)} P90={pct(values,90)} "
+            f"P95={pct(values,95)} P99={pct(values,99)} max={max(values) if values else 0}"
+        )
+    print(f"{'truncated':>14}: {bucket['trunc']}/{count} = {bucket['trunc']/max(count,1):.3f}")
+
+frac = truncated / n if n else 0.0
+p99 = pct(groups.get("all", {}).get("total", []), 99)
+if frac <= 0.05 and p99 <= max_len:
+    print(f"verdict: 预算够用（截断率 {frac:.3f} 且 P99={p99}<=MAXLEN={max_len}），可全量")
+else:
+    print(
+        f"verdict: 建议调大 —— 截断率 {frac:.3f} 或 P99={p99} 逼近/超过 MAXLEN={max_len}。"
+        f"把 MAXLEN 提到 >= {int(p99 * 1.15)} 并相应提高 MAX_NEW_TOKENS 后重跑"
+        "（自蒸馏与采 C 的 MAXLEN 必须一致）。若只有 heval 那一档超，"
+        "也可以调小 --max_prompt_tokens 让长 stub 退回 bare。"
+    )
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Step 0: 建 OpenCoder 池（纯 CPU；含污染自检 + heval 改造 + 执行校验）
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_PREP}" != "1" ]]; then
+  echo "==== Step0 build OpenCoder pool -> ${POOL_FILE} ===="
+  [[ -e "${OPC_PATH}" ]] || { echo "缺 OpenCoder 原始数据: ${OPC_PATH}（先在登录节点跑 download_opc_data）"; exit 1; }
+
+  PREP_ARGS=(
+    --opc_path "${OPC_PATH}"
+    --out_dir "${VIEW_DIR}" --prefix "${VIEW_PREFIX}"
+    --num_samples "${NUM_SAMPLES}" --seed "${SAMPLE_SEED}"
+    --heval_ratio "${HEVAL_RATIO}"
+    --require_python_fence "${REQUIRE_FENCE}"
+    --max_prompt_tokens "${MAX_PROMPT_TOKENS}"
+    --drop_contaminated "${DROP_CONTAMINATED}"
+    --verify_exec "${VERIFY_EXEC}" --verify_timeout "${VERIFY_TIMEOUT}"
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+    --cache_dir "${DATASET_CACHE}"
+  )
+  # 用 if 而不是 `[[ ... ]] && arr+=(...)`：后者在测试为假时整条 && 列表返回 1，
+  # set -e 会直接把作业干掉。
+  if [[ -f "${HUMANEVAL_FILE}" ]]; then
+    PREP_ARGS+=(--humaneval_data_file "${HUMANEVAL_FILE}")
+  else
+    echo "WARNING: 缺 ${HUMANEVAL_FILE}，HumanEval 污染自检将跳过"
+  fi
+  if [[ -d "${MBPP_DIR}" ]]; then
+    PREP_ARGS+=(--mbpp_dataset_path "${MBPP_DIR}" --mbpp_split "${MBPP_SPLIT}")
+  else
+    echo "WARNING: 缺 ${MBPP_DIR}，MBPP 污染自检将跳过"
+  fi
+
+  python -m onereplay.scripts.prepare_opc_ccode "${PREP_ARGS[@]}"
+else
+  echo "SKIP_PREP=1：使用已有池 ${POOL_FILE}"
+fi
+[[ -f "${POOL_FILE}" ]] || { echo "缺池文件: ${POOL_FILE}"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Step 1: 自蒸馏（断点续跑）。DIAG=1 时只跑小样本并诊断后退出。
+# ---------------------------------------------------------------------------
+self_distill () {
+  local num_samples=$1
+  local out_file=$2
+
+  echo "==== self-distill thinking=${THINKING} -> ${out_file} ===="
+  python -m onereplay.scripts.generate_replay_targets \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --data_files "${POOL_FILE}" --split train \
+    --cache_dir "${DATASET_CACHE}" \
+    --input_column inputs --target_column targets \
+    --pool_size 0 --sample_seed "${SAMPLE_SEED}" \
+    --num_samples "${num_samples}" \
+    --batch_size "${GEN_BATCH}" --max_len "${MAXLEN}" \
+    --max_new_tokens "${MAX_NEW_TOKENS}" --min_new_tokens "${MIN_NEW_TOKENS}" \
+    --enable_thinking "${THINKING}" \
+    --output_path "${out_file}" --resume 1
+}
+
+if [[ "${DIAG}" == "1" ]]; then
+  diag_file="${DISTILL_DIR}/${VIEW_PREFIX}_diag${DIAG_SAMPLES}.jsonl"
+  rm -f "${diag_file}"
+  self_distill "${DIAG_SAMPLES}" "${diag_file}"
+  analyze_lengths "${diag_file}" "${POOL_FILE}"
+  set +x
+  echo "========================================================================"
+  echo "DIAG 完成。要看三件事:"
+  echo "  1) 上面 style=bare / style=heval 两档的 total P99 与截断率。两档差异大是"
+  echo "     正常的（heval stub 带 preamble），关键是**两档都**在 MAXLEN 之内。"
+  echo "  2) Step0 打印的污染命中数。41 号 Magicoder 那次几乎是 0；这次语料句式与"
+  echo "     MBPP 高度相似，命中几百条是可能的，那个数要记下来写进结果。"
+  echo "  3) Step0 打印的 heval 改造成功率与执行校验三项计数"
+  echo "     （原始就不过 / 改造后行为变化 / 超预算退回）。"
+  echo "确认后把「阶段开关」段的 DIAG 默认值改回 0，重投一次跑全链。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+if [[ "${SKIP_GEN}" != "1" ]]; then
+  self_distill 0 "${DISTILL_FILE}"
+  analyze_lengths "${DISTILL_FILE}" "${POOL_FILE}"
+else
+  echo "SKIP_GEN=1：使用已有自蒸馏语料"
+fi
+[[ -f "${DISTILL_FILE}" ]] || { echo "缺自蒸馏语料: ${DISTILL_FILE}"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Step 2: 采 C_code + 对 C_if 出 trace 比值
+#   采集协议与 41/31 号逐字一致。51 号采 F_code 时必须原样对齐这一段的
+#   max_len / truncation_side / require_target / sample_shuffle / target_modules。
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_COV}" != "1" ]]; then
+  echo "==== Step2 collect C_code -> ${CODE_COV} ===="
+  python -m onereplay.scripts.collect_cov \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --data_files "${DISTILL_FILE}" --dataset_split train \
+    --cache_dir "${DATASET_CACHE}" \
+    --input_column inputs --target_column targets \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --enable_thinking "${THINKING}" \
+    --concat_prompt_target "${THINKING}" \
+    --debug_print_examples "${DEBUG_EXAMPLES}" \
+    --require_target 1 \
+    --max_samples 0 \
+    --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+    --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
+    --truncation_side left \
+    --target_modules "${TARGET_MODULES}" \
+    --output_path "${CODE_COV}"
+
+  if [[ -f "${IF_COV}" ]]; then
+    echo "==== compare C_code against C_if: ${IF_COV} ===="
+    python - "${CODE_COV}" "${IF_COV}" <<'PY'
+import sys
+
+import torch
+
+from onereplay.core.covariance import load_covariance_file
+
+code_cov = load_covariance_file(sys.argv[1])
+if_cov = load_covariance_file(sys.argv[2])
+shared = sorted(set(code_cov) & set(if_cov))
+print(f"layers: {len(code_cov)} C_code, {len(if_cov)} C_if, {len(shared)} shared")
+only_code = sorted(set(code_cov) - set(if_cov))
+only_if = sorted(set(if_cov) - set(code_cov))
+if only_code or only_if:
+    print(f"WARNING: layer sets differ. only-code={only_code[:5]} only-if={only_if[:5]}")
+    print("         层集合对不上就不能混合：先确认两份 C 的 --target_modules 一致。")
+
+ratios = []
+for name in shared:
+    c = torch.diagonal(code_cov[name].float()).sum().item()
+    f = torch.diagonal(if_cov[name].float()).sum().item()
+    if f > 0:
+        ratios.append(c / f)
+if ratios:
+    r = torch.tensor(ratios)
+    mean_ratio = r.mean().item()
+    print(
+        "trace(C_code)/trace(C_if) per layer: "
+        f"mean={mean_ratio:.3f} min={r.min().item():.3f} max={r.max().item():.3f}"
+    )
+    print(
+        "对照: Magicoder 版 C_code 的同一比值记在 41 号作业日志里，换池后这个数变了"
+        "多少，本身就是「池换了什么」的一个刻度。"
+    )
+    print(
+        "注：本轮按 31/41 号的约定用等权 0.5/0.5 混合。若 trace 比值远离 1，"
+        f"等权实际上会让大 trace 一方主导；按 trace 反比应为 w_if:w_code ≈ 1 : {1.0 / mean_ratio:.3f}"
+    )
+else:
+    print("no comparable layers; skipping scale report")
+PY
+  else
+    echo "跳过 C_code/C_if 尺度对比：未找到 C_if ${IF_COV}"
+  fi
+else
+  echo "SKIP_COV=1：使用已有 C_code ${CODE_COV}"
+fi
+[[ -f "${CODE_COV}" ]] || { echo "缺 C_code: ${CODE_COV}"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Step 3: 混合 C_mix = w_if*C_if + w_code*C_code（等权）+ trace 诊断（供下游定 λ）
+# ---------------------------------------------------------------------------
+if [[ "${SKIP_MIX}" != "1" ]]; then
+  [[ -f "${IF_COV}" ]] || { echo "缺 C_if(混合需要): ${IF_COV}"; exit 1; }
+  echo "==== Step3 mix -> ${MIX_COV} (if=${W_IF} code=${W_CODE}) ===="
+  python -m onereplay.mix_covariances \
+    --inputs "${IF_COV},${CODE_COV}" \
+    --weights "${W_IF},${W_CODE}" \
+    --output_path "${MIX_COV}" \
+    --normalize_weights 1
+
+  echo "==== trace diagnostic: C_mix vs C_if / C_code ===="
+  python - "${MIX_COV}" "${IF_COV}" "${CODE_COV}" <<'PY'
+import sys
+
+import torch
+
+from onereplay.core.covariance import load_covariance_file
+
+mix = load_covariance_file(sys.argv[1])
+c_if = load_covariance_file(sys.argv[2])
+c_code = load_covariance_file(sys.argv[3])
+shared = sorted(set(mix) & set(c_if) & set(c_code))
+print(f"shared layers: {len(shared)}")
+
+
+def trace(cov, name):
+    return torch.diagonal(cov[name].float()).sum().item()
+
+
+ratio_mix_if, ratio_mix_code = [], []
+for name in shared:
+    ti, tc, tx = trace(c_if, name), trace(c_code, name), trace(mix, name)
+    if ti > 0:
+        ratio_mix_if.append(tx / ti)
+    if tc > 0:
+        ratio_mix_code.append(tx / tc)
+
+
+def report(label, values):
+    if not values:
+        print(f"{label}: n/a")
+        return
+    t = torch.tensor(values)
+    print(f"{label}: mean={t.mean().item():.3f} min={t.min().item():.3f} max={t.max().item():.3f}")
+
+
+report("trace(C_mix)/trace(C_if)  ", ratio_mix_if)
+report("trace(C_mix)/trace(C_code)", ratio_mix_code)
+mean_mix_if = torch.tensor(ratio_mix_if).mean().item() if ratio_mix_if else 1.0
+print(
+    "定 λ: C_if 单独 run 用 λ=3e-2；要让 C_mix 上 IF 保护强度相当，"
+    f"可用 λ_mix ≈ 3e-2 / {mean_mix_if:.3f} = {3e-2 / mean_mix_if:.2e}"
+)
+print(
+    "λ 换配置必须重调。要精确定，用 --replay_lambda 0 "
+    "--measure_replay_when_lambda_zero 1 跑几百步读 reg 量级，"
+    "按 r=8 时 λ·reg 占 task loss 6.4% 的比例反推。"
+)
+PY
+else
+  echo "SKIP_MIX=1：跳过混合"
+fi
+
+set +x
+echo "========================================================================"
+echo "产物:"
+echo "  池      : ${POOL_FILE} + ${VIEW_DIR}/${VIEW_PREFIX}_manifest.json"
+echo "  自蒸馏  : ${DISTILL_FILE}"
+echo "  CODE_COV=${CODE_COV}"
+echo "  MIX_COV =${MIX_COV}"
+echo "下一步: qsub onereplay/pbs/51_opc_code_fisher.pbs（采 F_code，仍不训练）"
+echo "  51 号会用 ${DISTILL_FILE} 和 ${CODE_COV} 的池指纹做一致性校验，"
+echo "  所以必须等本作业跑完 Step2 之后再投。"
+echo "Job finished at: $(date)"

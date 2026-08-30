@@ -3,7 +3,7 @@
     python -m onereplay.scripts.evaluate --metrics ifeval,multiif,commonsense ...
 
 Available metrics: ifeval, multiif, commonsense, gsm8k, aime, math500, amc,
-humaneval, mbpp, apps, safety. Each metric writes <out_dir>/<metric>/<run_name>/
+humaneval, mbpp, safety. Each metric writes <out_dir>/<metric>/<run_name>/
 summary.json plus an appended row in <out_dir>/<metric>_summary.csv.
 """
 
@@ -70,44 +70,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--answer_field", type=str, default="")
     parser.add_argument("--humaneval_data_file", type=str, default="")
     parser.add_argument("--mbpp_dataset_path", type=str, default="")
-
-    # apps (stdin/stdout competitive programming; see onereplay/eval/apps_exec.py)
-    parser.add_argument(
-        "--apps_data_file",
-        type=str,
-        default="",
-        help="Parquet file from download_apps_data, or a save_to_disk directory.",
-    )
-    parser.add_argument(
-        "--apps_split",
-        type=str,
-        default="test",
-        help="Only used when --apps_data_file is a save_to_disk directory.",
-    )
-    parser.add_argument(
-        "--apps_difficulties",
-        type=str,
-        default="",
-        help="Comma-separated subset of introductory,interview,competition. "
-        "Empty means all. The tiers are contiguous index blocks, so slicing by "
-        "--limit alone silently selects a difficulty.",
-    )
-    parser.add_argument(
-        "--apps_stdin_only",
-        type=int,
-        default=1,
-        help="Drop call-based problems (those with fn_name); the stdin runner "
-        "cannot score them.",
-    )
-    parser.add_argument(
-        "--apps_max_tests",
-        type=int,
-        default=10,
-        help="Evaluate at most this many test cases per problem. Some problems "
-        "ship over a hundred; each costs a process launch. Must be identical "
-        "across every run being compared.",
-    )
-    parser.add_argument("--apps_max_new_tokens", type=int, default=1024)
     parser.add_argument("--dataset_name", type=str, default="google-research-datasets/mbpp")
     parser.add_argument("--dataset_config", type=str, default="full")
     parser.add_argument("--dataset_split", type=str, default="validation")

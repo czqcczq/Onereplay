@@ -79,4 +79,4 @@ huggingface/
 migrate_safety/adapters/
 
 # APPS dataset
-apps_ref/
+codedata_check/
