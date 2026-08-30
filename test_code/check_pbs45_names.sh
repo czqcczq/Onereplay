@@ -77,7 +77,7 @@ else
     append_spec "${run};${ADAPTERS}/${run}"
   done
 fi
-EXTRA_MODELS="cs_replaymix_4n4r_seed1;/safety/adapters/cs_replaymix_4n4r_seed1"
+EXTRA_MODELS="cs_replaymix_4n4r_seed1;/elsewhere/adapters/cs_replaymix_4n4r_seed1"
 if [[ -n "${EXTRA_MODELS}" ]]; then
   IFS='|' read -ra extra <<< "${EXTRA_MODELS}"
   for spec in "${extra[@]}"; do append_spec "${spec}"; done
@@ -88,7 +88,7 @@ IFS='|' read -ra specs <<< "${EVAL_SPECS}"
 for spec in "${specs[@]}"; do
   echo "eval spec  : name=${spec%%;*} adapter=${spec#*;}"
 done
-[[ "${specs[2]}" == "cs_replaymix_4n4r_seed1;/safety/adapters/cs_replaymix_4n4r_seed1" ]] \
+[[ "${specs[2]}" == "cs_replaymix_4n4r_seed1;/elsewhere/adapters/cs_replaymix_4n4r_seed1" ]] \
   || { echo "FAIL EXTRA_MODELS absolute path lost"; exit 1; }
 
 echo "ALL CHECKS PASSED"

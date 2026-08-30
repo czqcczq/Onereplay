@@ -1,0 +1,146 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_dsafe_sorry
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper: SORRY-Bench 判分（官方 ft-mistral evaluator，NSPO 协议）
+#   SORRY-Bench 不用 GPT-4——它的作者微调了一个 Mistral-7B 判分器，在本 benchmark 上
+#   与 GPT-4 级判分一致。那是个本地 ~14GB checkpoint，所以判分放在集群 GPU 上跑。
+#
+#   一次加载判完所有 arm（对着 responses_glob 里每份 responses.jsonl 的 sorrybench 行）。
+#   等 52 号的两个生成作业都完成后再投，否则会漏掉还没生成完的 arm。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) 52 号两个生成作业都已完成，${OUT_DIR}/direct_safety/*/responses.jsonl 就位。
+#   2) 登录节点下好判分模型（计算节点 offline）:
+#        huggingface-cli download sorry-bench/ft-mistral-7b-instruct-v0.2-sorry-bench-202406 \
+#          --local-dir ${REPO_ROOT}/models/ft-mistral-sorrybench
+#   3) 日志目录: mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 用法:
+#   冒烟: LIMIT=8   只判每个 arm 前 8 条 SORRY-Bench
+#   全量: qsub onereplay/pbs/53_sorrybench_judge.pbs
+#
+#   5 arm × 440 条，judge 只出 1 个 token，分钟级；walltime 给 4h 富余。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/53_sorrybench_judge.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    RESULTS_ROOT OUT_DIR JUDGE_MODEL RESPONSES_GLOB
+    JUDGE_BATCH_SIZE LIMIT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层
+# =============================================================================
+set -x
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}/direct_safety}"
+JUDGE_MODEL="${JUDGE_MODEL:-${REPO_ROOT}/models/ft-mistral-sorrybench}"
+RESPONSES_GLOB="${RESPONSES_GLOB:-${OUT_DIR}/direct_safety/*/responses.jsonl}"
+JUDGE_BATCH_SIZE="${JUDGE_BATCH_SIZE:-64}"
+LIMIT="${LIMIT:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${JUDGE_MODEL}" ]] || { echo "缺判分模型: ${JUDGE_MODEL}（先在登录节点 huggingface-cli download）"; exit 1; }
+
+python -m onereplay.scripts.judge_sorrybench \
+  --judge_model "${JUDGE_MODEL}" \
+  --responses_glob "${RESPONSES_GLOB}" \
+  --batch_size "${JUDGE_BATCH_SIZE}" \
+  --limit "${LIMIT}"
+
+set +x
+echo "========================================================================"
+echo "SORRY-Bench 判分完成。产物: <run_name>/sorry_judged.jsonl"
+echo "AdvBench+HarmBench 的 GPT-4 判分在本地做（judge_gpt4_safety.py），然后:"
+echo "  python -m onereplay.scripts.analyze_direct_safety --results_root ${RESPONSES_GLOB%/*/responses.jsonl}"
+echo "Job finished at: $(date)"

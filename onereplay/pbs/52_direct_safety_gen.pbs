@@ -1,0 +1,274 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_dsafe
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): direct-safety 生成阶段（NSPO 协议）
+#   五个 arm 在 AdvBench + HarmBench + SORRY-Bench 上各生成一份回答。只生成，不判分。
+#   judge 分两处：AdvBench/HarmBench 拉回本地走 GPT-4（judge_gpt4_safety.py），
+#   SORRY-Bench 用官方 ft-mistral 在集群上跑（53_sorrybench_judge.pbs）。
+#
+#   五个 arm：
+#     base        无 adapter
+#     vanilla     cs_vanilla_seed1
+#     ewc         cs_ewc_lam3e2_seed1
+#     replaymix   cs_replaymix_4n4r_seed1
+#     onereplay   cs_onereplay_lam3e-2_seed1_regonce
+#
+# -----------------------------------------------------------------------------
+# !! 统一生成配置（任何一处不同都会破坏跨模型可比性）
+#   同一个 chat template、同一份 prompts、greedy、max_new_tokens=512。五个 arm 只有
+#   adapter 不同。prompts 由 prepare_direct_safety_data.py 冻结成一份 JSONL，五个 arm
+#   读同一份，杜绝"喂进去的题目本身就不一样"。
+#
+# -----------------------------------------------------------------------------
+# !! 两作业并行（本站点特有约束）
+#   H200 上 Qwen3-1.7B 生成极快，但五个 arm 串行仍要排一次队。拆成两个作业同时跑，
+#   base+vanilla 这对最关键的对照会先出来。
+#
+#   本站点 qsub 不吃命令行变量（-v 无效），外层还会 `bash ${SELF_PATH}` 从磁盘重读
+#   本文件——所以"改一行再投两次"会让两个作业最终读到同一份（后改的）ARMS，是错的。
+#   正确做法是复制成两个独立文件，各自钉死自己的 ARMS：
+#
+#     cp onereplay/pbs/52_direct_safety_gen.pbs onereplay/pbs/52a_dsafe_base_vanilla.pbs
+#     cp onereplay/pbs/52_direct_safety_gen.pbs onereplay/pbs/52b_dsafe_rest.pbs
+#     # 在 52a 里把 ARMS 改成 "base vanilla"、SELF_PATH 改成 52a 自己；
+#     # 在 52b 里把 ARMS 改成 "ewc replaymix onereplay"、SELF_PATH 改成 52b 自己。
+#     qsub onereplay/pbs/52a_dsafe_base_vanilla.pbs
+#     qsub onereplay/pbs/52b_dsafe_rest.pbs
+#
+#   直接 `qsub 52_direct_safety_gen.pbs`（不复制）会串行跑全部五个，结果一致，只是慢。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) 登录节点冻结 prompts（计算节点 offline，SORRY-Bench 还要 HF_TOKEN）:
+#        python codedata_check/safe/check_safe_data.py --out-dir data/direct_safety_benchmarks
+#        python -m onereplay.scripts.prepare_direct_safety_data \
+#          --data_dir data/direct_safety_benchmarks --out_dir data/direct_safety_prompts
+#   2) 四个 adapter 已 rsync 到 ${ADAPTERS_DIR}（默认 migrate_safety/adapters）。
+#   3) 日志目录: mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 用法:
+#   冒烟（每 bench 前几条，先确认生成->落盘通了）: LIMIT=24  见 evaluate 的 --limit
+#   只看配置:                                     DRY_RUN=1
+#   全量:                                         qsub onereplay/pbs/52_direct_safety_gen.pbs
+#
+#   1280 prompts × 512 token，H200 batch=128，单模型分钟级；walltime 给 8h 足够。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/52_direct_safety_gen.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# 复制成 52a/52b 时，这一行是你要改的两处之一（另一处是上面的 SELF_PATH）。
+ARMS="${ARMS:-base vanilla ewc replaymix onereplay}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。起容器，把本脚本在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  echo "ARMS: ${ARMS}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTERS_DIR OUT_DIR
+    ARMS SAFETY_PROMPTS SAFETY_MAX_NEW_TOKENS SAFETY_BATCH_SIZE
+    SEED LIMIT FORCE_EVAL DRY_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。真正的生成。
+# =============================================================================
+set -x
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+ADAPTERS_DIR="${ADAPTERS_DIR:-${REPO_ROOT}/migrate_safety/adapters}"
+
+SAFETY_PROMPTS="${SAFETY_PROMPTS:-${REPO_ROOT}/data/direct_safety_prompts/direct_safety_prompts.jsonl}"
+SAFETY_MAX_NEW_TOKENS="${SAFETY_MAX_NEW_TOKENS:-512}"
+SAFETY_BATCH_SIZE="${SAFETY_BATCH_SIZE:-128}"
+SEED="${SEED:-1}"
+LIMIT="${LIMIT:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+
+# LIMIT>0 的产物只覆盖前 N 条，写进正式目录会被"已有 summary.json 就跳过"当成完整
+# 结果挡住后续正式评测（39 号踩过）。这里自动改道到 _limit<N>。
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}/direct_safety}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -f "${SAFETY_PROMPTS}" ]] || { echo "缺 prompts: ${SAFETY_PROMPTS}（先在登录节点跑 prepare_direct_safety_data）"; exit 1; }
+mkdir -p "${OUT_DIR}"
+
+resolve_path () {
+  case "$1" in
+    base)      echo "" ;;
+    vanilla)   echo "${ADAPTERS_DIR}/cs_vanilla_seed1" ;;
+    ewc)       echo "${ADAPTERS_DIR}/cs_ewc_lam3e2_seed1" ;;
+    replaymix) echo "${ADAPTERS_DIR}/cs_replaymix_4n4r_seed1" ;;
+    onereplay) echo "${ADAPTERS_DIR}/cs_onereplay_lam3e-2_seed1_regonce" ;;
+    *)         echo "" ;;
+  esac
+}
+resolve_name () {
+  case "$1" in
+    base)      echo "base" ;;
+    vanilla)   echo "cs_vanilla_seed1" ;;
+    ewc)       echo "cs_ewc_lam3e2_seed1" ;;
+    replaymix) echo "cs_replaymix_4n4r_seed1" ;;
+    onereplay) echo "cs_onereplay_lam3e-2_seed1_regonce" ;;
+    *)         echo "$1" ;;
+  esac
+}
+
+set +x
+echo "========================================================================"
+echo "direct-safety 生成  ARMS=${ARMS}"
+echo "  prompts : ${SAFETY_PROMPTS}"
+echo "  预算    : ${SAFETY_MAX_NEW_TOKENS} token   batch=${SAFETY_BATCH_SIZE}   limit=${LIMIT}"
+echo "  输出    : ${OUT_DIR}/direct_safety/<run_name>/responses.jsonl"
+printf "%-10s %-42s %s\n" "arm" "run_name" "待生成 / 跳过原因"
+for arm in ${ARMS}; do
+  name="$(resolve_name "${arm}")"
+  path="$(resolve_path "${arm}")"
+  if [[ -n "${path}" && ! -d "${path}" ]]; then
+    printf "%-10s %-42s %s\n" "${arm}" "${name}" "!! 缺 adapter ${path}"
+    continue
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/direct_safety/${name}/summary.json" ]]; then
+    printf "%-10s %-42s %s\n" "${arm}" "${name}" "已有结果，跳过"
+  else
+    printf "%-10s %-42s %s\n" "${arm}" "${name}" "待生成"
+  fi
+done
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+set -x
+
+gen_one () {
+  local arm=$1
+  local name path
+  name="$(resolve_name "${arm}")"
+  path="$(resolve_path "${arm}")"
+  if [[ -n "${path}" && ! -d "${path}" ]]; then
+    echo "跳过 ${arm}：缺 ${path}"; return 0
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/direct_safety/${name}/summary.json" ]]; then
+    echo "已有结果，跳过 ${name}"; return 0
+  fi
+  echo "==== generate: ${name} ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${path}" --run_name "${name}" \
+    --metrics direct_safety --out_dir "${OUT_DIR}" --seed "${SEED}" \
+    --limit "${LIMIT}" \
+    --safety_prompts "${SAFETY_PROMPTS}" \
+    --safety_max_new_tokens "${SAFETY_MAX_NEW_TOKENS}" \
+    --safety_batch_size "${SAFETY_BATCH_SIZE}"
+}
+
+for arm in ${ARMS}; do
+  gen_one "${arm}"
+done
+
+set +x
+echo "========================================================================"
+echo "生成完成。下一步:"
+echo "  1) 两个生成作业都完成后，判 SORRY-Bench（集群 GPU，ft-mistral）:"
+echo "       qsub onereplay/pbs/53_sorrybench_judge.pbs"
+echo "  2) 把 ${OUT_DIR}/direct_safety/*/responses.jsonl 拉回本地，判 AdvBench+HarmBench:"
+echo "       OPENAI_API_KEY=sk-... python -m onereplay.scripts.judge_gpt4_safety \\"
+echo "         --responses <arm>/responses.jsonl"
+echo "  3) 出主表: python -m onereplay.scripts.analyze_direct_safety --results_root <dir>"
+echo "产物: ${OUT_DIR}/direct_safety/<run_name>/{responses.jsonl,summary.json}"
+echo "Job finished at: $(date)"

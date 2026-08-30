@@ -3,7 +3,7 @@
     python -m onereplay.scripts.evaluate --metrics ifeval,multiif,commonsense ...
 
 Available metrics: ifeval, multiif, commonsense, gsm8k, aime, math500, amc,
-humaneval, mbpp, safety. Each metric writes <out_dir>/<metric>/<run_name>/
+humaneval, mbpp, direct_safety. Each metric writes <out_dir>/<metric>/<run_name>/
 summary.json plus an appended row in <out_dir>/<metric>_summary.csv.
 """
 
@@ -57,9 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--math_max_new_tokens", type=int, default=1024)
     parser.add_argument("--code_max_new_tokens", type=int, default=512)
 
-    # safety (generation half; judge runs separately)
+    # direct safety (generation half; judges run separately, off-cluster)
     parser.add_argument("--safety_prompts", type=str, default="")
-    parser.add_argument("--safety_max_new_tokens", type=int, default=256)
+    parser.add_argument("--safety_max_new_tokens", type=int, default=512)
+    parser.add_argument("--safety_batch_size", type=int, default=128)
 
     # math / code probes
     parser.add_argument("--gsm8k_data_path", type=str, default="")

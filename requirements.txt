@@ -23,3 +23,6 @@ immutabledict
 
 # --- optional: legacy standard_ft/vanilla_lora.py TensorBoard logging ---
 tensorboardX
+
+# --- direct-safety eval: GPT-4 judge for AdvBench + HarmBench (off-cluster) ---
+openai

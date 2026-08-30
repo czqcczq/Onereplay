@@ -308,9 +308,9 @@ MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/mult
 MULTIIF_LANG="${MULTIIF_LANG:-English}"
 MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
 
-# 默认只评本脚本训出来的两臂。要并排读「只保 IF 的 replay」那一列，把迁移来的
-# IF-only adapter 加进来（它在 results_safety 树里，路径不同，用 EXTRA_MODELS 传
-# "简称;adapter绝对路径" 的分号对，多个用 | 分隔）。
+# 默认只评本脚本训出来的两臂。要并排读别的结果树里训好的 adapter（路径不在
+# ${ADAPTERS} 下面），用 EXTRA_MODELS 传 "简称;adapter绝对路径" 的分号对，
+# 多个用 | 分隔。
 MODELS="${MODELS:-}"
 EXTRA_MODELS="${EXTRA_MODELS:-}"
 

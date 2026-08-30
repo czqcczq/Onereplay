@@ -72,7 +72,7 @@ else
     done
   done
 fi
-EXTRA_MODELS="cs_ewc_lam3e2_seed1;/safety/adapters/cs_ewc_lam3e2_seed1"
+EXTRA_MODELS="cs_ewc_lam3e2_seed1;/elsewhere/adapters/cs_ewc_lam3e2_seed1"
 if [[ -n "${EXTRA_MODELS}" ]]; then
   IFS='|' read -ra extra <<< "${EXTRA_MODELS}"
   for spec in "${extra[@]}"; do append_spec "${spec}"; done
@@ -86,7 +86,7 @@ for spec in "${specs[@]}"; do
 done
 [[ "${specs[0]}" == "cs_ewcmix_equal_lam1_seed1;/adapters/cs_ewcmix_equal_lam1_seed1" ]] \
   || { echo "FAIL first spec"; exit 1; }
-[[ "${specs[8]}" == "cs_ewc_lam3e2_seed1;/safety/adapters/cs_ewc_lam3e2_seed1" ]] \
+[[ "${specs[8]}" == "cs_ewc_lam3e2_seed1;/elsewhere/adapters/cs_ewc_lam3e2_seed1" ]] \
   || { echo "FAIL EXTRA_MODELS absolute path lost"; exit 1; }
 
 echo "ALL CHECKS PASSED"

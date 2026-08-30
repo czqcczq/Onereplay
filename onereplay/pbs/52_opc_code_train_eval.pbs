@@ -1,0 +1,493 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_opctre
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): OPC-educational 代码线训练 + 评测
+#   训 C_mix(if + C_code_opc) 的 OneReplay run -> 跑 HumanEval/MBPP（+可选 IF 侧）
+#
+# 与 42 号（Magicoder 代码线）逐字同构：训练集仍是 commonsense_170k，超参与 C_if
+# 生产 run 完全一致，**唯一变量是 --cov_path**。42 与本脚本之间只差 C_code 的来源
+# （Magicoder 广义代码指令  vs  opc-sft-stage2/educational_instruct，后者与 MBPP/
+#   HumanEval 同形），因此两条线可以并排读。
+#
+# -----------------------------------------------------------------------------
+# 为什么换到 OPC-educational
+#   原设计（42）里保护池是 Magicoder，与 HE/MBPP 只是"同为代码"的弱相关。这一版
+#   刻意让保护池与评测集**强相关**：educational_instruct 的题面/函数签名/断言风格与
+#   MBPP、HumanEval 高度一致，50 号建池时还把一半改写成 HumanEval 风格 stub。主张是
+#   保护方向越贴近评测分布，C_code 收回被 commonsense SFT 破坏的代码能力就越多，
+#   pass@1 上应能看到比 Magicoder 线更明显的回收。
+#
+#   对照列（与 42 一致，便于交叉比较）：
+#     base      两端参照
+#     vanilla   未保护的另一端（commonsense SFT，无正则）
+#     cif       纯 C_if（balanced 那份 adapter，与 42 共用同一个，不重训）
+#     cifcode   本脚本新训的 C_if + C_code_opc 等权混合  <- 本线的主角
+#
+#   读法：cifcode(opc) vs cif 量"OPC 的 C_code 有没有用"；cifcode(opc) vs 42 的
+#   cifcode(magicoder) 量"把保护池换成与评测同形的语料，回收是否更强"。
+#
+# -----------------------------------------------------------------------------
+# !! run 名带 _opcedu，绝不能和 42 的 Magicoder adapter 撞名
+#   42 的 CODE_MIX_RUN 是 cs_onereplay_ifcode_lam..._regonce（不带 tag）。若本脚本沿用
+#   同名，FORCE_TRAIN=0 会因"adapter 已存在"直接跳过训练、评到 Magicoder 的那份模型。
+#   所以这里 CODE_RUN/CODE_MIX_RUN 都加 _opcedu 中缀。cif/vanilla 是共享基线，保持原名。
+#
+# -----------------------------------------------------------------------------
+# !! pass@1 的量程注意（同 39/42 号的功效分析）
+#   MBPP 500 题的配对可分辨下限约 3.30pp，HumanEval 164 题更差。本线赌的是"强相关
+#   保护池能把回收推到量程之上"，但若回收仍小于量程，pass@1 可能测不出显著差异，
+#   届时仍需代码 CE 探针（40 号那套思路）当主量具。先看 pass@1 与失败分桶：语法错误
+#   那一桶被压回多少，是 CE 之外唯一能给机制解释的证据。
+#
+# -----------------------------------------------------------------------------
+# !! 三个判分特性（都在 onereplay/eval/code_exec.py，与 39/42 号同）
+#   1) cleanup_completion 在第一个 '\ndef ' 处截断 —— 专门惩罚话多的模型。
+#   2) has_dangerous_code 拦掉含 'import os' / 'open(' 等字样的完成，包括正当用法。
+#      **绝对分数会低于公开报告值**，对比有效、绝对值不可外引。
+#   3) MBPP split 默认 validation（90 题），本脚本显式传 test（500 题）。
+#
+# -----------------------------------------------------------------------------
+# 用法:
+#   qsub onereplay/pbs/52_opc_code_train_eval.pbs      # 训 mix + 评全部
+#
+#   拆两次提交（各自可续跑，训练很久时建议）:
+#     只训练:   DO_EVAL=0
+#     只评测:   DO_TRAIN=0
+#   也训纯 C_code 对照:  TRAIN_KINDS="code mix"
+#   只评新 run:          MODELS="cifcode"
+#   顺带出失败分桶:      DO_ANALYZE=1（默认关；也可评完在登录节点单独跑，见文末）
+#   补 IF 侧（确认没为了代码牺牲 IF）: WITH_IF=1 MODELS="cifcode"
+#   用 50 号 trace 建议的 λ_mix: LAMBDA=<值>（注意 run 名会随之改变）
+#   冒烟（每指标前 20 题，产物自动改道到 _limit20）: LIMIT=20
+#
+# 前置条件:
+#   1) 50 号已产出 MIX_COV=cov_if_code_opcedu20k_mix_qv.pt（和 CODE_COV，若要训纯 C_code）。
+#   2) 代码评测数据就位: ${CODE_DATA_DIR}/humaneval_test.parquet、mbpp_full/
+#   3) 训练需要 commonsense_170k: ${CS_DATASET}
+#   4) cif 基线 adapter 已在 42/35 号训过（cs_onereplay_balanced_...），本脚本只复用不重训。
+#   5) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# walltime: 训练一个 run（commonsense170k / 3 epoch）约 10~14h，评测 (164+500) 题
+#   约 1~2h/run。两件都做建议拆两次提交。
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/52_opc_code_train_eval.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    # 写成 if 而不是 `[[ -f x ]] && source x && break`：后者在第一个候选不存在时
+    # 整条 && 列表返回 1，set -e 会当场把作业干掉（坑 #18）。
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      if [[ -f "${_init}" ]]; then
+        source "${_init}"
+        break
+      fi
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT CODE_DATA_DIR OUT_DIR
+    DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL TRAIN_KINDS DO_ANALYZE
+    SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LAMBDA IDENTITY_COV REG_ONCE SAVE TAG CODE_COV MIX_COV
+    VANILLA_RUN IF_RUN CODE_RUN CODE_MIX_RUN MODELS
+    CODE_MAX_NEW_TOKENS TIMEOUT LIMIT MBPP_SPLIT MBPP_CONFIG
+    WITH_IF IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, torch.__file__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+
+# ---- 阶段开关 ----
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+DO_ANALYZE="${DO_ANALYZE:-0}"        # 后置分析默认不跑，作业只出 pass@1；见文末
+# 默认只训 mix：主张只需要 cif vs cifcode 这一组对照，纯 C_code 是可选控制。
+TRAIN_KINDS="${TRAIN_KINDS:-mix}"
+
+# ---- 训练超参（与 C_if 生产 run 逐字一致，唯一变量是 C）----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"   # 必须与采 C 时一致（坑 #1）
+LAMBDA="${LAMBDA:-3e-2}"
+IDENTITY_COV="${IDENTITY_COV:-0}"
+REG_ONCE="${REG_ONCE:-1}"
+SAVE="${SAVE:-1}"
+
+# ---- 协方差（默认名对齐 50 号 PBS 的产物）----
+TAG="${TAG:-opcedu20k}"
+CODE_COV="${CODE_COV:-${RESULTS_ROOT}/cov/cov_code_${TAG}_qv.pt}"
+MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_code_${TAG}_mix_qv.pt}"
+
+# ---- run 名 ----
+VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
+# 见坑 #8：Hopper 上纯 C_if 是 balanced 那份，不是 32 号默认的 RWTH 名字。
+# 名字对不上时 eval_one 只打一行「缺 adapter」然后静默跳过。cif 与 42 共用同一 adapter。
+IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam${LAMBDA}_seed${SEED}_regonce}"
+# !! _opcedu 中缀是关键：不带它会和 42 的 Magicoder adapter 撞名，评到错的模型。
+CODE_RUN="${CODE_RUN:-cs_onereplay_code_opcedu_lam${LAMBDA}_seed${SEED}_regonce}"
+CODE_MIX_RUN="${CODE_MIX_RUN:-cs_onereplay_ifcode_opcedu_lam${LAMBDA}_seed${SEED}_regonce}"
+# base/vanilla 已在 39 号出过代码结果，且 OUT_DIR 同目录会被 pending_metrics 自动跳过，
+# 这里直接不列。cif 在 39 号没跑过代码，且 cif vs cifcode 是「C_code 是否必要」的核心
+# pass@1 对照，必须留；cifcode 是本作业新训的那份。要再加纯 C_code 控制就 MODELS="cif ccode cifcode"。
+MODELS="${MODELS:-cif cifcode}"
+
+# ---- 代码评测参数（与 39 号一致，所有 run 必须同预算才可比）----
+MBPP_CONFIG="${MBPP_CONFIG:-full}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
+TIMEOUT="${TIMEOUT:-10}"
+LIMIT="${LIMIT:-0}"
+
+HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
+MBPP_DIR="${CODE_DATA_DIR}/mbpp_${MBPP_CONFIG}"
+
+# ---- 可选 IF/CS 侧 ----
+WITH_IF="${WITH_IF:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+
+# LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"的逻辑
+# 当成完整结果挡住后续正式评测（坑 #7）。这里自动改道。
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}" \
+         "${RESULTS_ROOT}/map_cache/eval_code_seed${SEED}"
+
+echo "TAG=${TAG}  CODE_COV=${CODE_COV}  MIX_COV=${MIX_COV}"
+echo "LAMBDA=${LAMBDA}  SEED=${SEED}  OUT_DIR=${OUT_DIR}"
+echo "MODELS=${MODELS}  TRAIN_KINDS=${TRAIN_KINDS}  WITH_IF=${WITH_IF}"
+
+# ===========================================================================
+# 训练：循环 TRAIN_KINDS
+# ===========================================================================
+train_one () {
+  local kind=$1
+  local cov_path run
+  case "${kind}" in
+    code) cov_path="${CODE_COV}"; run="${CODE_RUN}" ;;
+    mix)  cov_path="${MIX_COV}";  run="${CODE_MIX_RUN}" ;;
+    *)    echo "未知 TRAIN_KIND=${kind}，可选 code / mix"; return 1 ;;
+  esac
+
+  if [[ "${FORCE_TRAIN}" != "1" && -d "${ADAPTERS}/${run}" ]]; then
+    echo "跳过训练 ${run}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+    return 0
+  fi
+  [[ -f "${cov_path}" ]] || { echo "缺协方差 ${cov_path}（先跑 50 号）"; return 1; }
+  [[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; return 1; }
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+
+  echo "==== train ${kind}: ${run} (cov=${cov_path} lam=${LAMBDA}) ===="
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --cov_path "${cov_path}" --replay_lambda "${LAMBDA}" \
+    --identity_cov "${IDENTITY_COV}" --reg_once_per_update "${REG_ONCE}" \
+    --save "${SAVE}" --save_path "${ADAPTERS}/${run}" \
+    --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
+}
+
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  for kind in ${TRAIN_KINDS}; do
+    train_one "${kind}"
+  done
+else
+  echo "DO_TRAIN=0：跳过训练"
+fi
+
+# ===========================================================================
+# 评测
+# ===========================================================================
+resolve_adapter () {
+  case "$1" in
+    base)     echo "" ;;
+    vanilla)  echo "${ADAPTERS}/${VANILLA_RUN}" ;;
+    cif)      echo "${ADAPTERS}/${IF_RUN}" ;;
+    ccode)    echo "${ADAPTERS}/${CODE_RUN}" ;;
+    cifcode)  echo "${ADAPTERS}/${CODE_MIX_RUN}" ;;
+    *)        echo "" ;;
+  esac
+}
+
+resolve_name () {
+  case "$1" in
+    base)     echo "base" ;;
+    vanilla)  echo "${VANILLA_RUN}" ;;
+    cif)      echo "${IF_RUN}" ;;
+    ccode)    echo "${CODE_RUN}" ;;
+    cifcode)  echo "${CODE_MIX_RUN}" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+pending_metrics () {
+  local name=$1; shift
+  local out="" m
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" != "1" && -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then
+      echo "已有结果，跳过 ${m}/${name}" >&2
+      continue
+    fi
+    out="${out},${m}"
+  done
+  echo "${out#,}"
+}
+
+if [[ "${DO_EVAL}" == "1" ]]; then
+  CODE_AVAIL=""
+  if [[ -f "${HUMANEVAL_FILE}" ]]; then
+    CODE_AVAIL="${CODE_AVAIL} humaneval"
+  else
+    echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}（先在登录节点跑 download_code_data）"
+  fi
+  if [[ -d "${MBPP_DIR}" ]]; then
+    CODE_AVAIL="${CODE_AVAIL} mbpp"
+  else
+    echo "跳过 mbpp：缺 ${MBPP_DIR}（先在登录节点跑 download_code_data）"
+  fi
+  CODE_AVAIL="${CODE_AVAIL# }"
+  [[ -n "${CODE_AVAIL}" ]] || { echo "两份代码数据都不在，先下载"; exit 1; }
+
+  IF_AVAIL=""
+  if [[ "${WITH_IF}" == "1" ]]; then
+    IF_AVAIL="ifeval commonsense"
+    if [[ -f "${MULTIIF_INPUT}" ]]; then
+      IF_AVAIL="${IF_AVAIL} multiif"
+    else
+      echo "跳过 multiif：缺 ${MULTIIF_INPUT}"
+    fi
+    [[ -d "${CS_DATASET}" ]] || echo "警告: commonsense 评测缺 ${CS_DATASET}"
+  fi
+  echo "CODE_AVAIL=[${CODE_AVAIL}]  IF_AVAIL=[${IF_AVAIL}]"
+
+  # -------------------------------------------------------------------------
+  # 判分链路自检：这套 exec-in-subprocess 的沙箱要是不通，整个作业跑完只会得到
+  # 一片 0 分，很难看出是模型差还是判分坏了。39 号加的，保留。
+  # -------------------------------------------------------------------------
+  python - <<'PY'
+from onereplay.eval.code_exec import evaluate_assert_program, evaluate_entry_point_program
+
+ok, err = evaluate_assert_program("def add(a, b):\n    return a + b\n", ["assert add(1, 2) == 3"], 5.0)
+print(f"自检 MBPP 路径      : passed={ok} error={err!r}")
+program = "def add(a, b):\n    return a + b\n"
+test = "def check(candidate):\n    assert candidate(1, 2) == 3\n"
+ok2, err2 = evaluate_entry_point_program(program, "add", test, 5.0)
+print(f"自检 HumanEval 路径 : passed={ok2} error={err2!r}")
+if not (ok and ok2):
+    raise SystemExit("判分沙箱不通（多半是容器里 multiprocessing 起不来），先修这个再评测")
+print("判分链路 OK")
+PY
+
+  eval_one () {
+    local short=$1
+    local name adapter cp ip
+    name="$(resolve_name "${short}")"
+    adapter="$(resolve_adapter "${short}")"
+    if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+      echo "跳过评测 ${short}：缺 adapter ${adapter}"
+      return 0
+    fi
+
+    # shellcheck disable=SC2086
+    cp="$(pending_metrics "${name}" ${CODE_AVAIL})"
+    if [[ -n "${cp}" ]]; then
+      echo "==== eval code: ${name} (${cp}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics "${cp}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+        --limit "${LIMIT}" \
+        --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}" --timeout "${TIMEOUT}" \
+        --humaneval_data_file "${HUMANEVAL_FILE}" \
+        --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
+        --cache_dir "${JOB_TMPDIR}/hf_datasets"
+    else
+      echo "跳过代码评测 ${name}：所有代码指标都已有结果"
+    fi
+
+    if [[ "${WITH_IF}" == "1" && -n "${IF_AVAIL}" ]]; then
+      # shellcheck disable=SC2086
+      ip="$(pending_metrics "${name}" ${IF_AVAIL})"
+      if [[ -n "${ip}" ]]; then
+        echo "==== eval IF/CS: ${name} (${ip}) ===="
+        python -m onereplay.scripts.evaluate \
+          --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+          --adapter_path "${adapter}" --run_name "${name}" \
+          --metrics "${ip}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+          --dataset_path "${CS_DATASET}" \
+          --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+          --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_code_seed${SEED}" \
+          --ifeval_input "${IFEVAL_INPUT}" \
+          --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+          --multiif_limit "${MULTIIF_LIMIT}"
+      else
+        echo "跳过 IF/CS 评测 ${name}：所有 IF/CS 指标都已有结果"
+      fi
+    fi
+  }
+
+  for m in ${MODELS}; do
+    eval_one "${m}"
+  done
+
+  # -------------------------------------------------------------------------
+  # 失败原因分桶 + 语法错误成因取证 + 配对 McNemar
+  #   这是本脚本真正的看点：语法错误那一桶被压回去多少。
+  # -------------------------------------------------------------------------
+  if [[ "${DO_ANALYZE}" == "1" ]]; then
+    DIAG_RUNS=""
+    for short in ${MODELS}; do
+      DIAG_RUNS="${DIAG_RUNS},$(resolve_name "${short}")"
+    done
+    python -m onereplay.scripts.analyze_code_failures \
+      --results_root "${OUT_DIR}" --metrics "${CODE_AVAIL// /,}" \
+      --runs "${DIAG_RUNS#,}" --baseline base --inspect 5 || true
+  fi
+
+  set +x
+  echo "========================================================================"
+  echo "怎么读："
+  echo "  1) **主量具不在这里。** pass@1 的量程不够测保护（MBPP 3.30pp vs 预期救回"
+  echo "     2.28pp），训完必须跑 40 号代码 CE 探针，看 cifcode 把漂移倍数压回多少，"
+  echo "     以及 bootstrap 里 cif vs cifcode 的配对差是否显著。"
+  echo "  2) 失败分桶要另跑（命令见下）：vanilla 的语法错误是 base 的 21 倍（MBPP 2 -> 43"
+  echo "     题），cifcode 若把这一桶压回接近 base，就是「保住了输出结构」的直接机制证据。"
+  echo "     断言失败那一桶本来就持平，它继续持平是预期，不是发现。"
+  echo "  3) 若开了 WITH_IF：确认 cifcode 的 IFEval 没比 cif 差 —— C_mix 的主张是"
+  echo "     同时保住两边，为代码牺牲 IF 不算成功。"
+  echo "  4) 绝对分数低于公开报告值（判分器有黑名单且会在第一个 '\\ndef ' 处截断），"
+  echo "     对比有效，绝对值不要外引。"
+  echo ""
+  echo "产物: ${OUT_DIR}/{humaneval,mbpp}/<run_name>/{summary.json,responses.jsonl}"
+  echo "      ${OUT_DIR}/{humaneval,mbpp}_summary.csv（append，以 summary.json 为唯一真相）"
+  echo ""
+  echo "本作业只出 pass@1（DO_ANALYZE=0）。失败分桶 / 语法错误取证 / 配对 McNemar"
+  echo "读的是上面已落盘的 responses.jsonl，纯 CPU 几秒，在登录节点上补即可："
+  echo "  python -m onereplay.scripts.analyze_code_failures \\"
+  echo "    --results_root ${OUT_DIR} --metrics ${CODE_AVAIL// /,} \\"
+  echo "    --runs <run1,run2,...> --baseline base --inspect 5"
+  echo "要让本作业自己跑，投递前设 DO_ANALYZE=1。"
+  set -x
+else
+  echo "DO_EVAL=0：跳过评测"
+fi
+
+set +x
+echo "Job finished at: $(date)"
