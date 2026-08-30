@@ -51,7 +51,7 @@
 #        python codedata_check/safe/check_safe_data.py --out-dir data/direct_safety_benchmarks
 #        python -m onereplay.scripts.prepare_direct_safety_data \
 #          --data_dir data/direct_safety_benchmarks --out_dir data/direct_safety_prompts
-#   2) 四个 adapter 已 rsync 到 ${ADAPTERS_DIR}（默认 migrate_safety/adapters）。
+#   2) 四个 adapter 已迁移到 ${ADAPTERS_DIR}（默认 results_safety/adapters）。
 #   3) 日志目录: mkdir -p /scratch/weiliu87/logs/onereplay
 #
 # 用法:
@@ -164,7 +164,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
-ADAPTERS_DIR="${ADAPTERS_DIR:-${REPO_ROOT}/migrate_safety/adapters}"
+ADAPTERS_DIR="${ADAPTERS_DIR:-${REPO_ROOT}/results_safety/adapters}"
 
 SAFETY_PROMPTS="${SAFETY_PROMPTS:-${REPO_ROOT}/data/direct_safety_prompts/direct_safety_prompts.jsonl}"
 SAFETY_MAX_NEW_TOKENS="${SAFETY_MAX_NEW_TOKENS:-512}"
