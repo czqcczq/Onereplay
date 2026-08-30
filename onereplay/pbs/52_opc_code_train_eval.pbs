@@ -55,18 +55,23 @@
 #   3) MBPP split 默认 validation（90 题），本脚本显式传 test（500 题）。
 #
 # -----------------------------------------------------------------------------
-# 用法:
-#   qsub onereplay/pbs/52_opc_code_train_eval.pbs      # 训 mix + 评全部
+# 用法（推荐两阶段）:
+#   1) 粗扫：每个 λ 只训 200 optimizer steps；HumanEval 全部 164 题、MBPP 前 200 题
+#      qsub -v 'SCAN_MODE=1,LAMBDAS=1e-2 2e-2 3e-2 1e-1' \
+#        onereplay/pbs/52_opc_code_train_eval.pbs
+#      扫描产物带 _scan_ms200 后缀，评测写进 results_limit200，不污染正式结果。
+#   2) 从扫描中选 λ（例 3e-2），完整训 3 epoch + 正式评完整 HE/MBPP：
+#      qsub -v LAMBDA=3e-2 onereplay/pbs/52_opc_code_train_eval.pbs
 #
 #   拆两次提交（各自可续跑，训练很久时建议）:
 #     只训练:   DO_EVAL=0
 #     只评测:   DO_TRAIN=0
 #   也训纯 C_code 对照:  TRAIN_KINDS="code mix"
-#   只评新 run:          MODELS="cifcode"
+#   固定基线默认只评 cif；方法 run 由 LAMBDAS × TRAIN_KINDS 自动展开
 #   顺带出失败分桶:      DO_ANALYZE=1（默认关；也可评完在登录节点单独跑，见文末）
-#   补 IF 侧（确认没为了代码牺牲 IF）: WITH_IF=1 MODELS="cifcode"
+#   补 IF 侧（确认没为了代码牺牲 IF）: WITH_IF=1
 #   用 50 号 trace 建议的 λ_mix: LAMBDA=<值>（注意 run 名会随之改变）
-#   冒烟（每指标前 20 题，产物自动改道到 _limit20）: LIMIT=20
+#   更快但更噪的粗扫: SCAN_MODE=1 SCAN_MAX_STEPS=100 SCAN_LIMIT=100
 #
 # 前置条件:
 #   1) 50 号已产出 MIX_COV=cov_if_code_opcedu20k_mix_qv.pt（和 CODE_COV，若要训纯 C_code）。
@@ -136,8 +141,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT CODE_DATA_DIR OUT_DIR
     DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL TRAIN_KINDS DO_ANALYZE
     SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
-    LAMBDA IDENTITY_COV REG_ONCE SAVE TAG CODE_COV MIX_COV
-    VANILLA_RUN IF_RUN CODE_RUN CODE_MIX_RUN MODELS
+    LAMBDA LAMBDAS IF_LAMBDA SCAN_MODE SCAN_MAX_STEPS SCAN_LIMIT MAX_STEPS
+    WALLTIME_SEC RESERVE_SEC ESTIMATE_SEC
+    IDENTITY_COV REG_ONCE SAVE TAG CODE_COV MIX_COV
+    VANILLA_RUN IF_RUN MODELS
     CODE_MAX_NEW_TOKENS TIMEOUT LIMIT MBPP_SPLIT MBPP_CONFIG
     WITH_IF IFEVAL_INPUT MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT
   )
@@ -215,34 +222,79 @@ VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-1000}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"   # 必须与采 C 时一致（坑 #1）
 LAMBDA="${LAMBDA:-3e-2}"
+
+# ---- 两阶段 λ 选择 ----
+# SCAN_MODE=1：每个 λ 只训 SCAN_MAX_STEPS 个 optimizer steps，并在每个 benchmark
+# 前 SCAN_LIMIT 题上粗评。adapter/run 名自动加 _scan_ms...，绝不会挡住后续正式训练。
+# SCAN_MODE=0：只跑 LAMBDA（除非显式传 LAMBDAS），完整训练 EPOCHS 个 epoch。
+SCAN_MODE="${SCAN_MODE:-0}"
+SCAN_MAX_STEPS="${SCAN_MAX_STEPS:-200}"
+SCAN_LIMIT="${SCAN_LIMIT:-200}"
+if [[ "${SCAN_MODE}" == "1" ]]; then
+  # C_mix 在真实 cif ΔW 下约为 C_if 惩罚的 1.252 倍，等效中心约 0.03/1.252=0.024。
+  LAMBDAS="${LAMBDAS:-1e-2 2e-2 3e-2 1e-1}"
+  MAX_STEPS="${MAX_STEPS:-${SCAN_MAX_STEPS}}"
+  RUN_SUFFIX="_scan_ms${MAX_STEPS}"
+else
+  LAMBDAS="${LAMBDAS:-${LAMBDA}}"
+  MAX_STEPS="${MAX_STEPS:-0}"
+  RUN_SUFFIX=""
+fi
 IDENTITY_COV="${IDENTITY_COV:-0}"
 REG_ONCE="${REG_ONCE:-1}"
 SAVE="${SAVE:-1}"
+
+# ---- walltime 守卫（扫描多 λ 时才有意义）----
+# 每训一个 λ 前估算剩余时间，不够就干净停在下一个 λ 之前，绝不半截被杀（半截 adapter
+# 若残留会被"已存在就跳过"误当完成）。原样重投即续跑。
+WALLTIME_SEC="${WALLTIME_SEC:-86400}"    # 与 #PBS -l walltime=24:00:00 对齐
+if [[ "${SCAN_MODE}" == "1" ]]; then
+  RESERVE_SEC="${RESERVE_SEC:-18000}"    # 扫完后给 4 个 λ 的子集评测预留约 5h
+  ESTIMATE_SEC="${ESTIMATE_SEC:-12000}"  # 200 steps 的首个 λ 粗估约 3.3h
+else
+  RESERVE_SEC="${RESERVE_SEC:-7200}"     # 单个正式 run 的完整 HE/MBPP 评测预留 2h
+  ESTIMATE_SEC="${ESTIMATE_SEC:-50000}"  # 完整 3 epoch 粗估约 14h
+fi
 
 # ---- 协方差（默认名对齐 50 号 PBS 的产物）----
 TAG="${TAG:-opcedu20k}"
 CODE_COV="${CODE_COV:-${RESULTS_ROOT}/cov/cov_code_${TAG}_qv.pt}"
 MIX_COV="${MIX_COV:-${RESULTS_ROOT}/cov/cov_if_code_${TAG}_mix_qv.pt}"
 
-# ---- run 名 ----
+# ---- 固定基线 run 名 ----
 VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_seed${SEED}}"
 # 见坑 #8：Hopper 上纯 C_if 是 balanced 那份，不是 32 号默认的 RWTH 名字。
-# 名字对不上时 eval_one 只打一行「缺 adapter」然后静默跳过。cif 与 42 共用同一 adapter。
-IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam${LAMBDA}_seed${SEED}_regonce}"
+# cif 与 42 共用同一 adapter；它固定在自己训练时的 λ（IF_LAMBDA），不随本线 λ 扫描变。
+IF_LAMBDA="${IF_LAMBDA:-3e-2}"
+IF_RUN="${IF_RUN:-cs_onereplay_balanced_lam${IF_LAMBDA}_seed${SEED}_regonce}"
+
+# ---- 方法 run 名：随 λ 变，扫描时每个 λ 前重算一次 ----
 # !! _opcedu 中缀是关键：不带它会和 42 的 Magicoder adapter 撞名，评到错的模型。
-CODE_RUN="${CODE_RUN:-cs_onereplay_code_opcedu_lam${LAMBDA}_seed${SEED}_regonce}"
-CODE_MIX_RUN="${CODE_MIX_RUN:-cs_onereplay_ifcode_opcedu_lam${LAMBDA}_seed${SEED}_regonce}"
-# base/vanilla 已在 39 号出过代码结果，且 OUT_DIR 同目录会被 pending_metrics 自动跳过，
-# 这里直接不列。cif 在 39 号没跑过代码，且 cif vs cifcode 是「C_code 是否必要」的核心
-# pass@1 对照，必须留；cifcode 是本作业新训的那份。要再加纯 C_code 控制就 MODELS="cif ccode cifcode"。
-MODELS="${MODELS:-cif cifcode}"
+# 扫描下 CODE_RUN/CODE_MIX_RUN 不接受环境覆盖（多个 λ 无法用单一名字），一律从 LAMBDA 生成。
+set_method_runs () {
+  CODE_RUN="cs_onereplay_code_opcedu_lam${LAMBDA}_seed${SEED}_regonce${RUN_SUFFIX}"
+  CODE_MIX_RUN="cs_onereplay_ifcode_opcedu_lam${LAMBDA}_seed${SEED}_regonce${RUN_SUFFIX}"
+}
+set_method_runs   # 先用网格首个 λ 初始化，供各处引用
+
+# 方法 kind -> 评测短名：mix=cifcode，code=ccode。评测哪些方法由 TRAIN_KINDS 决定。
+kind_to_short () { case "$1" in mix) echo cifcode ;; code) echo ccode ;; *) echo "" ;; esac; }
+
+# MODELS 只列**固定基线**（不随 λ 变的那些）。方法 run（cifcode/ccode）由 λ 网格 ×
+# TRAIN_KINDS 自动展开评测，不要往这里写。base/vanilla 的代码结果 39/42 已产出、同目录会
+# 被自动跳过；默认只留 cif 这个核心对照，想补进表就 MODELS="base vanilla cif"。
+MODELS="${MODELS:-cif}"
 
 # ---- 代码评测参数（与 39 号一致，所有 run 必须同预算才可比）----
 MBPP_CONFIG="${MBPP_CONFIG:-full}"
 MBPP_SPLIT="${MBPP_SPLIT:-test}"
 CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
 TIMEOUT="${TIMEOUT:-10}"
-LIMIT="${LIMIT:-0}"
+if [[ "${SCAN_MODE}" == "1" ]]; then
+  LIMIT="${LIMIT:-${SCAN_LIMIT}}"
+else
+  LIMIT="${LIMIT:-0}"
+fi
 
 HUMANEVAL_FILE="${CODE_DATA_DIR}/humaneval_test.parquet"
 MBPP_DIR="${CODE_DATA_DIR}/mbpp_${MBPP_CONFIG}"
@@ -267,8 +319,9 @@ mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}" \
          "${RESULTS_ROOT}/map_cache/eval_code_seed${SEED}"
 
 echo "TAG=${TAG}  CODE_COV=${CODE_COV}  MIX_COV=${MIX_COV}"
-echo "LAMBDA=${LAMBDA}  SEED=${SEED}  OUT_DIR=${OUT_DIR}"
-echo "MODELS=${MODELS}  TRAIN_KINDS=${TRAIN_KINDS}  WITH_IF=${WITH_IF}"
+echo "SCAN_MODE=${SCAN_MODE} MAX_STEPS=${MAX_STEPS} RUN_SUFFIX=${RUN_SUFFIX} LIMIT=${LIMIT}"
+echo "λ 网格=${LAMBDAS}  IF_LAMBDA=${IF_LAMBDA}  SEED=${SEED}  OUT_DIR=${OUT_DIR}"
+echo "基线 MODELS=${MODELS}  方法 TRAIN_KINDS=${TRAIN_KINDS}  WITH_IF=${WITH_IF}"
 
 # ===========================================================================
 # 训练：循环 TRAIN_KINDS
@@ -300,13 +353,45 @@ train_one () {
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --cov_path "${cov_path}" --replay_lambda "${LAMBDA}" \
     --identity_cov "${IDENTITY_COV}" --reg_once_per_update "${REG_ONCE}" \
+    --max_steps "${MAX_STEPS}" \
     --save "${SAVE}" --save_path "${ADAPTERS}/${run}" \
     --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
 }
 
 if [[ "${DO_TRAIN}" == "1" ]]; then
-  for kind in ${TRAIN_KINDS}; do
-    train_one "${kind}"
+  LAST_LAMBDA_SEC="${ESTIMATE_SEC}"
+  for LAMBDA in ${LAMBDAS}; do
+    set_method_runs
+
+    # walltime 守卫：只在这个 λ 确实还有 adapter 要训、且剩余时间不够时才停手。
+    need_train=0
+    for kind in ${TRAIN_KINDS}; do
+      case "${kind}" in code) r="${CODE_RUN}" ;; mix) r="${CODE_MIX_RUN}" ;; *) r="" ;; esac
+      if [[ -n "${r}" && ( "${FORCE_TRAIN}" == "1" || ! -d "${ADAPTERS}/${r}" ) ]]; then
+        need_train=1
+      fi
+    done
+    if (( need_train == 1 )); then
+      REMAINING=$(( WALLTIME_SEC - SECONDS - RESERVE_SEC ))
+      if (( REMAINING < LAST_LAMBDA_SEC )); then
+        echo "########################################################################"
+        echo "walltime 守卫：已用 ${SECONDS}s，剩余 ${REMAINING}s，不够再训一个 λ（约 ${LAST_LAMBDA_SEC}s）。"
+        echo "停在 λ=${LAMBDA} 之前。原样重投即续跑（已完成的自动跳过）:"
+        echo "  qsub -v LAMBDAS='${LAMBDAS}' onereplay/pbs/52_opc_code_train_eval.pbs"
+        echo "########################################################################"
+        break
+      fi
+    fi
+
+    LAMBDA_START="${SECONDS}"
+    echo "==== λ=${LAMBDA} 训练（已用 ${SECONDS}s）===="
+    for kind in ${TRAIN_KINDS}; do
+      train_one "${kind}"
+    done
+    LAMBDA_SEC=$(( SECONDS - LAMBDA_START ))
+    # 只有真正训满的才拿来预估下一个；跳过训练的那几秒会把守卫骗过去。
+    if (( LAMBDA_SEC > 600 )); then LAST_LAMBDA_SEC="${LAMBDA_SEC}"; fi
+    echo "λ=${LAMBDA} 训练用时 ${LAMBDA_SEC}s"
   done
 else
   echo "DO_TRAIN=0：跳过训练"
@@ -443,19 +528,31 @@ PY
     fi
   }
 
+  DIAG_RUNS=""
+
+  # 固定基线（默认 cif，可选 base/vanilla）——只评一次，不随 λ 变。
   for m in ${MODELS}; do
     eval_one "${m}"
+    DIAG_RUNS="${DIAG_RUNS},$(resolve_name "${m}")"
+  done
+
+  # 方法 run：λ 网格 × TRAIN_KINDS 展开，每个 λ 重算 run 名再评。
+  for LAMBDA in ${LAMBDAS}; do
+    set_method_runs
+    for kind in ${TRAIN_KINDS}; do
+      short="$(kind_to_short "${kind}")"
+      [[ -n "${short}" ]] || { echo "未知 TRAIN_KIND=${kind}，评测跳过"; continue; }
+      eval_one "${short}"
+      DIAG_RUNS="${DIAG_RUNS},$(resolve_name "${short}")"
+    done
   done
 
   # -------------------------------------------------------------------------
   # 失败原因分桶 + 语法错误成因取证 + 配对 McNemar
-  #   这是本脚本真正的看点：语法错误那一桶被压回去多少。
+  #   这是本脚本真正的看点：语法错误那一桶被压回去多少。分析覆盖上面评过的所有 run
+  #   （基线 + 每个 λ 的方法 run），baseline 固定为 base（其结果 39/42 已在同目录）。
   # -------------------------------------------------------------------------
   if [[ "${DO_ANALYZE}" == "1" ]]; then
-    DIAG_RUNS=""
-    for short in ${MODELS}; do
-      DIAG_RUNS="${DIAG_RUNS},$(resolve_name "${short}")"
-    done
     python -m onereplay.scripts.analyze_code_failures \
       --results_root "${OUT_DIR}" --metrics "${CODE_AVAIL// /,}" \
       --runs "${DIAG_RUNS#,}" --baseline base --inspect 5 || true
