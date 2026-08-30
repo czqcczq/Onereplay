@@ -1,0 +1,267 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_ifrerun
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 只对 cs_onereplay_lam3e-2_seed1_regonce
+#   重跑一次 IFEval（不训练、不评 multiif / commonsense / 数学 / 代码）。
+#
+# 【这个脚本能回答什么、不能回答什么】
+#   IFEval 用贪心解码（do_sample=False），对同一份 adapter 重评几乎逐位复现。
+#   所以本作业测的是「评测侧 / 跨集群（RWTH→Hopper，不同 GPU、库版本）的复现
+#   差异」，而不是「训练的随机浮动」。要量训练浮动得换 seed 重新训练
+#   （见 02_sweep_lambda.pbs，改 SEED）。跨集群复现差异本身也有意义：第四章
+#   记录过 RWTH↔Hopper 约 1.3pp 的环境差，本作业能把它坐实。
+#
+# 【默认写到新 run 名，不覆盖原结果】
+#   OUT_NAME 默认 = ${RUN}_rerun，summary.json 落到
+#     ${RESULTS_ROOT}/ifeval/${RUN}_rerun/
+#   原来的 ${RUN} 结果（65.25 那次）原样保留，方便并排对比。
+#   想直接覆盖原结果就传 OUT_NAME=cs_onereplay_lam3e-2_seed1_regonce。
+#
+# -----------------------------------------------------------------------------
+# !! adapter 名字很容易踩坑
+#   Hopper 上的 adapter 目录不一定叫 cs_onereplay_lam3e-2_seed1_regonce
+#   （那是 RWTH 的命名）。02_sweep_lambda.pbs 在本集群产出的名字带策略词：
+#     uniform  -> cs_onereplay_uniform_lam3e-2_seed1_regonce
+#     balanced -> cs_onereplay_balanced_lam3e-2_seed1_regonce
+#   如果你要复现的正是 RWTH 那次 65.25，得先把它的 adapter 传到 Hopper 的
+#     ${RESULTS_ROOT}/adapters/cs_onereplay_lam3e-2_seed1_regonce
+#   或者直接用 ADAPTER=<绝对路径> 指向已有目录。缺目录时本脚本会明确报错。
+#
+# -----------------------------------------------------------------------------
+# 用法（本站点不从 qsub 命令行传变量，要改就改下方默认值或用 -v）:
+#   qsub onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#
+#   指定别的 adapter 目录:
+#     qsub -v ADAPTER=/scratch/.../adapters/xxx onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#   覆盖原结果而不是写 _rerun:
+#     qsub -v OUT_NAME=cs_onereplay_lam3e-2_seed1_regonce onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#   冒烟（只评前 20 条，十几分钟）:
+#     qsub -v LIMIT=20 onereplay/pbs/54_ifeval_rerun_regonce.pbs
+#
+# 前置条件:
+#   1) adapter 就位（见上面的名字说明）
+#   2) IFEval 数据: onereplay/third_party/instruction_following_eval/data/input_data.jsonl
+#   3) 日志目录先建好: mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 预计耗时: IFEval 541 条贪心生成，单卡约 40–60 min，walltime 给 4 h。
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（与其它 pbs 脚本保持一致）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/54_ifeval_rerun_regonce.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT
+    SEED RUN ADAPTER OUT_NAME LIMIT MAX_NEW_TOKENS
+    IFEVAL_INPUT FORCE_EVAL
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+
+# ---- 评测参数（与第一章 / 02 号逐字一致，换了就不可比）----
+SEED="${SEED:-1}"
+LIMIT="${LIMIT:-0}"                  # >0 时只评前 N 条（冒烟用）
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-768}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+
+# ---- 要评的 run ----
+# RUN     = adapter 目录名（也是被复现的那次训练的名字）
+# ADAPTER = adapter 绝对路径（默认由 RUN 拼出，可整体覆盖指向别处）
+# OUT_NAME= 输出/记录用的 run 名，默认加 _rerun 后缀以免覆盖原结果
+RUN="${RUN:-cs_onereplay_lam3e-2_seed1_regonce}"
+ADAPTER="${ADAPTER:-${ADAPTERS}/${RUN}}"
+OUT_NAME="${OUT_NAME:-${RUN}_rerun}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -f "${IFEVAL_INPUT}" ]] || { echo "缺 IFEval 数据: ${IFEVAL_INPUT}"; exit 1; }
+if [[ ! -d "${ADAPTER}" ]]; then
+  echo "!! 缺 adapter: ${ADAPTER}"
+  echo "   Hopper 上该 run 可能叫 cs_onereplay_{uniform,balanced}_lam3e-2_seed1_regonce，"
+  echo "   或者需要先把 RWTH 的 adapter 传过来。可用 ADAPTER=<绝对路径> 指定。"
+  echo "   现有 adapters:"
+  ls -1 "${ADAPTERS}" 2>/dev/null | sed 's/^/     /' || true
+  exit 1
+fi
+mkdir -p "${RESULTS_ROOT}" "${RESULTS_ROOT}/map_cache/eval_if_seed${SEED}"
+
+if [[ "${LIMIT}" != "0" ]]; then
+  echo "!! LIMIT=${LIMIT}：冒烟模式，产出的 summary.json 只覆盖前若干条，不是正式结果。"
+fi
+
+# 已有结果就跳过（除非 FORCE_EVAL=1），避免 ifeval_summary.csv 追加重复行。
+if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/ifeval/${OUT_NAME}/summary.json" ]]; then
+  echo "已有结果，跳过: ${RESULTS_ROOT}/ifeval/${OUT_NAME}/summary.json"
+  echo "（FORCE_EVAL=1 可强制重评）"
+else
+  echo "==== eval IFEval: adapter=${ADAPTER}  ->  run_name=${OUT_NAME} ===="
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${ADAPTER}" --run_name "${OUT_NAME}" \
+    --metrics ifeval --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --limit "${LIMIT}" --max_new_tokens "${MAX_NEW_TOKENS}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_if_seed${SEED}" \
+    --ifeval_input "${IFEVAL_INPUT}"
+fi
+
+# ---------------------------------------------------------------------------
+# 后置：把重跑结果与原结果并排打出来，直接看有没有漂。
+# ---------------------------------------------------------------------------
+set +x
+python - "${RESULTS_ROOT}" "${RUN}" "${OUT_NAME}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root, orig, rerun = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+
+def load(name):
+    path = root / "ifeval" / name / "summary.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def cell(payload, key):
+    return f"{payload[key] * 100:6.2f}" if payload and key in payload else "  --  "
+
+
+keys = [
+    ("strict_prompt_accuracy", "strict prompt"),
+    ("strict_instruction_accuracy", "strict inst"),
+    ("loose_prompt_accuracy", "loose prompt"),
+    ("loose_instruction_accuracy", "loose inst"),
+]
+a, b = load(orig), load(rerun)
+
+print()
+print("=" * 78)
+print("IFEval 复现对比（%）。贪心解码，同一 adapter 重评差异应极小；跨集群/库版本")
+print("可能有几分之一到约 1pp 的漂移。差异远大于此才值得深究。")
+print("=" * 78)
+print(f"{'指标':<16}{'原结果':>12}{'重跑':>12}{'差(pp)':>12}")
+for k, label in keys:
+    if a and b and k in a and k in b:
+        diff = f"{(b[k] - a[k]) * 100:+.2f}"
+    else:
+        diff = "  --  "
+    print(f"{label:<16}{cell(a, k):>12}{cell(b, k):>12}{diff:>12}")
+print()
+print(f"原结果 run : {orig}   ({'有' if a else '缺'} summary.json)")
+print(f"重跑   run : {rerun}")
+print("541 条 prompt：1pp = 5.41 条。单个准确率二项标准误约 2pp。")
+PY
+
+echo "========================================================================"
+echo "产物: ${RESULTS_ROOT}/ifeval/${OUT_NAME}/summary.json"
+echo "      ${RESULTS_ROOT}/ifeval_summary.csv （append）"
+echo "Job finished at: $(date)"
