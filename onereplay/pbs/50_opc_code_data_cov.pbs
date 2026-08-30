@@ -248,13 +248,13 @@ MBPP_SPLIT="${MBPP_SPLIT:-test}"
 # ---- 自蒸馏 + 采 C 共用（与 41/31 号一致）----
 SEED="${SEED:-1}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
-GEN_BATCH="${GEN_BATCH:-16}"
+GEN_BATCH="${GEN_BATCH:-96}"
 THINKING="${THINKING:-0}"          # non-thinking，更贴近评测模式
 MAXLEN="${MAXLEN:-2048}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1280}"   # 沿用 41 号定稿值，但**必须先 DIAG 复核**
 MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-16}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"   # 见文件头第 5 点，别改
-COV_BATCH="${COV_BATCH:-1}"
+COV_BATCH="${COV_BATCH:-16}"
 DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"      # 2：bare 和 heval 各看一条渲染结果
 
 # ---- 阶段开关 ----
