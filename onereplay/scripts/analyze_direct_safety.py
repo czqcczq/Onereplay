@@ -81,10 +81,24 @@ def asr_for_bench(records: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
+GPT_JUDGED_CANDIDATES = ("gpt4_judged.jsonl", "gpt_judged.jsonl")
+
+
+def find_gpt_judged(run_dir: Path) -> Path | None:
+    for name in GPT_JUDGED_CANDIDATES:
+        path = run_dir / name
+        if path.is_file():
+            return path
+    return None
+
+
 def collect_run(run_dir: Path) -> dict[str, dict[str, Any] | None]:
     """Split an arm's judgments back into the three benchmarks."""
 
-    verdicts = load_jsonl(run_dir / "gpt4_judged.jsonl") + load_jsonl(run_dir / "sorry_judged.jsonl")
+    gpt_path = find_gpt_judged(run_dir)
+    if gpt_path is None:
+        print(f"warning: {run_dir.name} has no gpt4_judged.jsonl / gpt_judged.jsonl")
+    verdicts = (load_jsonl(gpt_path) if gpt_path else []) + load_jsonl(run_dir / "sorry_judged.jsonl")
     by_bench: dict[str, list[dict[str, Any]]] = {bench: [] for bench in BENCHES}
     for record in verdicts:
         bench = record.get("bench")
