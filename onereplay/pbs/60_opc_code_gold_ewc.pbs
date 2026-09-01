@@ -10,10 +10,10 @@
 #
 # =============================================================================
 # NUS Hopper: 代码线 gold-target 消融 —— EWC 臂（训练 + 代码评测）
-#   与 55 号的 cs_ewcmix_opcedu_equal_lam1_seed1 逐字相同，唯一变量是 --fisher_path
-#   指向 gold 版的 F_mix：
+#   与 55 号的训练协议相同；--fisher_path 指向 gold 版 F_mix，λ 按 F_mix 的尺度反比
+#   缩放，以保持 λ×mean(F_mix) 与自蒸馏对照相当：
 #     55 号  F_mix = mix(F_if(FLAN gold), F_code(OPC **自蒸馏**))
-#     本脚本 F_mix = mix(F_if(FLAN gold), F_code(OPC **gold**))      <- 57 号 + 混合
+#     本脚本 F_mix = mix(F_if(FLAN gold), F_code(OPC **gold**))      <- 57 号采集后手工混合
 #
 # -----------------------------------------------------------------------------
 # 这条臂在整个消融里的位置
@@ -25,19 +25,29 @@
 #   _gold 段，两批会落进同一份 summary.csv，可以并排读。
 #
 # -----------------------------------------------------------------------------
-# !! VARIANTS 默认只跑 equal，一次别贪两个
+# !! VARIANTS 默认依次跑 equal 和 half
 #   equal = 两域各自除以自己的 mean 再等权，罚项里两域等量贡献
-#   half  = 裸的 0.5/0.5，if 侧凭着更大的 mean 拿到约 73% 的份额，是「不做尺度归一」
-#           的对照臂
-#   code 线定稿用的是 equal（08-31 结果表里的 EWC 就是它），所以默认只跑 equal。
-#   单个 variant 完整 3 epoch 约 14 h，两个装不进一个 24 h 作业；真要 half 就改
-#   VARIANTS 再投一次，已训完的会被跳过，重复投等于续跑。
+#   half  = 裸的 0.5/0.5；在本次 gold F 下，实际 Fisher 质量约为 if 37.35% /
+#           code 62.65%，是「不做尺度归一」的对照臂
+#   实测一个 24 h 作业足够两个 variant，因此默认在同一张 GPU 上顺序训练、顺序评测。
+#   已训完的 adapter 和已有评测结果会自动跳过，重复投等于续跑。
 #
 # -----------------------------------------------------------------------------
-# !! λ：equal 通常不用动，half 要按 57 号 Step 4 的比值缩放
-#   equal 版在混合时就按 mean 归一过了，换 gold 之后罚项量级基本不变，λ=1 可以沿用。
-#   half 版没有归一，罚项量级直接随 mean(F_code) 变，57 号 Step 4 打印的
-#   mean(F_code_gold)/mean(F_code_selfdistill) 就是它的缩放系数（λ 要除以这个数）。
+# !! λ：**equal 和 half 都要改**，别沿用对照组的 λ=1
+#   容易想当然的地方：equal 用 --equalize mean，看着像"已经归一化过了"，于是以为
+#   λ 不用动。实际上 equalize 只把两域的**相对**贡献拉平（w_i ∝ 1/mean_i），混合后
+#   的**绝对**量级 mean(F_mix) = Σ w_i·mean_i = 调和平均(mean_if, mean_code)，照样
+#   随 mean(F_code) 走。half 是算术平均，同理。
+#
+#   57 号 Step 4 实测：mean(F_code_gold)=1.677e-1 vs 自蒸馏 3.613e-2，gold 大 4.64x。
+#   （gold 答案短 4.5 倍却梯度大 4.6 倍 —— 自蒸馏 target 是模型自己的输出，loss≈0，
+#     F 几乎测不到东西。这正是自蒸馏对 EWC 的伤害，而 C 是输入二阶矩，不受影响。）
+#   代入 mean(F_if)=9.997e-2 解析可得混合后的量级比：
+#     equal : 1.2527e-1 / 5.308e-2 = 2.360x  ->  λ = 1/2.360 = 0.42
+#     half  : 1.3384e-1 / 6.805e-2 = 1.967x  ->  λ = 1/1.967 = 0.51
+#   约束强度 ∝ λ×mean(F)，用上面的 λ 才能让 gold 臂与对照组只差「target 来源」一个
+#   变量。EWC_LAMBDA_EQUAL 默认 0.42，EWC_LAMBDA_HALF 默认 0.51。
+#   换数据重采后这两个数会失效，以 57 号 Step 4b 当次打印的 lambda 列为准。
 #   拿不准就先 PROBE=1 跑 300 步看罚项量级，别直接烧 14 h。
 #
 # -----------------------------------------------------------------------------
@@ -56,13 +66,13 @@
 # 用法（**本站点 qsub 不吃命令行变量**，开关改「阶段开关」段的默认值）
 #   qsub onereplay/pbs/60_opc_code_gold_ewc.pbs
 #
-#   VARIANTS="half"  改跑 half 那版（默认 equal）
+#   VARIANTS="equal half"  默认两版依次跑；也可只保留其中一个
 #   DRY_RUN=1        只打印 run 名与路径，不训练不评测（建议先跑）
 #   PROBE=1          300 步短跑，只看罚项量级，不保存不评测（换 λ 时用）
 #   DO_TRAIN=0 / DO_EVAL=0 / FORCE_TRAIN=1 / FORCE_EVAL=1
 #
 # 前置条件
-#   1) ${FISHER_MIX_GOLD_EQUAL} 已就位（57 号采集后按其文末命令混合；
+#   1) ${FISHER_MIX_GOLD_EQUAL} 已就位（57 号采集后按其文末打印的命令混合；
 #      跑 half 就还要 ${FISHER_MIX_GOLD_HALF}）
 #   2) ${CS_DATASET} = datasets/commonsense_170k_hf
 #   3) 代码评测数据 ${CODE_DATA_DIR}/humaneval_test.parquet、mbpp_full/
@@ -124,7 +134,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE
     SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     EVAL_BATCH SAVE MAX_STEPS
-    EWC_LAMBDA VARIANTS FISHER_MIX_GOLD_EQUAL FISHER_MIX_GOLD_HALF RUN_TAG
+    EWC_LAMBDA_EQUAL EWC_LAMBDA_HALF VARIANTS
+    FISHER_MIX_GOLD_EQUAL FISHER_MIX_GOLD_HALF RUN_TAG
     MODELS EXTRA_MODELS
     CODE_MAX_NEW_TOKENS TIMEOUT LIMIT MBPP_SPLIT MBPP_CONFIG
     WITH_IF IFEVAL_INPUT
@@ -216,9 +227,11 @@ if [[ "${PROBE}" == "1" ]]; then
   echo "PROBE=1：SAVE=0 MAX_STEPS=${MAX_STEPS} DO_EVAL=0，只看罚项量级"
 fi
 
-# ---- 正则化：λ 沿用前先看 57 号 Step 4 的 mean 比值（见文件头）----
-EWC_LAMBDA="${EWC_LAMBDA:-1}"
-VARIANTS="${VARIANTS:-equal}"    # 一次一个，理由见文件头
+# ---- 正则化：按 variant 分别保持 λ×mean(F_mix) 与自蒸馏对照相当 ----
+# 换数据重采后，以 57 号 Step 4b 当次打印的 lambda 列为准。
+EWC_LAMBDA_EQUAL="${EWC_LAMBDA_EQUAL:-0.42}"
+EWC_LAMBDA_HALF="${EWC_LAMBDA_HALF:-0.51}"
+VARIANTS="${VARIANTS:-equal half}"
 VARIANTS="${VARIANTS//,/ }"
 FISHER_MIX_GOLD_EQUAL="${FISHER_MIX_GOLD_EQUAL:-${RESULTS_ROOT}/fisher/fisher_if_code_opcedu20k_gold_mix_equal_qv.pt}"
 FISHER_MIX_GOLD_HALF="${FISHER_MIX_GOLD_HALF:-${RESULTS_ROOT}/fisher/fisher_if_code_opcedu20k_gold_mix_half_qv.pt}"
@@ -231,9 +244,20 @@ variant_fisher () {
   esac
 }
 
+variant_lambda () {
+  case "$1" in
+    equal) echo "${EWC_LAMBDA_EQUAL}" ;;
+    half)  echo "${EWC_LAMBDA_HALF}" ;;
+    *)     echo "" ;;
+  esac
+}
+
 # ---- run 名：_gold 段是关键，不带它会覆盖 55 号的 adapter ----
 RUN_TAG="${RUN_TAG:-gold}"
-run_name () { echo "cs_ewcmix_opcedu_${RUN_TAG}_$1_lam${EWC_LAMBDA}_seed${SEED}"; }
+run_name () {
+  local variant=$1
+  echo "cs_ewcmix_opcedu_${RUN_TAG}_${variant}_lam$(variant_lambda "${variant}")_seed${SEED}"
+}
 
 # ---- 评测：与 39/42/52/55/56 同口径，所有 run 必须同预算才可比 ----
 MBPP_CONFIG="${MBPP_CONFIG:-full}"
@@ -265,7 +289,7 @@ if (( ACCUM != 64 )); then
 fi
 mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}" "${DATASET_CACHE}"
 
-echo "VARIANTS = [${VARIANTS}]  λ = ${EWC_LAMBDA}  seed = ${SEED}"
+echo "VARIANTS = [${VARIANTS}]  λ(equal)=${EWC_LAMBDA_EQUAL}  λ(half)=${EWC_LAMBDA_HALF}  seed=${SEED}"
 echo "训练     = BATCH ${BATCH} / ACCUM ${ACCUM}(行/更新) / EPOCHS ${EPOCHS} / MAXLEN ${MAXLEN}"
 echo "评测     = MBPP ${MBPP_SPLIT}(${MBPP_CONFIG}) max_new=${CODE_MAX_NEW_TOKENS} timeout=${TIMEOUT} limit=${LIMIT}"
 echo "OUT_DIR  = ${OUT_DIR}"
@@ -274,9 +298,11 @@ echo "对照(自蒸馏版, 55 号): cs_ewcmix_opcedu_equal_lam1_seed${SEED}"
 echo "==== 前置检查 ===="
 for v in ${VARIANTS}; do
   f="$(variant_fisher "${v}")"
+  lam="$(variant_lambda "${v}")"
   [[ -n "${f}" ]] || { echo "未知 VARIANT=${v}，可选 equal / half"; exit 1; }
+  [[ -n "${lam}" ]] || { echo "没有为 VARIANT=${v} 配置 λ"; exit 1; }
   [[ -f "${f}" ]] || { echo "缺 F_mix_gold(${v}): ${f}（先跑 57 号采集，再按其文末命令混合）"; exit 1; }
-  echo "  ${v}: $(run_name "${v}")  <- ${f}"
+  echo "  ${v}: $(run_name "${v}")  <- ${f}  λ=${lam}"
 done
 [[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
 
@@ -288,12 +314,13 @@ fi
 
 # ===========================================================================
 # 训练：罚项 R = (1/L) Σ_l Σ_ij F_l,ij (ΔW_l,ij)²
-#   唯一变量是 --fisher_path 指向哪份 F_mix，其余逐字照抄 55 号。
+#   --fisher_path 使用 gold F_mix；λ 按其绝对尺度反比缩放，其余逐字照抄 55 号。
 # ===========================================================================
 train_one () {
-  local variant=$1 run fmix
+  local variant=$1 run fmix ewc_lambda
   run="$(run_name "${variant}")"
   fmix="$(variant_fisher "${variant}")"
+  ewc_lambda="$(variant_lambda "${variant}")"
 
   if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${ADAPTERS}/${run}" ]]; then
     echo "跳过训练 ${run}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
@@ -301,7 +328,7 @@ train_one () {
   fi
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
 
-  echo "==== train ${variant}: ${run} (F=${fmix} λ=${EWC_LAMBDA}) ===="
+  echo "==== train ${variant}: ${run} (F=${fmix} λ=${ewc_lambda}) ===="
   python -m onereplay.scripts.train --paradigm sft \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
     --dataset_path "${CS_DATASET}" \
@@ -312,12 +339,12 @@ train_one () {
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --max_steps "${MAX_STEPS}" \
     --regularizer ewc --fisher_path "${fmix}" \
-    --replay_lambda "${EWC_LAMBDA}" \
+    --replay_lambda "${ewc_lambda}" \
     --save "${SAVE}" --save_path "${ADAPTERS}/${run}" \
     --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
 
   echo "==== 训练自检: ${run} ===="
-  python - "${RESULTS_ROOT}/metrics/${run}.jsonl" "${EWC_LAMBDA}" "${fmix}" "${ACCUM}" <<'PY'
+  python - "${RESULTS_ROOT}/metrics/${run}.jsonl" "${ewc_lambda}" "${fmix}" "${ACCUM}" <<'PY'
 import json
 import sys
 

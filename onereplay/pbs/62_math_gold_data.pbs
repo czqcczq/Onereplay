@@ -201,6 +201,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     FISHER_DEVICE USE_BF16 LOG_EVERY DEBUG_EXAMPLES
     VIEW_DIR VIEW_PREFIX DISTILL_DIR DISTILL_GLOB
     GOLD_COLUMN KEEP_COLUMN
+    EWC_LAMBDA_SD
     IF_COV IF_FISHER MATH_COV_SD MATH_FISHER_SD
     MATH_COV_GOLD MATH_FISHER_GOLD
     W_IF W_MATH
@@ -302,6 +303,8 @@ MATH_FISHER_GOLD="${MATH_FISHER_GOLD:-${RESULTS_ROOT}/fisher/fisher_math_metamat
 # 只用于 Step 2 解析预测混合后的尺度，本脚本不真的按它混合。
 W_IF="${W_IF:-0.5}"
 W_MATH="${W_MATH:-0.5}"
+# 自蒸馏对照组 EWC 用的 λ（48 号定稿值），Step 4b 拿它折算 gold 臂的等强度 λ。
+EWC_LAMBDA_SD="${EWC_LAMBDA_SD:-1}"
 
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
@@ -577,9 +580,16 @@ fi
 
 # ===========================================================================
 # Step 4: 诊断 F（**不混合**，混合命令见文末）
-#   inspect_fisher --reference 打印 mean(F_path)/mean(F_reference)，正是 half 变体的
-#   λ 要跟着缩放的那个系数。equal 变体在混合时按 mean 现算权重，λ 不随它变。
+#   inspect_fisher --reference 打印 mean(F_math_gold)/mean(F_math_sd)。
 #   不自己读 payload：F 的键是 "fishers"，写错了会静默算出别的数。
+#
+# !! equal 变体的 λ **也要跟着缩放**，别被「equalize 已经归一化过了」骗过去。
+#   --equalize mean 取 w_i ∝ 1/mean_i 再归一，两域的贡献确实被拉平了，但混合后的
+#   绝对量级 mean(F_mix) = Σ w_i·mean_i = 调和平均(mean_if, mean_math)，照样随
+#   mean(F_math) 走。math 侧换 gold 若把 mean(F_math) 抬上去，调和平均跟着抬，沿用
+#   对照组的 λ 就等于把 gold 臂罚得更重。half 是算术平均，同理。
+#   Step 4b 把两个变体的 mean(F_mix) 都解析算出来 —— F 逐元素线性叠加，混合结果的
+#   mean 就是各输入 mean 的加权和，不必真混一份出来 —— 并给出等强度的 λ。
 #
 #   数学线额外要看的是它对 half 的影响。48 号实测 mean(F_if)/mean(F_math) ≈ 3.78，
 #   half 臂就是靠这个失衡让 IF 占 3.78 倍份额的，而自蒸馏版恰恰是 half 比 equal 好。
@@ -589,11 +599,50 @@ fi
 [[ -f "${MATH_FISHER_GOLD}" ]] || { echo "缺 F_math_gold: ${MATH_FISHER_GOLD}"; exit 1; }
 if [[ -f "${MATH_FISHER_SD}" ]]; then
   echo "==== Step 4 诊断: F_math_gold vs F_math_selfdistill 的量级 ===="
-  echo "  下面的 mean 比值就是 half 臂 λ 的缩放系数（equal 臂不用改）。"
   python -m onereplay.scripts.inspect_fisher \
     --path "${MATH_FISHER_GOLD}" \
     --reference "${MATH_FISHER_SD}" \
     --strict 0
+
+  echo "==== Step 4b 诊断: 两个混合变体各自的 λ 缩放系数 ===="
+  python - "${IF_FISHER}" "${MATH_FISHER_GOLD}" "${MATH_FISHER_SD}" "${EWC_LAMBDA_SD}" <<'PY'
+import sys
+
+import torch
+
+from onereplay.core.fisher import fisher_summary
+
+
+def mean_of(path: str) -> float:
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or "fishers" not in payload:
+        raise SystemExit(f"{path} 不是 Fisher 文件（缺 'fishers' 键）")
+    return fisher_summary(payload["fishers"])["mean"]
+
+
+if_path, gold_path, sd_path, lam_text = sys.argv[1:5]
+lam_sd = float(lam_text)
+m_if, m_gold, m_sd = (mean_of(path) for path in (if_path, gold_path, sd_path))
+
+print(f"mean(F_if)        = {m_if:.6e}")
+print(f"mean(F_math_gold) = {m_gold:.6e}")
+print(f"mean(F_math_sd)   = {m_sd:.6e}    gold/selfdistill = {m_gold / m_sd:.3f}x")
+print()
+print("F is summed elementwise, so mean(F_mix) = sum_i w_i * mean_i (no need to mix):")
+print(f"{'variant':<9}{'mean gold':>14}{'mean selfdist':>16}{'gold/sd':>10}{'lambda':>10}")
+for name, mix in (
+    ("half", lambda a, b: 0.5 * (a + b)),
+    ("equal", lambda a, b: 2.0 / (1.0 / a + 1.0 / b)),
+):
+    mix_gold, mix_sd = mix(m_if, m_gold), mix(m_if, m_sd)
+    ratio = mix_gold / mix_sd
+    print(f"{name:<9}{mix_gold:>14.4e}{mix_sd:>16.4e}{ratio:>9.3f}x{lam_sd / ratio:>10.4g}")
+print()
+print(f"对照组(自蒸馏)用 λ={lam_sd:g}。约束强度 ∝ λ×mean(F)，要让 gold 臂只差")
+print("「target 来源」一个变量，就把 64 号的 EWC_LAMBDA 设成上表 lambda 那一列")
+print("（数学线默认跑 half，看 half 那一行）。比值在 ±10% 以内可直接沿用对照组的 λ；")
+print("超了就按上表改，并在结果里写明这一臂 λ 不同。")
+PY
 else
   echo "跳过 gold/自蒸馏量级对比：找不到 ${MATH_FISHER_SD}"
 fi
@@ -614,9 +663,10 @@ cat <<EOF
   F_math_gold = ${MATH_FISHER_GOLD}
 
 下一步:
-  1) 看 Step 2 打印的 λ_mix 建议，与 32 号在用的 3e-2 对一下；差 10% 以内就沿用
-  2) 看 Step 4 打印的两个 mean 比值：对自蒸馏的比值决定 half 臂 λ 要不要缩放，
-     对 F_if 的比值决定 half 与 equal 还差多远（equal 臂 λ 不用动）
+  1) 看 Step 2 的 trace(C_math_gold)/trace(C_math_sd)：±10% 以内，63 号 LAMBDA 沿用 3e-2
+  2) 看 Step 4b 的 lambda 那一列，把 64 号的 EWC_LAMBDA 设成它（**equal 臂同样要改**，
+     equalize 只拉平两域的相对贡献，混合后的绝对量级还是随 mean(F_math) 走）；
+     Step 4 对 F_if 的比值则决定 half 与 equal 还差多远
   3) 混合（登录节点直接敲，几分钟，不用 GPU）:
 
 cd ${REPO_ROOT} && source ${VENV}/bin/activate
