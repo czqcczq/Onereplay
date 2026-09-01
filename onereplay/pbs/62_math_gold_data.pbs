@@ -76,12 +76,17 @@
 #   不是 gold 与自蒸馏之间。别照搬 46 号那条「指纹必须等于 C_math」的断言。
 #
 # -----------------------------------------------------------------------------
-# !! λ 必须重定，不能沿用 3e-2 / 1
+# !! λ 要不要动，由诊断说了算，默认是**不动**
 #   MetaMath 的 gold 与自蒸馏解答长度和风格都不同，C 的 trace 与 F 的 magnitude 都会
 #   跟着变。Step 2 打印 trace(C_math_gold)/trace(C_math_sd) 与 trace(C_math_gold)/
 #   trace(C_if)，并按线性混合解析预测 trace(C_mix)/trace(C_if)（等权混合下 trace 可
 #   加，不必真去混一份出来才知道）；Step 4 打印 mean(F_math_gold)/mean(F_math_sd)。
-#   比值落在 0.9~1.1 之间就可以沿用旧 λ，否则按反比缩放再跑一次短探针确认。
+#
+#   定 λ 的判据是 **gold/自蒸馏** 那个比值，不是解析出来的 λ_mix 建议。数学线这里
+#   尤其要小心：31 号当年也算过一个建议（约 2e-2），32 号并没有采纳，直接沿用了
+#   C_if 的 3e-2，对照组就是在 3e-2 下训出来的。gold 臂若去追那个建议值，等于同时
+#   动「target 来源」和「λ」两个变量。约束强度 ∝ λ × trace，只要 trace 没怎么动，
+#   沿用 3e-2 两臂就是可比的。比值超出 ±10% 才按反比缩放，且要在结果里写明。
 #
 #   数学域这里预期比 code 域温和：MetaMath 的 gold 本身就是 CoT，和自蒸馏出来的
 #   东西同属一类文本；code 域的 gold 是纯函数体，与自蒸馏的「解释 + 代码」差得远。
@@ -460,16 +465,20 @@ if only_gold or only_if:
     print(f"WARNING: 层集合对不上 only-gold={only_gold[:5]} only-if={only_if[:5]}")
     print("         对不上就不能混合，先确认两份 C 的 --target_modules 一致。")
 
-# 换答案对 math 侧尺度的影响。这是本消融最直接的一个刻度。
+# 换答案对 math 侧尺度的影响。这是本消融最直接的一个刻度，**也是定 λ 的那个数**，
+# 理由见下面的 λ 段。
+r_gold_sd = None
 if Path(sd_path).is_file():
     sd = load_covariance_file(sd_path)
-    r = ratio_report("trace(C_math_gold)/trace(C_math_selfdistill)", gold, sd)
-    if r is not None:
-        if 0.9 <= r <= 1.1:
+    r_gold_sd = ratio_report("trace(C_math_gold)/trace(C_math_selfdistill)", gold, sd)
+    if r_gold_sd is not None:
+        if 0.9 <= r_gold_sd <= 1.1:
             print("  -> 尺度基本没动，math 侧换 gold 不必为此改 λ。")
             print("     这也是预期结果：MetaMath 的 gold 与自蒸馏解答同属 CoT 文本。")
         else:
-            print(f"  -> 尺度动了 {r:.3f}x，同一个 λ 的实际约束强度会跟着变这么多。")
+            print(
+                f"  -> 尺度动了 {r_gold_sd:.3f}x，同一个 λ 的实际约束强度会跟着变这么多。"
+            )
 else:
     print(f"跳过 gold/自蒸馏对比：找不到 {sd_path}")
 
@@ -482,12 +491,32 @@ if r_math_if is not None:
         f"  预测 trace(C_mix_gold)/trace(C_if) = {w_if:.3f} + {w_math:.3f} x "
         f"{r_math_if:.3f} = {predicted:.3f}"
     )
-    print("  C_if 单独 run 用 λ=3e-2，要让 C_mix_gold 上的 IF 保护强度与之相当：")
+    print("  C_if 单独 run 用 λ=3e-2，若按 trace 反比给 C_mix_gold 定一个等强度的 λ：")
     print(f"  λ_mix ≈ 3e-2 / {predicted:.3f} = {3e-2 / predicted:.2e}")
     print(
-        "\n数学线自蒸馏版的 C_mix 用的就是 3e-2（32 号）。上面这个数与 3e-2 相差在 10%\n"
-        "以内就沿用 3e-2，两条线的 λ 才是同一把尺子；差得多就据此改 63 号的 LAMBDA。"
+        "\n**但 63 号不要照这个数改 LAMBDA。** 31 号当年同样算出过一个建议（约 2e-2），\n"
+        "32 号并没有采纳，直接沿用了 C_if 的 3e-2 —— 数学线自蒸馏版的对照组就是在\n"
+        "3e-2 下训出来的。gold 臂若改用上面这个建议值，等于同时动了「target 来源」和\n"
+        "「λ」两个变量，与对照组的差异就再也拆不开了。上面这个数只用来判断两域尺度\n"
+        "有没有严重失衡，不是本次要采纳的配置。"
     )
+    print(
+        "\n真正决定 λ 的判据是上面第一行那个 gold/自蒸馏比值：约束强度 ∝ λ × trace，\n"
+        "所以只要 trace(C_math_gold) ≈ trace(C_math_selfdistill)，沿用 3e-2 两臂的实际\n"
+        "约束强度就是相当的。"
+    )
+    if r_gold_sd is None:
+        print("  这次没算出该比值（缺自蒸馏版 C_math），保守起见沿用 3e-2。")
+    elif 0.9 <= r_gold_sd <= 1.1:
+        print(f"  本次 {r_gold_sd:.3f}x，落在 ±10% 内 -> 63 号保持 LAMBDA=3e-2，不要动。")
+    else:
+        # 只有这一种情形才该改 λ：不改的话两臂的约束强度本身就不等，
+        # 「gold 更好/更差」里会混进「罚得更松/更紧」。
+        print(
+            f"  本次 {r_gold_sd:.3f}x，超出 ±10%。要让两臂约束强度可比，63 号应设\n"
+            f"  LAMBDA ≈ 3e-2 / {r_gold_sd:.3f} = {3e-2 / r_gold_sd:.2e}，并在结果里写明\n"
+            "  这一臂的 λ 与对照组不同、以及为什么。"
+        )
     if abs(r_math_if - 1.0) > 0.3:
         print(
             f"\n注意 trace 比值 {r_math_if:.3f} 离 1 较远，等权混合会让 trace 大的一方主导。\n"

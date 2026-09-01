@@ -162,10 +162,23 @@ def report(
         if not path.is_file():
             print(f"[skip] {path} 不存在")
             continue
-        loaded[run] = item_verdicts(load_rows(path), path)
+        try:
+            rows = load_rows(path)
+            if not rows:
+                print(f"[skip] {path} 是空文件（评测未完成或失败）")
+                continue
+            loaded[run] = item_verdicts(rows, path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            # --runs all intentionally scans directories left by interrupted
+            # evaluations too. One bad/incomplete run must not hide every
+            # healthy run for this metric.
+            print(f"[skip] {path} 无法读取为完整判分结果: {exc}")
+            continue
 
     if baseline not in loaded:
-        print(f"[skip] metric={metric}: 基线 run {baseline!r} 没有结果文件，无法定义子集")
+        print(
+            f"[skip] metric={metric}: 基线 run {baseline!r} 没有有效判分结果，无法定义子集"
+        )
         return []
 
     base_verdicts = loaded[baseline]
