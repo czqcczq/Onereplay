@@ -186,6 +186,18 @@ def parse_args() -> argparse.Namespace:
             "this, C would cover rows replay never trains on."
         ),
     )
+    parser.add_argument(
+        "--require_target_column",
+        type=str,
+        default="",
+        help=(
+            "Column --require_target checks for emptiness. Empty means --target_column, "
+            "which is right whenever the two are the same corpus. Set it to targets while "
+            "--target_column is gold_targets to run the gold ablation on the self-distilled "
+            "file's exact row set: gold is filled in on truncated rows too, so filtering on "
+            "it would give the gold arm extra rows and confound target source with pool size."
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_len", type=int, default=512)
     parser.add_argument(
@@ -335,6 +347,7 @@ def collect_covariances(args: argparse.Namespace) -> None:
         "include_target_in_chat": args.include_target_in_chat,
         "system_prompt": args.system_prompt,
         "require_target": args.require_target,
+        "require_target_column": args.require_target_column,
         "truncation_side": args.truncation_side or getattr(tokenizer, "truncation_side", ""),
         "max_samples": args.max_samples,
         "sample_shuffle": args.sample_shuffle,

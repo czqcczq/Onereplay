@@ -1,0 +1,565 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_goldcov
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper: 代码线 gold-target 消融的数据链
+#   在与 50/51 号**逐行相同**的旧知识上重采 C_code 和 F_code，唯一的变化是
+#   assistant 侧读 gold_targets（数据集自带的解答）而不是 targets（base 自蒸馏
+#   出来的解答）。产物一律带 _gold 后缀，50/51 号的自蒸馏版原封不动。
+#
+# -----------------------------------------------------------------------------
+# 这个消融要回答什么
+#   现在这套 code 线的保护数据是这么组装的：
+#       C_if / F_if     FLAN gold          （从来就是 gold，01/47 号）
+#       C_code / F_code OPC **自蒸馏**      （50/51 号）
+#       replay-if       FLAN **自蒸馏**
+#       replay-code     OPC **自蒸馏**
+#   也就是说三条臂并不同配置：OneReplay 的 C_if 是 gold，而 replay 的 if 池是自蒸馏。
+#   文献里的 experience replay 定义是复习原始训练数据，所以 replay 基线本该是 gold；
+#   自蒸馏那版是给 OneReplay 用的「信息匹配」对照，可以有，但不能顶替标准基线。
+#
+#   本脚本 + 59/60/61 把三条臂统一到 gold：if 域全 FLAN gold、code 域全 OPC gold。
+#
+# -----------------------------------------------------------------------------
+# !! 为什么不是「重新指向原始 OPC 池」，而是从自蒸馏文件里读 gold_targets
+#   generate_replay_targets.py 给**每一行**都写了 gold_targets，包括生成撞上 token
+#   预算、targets 被清空的那些行。所以自蒸馏 jsonl 本身就是一份行序完全对齐的 gold
+#   副本，读它的 gold_targets 列 = 同样的 prompt、同样的顺序、同样的池切法，只有
+#   assistant 文本变了。改指原始池则会把 shuffle 和 pool cut 重新掷一遍，target 来源
+#   和池成分两个变量一起动，结果就说不清是哪个造成的。
+#
+#   代价是要多传一个参数，见下条。
+#
+# -----------------------------------------------------------------------------
+# !! --require_target_column targets 绝对不能漏
+#   collect_cov --require_target 1 默认按 --target_column 判空。一旦 --target_column
+#   换成 gold_targets，那些「自蒸馏截断 -> targets 为空」的行因为 gold 非空就全被留下
+#   来了，gold 臂会凭空多拿约 900 行（自蒸馏 usable 19823 / 池 20000）。那样跑出来的
+#   差异里混着池大小，不再是纯粹的 target 来源消融。
+#
+#   --require_target_column targets 让「谁决定行留下」仍然由自蒸馏那一列说了算，
+#   「谁被当成答案读」才由 gold_targets 说了算。Step 0 会断言两边行数相等，漏传就停。
+#
+# -----------------------------------------------------------------------------
+# !! 池指纹会变，这是对的
+#   fingerprint_pool 把 (prompt, target) 一起哈希，所以 gold 池的指纹必然不等于
+#   自蒸馏池的。要对齐的是 **C_code_gold 与 F_code_gold 之间**（Step 3 会校验），
+#   不是 gold 与自蒸馏之间。别照搬 51 号那条「指纹必须等于 C_code」的断言。
+#
+# -----------------------------------------------------------------------------
+# !! λ 必须重定，不能沿用 2e-2 / 1
+#   gold 解答与自蒸馏解答长度和风格都不同，C 的 trace 与 F 的 magnitude 都会跟着变。
+#   Step 2 打印 trace(C_code_gold)/trace(C_code_sd) 与 trace(C_code_gold)/trace(C_if)，
+#   并按线性混合解析预测 trace(C_mix)/trace(C_if)（等权混合下 trace 可加，不必真去混
+#   一份出来才知道）；Step 4 打印 mean(F_code_gold)/mean(F_code_sd)。
+#   比值落在 0.9~1.1 之间就可以沿用旧 λ，否则按反比缩放再跑一次短探针确认。
+#
+# -----------------------------------------------------------------------------
+# 采集协议：除 target 列外，逐字对齐 50 号 Step2 / 51 号 Step1
+#   max_len 2048、truncation_side left、require_target 1、sample_shuffle 0、
+#   max_samples 0（全池）、q_proj,v_proj、chat template 开、include_target 开。
+#   collect_fisher 的 use_bf16 用 0（fp32：梯度先平方，bf16 尾数会留噪声底）。
+#   任何一处偏了，gold 与自蒸馏就不再只差 target 一个变量。
+#
+# -----------------------------------------------------------------------------
+# 流程（全部不需要 GPU 生成，只有前向/反向）
+#   Step 0  前置检查    行数断言 + gold 池指纹
+#   Step 1  采 C_code_gold
+#   Step 2  诊断 C      trace 比值 + 解析预测混合后的尺度 + λ 建议
+#   Step 3  采 F_code_gold（指纹须等于 Step 1）
+#   Step 4  诊断 F      mean(F) 比值 + λ 缩放建议
+#
+# !! 本脚本只采集和诊断，**不混合**。混合是纯 torch 加权求和，几分钟、不用 GPU，
+#   不值得单独排一个作业；命令由本脚本文末直接打印出来，粘到登录节点跑即可。
+#   分开的理由：混合一旦落盘，下游 59/60/61 就会直接拿它训练，而混合权重合不合适
+#   恰恰要看这里的 trace / mean 比值才知道。先出诊断、人看一眼、再决定用什么权重去
+#   混合，比"采完顺手混掉、发现不对再重混"省事，也不会留下一份没人记得是按什么权重
+#   混出来的 C_mix。
+#
+# 成本：采 C 约 0.5~1 h，采 F 约 1~2 h（batch_size 写死 1）。walltime 12 h。
+#
+# -----------------------------------------------------------------------------
+# 用法（**本站点 qsub 不吃命令行变量**，开关改「阶段开关」段的默认值）
+#   qsub onereplay/pbs/57_opc_code_gold_data.pbs
+#
+#   DRY_RUN=1            只跑 Step 0 的行数断言和指纹，不碰 GPU（**建议先跑这个**）
+#   DO_COV/DO_FISHER=0   跳过对应采集（只想重看诊断时用）
+#   FORCE=1              产物已存在也重采
+#
+# 前置条件
+#   1) 50 号已产出自蒸馏语料 ${DISTILL_FILE}（本脚本读它的 gold_targets 列）
+#   2) C_if ${IF_COV} 与 F_if ${IF_FISHER} 就位（01/47 号产物，本消融不动它们）
+#   3) 自蒸馏版 C_code/F_code 就位（只用于打印比值；缺了不停，只是少一个刻度）
+#   4) mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 下一步: 看完 Step 2 / Step 4 的诊断，按文末打印的命令混合，再投 59/60/61
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail 
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/57_opc_code_gold_data.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE
+    DRY_RUN FORCE DO_COV DO_FISHER
+    SEED SAMPLE_SEED MAXLEN TARGET_MODULES COV_BATCH
+    FISHER_DEVICE USE_BF16 LOG_EVERY DEBUG_EXAMPLES
+    VIEW_DIR VIEW_PREFIX DISTILL_DIR DISTILL_FILE
+    GOLD_COLUMN KEEP_COLUMN
+    IF_COV IF_FISHER CODE_COV_SD CODE_FISHER_SD
+    CODE_COV_GOLD CODE_FISHER_GOLD
+    W_IF W_CODE
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的采集。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"          # 默认只做 Step 0，确认行数断言过了再改 0 投全链
+FORCE="${FORCE:-0}"
+DO_COV="${DO_COV:-1}"
+DO_FISHER="${DO_FISHER:-1}"
+
+# ---- 采集参数：与 50 号 Step2 / 51 号 Step1 逐字对齐，唯一新增的是两个列名 ----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+MAXLEN="${MAXLEN:-2048}"                 # 必须等于 50 号的 MAXLEN
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+# 16 是 50 号的值，这里是对齐项而不是性能旋钮。hook 按 attention_mask 过滤了 padding，
+# 所以 batch 只改变浮点累加顺序、不改变 C 的数学定义；但既然本消融的卖点就是"唯一
+# 变量是 target 文本"，连 1e-6 量级的口径差也没必要引进来。H200 上显存不是瓶颈，
+# 真正的时间大头是 F（batch_size 写死 1，见 Step 3），调这个省不下多少。
+COV_BATCH="${COV_BATCH:-16}"
+USE_BF16="${USE_BF16:-0}"                # 只作用于 collect_fisher，理由见文件头
+FISHER_DEVICE="${FISHER_DEVICE:-cuda}"
+LOG_EVERY="${LOG_EVERY:-1000}"
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"    # 打两条渲染后的文本，肉眼确认读的是 gold
+
+# 本消融的全部改动就这两行。
+GOLD_COLUMN="${GOLD_COLUMN:-gold_targets}"   # 当成答案读的列
+KEEP_COLUMN="${KEEP_COLUMN:-targets}"        # 决定行留不留的列（见文件头）
+
+# ---- 语料 ----
+VIEW_DIR="${VIEW_DIR:-${REPO_ROOT}/datasets/OPC_views}"
+VIEW_PREFIX="${VIEW_PREFIX:-opc_edu_ccode_20k}"
+DISTILL_DIR="${DISTILL_DIR:-${RESULTS_ROOT}/replay}"
+DISTILL_FILE="${DISTILL_FILE:-${DISTILL_DIR}/${VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}.jsonl}"
+
+# ---- 既有产物（本脚本只读不写）----
+IF_COV="${IF_COV:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+IF_FISHER="${IF_FISHER:-${RESULTS_ROOT}/fisher/fisher_flan_chat_20k_qv.pt}"
+CODE_COV_SD="${CODE_COV_SD:-${RESULTS_ROOT}/cov/cov_code_opcedu20k_qv.pt}"
+CODE_FISHER_SD="${CODE_FISHER_SD:-${RESULTS_ROOT}/fisher/fisher_code_opcedu20k_qv.pt}"
+
+# ---- 本脚本的产物：一律 _gold 后缀，绝不覆盖 50/51 号 ----
+# 混合产物（C_mix_gold / F_mix_gold）不在这里生成，混合命令见文末。
+CODE_COV_GOLD="${CODE_COV_GOLD:-${RESULTS_ROOT}/cov/cov_code_opcedu20k_gold_qv.pt}"
+CODE_FISHER_GOLD="${CODE_FISHER_GOLD:-${RESULTS_ROOT}/fisher/fisher_code_opcedu20k_gold_qv.pt}"
+# 只用于 Step 2 解析预测混合后的尺度，本脚本不真的按它混合。
+W_IF="${W_IF:-0.5}"
+W_CODE="${W_CODE:-0.5}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "$(dirname "${CODE_COV_GOLD}")" "$(dirname "${CODE_FISHER_GOLD}")" "${DATASET_CACHE}"
+
+echo "DISTILL_FILE = ${DISTILL_FILE}"
+echo "读答案的列   = ${GOLD_COLUMN}    决定留行的列 = ${KEEP_COLUMN}"
+echo "C_code_gold  = ${CODE_COV_GOLD}"
+echo "F_code_gold  = ${CODE_FISHER_GOLD}"
+echo "对照(自蒸馏) C_code = ${CODE_COV_SD}"
+echo "             F_code = ${CODE_FISHER_SD}"
+echo "混合权重(仅供 Step 2 预测，本脚本不产出混合文件): if=${W_IF} code=${W_CODE}"
+echo "max_len=${MAXLEN} modules=${TARGET_MODULES} seed=${SAMPLE_SEED}"
+
+# ===========================================================================
+# Step 0: 前置检查（纯 CPU，一分钟）
+#   1) 语料在不在
+#   2) **行数断言**：gold 池行数必须等于自蒸馏池行数。这是 --require_target_column
+#      真的生效的唯一证据；漏传的话 gold 会多出几百行，而且不会报任何错。
+#   3) 记下 gold 池指纹，Step 3 拿它比 F_code_gold，钉死 C 和 F 消费同一批行。
+# ===========================================================================
+echo "==== Step 0: 前置检查 ===="
+[[ -f "${DISTILL_FILE}" ]] || { echo "缺自蒸馏语料: ${DISTILL_FILE}（先跑 50 号）"; exit 1; }
+
+SD_FP=$(python -m onereplay.scripts.check_old_knowledge_pool \
+  --data_files "${DISTILL_FILE}" --dataset_split train \
+  --cache_dir "${DATASET_CACHE}" --streaming 0 \
+  --input_column inputs --target_column "${KEEP_COLUMN}" \
+  --require_target 1 \
+  --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+  --label selfdistill | tail -n 1)
+echo "${SD_FP}"
+
+GOLD_FP=$(python -m onereplay.scripts.check_old_knowledge_pool \
+  --data_files "${DISTILL_FILE}" --dataset_split train \
+  --cache_dir "${DATASET_CACHE}" --streaming 0 \
+  --input_column inputs --target_column "${GOLD_COLUMN}" \
+  --require_target 1 --require_target_column "${KEEP_COLUMN}" \
+  --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+  --label gold | tail -n 1)
+echo "${GOLD_FP}"
+
+# 输出形如 "gold rows=19823 fingerprint=abc..."
+SD_ROWS="${SD_FP##*rows=}"; SD_ROWS="${SD_ROWS%% *}"
+GOLD_ROWS="${GOLD_FP##*rows=}"; GOLD_ROWS="${GOLD_ROWS%% *}"
+GOLD_HASH="${GOLD_FP##*fingerprint=}"
+
+if [[ "${SD_ROWS}" != "${GOLD_ROWS}" ]]; then
+  echo "行数不一致: 自蒸馏 ${SD_ROWS} vs gold ${GOLD_ROWS}"
+  echo "这正是文件头警告的那个坑：--require_target_column 没生效，gold 臂多拿了行。"
+  echo "差异里会混进池大小，不再是纯 target 消融。先修这个再采。"
+  exit 1
+fi
+echo "行数一致: ${GOLD_ROWS} 行（gold 与自蒸馏逐行对齐，只有答案文本不同）"
+echo "gold 池指纹: ${GOLD_HASH}"
+echo "注意：这个指纹**本来就**不等于自蒸馏池的，target 参与了哈希。要对齐的是"
+echo "      C_code_gold 与 F_code_gold 之间，Step 3 会校验。"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查。确认上面行数一致后，把 DRY_RUN 默认值改 0 再投。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 采 C_code_gold
+#   除 --target_column / --require_target_column 外，逐字等于 50 号 Step2。
+# ===========================================================================
+if [[ "${DO_COV}" == "1" ]]; then
+  if [[ "${FORCE}" != "1" && -f "${CODE_COV_GOLD}" ]]; then
+    echo "跳过采 C：${CODE_COV_GOLD} 已存在（FORCE=1 可强制重采）"
+  else
+    echo "==== Step 1: collect C_code_gold -> ${CODE_COV_GOLD} ===="
+    python -m onereplay.scripts.collect_cov \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --data_files "${DISTILL_FILE}" --dataset_split train \
+      --cache_dir "${DATASET_CACHE}" --streaming 0 \
+      --input_column inputs --target_column "${GOLD_COLUMN}" \
+      --require_target 1 --require_target_column "${KEEP_COLUMN}" \
+      --use_chat_template 1 --include_target_in_chat 1 \
+      --enable_thinking 0 --concat_prompt_target 0 \
+      --debug_print_examples "${DEBUG_EXAMPLES}" \
+      --max_samples 0 \
+      --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+      --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
+      --truncation_side left \
+      --target_modules "${TARGET_MODULES}" \
+      --output_path "${CODE_COV_GOLD}"
+  fi
+else
+  echo "DO_COV=0：使用已有 ${CODE_COV_GOLD}"
+fi
+[[ -f "${CODE_COV_GOLD}" ]] || { echo "缺 C_code_gold: ${CODE_COV_GOLD}"; exit 1; }
+
+# ===========================================================================
+# Step 2: 诊断 C（**不混合**，混合命令见文末）
+#   三个数：
+#     trace(C_code_gold)/trace(C_code_selfdistill)  换答案让 code 侧尺度动了多少
+#     trace(C_code_gold)/trace(C_if)                两域尺度差，等权混合是否合理
+#     预测 trace(C_mix)/trace(C_if)                 λ 相对 C_if 单独 run 该缩多少
+#
+#   第三个不必真混一份出来才知道：mix_covariances 是逐层线性加权，trace 可加，
+#     trace(C_mix_l)/trace(C_if_l) = w_if + w_code * trace(C_code_l)/trace(C_if_l)
+#   对层取均值仍保持这个关系。混完可以拿真实文件复核一次（文末给了命令），两边应当对得上。
+# ===========================================================================
+[[ -f "${IF_COV}" ]] || { echo "缺 C_if(诊断需要): ${IF_COV}"; exit 1; }
+echo "==== Step 2 诊断: gold 相对自蒸馏 / C_if 的尺度 ===="
+python - "${CODE_COV_GOLD}" "${IF_COV}" "${CODE_COV_SD}" "${W_IF}" "${W_CODE}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+from onereplay.core.covariance import load_covariance_file
+
+gold_path, if_path, sd_path = sys.argv[1:4]
+w_if, w_code = float(sys.argv[4]), float(sys.argv[5])
+# mix_covariances --normalize_weights 1 会先归一化，这里跟着归一才对得上。
+total = w_if + w_code
+w_if, w_code = w_if / total, w_code / total
+
+gold = load_covariance_file(gold_path)
+c_if = load_covariance_file(if_path)
+
+
+def trace(cov, name):
+    return torch.diagonal(cov[name].float()).sum().item()
+
+
+def ratio_report(label, numer, denom):
+    shared = sorted(set(numer) & set(denom))
+    values = [trace(numer, n) / trace(denom, n) for n in shared if trace(denom, n) > 0]
+    if not values:
+        print(f"{label}: n/a")
+        return None
+    t = torch.tensor(values)
+    mean = t.mean().item()
+    print(f"{label}: mean={mean:.3f} min={t.min().item():.3f} max={t.max().item():.3f}")
+    return mean
+
+
+only_gold = sorted(set(gold) - set(c_if))
+only_if = sorted(set(c_if) - set(gold))
+if only_gold or only_if:
+    print(f"WARNING: 层集合对不上 only-gold={only_gold[:5]} only-if={only_if[:5]}")
+    print("         对不上就不能混合，先确认两份 C 的 --target_modules 一致。")
+
+# 换答案对 code 侧尺度的影响。这是本消融最直接的一个刻度。
+if Path(sd_path).is_file():
+    sd = load_covariance_file(sd_path)
+    r = ratio_report("trace(C_code_gold)/trace(C_code_selfdistill)", gold, sd)
+    if r is not None:
+        if 0.9 <= r <= 1.1:
+            print("  -> 尺度基本没动，code 侧换 gold 不必为此改 λ。")
+        else:
+            print(f"  -> 尺度动了 {r:.3f}x，同一个 λ 的实际约束强度会跟着变这么多。")
+else:
+    print(f"跳过 gold/自蒸馏对比：找不到 {sd_path}")
+
+r_code_if = ratio_report("trace(C_code_gold)/trace(C_if)             ", gold, c_if)
+
+if r_code_if is not None:
+    predicted = w_if + w_code * r_code_if
+    print(f"\n按 w_if={w_if:.3f} w_code={w_code:.3f} 混合，逐层 trace 线性可加，于是")
+    print(
+        f"  预测 trace(C_mix_gold)/trace(C_if) = {w_if:.3f} + {w_code:.3f} x "
+        f"{r_code_if:.3f} = {predicted:.3f}"
+    )
+    print("  C_if 单独 run 用 λ=3e-2，要让 C_mix_gold 上的 IF 保护强度与之相当：")
+    print(f"  λ_mix ≈ 3e-2 / {predicted:.3f} = {3e-2 / predicted:.2e}")
+    print(
+        "\n自蒸馏版算出来的等效中心是 2e-2（52 号在用）。上面这个数与 2e-2 相差在 10%\n"
+        "以内就沿用 2e-2，两条线的 λ 才是同一把尺子；差得多就据此改 59 号的 LAMBDA。"
+    )
+    if abs(r_code_if - 1.0) > 0.3:
+        print(
+            f"\n注意 trace 比值 {r_code_if:.3f} 离 1 较远，等权混合会让 trace 大的一方主导。\n"
+            f"按 trace 反比的等效权重应为 w_if:w_code = 1 : {1.0 / r_code_if:.3f}。\n"
+            "要改就改文末混合命令里的 --weights，本脚本不产出混合文件。"
+        )
+PY
+
+# ===========================================================================
+# Step 3: 采 F_code_gold
+#   collect_fisher 有三个默认值与 collect_cov 不同且都不报错：truncation_side、
+#   require_target、sample_shuffle。全部显式传上（这是 51 号踩过的坑）。
+#   batch_size 不可配：Fisher 要 per-example 梯度，脚本内部写死 1。
+# ===========================================================================
+if [[ "${DO_FISHER}" == "1" ]]; then
+  if [[ "${FORCE}" != "1" && -f "${CODE_FISHER_GOLD}" ]]; then
+    echo "跳过采 F：${CODE_FISHER_GOLD} 已存在（FORCE=1 可强制重采）"
+  else
+    echo "==== Step 3: collect F_code_gold -> ${CODE_FISHER_GOLD} ===="
+    python -m onereplay.scripts.collect_fisher \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --seed "${SAMPLE_SEED}" \
+      --use_bf16 "${USE_BF16}" \
+      --data_files "${DISTILL_FILE}" --dataset_split train \
+      --cache_dir "${DATASET_CACHE}" --streaming 0 \
+      --input_column inputs --target_column "${GOLD_COLUMN}" \
+      --require_target 1 --require_target_column "${KEEP_COLUMN}" \
+      --use_chat_template 1 --include_target_in_chat 1 \
+      --max_samples 0 \
+      --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+      --max_len "${MAXLEN}" \
+      --truncation_side left \
+      --target_modules "${TARGET_MODULES}" \
+      --fisher_device "${FISHER_DEVICE}" \
+      --log_every "${LOG_EVERY}" \
+      --output_path "${CODE_FISHER_GOLD}"
+  fi
+
+  echo "==== Step 3 自检: F_code_gold 与 C_code_gold 必须同池 ===="
+  # 这里的期望指纹来自 Step 0 的 gold 池，不是自蒸馏池。
+  python -m onereplay.scripts.inspect_fisher \
+    --path "${CODE_FISHER_GOLD}" \
+    --expect_max_len "${MAXLEN}" \
+    --expect_truncation_side left \
+    --expect_target_modules "${TARGET_MODULES}" \
+    --expect_require_target 1 \
+    --expect_sample_shuffle 0 \
+    --expect_use_bf16 "${USE_BF16}" \
+    --expect_zero_supervision_rows 0 \
+    --expect_pool_fingerprint "${GOLD_HASH}" \
+    --reference "${IF_FISHER}" \
+    --strict 1
+else
+  echo "DO_FISHER=0：使用已有 ${CODE_FISHER_GOLD}"
+fi
+
+# ===========================================================================
+# Step 4: 诊断 F（**不混合**，混合命令见文末）
+#   inspect_fisher --reference 打印 mean(F_path)/mean(F_reference)，正是 half 变体的
+#   λ 要跟着缩放的那个系数。equal 变体在混合时按 mean 现算权重，λ 不随它变。
+#   不自己读 payload：F 的键是 "fishers"，写错了会静默算出别的数。
+# ===========================================================================
+[[ -f "${CODE_FISHER_GOLD}" ]] || { echo "缺 F_code_gold: ${CODE_FISHER_GOLD}"; exit 1; }
+if [[ -f "${CODE_FISHER_SD}" ]]; then
+  echo "==== Step 4 诊断: F_code_gold vs F_code_selfdistill 的量级 ===="
+  echo "  下面的 mean 比值就是 half 臂 λ 的缩放系数（equal 臂不用改）。"
+  python -m onereplay.scripts.inspect_fisher \
+    --path "${CODE_FISHER_GOLD}" \
+    --reference "${CODE_FISHER_SD}" \
+    --strict 0
+else
+  echo "跳过 gold/自蒸馏量级对比：找不到 ${CODE_FISHER_SD}"
+fi
+
+set +x
+echo "========================================================================"
+# 混合不值得单独排一个作业：纯 torch 加权求和，几分钟，不用 GPU。看完上面的诊断
+# 直接把下面几条粘到登录节点跑即可。变量已经展开成真实路径。
+cat <<EOF
+产物（都是单域的，混合见下）:
+  C_code_gold = ${CODE_COV_GOLD}
+  F_code_gold = ${CODE_FISHER_GOLD}
+
+下一步:
+  1) 看 Step 2 打印的 λ_mix 建议，与 52 号在用的 2e-2 对一下；差 10% 以内就沿用
+  2) 看 Step 4 打印的 mean 比值，决定 EWC half 臂的 λ 要不要缩放（equal 不用动）
+  3) 混合（登录节点直接敲，几分钟，不用 GPU）:
+
+cd ${REPO_ROOT} && source ${VENV}/bin/activate
+
+# C_mix_gold —— 权重要改就改这里的 --weights，改了必须同步改 59 号的 LAMBDA
+python -m onereplay.mix_covariances \\
+  --inputs "${IF_COV},${CODE_COV_GOLD}" \\
+  --weights "${W_IF},${W_CODE}" --normalize_weights 1 \\
+  --output_path "${RESULTS_ROOT}/cov/cov_if_code_opcedu20k_gold_mix_qv.pt"
+
+# F_mix_gold equal —— 按 mean 归一后等权，code 线定稿用的是它
+python -m onereplay.mix_fishers \\
+  --inputs "${IF_FISHER},${CODE_FISHER_GOLD}" \\
+  --equalize mean \\
+  --output_path "${RESULTS_ROOT}/fisher/fisher_if_code_opcedu20k_gold_mix_equal_qv.pt"
+
+# F_mix_gold half —— 裸 0.5/0.5，「不做尺度归一」的对照臂，不跑 half 就不用建
+python -m onereplay.mix_fishers \\
+  --inputs "${IF_FISHER},${CODE_FISHER_GOLD}" \\
+  --weights 0.5,0.5 \\
+  --output_path "${RESULTS_ROOT}/fisher/fisher_if_code_opcedu20k_gold_mix_half_qv.pt"
+
+  4) 混完复核一次（可选，一分钟）：真实 trace 比值应当等于 Step 2 的解析预测，
+     逐层线性加权下两者分毫不差，对不上就是输入或权重接错了:
+
+python - <<'PYEOF'
+import torch
+from onereplay.core.covariance import load_covariance_file
+mix = load_covariance_file("${RESULTS_ROOT}/cov/cov_if_code_opcedu20k_gold_mix_qv.pt")
+c_if = load_covariance_file("${IF_COV}")
+t = lambda c, n: torch.diagonal(c[n].float()).sum().item()
+shared = sorted(set(mix) & set(c_if))
+r = torch.tensor([t(mix, n) / t(c_if, n) for n in shared if t(c_if, n) > 0])
+print(f"trace(C_mix_gold)/trace(C_if) mean={r.mean():.4f}  ->  lambda_mix = {3e-2 / r.mean():.3e}")
+PYEOF
+
+  5) 三条臂各投一次（互不依赖，可同时排队）:
+     qsub onereplay/pbs/59_opc_code_gold_onereplay.pbs
+     qsub onereplay/pbs/60_opc_code_gold_ewc.pbs
+     qsub onereplay/pbs/61_opc_code_gold_replay.pbs
+EOF
+echo "Job finished at: $(date)"

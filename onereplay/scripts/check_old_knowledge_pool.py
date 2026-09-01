@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle_buffer_size", type=int, default=10000)
     parser.add_argument("--require_target", type=int, default=0)
     parser.add_argument(
+        "--require_target_column",
+        type=str,
+        default="",
+        help="Mirror collect_cov: column --require_target checks, empty means --target_column.",
+    )
+    parser.add_argument(
         "--label",
         type=str,
         default="pool",

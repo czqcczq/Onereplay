@@ -21,6 +21,14 @@ Two flavors of target, selected by --replay_self_distill_file:
                   starts near zero loss and only anchors the model to W0,
                   which is the same thing the OneReplay penalty approximates.
                   This is the information-matched comparison.
+
+The self-distilled file keeps the corpus's own answer in gold_targets on every
+row, so --replay_self_distill_file FILE --replay_target_column gold_targets is
+a third configuration: gold answers on the self-distilled file's exact rows, in
+its exact order. That is the ablation to run when the suspicion is that the
+base model's own answers are simply wrong often enough to poison the anchor --
+pointing --replay_data_files back at the raw corpus would re-roll the shuffle
+and the pool cut at the same time, and could not tell the two causes apart.
 """
 
 from __future__ import annotations
@@ -56,6 +64,31 @@ def replay_max_len(args: argparse.Namespace) -> int:
 
     value = int(getattr(args, "replay_max_len", 0) or 0)
     return value if value > 0 else args.max_len
+
+
+def replay_target_flavor(args: argparse.Namespace) -> str:
+    """Name the answers replay is about to train on, for the run log.
+
+    Follows the column rather than the filename: reading gold_targets out of a
+    self-distilled file is the gold ablation, and a log that called it
+    self-distilled would mislabel the one run whose whole point is the switch.
+
+    --replay_mix_files carries those same self-distilled files, one per domain,
+    so it has to count as a self-distilled source too. Checking only the
+    single-file flag labels every multi-domain arm "gold-target" whatever
+    column it actually trained on, which is exactly backwards for the arms
+    that kept the default targets column.
+    """
+
+    column = getattr(args, "replay_target_column", "") or "targets"
+    from_self_distilled_file = bool(
+        getattr(args, "replay_self_distill_file", "") or getattr(args, "replay_mix_files", "")
+    )
+    if not from_self_distilled_file:
+        return "gold-target"
+    if column == "targets":
+        return "self-distilled"
+    return f"gold-target (column {column} of the self-distilled file)"
 
 
 def load_replay_pool(args: argparse.Namespace):
@@ -256,6 +289,7 @@ def build_replay_pools(args: argparse.Namespace, tokenizer) -> list[ReplayPool]:
     instead would change how often its rows repeat, which is a second variable.
     """
 
+    print(f"replay targets: {replay_target_flavor(args)}")
     mix = parse_replay_mix(args)
     if not mix:
         return [ReplayPool(label="", dataset=build_replay_dataset(args, tokenizer), weight=1.0)]
@@ -301,7 +335,7 @@ def mix_replay_into_train(args: argparse.Namespace, tokenizer, train_dataset):
     )
 
     mixed = concatenate_datasets([train_dataset, replay_dataset]).shuffle(seed=args.seed)
-    flavor = "self-distilled" if getattr(args, "replay_self_distill_file", "") else "gold-target"
+    flavor = replay_target_flavor(args)
     print(
         f"{flavor} replay: {len(train_dataset)} new-task + {len(replay_dataset)} replay "
         f"= {len(mixed)} rows (ratio={args.replay_ratio}, "

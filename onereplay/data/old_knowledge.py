@@ -49,10 +49,19 @@ def filter_incomplete_rows(dataset, args: argparse.Namespace):
     those rows via --replay_drop_truncated plus to_sft_schema's non-empty
     filter. Without the same filter here, C would still absorb the prompt-side
     activations of rows replay never sees.
+
+    --require_target_column decouples "which column decides the row survives"
+    from "which column is read as the answer". They are the same by default.
+    They differ in exactly one case: the gold-target ablation, which reads
+    gold_targets out of the self-distilled file so that the prompts, the row
+    order and the pool cut all stay bit-identical and only the assistant text
+    changes. Gold is present on every row including the truncated ones, so
+    filtering on gold_targets would silently hand the gold arm ~13% more rows
+    and turn a target-source ablation into a pool-size one.
     """
 
     input_column = args.input_column
-    target_column = args.target_column
+    target_column = getattr(args, "require_target_column", "") or args.target_column
 
     def is_complete(example: dict[str, Any]) -> bool:
         target = example.get(target_column)

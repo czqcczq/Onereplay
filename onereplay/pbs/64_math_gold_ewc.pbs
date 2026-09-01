@@ -1,0 +1,590 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_mgld_ewc
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper: 数学线 gold-target 消融 —— EWC 臂（训练 + 数学评测）
+#   与 48 号的 cs_ewcmix_<variant>_lam1_seed1 逐字相同，唯一变量是 --fisher_path
+#   指向 gold 版的 F_mix：
+#     48 号  F_mix = mix(F_if(FLAN gold), F_math(MetaMath **自蒸馏**))
+#     本脚本 F_mix = mix(F_if(FLAN gold), F_math(MetaMath **gold**))    <- 62 号 + 混合
+#
+# -----------------------------------------------------------------------------
+# 这条臂在整个消融里的位置
+#   gold 消融一共三条臂，分三个脚本投，互不依赖，可以同时排队：
+#     63          OneReplay  --cov_path    C_mix_gold
+#     64（本脚本）EWC        --fisher_path F_mix_gold_<variant>
+#     65          replay     --replay_target_column gold_targets，4n4r
+#   与之配对的自蒸馏版结果直接读 48 号已有的 run，不用重跑。本脚本的 run 名多一个
+#   _gold 段，两批会落进同一份 summary.csv，可以并排读。
+#
+# -----------------------------------------------------------------------------
+# !! 数学线默认跑 half，这与代码线相反，理由和保留意见一起写在这里
+#   两个 variant 的差别只在「怎么把两域的 F 加起来」：
+#     half  = 裸的 0.5·F_if + 0.5·F_math，不做任何尺度归一
+#     equal = --equalize mean，各自除以自己的 mean 再等权，两域等量贡献
+#   数学线实测 mean(F_if)=9.98e-2、mean(F_math)=2.64e-2，if 大约 3.78x（08-29
+#   inspect_fisher）。所以 half 下罚项里 IF 域实际占 3.78 倍份额；equal 折算成权重
+#   约 0.21:0.79，反过来由 math 侧主导行数意义上的权重、两域贡献相等。
+#
+#   自蒸馏版（48 号）跑下来 half 明显更好：
+#       variant   GSM8K    MATH-500   IFEval strict-prompt
+#       half      0.7900   0.708      0.6617
+#       equal     0.7839   0.678      0.6488
+#   所以默认 VARIANTS=half。注意这个结论与代码线相反（代码线是 equal 更好）。
+#
+#   >>> 但这个结论本身是可疑的，而 gold 消融正是要重新检验它。
+#   当前配置下 LoRA 很可能并没有真的损伤模型的数学能力，只是让它不知道该用什么格式
+#   答题（不再写 "####"、不再收尾 \boxed{}）。如果是这样，那么「更强的 IF 保护」并不
+#   是在保护数学知识，而是在保住答题格式，数学分跟着变高只是判分口径的副产物。half
+#   之所以赢，就可能只是因为它把 IF 域的份额放大了 3.78 倍。
+#   换成 gold target 之后 F_math 的量级会变（MetaMath 的 response 比自蒸馏轨迹短且
+#   分布不同），两域的 3.78x 比值不再成立，half/equal 的相对强弱有可能翻转。所以：
+#     - 跑完 half 之后建议再投一次 VARIANTS=equal，把两个点都拿到
+#     - 写结论时不要只报 GSM8K/MATH-500 的整体分，要同时看 IFEval 和 base 答对子集上
+#       的保留率，否则区分不了「保住了数学」和「保住了格式」
+#   单个 variant 完整 3 epoch 约 14 h，加上数学评测装不进一个 24 h 作业里跑两个，所以
+#   一次只跑一个；已训完的会被跳过，重复投等于续跑。
+#
+# -----------------------------------------------------------------------------
+# !! λ：equal 通常不用动，half 要按 62 号的比值缩放
+#   λ=1 是 48 号 08-29 探针定的：300 步短探下 λ·R 占 task_loss 的比例，equal 5.2% /
+#   half 7.9%，两版都落在 1%–10% 的目标带内。equal 版在混合时按 mean 归一过，换 gold
+#   之后罚项量级基本不变，λ=1 可以直接沿用。
+#   half 版没有归一，罚项量级直接随 mean(F_math) 变，62 号打印的
+#   mean(F_math_gold)/mean(F_math_selfdistill) 就是它的缩放系数（λ 要除以这个数）。
+#   拿不准就先 PROBE=1 跑 300 步看罚项量级，别直接烧 14 h。
+#   改 λ 是有代价的：对照组 cs_ewcmix_half_lam1_seed1 是在 λ=1 下训出来的，本臂换了 λ
+#   就等于同时动了两个变量。所以只有在缩放系数明显偏离 1（罚项占比掉出 1%–10% 目标带）
+#   时才改，改了要在结果表里注明两版的 λ 不同、以及各自的罚项占比。
+#   另外别拿 OneReplay 的 3e-2 来「对齐」EWC 的 λ：F 是逐元素的、C 沿 hidden 收缩过
+#   一次，两者尺度差约 1e5，那样等于无约束、退回 vanilla。
+#
+# -----------------------------------------------------------------------------
+# !! F_if 两条线共用，本消融不重采
+#   F_if 是 47 号的既有产物，代码线和数学线用的是同一份。gold 消融只动 math 侧的 F，
+#   重采 F_if 会同时毁掉与代码线 gold 消融、以及与 48 号自蒸馏版的可比性。
+#
+# -----------------------------------------------------------------------------
+# !! 训练超参必须与 48 号逐字相同，否则消融不成立
+#   BATCH=8 ACCUM=64（EWC 没有回放占位，每次更新的新任务行数就等于 ACCUM）、
+#   EVAL_BATCH=8（val_loss 按 batch 平均，改了就与 32/45/48/63/65 不可比）、
+#   EPOCHS=3、LR=1e-4、MAXLEN=512、q_proj,v_proj。
+#
+# -----------------------------------------------------------------------------
+# !! 结果怎么读（照抄 48 号的告诫）
+#   EWC-LoRA (arXiv 2602.17559) 实测 precomputed 固定 Fisher 塑性最低——EWC 很可能
+#   不是"retention 更好"，而是"新任务学不动"。所以别直接说 EWC retention 更好，要在
+#   相同 commonsense val_loss 处比 math500/gsm8k（和 IF）。
+#
+# -----------------------------------------------------------------------------
+# 预算与拆投
+#   训练一个 run 约 10~14 h，数学评测（math500 500 题 + gsm8k 1319 题，cap 4096）约
+#   3~5 h，合计接近 24 h 上限。队列紧张或第一次跑就建议拆两次投：
+#     先 DO_EVAL=0 只训练，再 DO_TRAIN=0 只评测。两边都能续跑，超时后原样再投即可。
+#
+# -----------------------------------------------------------------------------
+# 用法（**本站点 qsub 不吃命令行变量**，开关改「阶段开关」段的默认值）
+#   qsub onereplay/pbs/64_math_gold_ewc.pbs
+#
+#   VARIANTS="equal" 改跑 equal 那版（默认 half，理由见上）
+#   DRY_RUN=1        只打印 run 名与路径，不训练不评测（建议先跑）
+#   PROBE=1          300 步短跑，只看罚项量级，不保存不评测（换 λ 时用）
+#   DO_TRAIN=0 / DO_EVAL=0 / FORCE_TRAIN=1 / FORCE_EVAL=1
+#
+# 前置条件
+#   1) ${FISHER_MIX_GOLD_HALF} 已就位（跑 equal 就还要 ${FISHER_MIX_GOLD_EQUAL}）
+#      —— 62 号采完 F_math_gold 之后，按其文末打印的命令在登录节点混合
+#   2) ${CS_DATASET} = datasets/commonsense_170k_hf
+#   3) 数学评测数据 ${MATH_DATA_DIR}/{math500,gsm8k}_test.jsonl
+#   4) mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/64_math_gold_ewc.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR DATASET_CACHE OUT_DIR
+    DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE
+    SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    EVAL_BATCH SAVE MAX_STEPS
+    EWC_LAMBDA VARIANTS FISHER_MIX_GOLD_EQUAL FISHER_MIX_GOLD_HALF RUN_TAG
+    MODELS EXTRA_MODELS
+    MATH500_FILE GSM8K_FILE AMC_FILE AIME_FILE WITH_AMC_AIME
+    MATH_MAX_NEW_TOKENS LIMIT DIAG_LEN
+    WITH_IF IFEVAL_INPUT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的训练与评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"          # 默认只打印计划，确认无误后改 0
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+PROBE="${PROBE:-0}"
+
+# ---- 训练超参：与 48 号逐字一致，唯一变量是 F 的来源 ----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"             # EWC 无回放占位，每次更新的新任务行数就是它
+EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 48/63/65 不可比
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+SAVE="${SAVE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"
+
+if [[ "${PROBE}" == "1" ]]; then
+  SAVE=0
+  [[ "${MAX_STEPS}" == "0" ]] && MAX_STEPS=300
+  DO_EVAL=0
+  echo "PROBE=1：SAVE=0 MAX_STEPS=${MAX_STEPS} DO_EVAL=0，只看罚项量级"
+fi
+
+# ---- 正则化：λ 沿用前先看 62 号打印的 mean(F_math) 比值（见文件头）----
+EWC_LAMBDA="${EWC_LAMBDA:-1}"
+VARIANTS="${VARIANTS:-half}"     # 数学线默认 half，一次一个，理由见文件头
+VARIANTS="${VARIANTS//,/ }"
+FISHER_MIX_GOLD_EQUAL="${FISHER_MIX_GOLD_EQUAL:-${RESULTS_ROOT}/fisher/fisher_if_math_metamath30k_gold_mix_equal_qv.pt}"
+FISHER_MIX_GOLD_HALF="${FISHER_MIX_GOLD_HALF:-${RESULTS_ROOT}/fisher/fisher_if_math_metamath30k_gold_mix_half_qv.pt}"
+
+variant_fisher () {
+  case "$1" in
+    equal) echo "${FISHER_MIX_GOLD_EQUAL}" ;;
+    half)  echo "${FISHER_MIX_GOLD_HALF}" ;;
+    *)     echo "" ;;
+  esac
+}
+
+# ---- run 名：_gold 段是关键，不带它会覆盖 48 号的 adapter ----
+RUN_TAG="${RUN_TAG:-gold}"
+run_name () { echo "cs_ewcmix_ifmath_${RUN_TAG}_$1_lam${EWC_LAMBDA}_seed${SEED}"; }
+
+# ---- 评测：与 32/33/45/48 同口径，所有 run 必须同预算才可比 ----
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+AMC_FILE="${AMC_FILE:-${MATH_DATA_DIR}/amc_test.jsonl}"
+AIME_FILE="${AIME_FILE:-${MATH_DATA_DIR}/aime_test.jsonl}"
+WITH_AMC_AIME="${WITH_AMC_AIME:-0}"          # AMC(83)/AIME(60) 接近地板，数学线已判为放弃
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"   # 必须与 32/45/48 同值才可比
+LIMIT="${LIMIT:-0}"
+DIAG_LEN="${DIAG_LEN:-1}"
+
+WITH_IF="${WITH_IF:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+
+MODELS="${MODELS:-}"
+EXTRA_MODELS="${EXTRA_MODELS:-}"
+
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+if (( ACCUM % BATCH != 0 )); then
+  echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"; exit 1
+fi
+if (( ACCUM != 64 )); then
+  echo "ACCUM=${ACCUM} 与 48/63/65 的 64 不符，三条臂走的不是同一条优化轨迹"; exit 1
+fi
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}" "${DATASET_CACHE}"
+
+echo "VARIANTS = [${VARIANTS}]  λ = ${EWC_LAMBDA}  seed = ${SEED}"
+echo "训练     = BATCH ${BATCH} / ACCUM ${ACCUM}(行/更新) / EPOCHS ${EPOCHS} / MAXLEN ${MAXLEN}"
+echo "评测     = math max_new=${MATH_MAX_NEW_TOKENS} limit=${LIMIT} with_amc_aime=${WITH_AMC_AIME}"
+echo "OUT_DIR  = ${OUT_DIR}"
+echo "对照(自蒸馏版, 48 号): cs_ewcmix_half_lam${EWC_LAMBDA}_seed${SEED} / cs_ewcmix_equal_lam${EWC_LAMBDA}_seed${SEED}"
+
+echo "==== 前置检查 ===="
+for v in ${VARIANTS}; do
+  f="$(variant_fisher "${v}")"
+  [[ -n "${f}" ]] || { echo "未知 VARIANT=${v}，可选 equal / half"; exit 1; }
+  [[ -f "${f}" ]] || { echo "缺 F_mix_gold(${v}): ${f}（先跑 62 号采集，再按其文末打印的命令混合）"; exit 1; }
+  echo "  ${v}: $(run_name "${v}")  <- ${f}"
+done
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查，不训练不评测。确认无误后把默认值改 0 再投。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# 训练：罚项 R = (1/L) Σ_l Σ_ij F_l,ij (ΔW_l,ij)²
+#   唯一变量是 --fisher_path 指向哪份 F_mix，其余逐字照抄 48 号。
+# ===========================================================================
+train_one () {
+  local variant=$1 run fmix
+  run="$(run_name "${variant}")"
+  fmix="$(variant_fisher "${variant}")"
+
+  if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${ADAPTERS}/${run}" ]]; then
+    echo "跳过训练 ${run}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+    return 0
+  fi
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+
+  echo "==== train ${variant}: ${run} (F=${fmix} λ=${EWC_LAMBDA}) ===="
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --max_steps "${MAX_STEPS}" \
+    --regularizer ewc --fisher_path "${fmix}" \
+    --replay_lambda "${EWC_LAMBDA}" \
+    --save "${SAVE}" --save_path "${ADAPTERS}/${run}" \
+    --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
+
+  echo "==== 训练自检: ${run} ===="
+  python - "${RESULTS_ROOT}/metrics/${run}.jsonl" "${EWC_LAMBDA}" "${fmix}" "${ACCUM}" <<'PY'
+import json
+import sys
+
+path, want_lambda, want_fisher, want_accum = sys.argv[1], float(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+
+epochs = []
+with open(path, encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("epoch") is not None:
+            epochs.append(row)
+if not epochs:
+    raise SystemExit(f"{path} 里没有 epoch 记录，训练没有跑完一个 epoch")
+last = epochs[-1]
+
+# train.py 把罚项的来源文件统一记成 penalty_path（EWC 时就是 fisher_path）。
+penalty_path = str(last.get("penalty_path") or "")
+
+print(f"epochs done     = {len(epochs)}")
+print(f"regularizer     = {last.get('regularizer')} (want ewc)")
+print(f"replay_lambda   = {last.get('replay_lambda')} (want {want_lambda})")
+print(f"penalty_path    = {penalty_path}")
+print(f"accumulation    = {last.get('accumulation_size')} (want {want_accum})")
+print(f"eval_batch_size = {last.get('eval_batch_size')} (want 8, 见文件头)")
+print(f"val_loss        = {last.get('val_loss')}")
+
+failures = []
+if last.get("regularizer") != "ewc":
+    failures.append(f"regularizer={last.get('regularizer')!r}，这一臂没走 EWC")
+if abs(float(last.get("replay_lambda") or 0.0) - want_lambda) > 1e-12:
+    failures.append(f"λ 记录为 {last.get('replay_lambda')}，与本次要求的 {want_lambda} 不符")
+if not penalty_path:
+    failures.append(
+        "metrics 里没有 penalty_path。train.py 的 extra_record 改过字段名的话，"
+        "这个自检就形同虚设，先去核对再重训"
+    )
+elif penalty_path != want_fisher:
+    failures.append(f"penalty_path 记录为 {penalty_path}，不是本次要用的 {want_fisher}")
+elif "gold" not in penalty_path:
+    failures.append(
+        f"penalty_path {penalty_path!r} 里没有 gold 字样：这一臂很可能训在自蒸馏的 F 上，"
+        "那样就和 48 号是同一个 run，消融白跑"
+    )
+if int(last.get("accumulation_size") or 0) != want_accum:
+    failures.append(f"accumulation_size={last.get('accumulation_size')}，与 48 号的 {want_accum} 不符")
+
+if failures:
+    print("\n训练自检失败:")
+    for item in failures:
+        print(f"  - {item}")
+    raise SystemExit(1)
+print("\n训练自检通过")
+PY
+}
+
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  for v in ${VARIANTS}; do train_one "${v}"; done
+else
+  echo "DO_TRAIN=0：跳过训练"
+fi
+
+# ===========================================================================
+# 评测：math500 + gsm8k（+ 可选 amc/aime、IFEval），与 32/33/45/48 同口径
+# ===========================================================================
+if [[ "${DO_EVAL}" != "1" ]]; then
+  echo "DO_EVAL=0：跳过评测"
+  set +x
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+EVAL_SPECS=""
+append_spec () {
+  if [[ -z "${EVAL_SPECS}" ]]; then EVAL_SPECS="$1"; else EVAL_SPECS="${EVAL_SPECS}|$1"; fi
+}
+for v in ${VARIANTS}; do
+  r="$(run_name "${v}")"
+  append_spec "${r};${ADAPTERS}/${r}"
+done
+for m in ${MODELS}; do append_spec "${m};${ADAPTERS}/${m}"; done
+if [[ -n "${EXTRA_MODELS}" ]]; then
+  IFS='|' read -ra extra <<< "${EXTRA_MODELS}"
+  for spec in "${extra[@]}"; do append_spec "${spec}"; done
+fi
+
+# 缺哪个数据文件就跳过哪个指标（数据没搬全时不至于整个作业白挂）。
+MATH_AVAIL=""
+if [[ -f "${MATH500_FILE}" ]]; then MATH_AVAIL="${MATH_AVAIL} math500"; else echo "跳过 math500：缺 ${MATH500_FILE}"; fi
+if [[ -f "${GSM8K_FILE}"  ]]; then MATH_AVAIL="${MATH_AVAIL} gsm8k";   else echo "跳过 gsm8k：缺 ${GSM8K_FILE}"; fi
+if [[ "${WITH_AMC_AIME}" == "1" ]]; then
+  if [[ -f "${AMC_FILE}"  ]]; then MATH_AVAIL="${MATH_AVAIL} amc";  else echo "跳过 amc：缺 ${AMC_FILE}"; fi
+  if [[ -f "${AIME_FILE}" ]]; then MATH_AVAIL="${MATH_AVAIL} aime"; else echo "跳过 aime：缺 ${AIME_FILE}"; fi
+fi
+MATH_AVAIL="${MATH_AVAIL# }"
+if [[ -z "${MATH_AVAIL}" ]]; then
+  echo "找不到任何数学评测数据（${MATH500_FILE} / ${GSM8K_FILE}），跳过评测"
+  set +x
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+echo "MATH_AVAIL=[${MATH_AVAIL}]"
+
+pending_metrics () {
+  # $1=run_name, 其余=候选 metric。已有 summary.json 的跳过，除非 FORCE_EVAL=1。
+  local name=$1; shift
+  local out=""
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" == "1" || ! -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then
+      out="${out}${out:+,}${m}"
+    fi
+  done
+  echo "${out}"
+}
+
+EVAL_NAMES=()
+IFS='|' read -ra SPECS <<< "${EVAL_SPECS}"
+for spec in "${SPECS[@]}"; do
+  name="${spec%%;*}"
+  adapter="${spec#*;}"
+  if [[ ! -d "${adapter}" ]]; then
+    echo "跳过评测 ${name}：找不到 adapter ${adapter}"
+    continue
+  fi
+  EVAL_NAMES+=("${name}")
+  # shellcheck disable=SC2086
+  mp="$(pending_metrics "${name}" ${MATH_AVAIL})"
+  if [[ -z "${mp}" ]]; then
+    echo "跳过数学评测 ${name}：所有数学指标都已有结果（FORCE_EVAL=1 可重评）"
+  else
+    echo "==== eval math: ${name} (${mp}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${adapter}" --run_name "${name}" \
+      --metrics "${mp}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" --limit "${LIMIT}" \
+      --math500_data_path "${MATH500_FILE}" \
+      --gsm8k_data_path "${GSM8K_FILE}" \
+      --amc_data_path "${AMC_FILE}" \
+      --aime_data_path "${AIME_FILE}"
+  fi
+
+  if [[ "${WITH_IF}" == "1" ]]; then
+    ip="$(pending_metrics "${name}" ifeval)"
+    if [[ -n "${ip}" ]]; then
+      echo "==== eval IF: ${name} ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" --run_name "${name}" \
+        --metrics ifeval --out_dir "${OUT_DIR}" --seed "${SEED}" \
+        --ifeval_input "${IFEVAL_INPUT}"
+    fi
+  fi
+done
+
+# ---------------------------------------------------------------------------
+# 长度/截断诊断：用 responses.jsonl 反查 MATH_MAX_NEW_TOKENS 够不够
+#   no-answer : 没抽出答案的比例；hit-cap : 生成长度顶到上限的比例。
+# ---------------------------------------------------------------------------
+length_diagnostic () {
+  python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, cap, paths = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+print(f"==== response length / truncation diagnostic (cap={cap}) ====")
+for path in paths:
+    file = Path(path)
+    if not file.is_file():
+        continue
+    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+    if not rows:
+        continue
+    lengths = sorted(
+        len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+        for row in rows
+    )
+    missing = sum(row.get("prediction") in (None, "") for row in rows)
+    hit_cap = sum(length >= cap - 8 for length in lengths)
+    label = f"{file.parent.parent.name}/{file.parent.name}"
+    print(
+        f"{label:>52}: n={len(rows)} "
+        f"no-answer={missing} ({missing / len(rows):.1%}) "
+        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
+    )
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则提高 MATH_MAX_NEW_TOKENS 后重评。")
+PY
+}
+
+if [[ "${DIAG_LEN}" == "1" && ${#EVAL_NAMES[@]} -gt 0 ]]; then
+  DIAG_FILES=()
+  for m in ${MATH_AVAIL}; do
+    for name in "${EVAL_NAMES[@]}"; do
+      DIAG_FILES+=("${OUT_DIR}/${m}/${name}/responses.jsonl")
+    done
+  done
+  length_diagnostic "${DIAG_FILES[@]}"
+fi
+
+set +x
+echo "========================================================================"
+echo "汇总  : ${OUT_DIR}/<metric>_summary.csv"
+echo "逐题  : ${OUT_DIR}/<metric>/<run_name>/responses.jsonl"
+echo "所有 run 必须用同一个 MATH_MAX_NEW_TOKENS=${MATH_MAX_NEW_TOKENS} 才可比。"
+echo "GSM8K 要同时报 production 与 strict（缺 '####' 的比例），见任务3 文档 5.2 节。"
+echo ""
+echo "对照读法（同一份 CSV，自蒸馏版不用重评）:"
+echo "  自蒸馏 cs_ewcmix_half_lam${EWC_LAMBDA}_seed${SEED}    <- 48 号（数学线较优的那版）"
+echo "  自蒸馏 cs_ewcmix_equal_lam${EWC_LAMBDA}_seed${SEED}   <- 48 号"
+for v in ${VARIANTS}; do echo "  gold   $(run_name "${v}")"; done
+echo "  half/equal 的强弱在 gold 下可能翻转，见文件头；结论要连 IFEval 一起看。"
+echo ""
+echo "整体分数之外，务必再看 base 答对子集上的保留率:"
+for v in ${VARIANTS}; do
+  echo "  python -m onereplay.scripts.score_retention_subset \\"
+  echo "    --results_root ${OUT_DIR} --metrics gsm8k,math500 \\"
+  echo "    --runs base,cs_vanilla_seed${SEED},$(run_name "${v}") --baseline base"
+done
+echo "Job finished at: $(date)"
