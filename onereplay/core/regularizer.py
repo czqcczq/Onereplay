@@ -224,6 +224,19 @@ def resolve_full_layers(
     pairing cannot change during a run -- C is frozen, W0 is frozen, and the
     module tree is fixed once the model is built -- so it is resolved once here
     and reused.
+
+    Only the device is resolved here, never the dtype. Casting to fp32 at this
+    point looks free, since full_covariance_grad_ needs fp32 operands anyway, but
+    the converted tensor would then be cached for the whole run beside the bf16
+    snapshot it came from, leaving W0 resident twice. On Qwen3-1.7B that was 6.41
+    GiB of fp32 on top of 3.20 GiB of bf16, which made the analytic path peak 2.06
+    GiB *higher* than the autograd path it exists to be cheaper than, and
+    reference_memory_bytes could not see the second copy, so the difference
+    surfaced in the cost tables as unexplained "temporary" memory.
+
+    full_covariance_grad_ casts per layer instead. That is exact either way -- the
+    snapshot is cloned from a bf16 model, so widening it recovers no information --
+    and it keeps one layer of temporaries alive rather than 197.
     """
 
     layers: list[tuple[str, nn.Parameter, torch.Tensor, torch.Tensor]] = []
@@ -243,8 +256,8 @@ def resolve_full_layers(
             (
                 module_name,
                 weight,
-                covariance.to(device=weight.device, dtype=torch.float32),
-                reference.to(device=weight.device, dtype=torch.float32),
+                covariance.to(device=weight.device),
+                reference.to(device=weight.device),
             )
         )
     return layers, missing
@@ -265,10 +278,14 @@ def full_covariance_grad_(
 
     and DeltaW C is exactly the product the forward pass already forms. Letting
     autograd rediscover it costs a second matmul of the same size, and keeps every
-    layer's fp32 DeltaW alive in the graph until backward returns -- on Qwen3-1.7B
-    that is 6.9 GB of temporaries for the 197 covered layers. Writing the gradient
-    directly halves the arithmetic and lets each layer's temporaries die
+    layer's fp32 DeltaW alive in the graph until backward returns -- measured at
+    4.35 GiB of temporaries for the 197 covered layers on Qwen3-1.7B. Writing the
+    gradient directly halves the arithmetic and lets each layer's temporaries die
     immediately, so the peak is one layer instead of all of them.
+
+    That last sentence holds only while the caller hands over the snapshot in its
+    stored dtype; resolve_full_layers documents the cached fp32 copy that used to
+    defeat it.
 
     R reads only weights, and weights are frozen across a gradient-accumulation
     window, so injecting once per window accumulates the same gradient as adding
@@ -575,6 +592,11 @@ class ReplayRegularizer:
         Full fine-tuning needs DeltaW = W - W0, so the initial weights of every
         regularized layer stay resident. LoRA reads DeltaW straight from B and
         A and pays nothing here.
+
+        This is the entire snapshot cost on both reg_impl paths, which is true
+        only because resolve_full_layers caches these very tensors instead of
+        dtype-converted copies of them. A cast there would be invisible to this
+        method, and the cost tables would carry it as temporary memory.
         """
 
         if not self.reference_weights:
