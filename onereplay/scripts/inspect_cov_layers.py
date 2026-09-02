@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help=(
             "Power-iteration steps for lambda_max. The measured spectra are very "
-            "top-heavy (top-1 around 35% of the trace), so this converges quickly."
+            "top-heavy (top-1 around a third of the trace), so this converges quickly."
         ),
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -153,6 +153,48 @@ def top_eigenvalue(matrix: torch.Tensor, iterations: int, generator: torch.Gener
         vector = product / norm
         value = float(vector @ (matrix @ vector))
     return value
+
+
+def require_local_model_dir(path: str, flag: str) -> None:
+    """Fail on a missing local directory instead of letting transformers reach the Hub.
+
+    An unset ${MODEL_DIR} expands to an empty string, so the path becomes
+    "/Qwen3-1.7B", which from_pretrained treats as a Hub repo id and reports three
+    frames deep as an HFValidationError about alphanumeric characters, never
+    naming the flag that was wrong. The pbs scripts set these variables
+    themselves, so an interactive session is exactly where this happens.
+    """
+
+    if not path:
+        raise SystemExit(f"{flag} is empty; pass an absolute path to the model directory")
+    if not (Path(path) / "config.json").is_file():
+        raise SystemExit(
+            f"{flag}={path!r} is not a local model directory (no config.json inside).\n"
+            "If you used ${MODEL_DIR}, note that it is set inside the pbs scripts rather\n"
+            "than in an interactive shell, so it expands to nothing here."
+        )
+
+
+def check_local_model_dir(path: str, flag: str) -> None:
+    """Reject a path that is not a local checkpoint, before transformers sees it.
+
+    from_pretrained falls back to treating its argument as a Hub repo id, so an
+    unset ${MODEL_DIR} expanding to an empty string arrives as "/Qwen3-1.7B" and
+    surfaces as an HFValidationError about alphanumeric characters, three frames
+    deep and without naming the flag that was wrong. The shell variables the pbs
+    scripts define do not exist in an interactive session, which makes that the
+    likeliest way to call this script incorrectly.
+    """
+
+    if not path:
+        raise SystemExit(f"{flag} is empty; pass an absolute path to the checkpoint")
+    if not (Path(path) / "config.json").is_file():
+        raise SystemExit(
+            f"{flag}={path!r} is not a local model directory (no config.json inside).\n"
+            "If the path looks truncated, an unset shell variable expanded to an empty\n"
+            "string: MODEL_DIR and friends are set inside the pbs scripts, not in an\n"
+            "interactive shell."
+        )
 
 
 def load_linear_shapes(model_dir: str) -> tuple[dict[str, int], bool | None]:
@@ -319,8 +361,14 @@ def report(level: str, name: str, detail: str) -> None:
     print(f"[{level:<4}] {name}: {detail}")
 
 
-def verdict(rows: list[dict], args: argparse.Namespace) -> bool:
-    """Print the summary and return False only when the penalty is unusable as-is."""
+def verdict(rows: list[dict], args: argparse.Namespace) -> str:
+    """Print the summary and return "ok", "concentrated", or "dominated".
+
+    Three states rather than a boolean because the middle one is the interesting
+    answer. A largest share of, say, 40% is under any reasonable fail bar and is
+    still 80x an even split over 197 layers, which is not a penalty on 197 layers.
+    Collapsing that into "passed" would report the opposite of what it means.
+    """
 
     layers = len(rows)
     even = 1.0 / max(layers, 1)
@@ -380,7 +428,9 @@ def verdict(rows: list[dict], args: argparse.Namespace) -> bool:
             "       Re-run this script after either one; the largest share should land\n"
             f"       near {100.0 * even:.3f}%."
         )
-    return not dominated
+    if dominated:
+        return "dominated"
+    return "concentrated" if concentrated else "ok"
 
 
 def main() -> None:
@@ -394,6 +444,9 @@ def main() -> None:
     out_features: dict[str, int] = {}
     tied: bool | None = None
     if args.base_model_dir:
+        check_local_model_dir(args.base_model_dir, "--base_model_dir")
+        if args.trained_model_dir:
+            check_local_model_dir(args.trained_model_dir, "--trained_model_dir")
         out_features, tied = load_linear_shapes(args.base_model_dir)
         covered = [name for name in covariances if name in out_features]
         print(
@@ -436,7 +489,7 @@ def main() -> None:
         print_table(ordered[-5:], share_keys, "smallest 5 layers")
 
     print_by_kind(rows)
-    passed = verdict(rows, args)
+    status = verdict(rows, args)
 
     if args.out_json:
         Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)
@@ -452,15 +505,21 @@ def main() -> None:
         )
         print(f"\nwrote {args.out_json}")
 
-    if not passed:
-        # Printed rather than raised with a message, so it lands after the report
-        # on an unbuffered stdout instead of ahead of it on stderr.
+    # Printed rather than raised with a message, so the line lands after the report
+    # on stdout instead of ahead of it on stderr.
+    if status == "dominated":
         print(
             "\nPENALTY IS LAYER-DOMINATED: see the note above before trusting any "
             "full fine-tune result",
             flush=True,
         )
         raise SystemExit(1)
+    if status == "concentrated":
+        print(
+            "\nPENALTY IS CONCENTRATED: under the fail bar, but far from an even split. "
+            "Read the shares above before treating this as full-model protection."
+        )
+        return
     print("\nALL CHECKS PASSED: the penalty is spread across the layers it covers")
 
 
