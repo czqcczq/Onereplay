@@ -522,6 +522,23 @@ def ngram_hashes(tokens: np.ndarray, n: int, stride: int) -> set[bytes]:
     return out
 
 
+def ngram_hashes_u64(tokens: np.ndarray, n: int, stride: int) -> np.ndarray:
+    """同上，但返回 uint64 数组而不是 bytes 的 set。
+
+    参照集要装千万级指纹：Python 的 set 每个元素连对象带槽位约 80 字节，2000 万个就是
+    1.6 GB；uint64 数组是 160 MB，配 searchsorted 做成员查询还是对数时间。
+    """
+    idx = range(0, max(0, tokens.size - n + 1), stride)
+    return np.fromiter(
+        (
+            int.from_bytes(hashlib.blake2b(tokens[i : i + n].tobytes(), digest_size=8).digest(), "big")
+            for i in idx
+        ),
+        dtype=np.uint64,
+        count=len(idx),
+    )
+
+
 def check_leakage(args) -> int:
     """端到端的划分检查：不看代码，只看产物里 val/test 和 train 有没有共同的 50-gram。
 
@@ -608,25 +625,44 @@ def check_overlap(args) -> int:
     print(f"{args.n}-gram 重合（抽样）")
     print("=" * 70)
     tok = load_tokenizer(args.tokenizer_dir)
+    ref_docs = args.ref_docs or args.docs
 
-    def sample_ngrams(shards, tag, n_docs):
-        grams, got = set(), 0
+    def sample_ngrams(shards, tag, n_docs) -> np.ndarray:
+        """跨分片摊开取 n_docs 篇，返回去重排序后的 uint64 指纹。
+
+        摊开取而不是从头读到够：分片大致按抓取顺序排，只读前几个分片会偏向特定站点和
+        时间段，而参照集偏了就会低估重合率。
+        """
+        per_shard = max(1, n_docs // len(shards))
+        parts: list[np.ndarray] = []
+        got = 0
         for s in shards:
-            for batch in iter_parquet_batches(s, ("text",), batch_size=512):
+            in_shard = 0
+            for batch in iter_parquet_batches(s, ("text",), batch_size=min(per_shard, 512)):
                 for arr in encode_batch(tok, [t for t in batch["text"] if t]):
-                    grams |= ngram_hashes(arr, args.n, args.stride)
+                    g = ngram_hashes_u64(arr, args.n, args.stride)
+                    if g.size:
+                        parts.append(g)
+                in_shard += len(batch["text"])
                 got += len(batch["text"])
-                if got >= n_docs:
+                if in_shard >= per_shard:
                     break
-            if got >= n_docs:
-                break
-        print(f"  {tag}: {fmt_int(got)} 篇 → {fmt_int(len(grams))} 个指纹")
-        return grams
+        out = np.unique(np.concatenate(parts)) if parts else np.empty(0, dtype=np.uint64)
+        print(f"  {tag}: {fmt_int(got)} 篇 → {fmt_int(out.size)} 个指纹")
+        return out
 
-    ga = sample_ngrams(fwe, "fineweb-edu", args.docs)
-    gb = sample_ngrams(fm, "finemath", args.docs)
-    inter_g = ga & gb
-    print(f"\n  交集 {fmt_int(len(inter_g))}，占 finemath 抽样的 {len(inter_g) / max(1, len(gb)):.4%}")
+    # FineWeb-Edu 是参照集，FineMath 是查询集。要压低「重合率上界」这个数，该放大的是
+    # 参照集：基座见过的是完整的 1.3T，池子只是其中约 0.8%，参照集抽得越大，这个下界
+    # 离真值越近。查询集只需要能代表 FineMath 的分布，两万篇足够。
+    ga = sample_ngrams(fwe, "fineweb-edu（参照集）", ref_docs)
+    gb = sample_ngrams(fm, "finemath（查询集）", args.docs)
+
+    if ga.size and gb.size:
+        pos = np.clip(np.searchsorted(ga, gb), 0, ga.size - 1)
+        n_inter = int((ga[pos] == gb).sum())
+    else:
+        n_inter = 0
+    print(f"\n  交集 {fmt_int(n_inter)}，占 finemath 抽样的 {n_inter / max(1, gb.size):.4%}")
     print("\n  这两个数字用来决定 FineMath 能不能直接当第二个新域；Biomed 来自 PMC 全文，")
     print("  污染风险低一个量级，所以先做 Biomed，这项检查可以推迟但不能跳过。")
     return 0
@@ -694,7 +730,13 @@ def main(argv=None) -> int:
     p = sub.add_parser("overlap", help="FineMath 与 FineWeb-Edu 的 URL / n-gram 重合")
     p.add_argument("--n", type=int, default=50)
     p.add_argument("--stride", type=int, default=25)
-    p.add_argument("--docs", type=int, default=20000)
+    p.add_argument("--docs", type=int, default=20000, help="FineMath 侧（查询集）抽几篇")
+    p.add_argument(
+        "--ref-docs",
+        type=int,
+        help="FineWeb-Edu 侧（参照集）抽几篇，不给就同 --docs。"
+             "重合率是个下界，参照集越大这个界越紧；50 万篇约 2000 万指纹、160 MB",
+    )
     p.set_defaults(fn=check_overlap)
 
     args = ap.parse_args(argv)
