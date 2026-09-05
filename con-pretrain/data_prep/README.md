@@ -16,14 +16,13 @@ python -m data_prep.download --dataset biomed --dry-run
 con-pretrain/data/
   raw/                          # snapshot_download 落地的原始 parquet
     fineweb_edu_pool/           #   sample/10BT，14 片 28.5 GB
-    fineweb_edu_probe/          #   CC-MAIN-2024-18 及之后，按需取几片
     biomed/                     #   data/commercial-*，26 片 49 GB
     finemath/                   #   finemath-4plus，64 片 18.4 GB
   chunks/                       # litdata 产物，pretrain 直接读
     fineweb_edu/
       seg00/ seg01/ seg02/      #   replay 段，同时也是采 C 的来源
-      probe/                    #   干净的 held-out
-      pool_url_index.npy        #   10BT 的 URL 指纹，probe 排除用
+      probe/                    #   干净的 held-out，取自 2025 的 dump
+      pool_url_index.npy        #   10BT 的 URL 指纹，checks overlap 用
       replay_plan.json          #   每条臂读哪些段、各多少 token
     biomed/  train/ val/ test/
     finemath/ train/ val/ test/
@@ -71,15 +70,22 @@ wsl -e /home/czq/ENTER/bin/python test_code_CPT/setup_kres_env.py
 先 `--dry-run` 看清单和体积。
 
 ```bash
-python -m data_prep.download --dataset fineweb_edu_pool                    # 28.5 GB
-python -m data_prep.download --dataset fineweb_edu_probe --shards-per-dump 2  # 6.7 GB
-python -m data_prep.download --dataset biomed                             # 49 GB
-python -m data_prep.download --dataset finemath                           # 18.4 GB
+python -m data_prep.download --dataset fineweb_edu_pool   # 28.5 GB
+python -m data_prep.download --dataset fineweb_edu_probe  #  3.1 GB
+python -m data_prep.download --dataset biomed             # 49 GB
+python -m data_prep.download --dataset finemath           # 18.4 GB
 ```
 
-probe 默认取 `CC-MAIN-2024-18` 和 `CC-MAIN-2024-22` 各 2 片。**不能取 2024-18 之前的
-dump**：基座用的 FineWeb-Edu v1.0.0 覆盖到 `CC-MAIN-2024-10` 为止，更早的 dump 都在
-基座见过的池子里。脚本对此有硬检查。
+共约 99 GB。probe 默认取 `CC-MAIN-2025-18` 和 `CC-MAIN-2025-26` **各 1 片**（单片约
+1.4 GB ≈ 4.9 亿 token，而 probe 只要 16M，1 片就够了；取两个 dump 各 1 片是因为分片
+大致按抓取顺序排，跨爬取月份取样比在同一次爬取里多取一片更能代表旧分布）。
+
+**不能取 `CC-MAIN-2024-18` 之前的 dump**，脚本对此有硬检查。依据是查证过的：
+open-sci-ref 的论文、LAION 博客、GitHub 三处都把参考数据集写成
+「FineWeb-Edu-1.4T (v1.0.0)」，模型名里的 `-1.4t-` 就是他们给 v1.0.0 的版本标签
+（1.4T 是 1.3T 的 GPT-2 计数换成 GPT-NeoX-20B 的数）；而 HF 上 `v1.0.0` 分支实测是
+95 个 dump、最晚 `CC-MAIN-2024-10`，`2024-18` 是 `v1.2.0` 才加进来的。实际用 2025 的
+dump 又比这个下限隔了一年，就算基座用的其实是个稍新的快照也还在安全侧。
 
 ### 第 2 步：先量 token 数，再定 ppm
 
@@ -104,8 +110,22 @@ python -m data_prep.prepare_fineweb_edu --stage tokenize --role seg00 --pool-tok
 python -m data_prep.prepare_fineweb_edu --stage tokenize --role seg01 --pool-tokens <同>
 python -m data_prep.prepare_fineweb_edu --stage tokenize --role seg02 --pool-tokens <同>
 python -m data_prep.prepare_fineweb_edu --stage tokenize --role probe
-python -m data_prep.prepare_fineweb_edu --stage plan --pool-tokens <同>
+python -m data_prep.prepare_fineweb_edu --stage plan  --pool-tokens <同>
 ```
+
+`--pool-tokens` 三次分段调用和 `plan` 都必须传同一个值，`plan` 会把各段的 ppm 区间与
+本次换算结果逐一核对，不一致直接报错（边界一动，段之间就会重叠或漏文档）。
+
+probe 不需要 `--pool-tokens`：它换了来源，抽样 ppm 由 `--probe-tokens`（默认 16M）和
+probe 分片自己的 `token_count` 列自动换算，不用再手工量一个数。这里没沿用池子那套
+GPT-2→GPT-NeoX 的比值换算，因为 probe 的 token 数不是实验变量，差几个百分点不影响任何
+结论；池子那边必须换算，段的 token 数就是 replay 1B/4B/8B 本身。
+
+`--probe-tokens` 是 **URL 排除之前**的量。排除发生在抽样之后，所以最终会少掉与 10BT
+重合的那一部分，跑完会把目标和实际并排打出来；剩不到一半会警告（说明 dump 选得太旧）。
+
+`url-index` 必须在 probe 之前跑：probe 靠它排除 10BT 的 URL。它同时也给 `checks
+overlap` 检测新域（FineMath）与 FineWeb-Edu 的 URL 重合。
 
 `pool-tokens` 单独做一个子命令而不是复用 `token-count`，是因为估偏的代价太高：三段
 tokenize 各要过一遍 28.5GB，估偏几个百分点就得整个重跑。`token-count` 用的是「头部抽样
@@ -282,4 +302,4 @@ wsl -e /home/czq/ENTER/bin/python test_code_CPT/run_kres.py pipeline.log \
 它造一批合成 parquet（段落级、段落号有空洞且行序打乱、文章跨分片、混多语种），
 给每篇文章埋唯一标记，跑完整流水线后把产物解码回文本、抽出标记，直接验证三个 split
 的文章集合互不相交、每篇落在 Router 预测的 split、全 fr 文章被过滤、段落被正确重组，
-以及 probe 的 URL 排除真的生效。
+以及 probe 的 URL 排除真的生效、抽样 ppm 与 token_count 换算出的一致。

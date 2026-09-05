@@ -45,8 +45,8 @@ DEFAULT_CHUNKS = ROOT / "data" / "chunks"
 
 # 各数据集的正文列与主键列，token-count / overlap 都靠这张表定位
 SOURCE = {
-    "fineweb_edu_pool": ("fineweb_edu_pool", "text", "id"),
     "fineweb_edu_probe": ("fineweb_edu_probe", "text", "id"),
+    "fineweb_edu_pool": ("fineweb_edu_pool", "text", "id"),
     "biomed": ("biomed", "text", "article_id"),
     "finemath": ("finemath", "text", "url"),
 }
