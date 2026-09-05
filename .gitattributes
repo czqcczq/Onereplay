@@ -1,0 +1,14 @@
+# con-pretrain 会被 git subtree split 成独立的 cpt 分支，那时这个目录就是仓库根，
+# 外层仓库的 .gitattributes 不跟着走。集群上的 bash 不吃 CRLF（`cleanup () {` 会报
+# syntax error near unexpected token $'{\r'），所以脚本类文件在这里再钉一次 LF。
+*.pbs text eol=lf
+*.sh text eol=lf
+*.slurm text eol=lf
+*.py text eol=lf
+*.jsonl text eol=lf
+
+*.pt binary
+*.bin binary
+*.safetensors binary
+*.npy binary
+*.parquet binary

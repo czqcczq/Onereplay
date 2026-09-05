@@ -1,0 +1,515 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N kres_cov
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto 
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/kres/
+#
+# =============================================================================
+# CPT Stage 1：在冻结的 open-sci-ref 基座上采集 C = E[x xᵀ]
+#
+# 一段一次，采完按 token 计数加权合并成各臂的 C。段目录同时就是那条臂 replay 用的
+# 目录，这是设计要求：本方法要论证「用旧数据估出来的 C 可以替代重放这些旧数据」，
+# 两条臂必须面对同一批旧数据。目录由 replay_plan.json 给定，脚本不自己拼 seg%02d。
+#
+# -----------------------------------------------------------------------------
+# 为什么 --cov-tokens 要按段的实测大小给，而不是用默认的 5e8
+#
+#   collect_cov 默认只采 5e8 token 就停。三段大小是 1.00B / 3.01B / 4.00B，各采 5e8
+#   的话每段的 counts 都是 5e8，而 mix_covariances 正是按 counts 加权——合出来的
+#   C 就变成三段等权，可实际比例是 1:3:4。那样得到的不是并集的 C。
+#
+#   本脚本从 replay_plan.json 读每段的实测 tokens 当 --cov-tokens，于是每段跑满一个
+#   epoch：dataloader 读完自然结束，counts 就是该段的真实 token 数，加权合并与
+#   「直接在并集上采一次」严格等价（存的是 C_k = Σxxᵀ/n_k 和 n_k，
+#   Σ(C_k·n_k)/Σn_k 正好还原成 Σxxᵀ/Σn）。
+#
+#   chunk 末尾不足一个 block 的 token 会被丢弃（约 0.01%），所以实际读到的比写入量
+#   略少，循环会在数据读完时自己退出，不会重复读。这正是我们要的「跑满一个 epoch」。
+#
+# -----------------------------------------------------------------------------
+# !! 不要 torch.compile
+#   编译会给模块名加 `_orig_mod.` 前缀，而且在编译后的子模块上挂 forward hook 会
+#   graph break 或被静默跳过。covariance.find_target_linears 对此有硬检查。
+#
+# !! 目录名不能叫 litgpt
+#   con-pretrain/ 下跑 `python -m kres.xxx` 时 cwd 进 sys.path，若这里有个名为
+#   litgpt 的目录（litgpt 仓库根不是 python 包），import litgpt 会命中它，
+#   报 `No module named 'litgpt.tokenizer'`。所以源码装在 litgpt-src/。
+#   Preflight 会拦这个。
+#
+# -----------------------------------------------------------------------------
+# 时间：**不要相信拍脑袋的估计，跑 SMOKE=1 让它算**
+#
+#   seq_len 4096、micro_batch 4 时每 batch 16384 token，三段共 8.01B token 约 49 万
+#   batch。总时长 = 49万 × s/batch，而 s/batch 事先不好估：hook 里每层要做一次
+#   xᵀx（对 in_features=d 的层是 2·N·d² FLOPs），把所有目标层加起来，这部分的量级
+#   和前向本身相当，也就是说采 C 大约是纯前向的两倍开销。到底多少要实测。
+#
+#   SMOKE=1 跑完会直接打印每段的预计耗时和建议 walltime，按那个数改本文件顶部的
+#   `#PBS -l walltime=`。若排不下，最有效的杠杆是 FORWARD_DTYPE=bfloat16（与训练时
+#   bf16-mixed 看到的激活精度一致，XᵀX 仍是 fp32 累加），通常能省一半以上。
+#
+#   默认 SEG=all 配合「产物已存在就跳过」：超时了重投一次会从没采完的那段继续，
+#   已完成的段不会重跑。但**中途超时的那一段会白跑**，稳妥做法是一段一投：
+#
+#     qsub -v SEG=seg00 con-pretrain/pbs/01_collect_cov_fineweb.pbs
+#     qsub -v SEG=seg01 con-pretrain/pbs/01_collect_cov_fineweb.pbs
+#     qsub -v SEG=seg02 con-pretrain/pbs/01_collect_cov_fineweb.pbs
+#
+#   三段互不依赖，可以同时排队。合并（DO_MIX）只在三段都齐了才做，是纯 CPU 的加权
+#   求和，几分钟。
+#
+# -----------------------------------------------------------------------------
+# 用法
+#
+#   qsub -v SMOKE=1 con-pretrain/pbs/01_collect_cov_fineweb.pbs
+#       几分钟冒烟：只跑 50 个 batch，写到临时目录，然后 inspect_cov + 推算耗时。
+#       **第一次务必先跑这个**，确认 hook 全挂上、目标层数对、C 不病态，
+#       并拿到实测 s/batch 去定 walltime，再提交十几个小时的正式作业。
+#
+#   qsub -v PREFLIGHT_ONLY=1 ...    只做前置检查，不上 GPU
+#   qsub -v SEG=seg01 ...           只采某一段
+#   qsub -v FORCE=1 ...             产物已存在也重采
+#   qsub -v DO_MIX=0 ...            采完不合并
+#
+#   本站点 qsub 有时不吃 -v，那就直接改下面「可调项」段的默认值。
+#
+# 前置条件
+#   1) data/chunks/fineweb_edu/{seg00,seg01,seg02} 与 replay_plan.json 就位
+#   2) model/<基座>/lit_model.pth 与 model_config.yaml 就位（HF→litgpt 转换已做）
+#   3) litgpt-src 已 pip install -e（打过 open-sci-ref 补丁的那份）
+#   4) mkdir -p /scratch/weiliu87/logs/kres
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/con-pretrain}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/pbs/01_collect_cov_fineweb.pbs}"
+
+# NGC 24.04 = ubuntu22.04 + python3.10。不要用裸 cuda:*-u20.04（自带 python3.8，
+# venv 的 bin/python 只是指向创建它那个解释器的软链，版本对不上 venv 起不来）。
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_kres_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_kres_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  # 只删本次作业自己建的那一个目录，且必须匹配前缀，避免手滑清掉共享缓存。
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_kres_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  # PBS 起的 shell 不一定是 login shell，module 可能还没定义；set -e 下那会让作业
+  # 在第一步就静默挂掉，所以先兜一层初始化。
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR CHUNKS_ROOT PLAN COV_DIR
+    SEG SMOKE FORCE PREFLIGHT_ONLY DO_MIX
+    COV_TOKENS MICRO_BATCH SEQ_LEN NUM_WORKERS SEED FORWARD_DTYPE
+    LOG_EVERY SMOKE_BATCHES
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_KRES_IN_CONTAINER=1
+  export APPTAINERENV_KRES_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的采集流程。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 计算节点离线：禁止任何 HuggingFace 联网调用。采 C 只读本地 checkpoint 和本地 chunk。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+# ---- 可调项（qsub -v 不生效时直接改这里的默认值）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/model/open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096}"
+CHUNKS_ROOT="${CHUNKS_ROOT:-${REPO_ROOT}/data/chunks/fineweb_edu}"
+PLAN="${PLAN:-${CHUNKS_ROOT}/replay_plan.json}"
+COV_DIR="${COV_DIR:-${REPO_ROOT}/cov}"
+
+SEG="${SEG:-all}"                    # seg00 / seg01 / seg02 / all
+SMOKE="${SMOKE:-0}"                  # 1 = 只跑 SMOKE_BATCHES 个 batch，写临时目录
+# 50 而不是 20：这批 batch 还要用来推正式作业的耗时，样本太少会被首批 CUDA 预热带偏。
+SMOKE_BATCHES="${SMOKE_BATCHES:-50}"
+FORCE="${FORCE:-0}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+DO_MIX="${DO_MIX:-1}"
+
+# 与训练保持一致。改了这三个，C 描述的就不是训练时会遇到的那个分布了。
+MICRO_BATCH="${MICRO_BATCH:-4}"
+SEQ_LEN="${SEQ_LEN:-4096}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+SEED="${SEED:-42}"
+# float32 是对冻结基座的忠实求值、可复现；bfloat16 与训练时（bf16-mixed）看到的
+# 激活精度一致但更快。无论哪个，XᵀX 一律 fp32 累加。
+FORWARD_DTYPE="${FORWARD_DTYPE:-float32}"
+LOG_EVERY="${LOG_EVERY:-200}"
+
+cd "${REPO_ROOT}"
+mkdir -p "${COV_DIR}"
+
+echo "========================================================================"
+echo "REPO_ROOT   = ${REPO_ROOT}"
+echo "MODEL_DIR   = ${MODEL_DIR}"
+echo "CHUNKS_ROOT = ${CHUNKS_ROOT}"
+echo "PLAN        = ${PLAN}"
+echo "COV_DIR     = ${COV_DIR}"
+echo "SEG=${SEG} SMOKE=${SMOKE} FORCE=${FORCE} DO_MIX=${DO_MIX}"
+echo "micro_batch=${MICRO_BATCH} seq_len=${SEQ_LEN} dtype=${FORWARD_DTYPE} seed=${SEED}"
+echo "========================================================================"
+
+echo "Python : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ===========================================================================
+# Step 0: Preflight（纯 CPU，一分钟）
+#   上 GPU 之前把所有「跑到一半才发现」的失败前移。
+# ===========================================================================
+echo "==== Step 0: preflight ===="
+
+# 0a. litgpt 不能被同名目录遮蔽，且必须是打过补丁的那份
+if [[ -e "${REPO_ROOT}/litgpt" ]]; then
+  echo "FAILED: ${REPO_ROOT}/litgpt 存在。它会遮蔽已安装的 litgpt 包"
+  echo "        （仓库根不是 python 包，import litgpt 会命中它）。"
+  echo "        删掉它或改名为 litgpt-src。"
+  exit 1
+fi
+
+# 0b. 模型文件。放在 python 检查之前，好让下面能直接拿 model_config.yaml 去验。
+[[ -f "${MODEL_DIR}/model_config.yaml" ]] || { echo "缺 ${MODEL_DIR}/model_config.yaml"; exit 1; }
+[[ -f "${MODEL_DIR}/lit_model.pth" ]] || {
+  echo "缺 ${MODEL_DIR}/lit_model.pth —— HF→litgpt 转换还没做。在登录节点跑："
+  echo "  python -c \"from pathlib import Path; from litgpt.scripts.convert_hf_checkpoint import convert_hf_checkpoint; convert_hf_checkpoint(checkpoint_dir=Path('${MODEL_DIR}'), dtype='float32')\""
+  exit 1
+}
+[[ -f "${PLAN}" ]] || { echo "缺 ${PLAN}，先跑 data_prep.prepare_fineweb_edu --stage plan"; exit 1; }
+
+# 0c. litgpt 装对了没，且这个基座 litgpt 认得。
+#     走的是 collect_cov 真正会走的那条路（Config.from_file），不是另编一个检查。
+#     另外验一次 from_name：注册表里没有 open-sci-ref 就说明装的是未打补丁的上游
+#     litgpt，采 C 虽然只用 from_file 不受影响，但转换和后续训练都会挂。
+python - "${MODEL_DIR}" <<'PY'
+import sys
+from pathlib import Path
+
+import litgpt
+from litgpt.config import Config
+
+model_dir = Path(sys.argv[1])
+print(f"python  {sys.version.split()[0]}")
+print(f"litgpt  {litgpt.__file__}")
+
+cfg = Config.from_file(model_dir / "model_config.yaml")
+print(f"config  name={cfg.name} n_layer={cfg.n_layer} n_embd={cfg.n_embd} "
+      f"block_size={cfg.block_size} norm_qk={cfg.norm_qk}")
+
+try:
+    Config.from_name(cfg.name)
+except ValueError:
+    raise SystemExit(
+        f"litgpt 的注册表里没有 {cfg.name!r}，装的是未打补丁的上游 litgpt。\n"
+        "采 C 走 from_file 不受影响，但 convert_hf_checkpoint 和后续 pretrain 都会挂，\n"
+        "先把 litgpt-src 换成打了 open-sci-ref 补丁的那份再跑。"
+    )
+
+import torch
+
+print(f"torch   {torch.__version__}  cuda={torch.cuda.is_available()} count={torch.cuda.device_count()}")
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA 不可用。采 C 在 CPU 上慢到不可用，先查 -l select=1:ngpus=1 有没有生效")
+PY
+
+# 0d. 从 plan 读段名与实测 token 数。不自己拼 seg%02d：plan 是 replay 侧和 C 侧
+#     唯一的真相来源，两边各拼一次就有各拼错一次的机会。
+#
+#     写临时文件而不是 mapfile < <(python ...)：进程替换的退出码不进 pipefail，
+#     python 里 raise SystemExit 只会让 mapfile 读到 0 行，作业带着一个误导性的
+#     「plan 里没有 segments」继续走，真正的报错被吞掉。
+SEG_TSV="${JOB_TMPDIR}/segments.tsv"
+python - "${PLAN}" "${CHUNKS_ROOT}" > "${SEG_TSV}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+chunks_root = Path(sys.argv[2])
+for seg in plan["segments"]:
+    name, tokens = seg["name"], int(seg["tokens"])
+    if tokens <= 0:
+        raise SystemExit(f"plan 里 {name} 的 tokens 是 {tokens}，那一段没采成，重跑 tokenize")
+    d = chunks_root / name
+    if not (d / "index.json").exists():
+        raise SystemExit(f"{d} 下没有 index.json，chunk 不完整")
+    # plan 里记的绝对路径若与当前根不一致，多半是数据被搬过；采到的还是对的目录，
+    # 但 plan 里的 replay_dirs 会指向旧位置，训练侧读 plan 会出错，先提醒。
+    if Path(seg["dir"]).resolve() != d.resolve():
+        print(f"#WARN {name} plan 记的是 {seg['dir']}，实际用 {d}", file=sys.stderr)
+    print(f"{name}\t{tokens}")
+PY
+mapfile -t SEG_LINES < "${SEG_TSV}"
+[[ ${#SEG_LINES[@]} -gt 0 ]] || { echo "plan 里没有 segments"; exit 1; }
+
+echo "plan 里的段："
+for line in "${SEG_LINES[@]}"; do
+  name="${line%%$'\t'*}"; tokens="${line##*$'\t'}"
+  printf "  %-8s %16s token\n" "${name}" "${tokens}"
+done
+
+# 0e. 要采哪些段
+TARGETS=()
+if [[ "${SEG}" == "all" ]]; then
+  for line in "${SEG_LINES[@]}"; do TARGETS+=("${line}"); done
+else
+  # 用 if 而不是 `[[ ... ]] && TARGETS+=(...)`：后者作为循环体最后一条命令时，
+  # 最后一轮不匹配会让整个 for 返回非零，set -e 下脚本就在这里无声退出了。
+  for line in "${SEG_LINES[@]}"; do
+    if [[ "${line%%$'\t'*}" == "${SEG}" ]]; then
+      TARGETS+=("${line}")
+    fi
+  done
+  [[ ${#TARGETS[@]} -gt 0 ]] || { echo "SEG=${SEG} 不在 plan 的段列表里"; exit 1; }
+fi
+echo "本次要采: ${#TARGETS[@]} 段"
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：只做前置检查，不上 GPU。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 冒烟（SMOKE=1）
+#   20 个 batch 就能暴露绝大多数问题：hook 没挂上（collect_cov 会硬断言各层 token
+#   计数一致）、目标层数不对、C 病态。SFT 那边采出过 99.995% 的迹集中在单个方向、
+#   层间保护强度差 6.13e4 倍的 C，成因是 left padding + chat 模板；打包语料应当
+#   消失，但要当场验，别等训练。
+# ===========================================================================
+if [[ "${SMOKE}" == "1" ]]; then
+  SEG_NAME="${TARGETS[0]%%$'\t'*}"
+  SMOKE_OUT="${JOB_TMPDIR}/smoke_${SEG_NAME}.pt"
+  echo "==== SMOKE: ${SEG_NAME}，${SMOKE_BATCHES} 个 batch -> ${SMOKE_OUT} ===="
+  python -m kres.collect_cov \
+    --chunks "${CHUNKS_ROOT}/${SEG_NAME}" \
+    --output "${SMOKE_OUT}" \
+    --model-dir "${MODEL_DIR}" \
+    --cov-tokens 1e9 \
+    --max-batches "${SMOKE_BATCHES}" \
+    --micro-batch-size "${MICRO_BATCH}" \
+    --seq-len "${SEQ_LEN}" \
+    --num-workers "${NUM_WORKERS}" \
+    --seed "${SEED}" \
+    --forward-dtype "${FORWARD_DTYPE}" \
+    --log-every 5
+
+  echo "==== SMOKE: inspect_cov ===="
+  python -m kres.inspect_cov --cov "${SMOKE_OUT}" --model-dir "${MODEL_DIR}"
+
+  # 用实测 s/batch 推正式作业要多久。metadata 里的 elapsed_seconds 含模型加载后的
+  # 首批 CUDA 预热，样本又只有几十个 batch，所以这是个偏保守（偏大）的估计——用来
+  # 定 walltime 正合适。
+  echo "==== SMOKE: 据实测速度推算正式作业耗时 ===="
+  python - "${SMOKE_OUT}" "${SEG_TSV}" "${MICRO_BATCH}" "${SEQ_LEN}" <<'PY'
+import sys
+from pathlib import Path
+
+from kres.covariance import load_covariance_payload
+
+meta = load_covariance_payload(sys.argv[1])["metadata"]
+sec_per_batch = meta["elapsed_seconds"] / meta["batches"]
+tokens_per_batch = int(sys.argv[3]) * int(sys.argv[4])
+
+print(f"实测 {sec_per_batch:.3f} s/batch  ({tokens_per_batch:,} token/batch, "
+      f"dtype={meta['forward_dtype']}, {meta['target_layers']} 个目标层)")
+print("（含预热，偏保守）\n")
+
+print(f"  {'段':<8}{'token':>16}{'batch':>12}{'预计':>10}")
+hours_per_seg = []
+for line in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines():
+    if not line.strip():
+        continue
+    name, tokens = line.split("\t")
+    batches = int(tokens) / tokens_per_batch
+    hours = batches * sec_per_batch / 3600
+    hours_per_seg.append(hours)
+    print(f"  {name:<8}{int(tokens):>16,}{batches:>12,.0f}{hours:>9.1f}h")
+
+total = sum(hours_per_seg)
+per_seg_max = max(hours_per_seg)
+print(f"  {'合计':<8}{'':>16}{'':>12}{total:>9.1f}h\n")
+
+print(f"一段一投：最长的那段要 {per_seg_max:.1f}h，walltime 建议 "
+      f"{max(2, int(per_seg_max * 1.5) + 1)}:00:00")
+print(f"SEG=all ：要 {total:.1f}h，walltime 建议 "
+      f"{max(2, int(total * 1.3) + 1)}:00:00")
+if per_seg_max > 24:
+    print("\n最长那段单独就超过 24h。改 FORWARD_DTYPE=bfloat16（与训练时 bf16-mixed 的")
+    print("激活精度一致，XᵀX 仍 fp32 累加）通常能省一半以上，先用它再冒烟一次。")
+PY
+
+  echo "========================================================================"
+  echo "冒烟通过。两件事确认完再投正式作业："
+  echo "  1) 上面 inspect_cov 的层间分布与谱集中度没有异常"
+  echo "  2) 按上面的建议改本文件顶部的 #PBS -l walltime="
+  echo "然后："
+  echo "  qsub -v SEG=seg00 ${SELF_PATH}"
+  echo "  qsub -v SEG=seg01 ${SELF_PATH}"
+  echo "  qsub -v SEG=seg02 ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 2: 逐段采集
+#   --cov-tokens 用 plan 里的实测 tokens，让每段跑满一个 epoch，理由见文件头。
+# ===========================================================================
+for line in "${TARGETS[@]}"; do
+  SEG_NAME="${line%%$'\t'*}"
+  SEG_TOKENS="${line##*$'\t'}"
+  OUT="${COV_DIR}/${SEG_NAME}.pt"
+
+  if [[ "${FORCE}" != "1" && -f "${OUT}" ]]; then
+    echo "==== 跳过 ${SEG_NAME}：${OUT} 已存在（FORCE=1 可强制重采）===="
+    continue
+  fi
+
+  echo "========================================================================"
+  echo "==== collect ${SEG_NAME}: ${SEG_TOKENS} token -> ${OUT} ===="
+  echo "     开始于 $(date)"
+  python -m kres.collect_cov \
+    --chunks "${CHUNKS_ROOT}/${SEG_NAME}" \
+    --output "${OUT}" \
+    --model-dir "${MODEL_DIR}" \
+    --cov-tokens "${SEG_TOKENS}" \
+    --micro-batch-size "${MICRO_BATCH}" \
+    --seq-len "${SEQ_LEN}" \
+    --num-workers "${NUM_WORKERS}" \
+    --seed "${SEED}" \
+    --forward-dtype "${FORWARD_DTYPE}" \
+    --log-every "${LOG_EVERY}" \
+    2>&1 | tee "${OUT%.pt}.collect.log"
+
+  echo "==== inspect ${SEG_NAME} ===="
+  python -m kres.inspect_cov --cov "${OUT}" --model-dir "${MODEL_DIR}" \
+    --out-json "${OUT%.pt}.inspect.json"
+done
+
+# ===========================================================================
+# Step 3: 合并成各臂的 C（纯 CPU 加权求和，几分钟）
+#   第 1 条臂只读 seg00，它的 C 就是 cov/seg00.pt 本身——mix_covariances 少于两个
+#   输入会直接报错，所以从第 2 条臂开始合。
+#   --from-plan 会核对 replay_dirs == cov_dirs，这是「replay 与 C 同源」的机械保证。
+# ===========================================================================
+if [[ "${DO_MIX}" != "1" ]]; then
+  echo "DO_MIX=0：不合并。"
+else
+  MISSING=0
+  for line in "${SEG_LINES[@]}"; do
+    name="${line%%$'\t'*}"
+    [[ -f "${COV_DIR}/${name}.pt" ]] || { echo "还缺 ${COV_DIR}/${name}.pt"; MISSING=1; }
+  done
+  if [[ "${MISSING}" == "1" ]]; then
+    echo "==== 跳过合并：还有段没采完，等三段齐了重投一次（已采的会自动跳过）===="
+  else
+    N_ARMS="$(python -c "import json,sys;print(len(json.load(open(sys.argv[1]))['arms']))" "${PLAN}")"
+    echo "==== 合并 ${N_ARMS} 条臂（第 1 条就是 seg00.pt 本身，不用合）===="
+    for ((arm = 2; arm <= N_ARMS; arm++)); do
+      ARM_OUT="${COV_DIR}/arm${arm}.pt"
+      if [[ "${FORCE}" != "1" && -f "${ARM_OUT}" ]]; then
+        echo "跳过 arm${arm}：${ARM_OUT} 已存在"
+        continue
+      fi
+      python -m kres.mix_covariances \
+        --from-plan "${PLAN}" --arm "${arm}" \
+        --cov-dir "${COV_DIR}" --output "${ARM_OUT}"
+      python -m kres.inspect_cov --cov "${ARM_OUT}" --model-dir "${MODEL_DIR}" \
+        --out-json "${ARM_OUT%.pt}.inspect.json"
+    done
+  fi
+fi
+
+echo "========================================================================"
+echo "产物："
+ls -lh "${COV_DIR}" || true
+cat <<EOF
+
+各臂的 C（arm 编号与 replay_plan.json 的 arms 顺序一致）：
+  arm 1 (replay 1B) -> ${COV_DIR}/seg00.pt      （单段，不需要合并）
+  arm 2 (replay 4B) -> ${COV_DIR}/arm2.pt       （seg00+seg01）
+  arm 3 (replay 8B) -> ${COV_DIR}/arm3.pt       （seg00+seg01+seg02）
+
+下一步：核对 inspect_cov 的层间分布。若层间保护强度差到 1e4 量级，
+那就不是数据管线的问题，得回到 C 的定义本身。
+EOF
+echo "Job finished at: $(date)"
