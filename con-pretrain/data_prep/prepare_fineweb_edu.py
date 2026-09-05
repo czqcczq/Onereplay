@@ -72,6 +72,7 @@ from data_prep.common import (
     segment_name,
     segment_ppms_from_tokens,
     segment_router,
+    shard_tag,
     subsample_router,
     url_hashes,
     write_manifest,
@@ -163,7 +164,7 @@ def tokenize_shard(
             st.add("tokens_written", int(arr.size))
             yield arr
 
-    st.dump(stats_dir, f"{role}-{Path(shard).stem}")
+    st.dump(stats_dir, f"{role}-{shard_tag(shard)}")
 
 
 def probe_source_tokens(shards: list[str], batch_size: int) -> int:
@@ -518,7 +519,7 @@ def main(argv=None) -> int:
             "probe_tokens_target": int(args.probe_tokens) if args.role == "probe" else None,
             "probe_ppm": probe_ppm,
             "source_dir": str(src),
-            "shards": [Path(s).name for s in shards],
+            "shards": [shard_tag(s) for s in shards],
             "doc_key": DOC_KEY["fineweb_edu"],
             "router": router.describe(),
             "url_exclusion": exclude_path,

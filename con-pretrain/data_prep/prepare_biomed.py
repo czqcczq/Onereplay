@@ -57,6 +57,7 @@ from data_prep.common import (
     iter_parquet_batches,
     load_tokenizer,
     merge_stats,
+    shard_tag,
     three_way_router,
     write_manifest,
     write_token_chunks,
@@ -184,7 +185,7 @@ def tokenize_shard(
     if pending:
         yield from encode_articles(tok, pending, st)
 
-    st.dump(stats_dir, f"{split}-{Path(shard).stem}")
+    st.dump(stats_dir, f"{split}-{shard_tag(shard)}")
 
 
 def main(argv=None) -> int:
@@ -290,7 +291,7 @@ def main(argv=None) -> int:
             "hf_split": "commercial",
             "split": args.split,
             "source_dir": str(args.raw_dir),
-            "shards": [Path(s).name for s in shards],
+            "shards": [shard_tag(s) for s in shards],
             "doc_key": DOC_KEY["biomed"],
             "router": router.describe(),
             "train_tokens_target": args.train_tokens,
