@@ -1,0 +1,25 @@
+# 这份是给 `git subtree split --prefix=con-pretrain` 切出来的 cpt 分支用的：
+# 那个分支以本目录为仓库根，看不到仓库根那份 .gitignore，规则必须在这里重复一遍。
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 原始 parquet 和 litdata chunk，几十到几百 GB。集群上这通常是指向大存储的软链。
+data/
+
+# litgpt 源码。目录名和 python 包同名，而它是仓库根不是包，在本目录下跑
+# `python -m data_prep.xxx` 时 cwd 进 sys.path，import litgpt 会命中这个目录，
+# 报 `No module named 'litgpt.tokenizer'`。
+litgpt/
+
+# 模型权重与协方差产物
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.npy
+*.npz
+
+*.log
