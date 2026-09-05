@@ -4,14 +4,14 @@
 所以下载和后面的 prepare 都必须在登录节点做完，进队列时只能读本地文件。
 
 分片数量是显式参数而不是「下整个 config」，因为体积差别巨大：
-  fineweb-edu sample/10BT   14 片   28.5 GB   —— 全要（replay 池 + 采 C 的来源）
-  fineweb-edu CC-MAIN-2024-18  50 片  55.2 GB —— 只要 2~4 片，probe 用不了几千万 token
+  fineweb-edu sample/10BT   14 片   28.5 GB  —— 全要（replay 池 + 采 C 的来源）
+  fineweb-edu CC-MAIN-2025-*   每 dump 50 片 约 50 GB —— 只要 2 片，probe 用不了几千万 token
   finemath   finemath-4plus  64 片   18.4 GB  —— 全要
   Biomed-Enriched data/commercial-*  26 片  49.0 GB —— 全要
 
 用法（先 --dry-run 看清单和体积，再去掉它真下）：
     python -m data_prep.download --dataset fineweb_edu_pool  --dry-run
-    python -m data_prep.download --dataset fineweb_edu_probe --probe-dumps CC-MAIN-2024-18,CC-MAIN-2024-22 --shards-per-dump 2
+    python -m data_prep.download --dataset fineweb_edu_probe
     python -m data_prep.download --dataset biomed
     python -m data_prep.download --dataset finemath
 """
@@ -28,10 +28,16 @@ FINEWEB_REPO = "HuggingFaceFW/fineweb-edu"
 FINEMATH_REPO = "HuggingFaceTB/finemath"
 BIOMED_REPO = "almanach/Biomed-Enriched"
 
-# 基座 open-sci-ref-v0.02 用的 FineWeb-Edu v1.0.0 覆盖到 CC-MAIN-2024-10 为止，
-# 所以干净的 held-out probe 只能取 2024-18 及之后的 dump。
+# 基座 open-sci-ref-v0.02 训在 FineWeb-Edu-1.4T 上，而 open-sci-ref 的论文、LAION 博客
+# 和 GitHub 三处都把这个参考数据集写成「FineWeb-Edu-1.4T (v1.0.0)」——模型名里的
+# `-1.4t-` 就是他们给 v1.0.0 的版本标签（1.4T 是 1.3T 的 GPT-2 计数换成 GPT-NeoX-20B
+# 的数）。而 v1.0.0 分支实测是 95 个 dump、最晚 CC-MAIN-2024-10（2024-18 是 v1.2.0
+# 才加的），所以 2024-18 及之后基座都没见过，这是硬下限。
 FIRST_CLEAN_DUMP = "CC-MAIN-2024-18"
-DEFAULT_PROBE_DUMPS = ("CC-MAIN-2024-18", "CC-MAIN-2024-22")
+# 实际取 2025 的 dump：比下限又隔了一年，就算基座用的其实是个稍新的快照也还在安全侧。
+# 两个 dump 各取 1 片而不是一个 dump 取 2 片——分片大致按抓取顺序排，跨爬取月份取样
+# 比在同一次爬取里多取一片更能代表「旧的 web-edu 分布」。
+DEFAULT_PROBE_DUMPS = ("CC-MAIN-2025-18", "CC-MAIN-2025-26")
 
 
 def list_shards(repo: str, prefix: str) -> list[tuple[str, int]]:
@@ -90,8 +96,17 @@ def main(argv=None) -> int:
         choices=["fineweb_edu_pool", "fineweb_edu_probe", "finemath", "biomed"],
     )
     ap.add_argument("--raw-root", type=Path, default=DEFAULT_RAW_ROOT, help="原始 parquet 落地根目录")
-    ap.add_argument("--probe-dumps", default=",".join(DEFAULT_PROBE_DUMPS), help="probe 用哪些 CC dump（逗号分隔）")
-    ap.add_argument("--shards-per-dump", type=int, default=2, help="每个 probe dump 取几个分片")
+    ap.add_argument(
+        "--probe-dumps",
+        default=",".join(DEFAULT_PROBE_DUMPS),
+        help="probe 用哪些 CC dump（逗号分隔）。必须不早于 " + FIRST_CLEAN_DUMP,
+    )
+    ap.add_argument(
+        "--shards-per-dump",
+        type=int,
+        default=1,
+        help="每个 probe dump 取几个分片。单片约 1.4 GB ≈ 4.9 亿 token，probe 只要几千万，1 片就够",
+    )
     ap.add_argument("--workers", type=int, default=8, help="并发下载数")
     ap.add_argument("--dry-run", action="store_true", help="只打印清单和体积，不下载")
     args = ap.parse_args(argv)

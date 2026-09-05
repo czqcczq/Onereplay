@@ -13,13 +13,16 @@ sample-10BT 被切成若干**累积嵌套**的段，每一段既是某条 replay
 要求 shuffle seed、batch size、worker 数、以及混合 dataloader 的交错方式全都一致，任何
 一个变了就悄悄不成立。
 
-`probe` 必须换来源。sample-10BT 整个取自 FineWeb-Edu v1.0.0 的池子，而基座就是在
-v1.0.0 上训的，拿它当 held-out 大约 23% 是污染的。干净的 probe 取 CC-MAIN-2024-18 及
-之后的 dump（v1.0.0 之后才加入，基座证明没见过），再按 URL 减掉与 10BT 池子重合的部分。
+`probe` 必须换来源。sample-10BT 整个取自 FineWeb-Edu v1.0.0，而基座就是在 v1.0.0 上
+训的（open-sci-ref 的论文/博客/GitHub 都写「FineWeb-Edu-1.4T (v1.0.0)」，模型名里的
+`-1.4t-` 就是这个版本标签），拿它当 held-out 是污染的。干净的 probe 取 2025 的 CC
+dump——v1.0.0 实测只收到 `CC-MAIN-2024-10`，2025 的又比这个下限隔了一年，就算基座用的
+其实是个稍新的快照也还在安全侧——再按 URL 减掉与 10BT 重合的部分（同一个网页会被反复
+爬到，不减掉就有一小部分是基座真训过的）。
 
 四个 stage，按顺序跑：
 
-    # 1) 建 10BT 池子的 URL 指纹索引（probe 排除用）
+    # 1) 建 10BT 池子的 URL 指纹索引（probe 排除用，也给 checks overlap 用）
     python -m data_prep.prepare_fineweb_edu --stage url-index
 
     # 2) 各个 replay 段（一段一次调用，--replay-tokens 和 --pool-tokens 必须每次都一样）
@@ -27,7 +30,7 @@ v1.0.0 上训的，拿它当 held-out 大约 23% 是污染的。干净的 probe 
     python -m data_prep.prepare_fineweb_edu --stage tokenize --role seg01 --pool-tokens 1.03e10
     python -m data_prep.prepare_fineweb_edu --stage tokenize --role seg02 --pool-tokens 1.03e10
 
-    # 3) 干净 probe（自动排除 10BT 的 URL）
+    # 3) 干净 probe（自动排除 10BT 的 URL；抽多少由 --probe-tokens 定，默认 16M）
     python -m data_prep.prepare_fineweb_edu --stage tokenize --role probe
 
     # 4) 汇总成 replay_plan.json：每条臂该读哪些目录、实测各多少 token
@@ -65,6 +68,7 @@ from data_prep.common import (
     iter_parquet_batches,
     load_tokenizer,
     merge_stats,
+    ppm_from_tokens,
     segment_name,
     segment_ppms_from_tokens,
     segment_router,
@@ -162,6 +166,35 @@ def tokenize_shard(
     st.dump(stats_dir, f"{role}-{Path(shard).stem}")
 
 
+def probe_source_tokens(shards: list[str], batch_size: int) -> int:
+    """probe 来源里 en 文档的 token 总量，用来把 --probe-tokens 折成抽样 ppm。
+
+    直接全量求和 `token_count` 列（FineWeb-Edu 官方用 GPT-2 数的每行精确值）：probe 只
+    有两三个分片，只读这一列不解压正文，几秒就扫完，不需要 `checks pool-tokens` 那套
+    抽样外推，也就不用多一个手工传的参数。
+
+    这里**不**把 GPT-2 计数换算成本项目 tokenizer 的计数，差的那几个百分点直接体现在
+    probe 最终的 token 数上。池子那边必须换算，因为段的 token 数就是实验变量（replay
+    1B/4B/8B）；probe 只是个算 PPL 的评测集，多几个百分点少几个百分点都不影响任何结论，
+    实际落到多少 tokenize 完会打出来。
+    """
+    total = 0
+    rows = en_rows = 0
+    for s in shards:
+        for batch in iter_parquet_batches(s, ("token_count", "language"), batch_size=batch_size):
+            lang = np.asarray(batch["language"])
+            cnt = np.asarray(batch["token_count"], dtype=np.float64)
+            keep = (lang == "en") & np.isfinite(cnt)
+            rows += lang.size
+            en_rows += int(keep.sum())
+            total += int(cnt[keep].sum())
+    if not en_rows:
+        raise SystemExit(f"probe 来源里没有 language == 'en' 的行（共 {fmt_int(rows)} 行），语言列取值和预期不符")
+    print(f"  probe 来源：{fmt_int(rows)} 行，其中 en {fmt_int(en_rows)}，"
+          f"约 {fmt_tokens(total)} token（GPT-2 计数）")
+    return total
+
+
 def build_url_index(raw_root: Path, out_path: Path, batch_size: int) -> None:
     """把 sample-10BT 全部文档的 URL 指纹存成一个排序好的 uint64 数组。
 
@@ -188,7 +221,10 @@ def build_url_index(raw_root: Path, out_path: Path, batch_size: int) -> None:
 
 
 def write_replay_plan(
-    out_root: Path, segment_ppms: list[int], replay_tokens: list[int], new_tokens: int
+    out_root: Path,
+    segment_ppms: list[int],
+    replay_tokens: list[int],
+    new_tokens: int,
 ) -> None:
     """把各段的实测 token 数汇总成 replay_plan.json：每条臂读哪些目录、跑多少 token。
 
@@ -260,6 +296,28 @@ def write_replay_plan(
         if arm["replay_dirs"] != arm["cov_dirs"]:
             raise AssertionError(f"replay 与 C 的来源目录不一致：{arm}")
 
+    # probe 换了来源（2025 的 CC dump），和池子不共享 ppm 空间，所以这里没有边界要核对：
+    # 它与训练数据不相交靠的是 URL 排除，那一步在 tokenize 时做完并记进了 manifest。
+    # 写进 plan 只是为了让评测侧也从同一个文件取目录，而不是各自去拼路径。
+    probe_manifest = out_root / "probe" / "kres_manifest.json"
+    if not probe_manifest.exists():
+        raise SystemExit(f"缺少 {probe_manifest}，先跑 --stage tokenize --role probe")
+    probe_meta = json.loads(probe_manifest.read_text(encoding="utf-8"))
+    if not probe_meta.get("url_exclusion"):
+        raise SystemExit(
+            f"{probe_manifest} 里没记 url_exclusion，说明这份 probe 没排除 10BT 的 URL，"
+            f"里面有一部分是基座真训过的。重跑 --stage tokenize --role probe"
+        )
+    probe = {
+        "name": "probe",
+        "dir": str(out_root / "probe"),
+        "ppm": probe_meta.get("router", {}).get("ranges", {}).get("probe", [0, 0])[1],
+        "tokens": int(probe_meta["stats"].get("tokens_written", 0)),
+        "docs": int(probe_meta["stats"].get("docs_written", 0)),
+        "url_excluded_docs": int(probe_meta["stats"].get("rows_url_excluded", 0)),
+        "source_dir": probe_meta.get("source_dir"),
+    }
+
     plan_path = out_root / "replay_plan.json"
     write_manifest(
         plan_path,
@@ -268,8 +326,10 @@ def write_replay_plan(
             "segment_ppms": segment_ppms,
             "replay_tokens_target": replay_tokens,
             "segments": segments,
+            "probe": probe,
             "arms": arms,
-            "note": "每条臂的 replay_dirs 与 cov_dirs 逐字相同：重放的数据就是采 C 的数据",
+            "note": "每条臂的 replay_dirs 与 cov_dirs 逐字相同：重放的数据就是采 C 的数据。"
+                    "probe 取自 2025 的 CC dump 并按 URL 排除了 10BT，对基座是干净的 held-out",
         },
     )
 
@@ -280,6 +340,11 @@ def write_replay_plan(
             f"  {s['name']:<8}{s['ppm']:>9}{fmt_int(s['docs']):>14}"
             f"{fmt_int(s['tokens']):>16}  ({fmt_tokens(s['tokens'])})"
         )
+    print(
+        f"  {probe['name']:<8}{probe['ppm']:>9}{fmt_int(probe['docs']):>14}"
+        f"{fmt_int(probe['tokens']):>16}  ({fmt_tokens(probe['tokens'])})"
+        f"  ← held-out，另一来源，已排除 {fmt_int(probe['url_excluded_docs'])} 篇重合 URL"
+    )
     print(f"\n  新域预算固定 {fmt_tokens(new_tokens)} token，各臂：")
     print(f"  {'读的段':<22}{'目标':>8}{'实际':>10}{'偏差':>9}{'max_tokens':>13}{'占数据流':>10}")
     for arm in arms:
@@ -329,10 +394,12 @@ def main(argv=None) -> int:
              "**所有 tokenize 调用和 plan 都必须传同一个值**，改一个数所有段的边界就变了",
     )
     ap.add_argument(
-        "--probe-ppm",
-        type=int,
-        default=100_000,
-        help="从 probe dump 里抽多少（ppm，默认 10%%）。先跑 checks.py token-count 看实际 token 数再调",
+        "--probe-tokens",
+        type=float,
+        default=16e6,
+        help="probe 评测集要多少 token（默认 16M，够 PPL 稳定）。抽样 ppm 由它和 probe 来源"
+             "自己的 token_count 列换算，不用另外量。注意这是 URL 排除**之前**的量，"
+             "最终会少掉与 10BT 重合的那一部分（跑完会把两个数并排打出来）",
     )
     ap.add_argument(
         "--new-tokens",
@@ -357,8 +424,8 @@ def main(argv=None) -> int:
     if args.stage == "tokenize" and args.role is None:
         raise SystemExit("--stage tokenize 需要 --role：seg00 / seg01 / ... 或 probe")
 
-    # probe 不参与分段，也就不需要池子的 token 数；其余情况都要，且不能给默认值——
-    # 名义上的 10B 是别家 tokenizer 数的，拿它换算会让最后一段悄悄不够。
+    # probe 换了来源，不参与分段，也就不需要池子的 token 数；其余情况都要，且不能给
+    # 默认值——名义上的 10B 是别家 tokenizer 数的，拿它换算会让最后一段悄悄不够。
     needs_segments = args.stage == "plan" or args.role != "probe"
     segment_ppms: list[int] = []
     replay_tokens: list[int] = []
@@ -382,27 +449,33 @@ def main(argv=None) -> int:
         write_replay_plan(args.out_root, segment_ppms, replay_tokens, args.new_tokens)
         return 0
 
-    if args.role == "probe":
-        src = args.raw_root / "fineweb_edu_probe"
-        router = subsample_router("fineweb_edu", "probe", args.probe_ppm)
-        if not index_path.exists():
-            raise SystemExit(f"缺少 {index_path}，先跑 --stage url-index（probe 必须排除 10BT 池子的 URL）")
-        exclude_path = str(index_path)
-    elif args.role in segment_roles:
-        src = args.raw_root / "fineweb_edu_pool"
-        # 整套段一起构造再取一个，是为了让每次调用看到的边界完全一致：段 k 的起点是
-        # 前 k 段 ppm 之和，只算自己那一段是算不出来的。
-        router = segment_router(segment_ppms)
-        exclude_path = None
-    else:
+    if args.role not in segment_roles + ["probe"]:
         raise SystemExit(
             f"--role {args.role} 不在 {segment_roles + ['probe']} 里。"
             f"段数由 --replay-tokens（当前 {replay_tokens}）决定"
         )
-
+    src = args.raw_root / ("fineweb_edu_probe" if args.role == "probe" else "fineweb_edu_pool")
     shards = sorted(str(p) for p in src.rglob("*.parquet"))
     if not shards:
         raise SystemExit(f"{src} 下没有 parquet，先跑 download.py")
+
+    probe_ppm = None
+    if args.role == "probe":
+        if not index_path.exists():
+            raise SystemExit(f"缺少 {index_path}，先跑 --stage url-index（probe 必须排除 10BT 池子的 URL）")
+        exclude_path = str(index_path)
+        try:
+            probe_ppm = ppm_from_tokens(
+                int(args.probe_tokens), probe_source_tokens(shards, args.batch_size), "--probe-tokens"
+            )
+        except ValueError as e:
+            raise SystemExit(str(e))
+        router = subsample_router("fineweb_edu", "probe", probe_ppm)
+    else:
+        # 整套段一起构造再取一个，是为了让每次调用看到的边界完全一致：段 k 的起点是
+        # 前 k 段 ppm 之和，只算自己那一段是算不出来的。
+        router = segment_router(segment_ppms)
+        exclude_path = None
 
     out_dir = args.out_root / args.role
     stats_dir = args.out_root / "_stats" / args.role
@@ -442,6 +515,8 @@ def main(argv=None) -> int:
             "replay_tokens_target": replay_tokens or None,
             "pool_tokens": int(args.pool_tokens) if args.pool_tokens else None,
             "segment_ppms": segment_ppms or None,
+            "probe_tokens_target": int(args.probe_tokens) if args.role == "probe" else None,
+            "probe_ppm": probe_ppm,
             "source_dir": str(src),
             "shards": [Path(s).name for s in shards],
             "doc_key": DOC_KEY["fineweb_edu"],
@@ -455,6 +530,22 @@ def main(argv=None) -> int:
     print("\n统计：")
     for k in sorted(stats):
         print(f"  {k:<20} {fmt_int(stats[k])}")
+
+    if args.role == "probe":
+        # --probe-tokens 是抽样 ppm 的依据，而 URL 排除发生在抽样之后，所以最终量会比
+        # 目标少掉重合的那一部分。生产里重合率是个位数百分比，无所谓；但把两个数并排
+        # 打出来，才不至于事后奇怪「怎么少了」，重合率异常高也能当场看见。
+        got = stats.get("tokens_written", 0)
+        excluded = stats.get("rows_url_excluded", 0)
+        print(
+            f"\n  probe 目标 {fmt_tokens(args.probe_tokens)} → 实际 {fmt_tokens(got)}"
+            f"（抽样后又按 URL 排除了 {fmt_int(excluded)} 篇与 10BT 重合的文档）"
+        )
+        if got < 0.5 * args.probe_tokens:
+            print(
+                f"  ⚠ 只剩目标的 {got / args.probe_tokens:.0%}，重合率高得不正常。"
+                f"probe 的 dump 可能太旧（和 10BT 撞得多），换更晚的 dump 或调大 --probe-tokens。"
+            )
     return 0
 
 

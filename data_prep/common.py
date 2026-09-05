@@ -197,8 +197,10 @@ def segment_router(segment_ppms: Sequence[int]) -> Router:
     Σ(C_k·n_k)/Σn_k 正好还原成总的 Σxxᵀ/Σn。用简单平均只有在各段 token 数完全相等时
     才等价，而按主键哈希分段时各段会差几个百分点，所以合并一律用加权。
 
+    probe 不在这里：它换来源（2025 的 CC dump，基座没见过），用 `subsample_router`。
+
     剩余未被任何段覆盖的部分直接丢弃，留作缓冲：池子的真实 token 数要跑
-    `checks token-count` 才知道，段的 ppm 是按估计值定的，留一截余量才不至于因为估偏
+    `checks pool-tokens` 才知道，段的 ppm 是按估计值定的，留一截余量才不至于因为估偏
     了导致最后一段不足。
 
     **注意**：这里的历史版本曾把「采 C 用」和「replay 用」切成互不重叠的两半，理由是
@@ -257,6 +259,27 @@ def segment_ppms_from_tokens(cumulative_tokens: Sequence[int], pool_tokens: int)
             f"1 ppm 在这个池子里是 {pool_tokens // SPLIT_DENOM:,} token"
         )
     return ppms
+
+
+def ppm_from_tokens(tokens: int, source_tokens: int, what: str) -> int:
+    """把一个 token 目标折成来源的 ppm。给 probe 这种单段用，段列表用
+    `segment_ppms_from_tokens`。
+    """
+    if source_tokens <= 0:
+        raise ValueError(f"source_tokens 必须为正，收到 {source_tokens}")
+    if tokens <= 0:
+        raise ValueError(f"{what} 必须为正，收到 {tokens}")
+    if tokens > source_tokens:
+        raise ValueError(
+            f"{what}={tokens:,} 超过来源的 {source_tokens:,} token，多下几个分片"
+        )
+    ppm = round(tokens / source_tokens * SPLIT_DENOM)
+    if ppm <= 0:
+        raise ValueError(
+            f"{what}={tokens:,} 在这个来源里不到 1 ppm"
+            f"（1 ppm = {source_tokens // SPLIT_DENOM:,} token），调大一点"
+        )
+    return ppm
 
 
 def subsample_router(dataset: str, name: str, ppm: int) -> Router:
