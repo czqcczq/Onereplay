@@ -438,7 +438,29 @@ class Stats:
         d = Path(stats_dir)
         d.mkdir(parents=True, exist_ok=True)
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in tag)
-        (d / f"{safe}.json").write_text(json.dumps(self.counters, indent=2), encoding="utf-8")
+        path = d / f"{safe}.json"
+        # 独占创建。主进程在跑之前清空过这个目录，文件已存在只可能是两个 worker 的 tag
+        # 撞了，而撞了就是静默丢掉一整个分片的计数——tokens_written 少一截，却看不出来。
+        try:
+            with path.open("x", encoding="utf-8") as f:
+                json.dump(self.counters, f, indent=2)
+        except FileExistsError:
+            raise RuntimeError(
+                f"统计边车文件 {path} 已存在：两个分片算出了同一个 tag，汇总会少算一个分片。"
+                f"用 shard_tag() 生成 tag，它对当前的目录布局是唯一的"
+            ) from None
+
+
+def shard_tag(shard: str | Path) -> str:
+    """分片的唯一标签，用作统计边车文件名和 manifest 里的分片标识。
+
+    不能只用文件名：probe 从两个 dump 各取第 1 片，HF 上两片都叫 `000_00000.parquet`，
+    只用 stem 会让两个 worker 写同一个 json，后写的覆盖先写的，汇总出来的
+    tokens_written 只剩一片——而这个数正是判断 probe 够不够、要不要多下分片的依据。
+    带上父目录名（dump 名）就唯一了。
+    """
+    p = Path(shard)
+    return f"{p.parent.name}/{p.name}"
 
 
 def merge_stats(stats_dir: str | Path) -> dict[str, int]:
