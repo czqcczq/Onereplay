@@ -59,6 +59,20 @@ runs/
 wandb/
 lightning_logs/
 
+# CPT 数据准备的产物：原始 parquet 和 litdata chunk，几十到几百 GB
+con-pretrain/data/raw/
+con-pretrain/data/chunks/
+# con-pretrain/data 整个可以是指向大存储的软链，别让 git 跟踪它
+con-pretrain/data
+
+# litgpt 源码。目录名和 python 包同名，而它是仓库根不是包，在 con-pretrain/ 下跑
+# `python -m data_prep.xxx` 时 cwd 进 sys.path，import litgpt 会命中这个目录，
+# 报 `No module named 'litgpt.tokenizer'`。装 pip 包用，源码不要提交进来。
+con-pretrain/litgpt/
+
+# 探测 / 校验脚本的输出
+*.log
+
 # Generated datasets / covariance / fisher / map cache
 *.npy
 *.npz
@@ -78,5 +92,17 @@ huggingface/
 
 migrate_safety/adapters/
 
-# APPS dataset
+# 隔断文件
 codedata_check/
+
+onereplay/
+
+processed_dataset/
+
+standard_ft/
+
+results_log/
+
+test_code/
+
+test_code_CPT/
