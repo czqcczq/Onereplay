@@ -475,82 +475,130 @@ log_dir, gbs, seq_len, lam, data_dir = Path(sys.argv[1]), int(sys.argv[2]), int(
 total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
 RE_MEM = re.compile(r"peak GPU memory\s+:\s+([\d.]+) GiB allocated")
+# 判余量必须看 reserved 而不是 allocated：OOM 发生在 allocator 向驱动要不到新段的时候，
+# 而 reserved 是它已经占住的量。两者的差就是碎片，本项目实测约 8 GiB（差 6 个百分点），
+# 按 allocated 判会把一个 83% 的档位报成 78%
+RE_MEM_RES = re.compile(r"peak GPU memory\s+:\s+[\d.]+ GiB allocated / ([\d.]+) GiB reserved")
 RE_STEP = re.compile(r"per-step time\s+:\s+([\d.]+) ms")
 RE_TPS = re.compile(r"throughput\s+:\s+([\d.]+) tokens/s")
-RE_TRAIN = re.compile(r"\| R: ([\d.eE+-]+) \|g_lm\|: ([\d.]+|nan) \|g_reg\|: ([\d.eE+-]+) clip: (\d+)%")
+RE_TRAIN = re.compile(
+    r"\| R: ([\d.eE+-]+) \|g_lm\|: ([\d.]+|nan) \|g_reg\|: ([\d.eE+-]+) clip: (\d+)%/(\d+)%"
+)
+# 基线臂没有 R 和 |g_reg|，日志里是「| |g_lm|: ... clip: ...」。两条正则互斥：
+# 正则臂那行 |g_lm| 前面是「| R:」，不会出现管道-空格-管道的形状
+RE_CLIP_BASE = re.compile(r"\| \|g_lm\|: ([\d.]+|nan) clip: (\d+)%/(\d+)%")
 RE_ACCUM = re.compile(r"grad_accum\s+:\s+(\d+)")
 
 runs = {}
 for log in sorted(log_dir.glob("*.log")):
     text = log.read_text(encoding="utf-8", errors="replace")
     trains = RE_TRAIN.findall(text)
+    bases = RE_CLIP_BASE.findall(text)
     runs[log.stem] = {
         "mem": float(m.group(1)) if (m := RE_MEM.search(text)) else None,
+        "mem_res": float(m.group(1)) if (m := RE_MEM_RES.search(text)) else None,
         "ms": float(m.group(1)) if (m := RE_STEP.search(text)) else None,
         "tps": float(m.group(1)) if (m := RE_TPS.search(text)) else None,
         "accum": int(m.group(1)) if (m := RE_ACCUM.search(text)) else None,
         # 取最后一条：ΔW 随训练增长，最后一条的漂移最接近真实情形
         "last": trains[-1] if trains else None,
+        "last_base": bases[-1] if bases else None,
         "n_train_lines": len(trains),
         "oom": "CUDA out of memory" in text,
     }
 
 print(f"GPU 总显存 {total_gb:.0f} GiB\n")
-print(f"{'run':<18}{'accum':>6}{'峰值显存':>12}{'占比':>7}{'per-step':>11}{'tokens/s':>12}")
-print("-" * 68)
+print(f"{'run':<18}{'accum':>6}{'allocated':>12}{'reserved':>12}{'占比':>7}{'per-step':>11}{'tokens/s':>12}")
+print("-" * 80)
 for name, r in runs.items():
     if r["oom"]:
         print(f"{name:<18}{'':>6}{'OOM':>12}")
         continue
     mem = f"{r['mem']:.1f} GiB" if r["mem"] else "?"
-    pct = f"{r['mem'] / total_gb:.0%}" if r["mem"] else "?"
+    res = f"{r['mem_res']:.1f} GiB" if r["mem_res"] else "?"
+    # 占比按 reserved 算——那才是决定会不会 OOM 的量
+    pct = f"{r['mem_res'] / total_gb:.0%}" if r["mem_res"] else "?"
     ms = f"{r['ms']:.0f} ms" if r["ms"] else "?"
     tps = f"{r['tps']:,.0f}" if r["tps"] else "?"
-    print(f"{name:<18}{r['accum'] or '?':>6}{mem:>12}{pct:>7}{ms:>11}{tps:>12}")
+    print(f"{name:<18}{r['accum'] or '?':>6}{mem:>12}{res:>12}{pct:>7}{ms:>11}{tps:>12}")
+print("\n占比一列按 reserved 算：OOM 是 allocator 向驱动要不到新段，而不是张量总量超标。")
 
 # ---- micro_batch 建议 ----
 print("\n---- micro_batch ----")
-ok = {n: r for n, r in runs.items() if n.endswith("_reg") and not r["oom"] and r["mem"] and r["tps"]}
+ok = {n: r for n, r in runs.items() if n.endswith("_reg") and not r["oom"] and r["mem_res"] and r["tps"]}
 if ok:
-    # 留两成余量：估算的激活量不含 allocator 碎片、编译期临时峰值、以及后续可能加长的
-    # 序列。贴着上限跑，OOM 会发生在第 4 小时而不是第 1 分钟
-    safe = {n: r for n, r in ok.items() if r["mem"] < 0.8 * total_gb}
+    # 留两成余量：这里量到的是本次配置的峰值，不含后续可能加的东西（训练中开 val、
+    # 更长的 eval batch），也不含跨节点时 NCCL 的通信缓冲。贴着上限跑，OOM 会发生
+    # 在第 4 小时而不是第 1 分钟
+    safe = {n: r for n, r in ok.items() if r["mem_res"] < 0.8 * total_gb}
     if safe:
         best = max(safe, key=lambda n: safe[n]["tps"])
-        print(f"建议 {best}：{safe[best]['mem']:.1f} GiB（{safe[best]['mem'] / total_gb:.0%}），"
-              f"{safe[best]['tps']:,.0f} tokens/s")
+        print(f"建议 {best}：reserved {safe[best]['mem_res']:.1f} GiB"
+              f"（{safe[best]['mem_res'] / total_gb:.0%}），{safe[best]['tps']:,.0f} tokens/s")
         if len(ok) > 1:
             other = [n for n in ok if n != best]
             for n in other:
                 d = (safe[best]["tps"] / ok[n]["tps"] - 1) if ok[n]["tps"] else 0
-                print(f"  对比 {n}：{ok[n]['mem']:.1f} GiB，慢 {-d:.0%}" if d < 0
-                      else f"  对比 {n}：{ok[n]['mem']:.1f} GiB，快的那个多 {d:.0%} 吞吐")
+                print(f"  对比 {n}：reserved {ok[n]['mem_res']:.1f} GiB，慢 {-d:.0%}" if d < 0
+                      else f"  对比 {n}：reserved {ok[n]['mem_res']:.1f} GiB，快的那个多 {d:.0%} 吞吐")
     else:
-        print(f"所有档位都超过 {0.8 * total_gb:.0f} GiB 的安全线，往下降一档再测")
+        over = min(ok, key=lambda n: ok[n]["mem_res"])
+        print(f"所有档位的 reserved 都超过 {0.8 * total_gb:.0f} GiB 的安全线"
+              f"（最低的是 {over} 的 {ok[over]['mem_res']:.1f} GiB）。")
+        print("能跑完不等于安全：这次没 OOM，换一批长文档或者中途开一次 val 就可能炸。")
+        print("往下降一档 micro_batch 再测；吞吐的损失通常远小于显存的下降。")
 else:
     print("没有可用的正则 run，看上面的日志")
 
 # ---- 裁剪触发率与 λ ----
 print("\n---- 裁剪触发率与 λ 标定 ----")
+print("clip 两个数：累计率 / 最后一个 log 区间内的率。累计率会把 warmup 的暂态一直")
+print("摊进后面，只看它分不清裁剪是开头几步的事还是全程都在发生。\n")
+
+# 基线臂的触发率是底噪：loss spike 本来就会把范数顶过 max_norm，不减掉它，
+# 正则臂那个百分比说明不了任何事
+base_rate = None
 for name, r in runs.items():
-    if not r["last"] or not name.endswith("_reg"):
+    if not r["last_base"]:
         continue
-    R, g_lm, g_reg, clip = r["last"]
-    g_lm, g_reg, clip = float(g_lm), float(g_reg), int(clip)
-    print(f"{name}（最后一条，共 {r['n_train_lines']} 条日志）：")
-    print(f"  R={float(R):.3e}  |g_lm|={g_lm:.3f}  |g_reg|={g_reg:.3e}（λ={lam}）  clip={clip}%")
+    g_lm, clip, clip_w = float(r["last_base"][0]), int(r["last_base"][1]), int(r["last_base"][2])
+    base_rate = clip if base_rate is None else max(base_rate, clip)
+    print(f"{name}（基线，无惩罚）：|g_lm|={g_lm:.3f}  clip={clip}%/{clip_w}%")
+if base_rate is None:
+    print("（没有基线 run 的裁剪数据，正则臂的触发率无从归因——基线 run 要带 "
+          "--kres.log_grad_norms true）")
+
+for name, r in runs.items():
+    if not r["last"]:
+        continue
+    R, g_lm, g_reg, clip, clip_w = r["last"]
+    g_lm, g_reg, clip, clip_w = float(g_lm), float(g_reg), int(clip), int(clip_w)
+    print(f"\n{name}（最后一条，共 {r['n_train_lines']} 条日志）：")
+    print(f"  R={float(R):.3e}  |g_lm|={g_lm:.3f}  |g_reg|={g_reg:.3e}（λ={lam}）  clip={clip}%/{clip_w}%")
+    excess = None if base_rate is None else clip - base_rate
+    if excess is not None:
+        print(f"  减去基线 {base_rate}% 后，归因到惩罚的触发 ≈ {excess}%")
     if clip == 0:
         print("  → 裁剪一次都没触发：--kres.inject_before_clip 放哪边完全等价，")
         print("    论文里那段关于注入点的讨论可以删掉。")
+    elif excess is not None and excess <= 2:
+        print("  → 触发率与基线持平：裁剪是 loss spike 引起的，不是惩罚推上去的。")
+        print("    各臂的裁剪行为可比，λ 的语义没有被裁剪扭曲。")
     else:
         print(f"  → 裁剪触发 {clip}%：注入点的选择有实际影响，保持 inject_before_clip=true")
         print("    （裁剪对整个梯度做同一个标量缩放，先注入才能精确保住 LM 与惩罚的比例）")
+        print("    但触发率明显高于基线时还有个更麻烦的后果：惩罚把总范数顶过 max_norm，")
+        print("    整个梯度被按比例缩小，等于学新域的那部分也一起被压掉了。C 臂会在遗忘上")
+        print("    好看、在新域上难看，而原因是裁剪伪影不是方法本身。调小 λ 或抬 max_norm。")
     if g_reg > 0 and g_lm > 0:
-        ratio = lam * g_reg / g_lm
-        print(f"  惩罚/LM 梯度比 = {ratio:.2e}（λ={lam} 时）")
-        print(f"  要让这个比值达到 ρ，取 λ = ρ × {g_lm / g_reg:.3e}：")
+        # |g_reg| 里已经乘过 λ（full_covariance_grad_ 的 scale=λ/层数），别再乘一次
+        ratio = g_reg / g_lm
+        print(f"  惩罚/LM 梯度比 = {ratio:.3f}（λ={lam} 时）")
+        print("  注入梯度对 λ 线性，所以要让这个比值等于 ρ：")
         for rho in (0.03, 0.1, 0.3):
-            print(f"      ρ={rho:<5} → λ ≈ {rho * g_lm / g_reg:.3g}")
+            print(f"      ρ={rho:<5} → λ ≈ {lam * rho / ratio:.3g}")
+        print("  这是最后一步的瞬时值，不是稳态值。ΔW 还在涨，比值会继续上升，直到惩罚")
+        print("  梯度与任务梯度平衡。短 run 标出来的 λ 偏大，正式跑要往下留余量。")
     else:
         print("  |g_reg| 是 0：ΔW 还没长起来（步数太少或 LR 太低），λ 标不出来")
 
