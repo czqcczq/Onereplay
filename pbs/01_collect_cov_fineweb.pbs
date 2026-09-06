@@ -3,10 +3,10 @@
 #PBS -N kres_cov
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto 
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
-#PBS -o /scratch/weiliu87/logs/kres/
+#PBS -o /scratch/weiliu87/student/czq/con-pretrain/logs
 #
 # =============================================================================
 # CPT Stage 1：在冻结的 open-sci-ref 基座上采集 C = E[x xᵀ]
