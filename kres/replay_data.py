@@ -150,6 +150,16 @@ class MixedReplayLoader(DataLoader):
         """还剩几个 micro-batch 名额。续跑后不等于 `len(self)`。"""
         return len(self._order) - self._cursor
 
+    @property
+    def new_tokens_consumed(self) -> int:
+        """到目前为止喂进去的**新域** token 数。
+
+        跨臂画曲线的横轴只能用这个，不能用 step：各臂的 step 里掺的 replay 比例不同，
+        同样是第 200 步，vanilla 已经吃了 419M 新域 token，replay 8B 只吃了约 210M。
+        按 step 对齐等于拿「学了两倍新域」的点去比「忘得更少」，两条曲线不可比。
+        """
+        return self._consumed.get(NEW, 0) * self.tokens_per_batch
+
     def consumption_summary(self) -> str:
         t = self.tokens_per_batch
         want = " ".join(f"{n}={self.batches[n] * t / 1e9:.3f}B" for n in self.names)
@@ -251,8 +261,10 @@ class ReplayMixedData(DataModule):
         --data kres.replay_data.ReplayMixedData
         --data.plan_path  .../chunks/fineweb_edu/replay_plan.json
         --data.arm        replay_8.00B
-        --data.new_data_path .../chunks/biomed/train
-        --data.val_data_path .../chunks/fineweb_edu/probe
+        --data.new_data_path  .../chunks/biomed/train
+        --data.val_data_path  .../chunks/biomed/val
+        --data.probe_data_path .../chunks/fineweb_edu/probe
+        --data.test_data_path .../chunks/biomed/test
     """
 
     plan_path: Path = Path("replay_plan.json")
@@ -262,7 +274,11 @@ class ReplayMixedData(DataModule):
     new_data_path: Path = Path("data/")
     """新域训练集的 chunk 目录（比如 chunks/biomed/train）。"""
     val_data_path: Path | None = None
-    """验证集目录。旧知识遗忘量测在 FineWeb-Edu 的 probe 上，所以一般指向它。"""
+    """新域 held-out（chunks/biomed/val）。塑性侧的主验证集，训练中周期性评。"""
+    probe_data_path: Path | None = None
+    """旧域 held-out（chunks/fineweb_edu/probe）。遗忘量就是它相对基座涨了多少，训练中周期性评。"""
+    test_data_path: Path | None = None
+    """新域 test（chunks/biomed/test）。**只在收尾评一次**，见 `final_eval_dataloaders`。"""
     seed: int = 42
     num_workers: int = 2
     """**每个流**的 worker 数。总进程数是 (1 + 段数) × 这个值，8B 臂就是 4 倍。"""
@@ -286,7 +302,7 @@ class ReplayMixedData(DataModule):
         """该传给 `--train.max_tokens` 的值 = 新域预算 + 该臂的 replay 量。"""
         return int(self._arm["train_max_tokens"])
 
-    def _loader(self, path: str, seed: int, shuffle: bool) -> DataLoader:
+    def _loader(self, path: str, seed: int, shuffle: bool, num_workers: int | None = None) -> DataLoader:
         from litdata.streaming import StreamingDataLoader, StreamingDataset, TokensLoader
 
         return StreamingDataLoader(
@@ -298,7 +314,7 @@ class ReplayMixedData(DataModule):
             ),
             batch_size=self.batch_size,
             pin_memory=True,
-            num_workers=self.num_workers,
+            num_workers=self.num_workers if num_workers is None else num_workers,
             drop_last=True,
         )
 
@@ -357,7 +373,53 @@ class ReplayMixedData(DataModule):
             + "，".join(f"{n} {batches[n]}" for n in batches)
         )
 
+    # -- 评估集 --------------------------------------------------------------------
+    # 三个 held-out 各约 16M token，分工不同：
+    #   val   新域 biomed/val        塑性：新域学进去了多少
+    #   probe 旧域 fineweb_edu/probe 稳定性：遗忘量。2025 的 CC dump 且按 URL 排除过
+    #                                10BT，对基座是干净的
+    #   test  新域 biomed/test       只在收尾评一次
+    #
+    # test 为什么不跟着一起周期性评：λ 要扫三个点，而扫描是看着曲线选的。选的时候看过
+    # 的集合就不再是 held-out 了。val + probe 参与选 λ，test 只在最后报一次，主表里那个
+    # 数才是干净的。多评一个集合的算力成本可以忽略，被污染的 test 却没法补救。
+
+    def _eval_loader(self, path: str) -> DataLoader:
+        """评估用的 loader：不洗牌、**不开 worker**。
+
+        `num_workers=0` 是有意的，两个原因：
+        - litdata 按 chunk 把数据分给 worker，而一个 chunk 是 8192 个 block ≈ 33.6M
+          token，三个评估集各约 16M，也就是一两个 chunk。worker 一多就有 worker 空手，
+          那条流提前取空，评估悄悄少算一批数据而不报错。
+        - 评估 loader 活得和训练一样久，而 8B replay 臂已经有 4 条训练流。in-flight 的
+          共享内存张量数是 流数 × num_workers × prefetch_factor，603854 正是被 ENFILE
+          （errno 23，全系统 file table 满）打死的。评估只有 100 个 batch、GPU 前向占
+          绝大部分时间，取数从来不是瓶颈，多开 worker 是纯亏。
+
+        不洗牌 + 固定 seed，所以每次评的是同一批 batch。这是曲线可比的前提：换一批数据
+        重评，step 之间的差里就掺进了数据难度的差。
+        """
+        if not Path(path, "index.json").exists():
+            raise SystemExit(f"{path} 下没有 litdata 的 index.json，chunk 没生成或路径不对")
+        return self._loader(path, self.seed, shuffle=False, num_workers=0)
+
     def val_dataloader(self) -> DataLoader:
+        """主验证集（新域 held-out）。上游 litgpt 只认这一个，保留它的契约。"""
         if self.val_data_path is None:
-            raise SystemExit("没给 --data.val_data_path，遗忘量没地方测（一般指向 fineweb_edu/probe）")
-        return self._loader(str(self.val_data_path), self.seed, shuffle=False)
+            raise SystemExit(
+                "没给 --data.val_data_path（新域 held-out，一般指向 chunks/biomed/val）"
+            )
+        return self._eval_loader(str(self.val_data_path))
+
+    def eval_dataloaders(self) -> dict[str, DataLoader]:
+        """训练中每 `--eval.interval` 步评一次的集合。第一个是主验证集。"""
+        loaders = {"val": self.val_dataloader()}
+        if self.probe_data_path is not None:
+            loaders["probe"] = self._eval_loader(str(self.probe_data_path))
+        return loaders
+
+    def final_eval_dataloaders(self) -> dict[str, DataLoader]:
+        """只在收尾评一次的集合。见上面那段关于 test 为什么不参与调参的说明。"""
+        if self.test_data_path is None:
+            return {}
+        return {"test": self._eval_loader(str(self.test_data_path))}
