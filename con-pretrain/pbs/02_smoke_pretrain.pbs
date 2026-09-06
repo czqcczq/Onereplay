@@ -1,0 +1,544 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N kres_smoke
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -o /scratch/weiliu87/student/czq/con-pretrain/logs
+#
+# =============================================================================
+# CPT Stage 2 冒烟：在真基座 + 真 C 上跑几十步，把三个还没定的数一次量出来
+#
+#   1) micro_batch 定 16 还是 8。probe_batch_sizing.py 估的是 80 GB / 45 GB，误差
+#      ±40%，所以必须实测显存峰值。global_batch 固定 512，grad_accum 跟着变（32 / 64）。
+#   2) clip 触发率。--kres.inject_before_clip 这个选择只有在裁剪真的触发时才有意义；
+#      触发率是 0 的话注入点放哪边完全等价，那条讨论就可以从论文里删掉。
+#   3) λ 的量级。惩罚梯度在 λ=1 时的范数 |g_reg| 与 |g_lm| 的比值直接给出 λ 的标定：
+#      要让惩罚占 LM 梯度的 ρ，就取 λ = ρ·|g_lm|/|g_reg|。见文末的 caveat。
+#
+# 顺带把两件一直没验的事做掉：混合 dataloader 在真 chunk 上跑通（此前全是合成数据），
+# 以及 --resume 带着正则器能不能接上（W₀ 必须来自基座文件而不是漂移后的权重）。
+#
+# -----------------------------------------------------------------------------
+# 这个冒烟**不需要新域（Biomed）数据**
+#
+#   要量的三个数里，显存和吞吐与语料无关；|g_lm| 和 clip 触发率轻微相关；只有 λ 的
+#   标定强相关。所以 DATA_DIR 默认就用 seg00（FineWeb-Edu），有 Biomed 的 chunk 就
+#   指过去。用 seg00 时 λ 那一项只当量级参考——在基座见过的分布上训，ΔW 比在 Biomed
+#   上小得多，据此反算的 λ 会偏大。脚本会在这种情况下明确标注。
+#
+#   产出的 checkpoint 是垃圾，跑完就删。这不是一次训练。
+#
+# -----------------------------------------------------------------------------
+# !! --train.max_steps 不生效
+#   这份 fit() 的循环只看由 max_tokens 推出的 max_iters。限制步数只能设
+#   max_tokens = 步数 × global_batch_size × seq_len。本脚本按 STEPS 自己算，
+#   同时把这个数写进临时 plan 的 train_max_tokens（pretrain.py 会核对两者一致）。
+#
+# !! 临时 plan
+#   正式的 replay_plan.json 要三段齐了才能生成，而冒烟只有 seg00。所以脚本自己在
+#   JOB_TMPDIR 里造一份只描述本次冒烟的 plan。它**不能**被后续正式训练使用，跑完
+#   随 JOB_TMPDIR 一起删掉。
+#
+# -----------------------------------------------------------------------------
+# 用法
+#
+#   qsub -v PREFLIGHT_ONLY=1 con-pretrain/pbs/02_smoke_pretrain.pbs
+#       只做前置检查，不上 GPU。第一次先跑这个。
+#
+#   qsub con-pretrain/pbs/02_smoke_pretrain.pbs
+#       完整冒烟：4 个 run（micro_batch 16/8 × 有无正则）+ 1 个续跑验证，约 40 分钟。
+#
+#   qsub -v MICRO_BATCHES="16" ...     只测一个档位
+#   qsub -v STEPS=100 ...              跑更长（λ 的标定会更准，因为漂移更大）
+#   qsub -v DATA_DIR=.../biomed/train  用真实新域数据（λ 标定才可信）
+#   qsub -v DO_RESUME=0 ...            跳过续跑验证
+#
+# 前置条件
+#   1) model/<基座>/{lit_model.pth,model_config.yaml} 就位
+#   2) data/chunks/fineweb_edu/seg00/index.json 就位
+#   3) cov/seg00.pt 就位（01_collect_cov_fineweb.pbs 的产物）
+#   4) litgpt-src 已 pip install -e（打过 open-sci-ref 补丁的那份）
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/con-pretrain}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/pbs/02_smoke_pretrain.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_kres_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_kres_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_kres_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR DATA_DIR VAL_DIR COV_PATH OUT_ROOT
+    STEPS MICRO_BATCHES GLOBAL_BATCH SEQ_LEN PEAK_LR MIN_LR WARMUP_STEPS
+    LAMBDA_PROBE NUM_WORKERS SEED PREFLIGHT_ONLY DO_RESUME DO_BASELINE
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_KRES_IN_CONTAINER=1
+  export APPTAINERENV_KRES_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+# ---- 可调项（qsub -v 不生效时直接改这里）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/model/open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096}"
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/chunks/fineweb_edu/seg00}"
+VAL_DIR="${VAL_DIR:-${DATA_DIR}}"
+COV_PATH="${COV_PATH:-${REPO_ROOT}/cov/seg00.pt}"
+OUT_ROOT="${OUT_ROOT:-${JOB_TMPDIR}/smoke_out}"
+
+STEPS="${STEPS:-60}"                    # optimizer step 数。PhaseTimer 前 20 步算 warmup
+MICRO_BATCHES="${MICRO_BATCHES:-16 8}"
+GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
+SEQ_LEN="${SEQ_LEN:-4096}"
+PEAK_LR="${PEAK_LR:-3e-4}"
+MIN_LR="${MIN_LR:-3e-5}"
+# 5 而不是正式的 2000：冒烟要在 peak LR 上测梯度范数和裁剪触发率。warmup 里 LR 接近 0，
+# 权重几乎不动，ΔW≈0 于是惩罚梯度也≈0，三个数一个都量不到
+WARMUP_STEPS="${WARMUP_STEPS:-5}"
+# 用 λ=1 探针而不是某个猜的值：accumulate_grad 的 scale 是 λ/N，所以 λ=1 时报出来的
+# |g_reg| 就是未缩放的 ‖dR/dW‖/N，任何目标比例都能由它直接反算
+LAMBDA_PROBE="${LAMBDA_PROBE:-1.0}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
+SEED="${SEED:-42}"
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+DO_RESUME="${DO_RESUME:-1}"
+DO_BASELINE="${DO_BASELINE:-1}"
+
+MAX_TOKENS=$(( STEPS * GLOBAL_BATCH * SEQ_LEN ))
+SMOKE_PLAN="${JOB_TMPDIR}/smoke_plan.json"
+LOG_DIR="${JOB_TMPDIR}/runlogs"
+mkdir -p "${LOG_DIR}" "${OUT_ROOT}"
+
+cd "${REPO_ROOT}"
+
+echo "========================================================================"
+echo "MODEL_DIR = ${MODEL_DIR}"
+echo "DATA_DIR  = ${DATA_DIR}"
+echo "COV_PATH  = ${COV_PATH}"
+echo "STEPS=${STEPS} global_batch=${GLOBAL_BATCH} seq_len=${SEQ_LEN} -> max_tokens=${MAX_TOKENS}"
+echo "micro_batch 候选: ${MICRO_BATCHES}   peak_lr=${PEAK_LR} min_lr=${MIN_LR} warmup=${WARMUP_STEPS}"
+echo "========================================================================"
+echo "Python : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ===========================================================================
+# Step 0: Preflight（纯 CPU）
+# ===========================================================================
+echo ""
+echo "==== Step 0: preflight ===="
+
+if [[ -e "${REPO_ROOT}/litgpt" ]]; then
+  echo "FAILED: ${REPO_ROOT}/litgpt 存在，会遮蔽已安装的 litgpt 包。删掉或改名 litgpt-src。"
+  exit 1
+fi
+[[ -f "${MODEL_DIR}/model_config.yaml" ]] || { echo "缺 ${MODEL_DIR}/model_config.yaml"; exit 1; }
+[[ -f "${MODEL_DIR}/lit_model.pth" ]]     || { echo "缺 ${MODEL_DIR}/lit_model.pth（HF→litgpt 转换没做）"; exit 1; }
+[[ -f "${DATA_DIR}/index.json" ]]         || { echo "缺 ${DATA_DIR}/index.json（chunk 没生成）"; exit 1; }
+[[ -f "${VAL_DIR}/index.json" ]]          || { echo "缺 ${VAL_DIR}/index.json"; exit 1; }
+[[ -f "${COV_PATH}" ]]                    || { echo "缺 ${COV_PATH}（先跑 01_collect_cov_fineweb.pbs）"; exit 1; }
+
+# 把「跑到一半才发现」的失败全部前移：litgpt 认不认这个基座、CLI 解不解析得了自定义
+# data module（--data 走 jsonargparse 的子类解析，路径写错只会在启动时报，但那时
+# 容器已经起了、GPU 也占了）、C 的目标层数与模型对不对得上。
+python - "${MODEL_DIR}" "${COV_PATH}" <<'PY'
+import sys
+from pathlib import Path
+
+import torch
+
+import litgpt
+from litgpt.config import Config
+
+model_dir, cov_path = Path(sys.argv[1]), Path(sys.argv[2])
+print(f"python  {sys.version.split()[0]}")
+print(f"litgpt  {litgpt.__file__}")
+print(f"torch   {torch.__version__}  cuda={torch.cuda.is_available()}")
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA 不可用，先查 -l select=1:ngpus=1 有没有生效")
+
+cfg = Config.from_file(model_dir / "model_config.yaml")
+try:
+    Config.from_name(cfg.name)
+except ValueError:
+    raise SystemExit(f"litgpt 注册表里没有 {cfg.name!r}，装的是未打补丁的上游 litgpt")
+print(f"config  name={cfg.name} n_layer={cfg.n_layer} n_embd={cfg.n_embd}")
+
+# 自定义 data module 必须能被 import 到——CLI 用的是同一个点分路径
+from kres.replay_data import ReplayMixedData  # noqa: F401
+print("data    kres.replay_data.ReplayMixedData 可导入")
+
+# C 的键集与本模型的目标层清单双向比对。这一步等于把 build_regularizer 里那条硬断言
+# 提前到上 GPU 之前：C 少了几层不会报错，只会让惩罚静默变小
+from kres.covariance import load_covariance_payload, target_names_from_linears
+from kres.regularizer import canonical_name
+from litgpt.model import GPT
+
+with torch.device("meta"):
+    model = GPT(cfg)
+linear_names = [canonical_name(n) for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)]
+targets = set(target_names_from_linears(linear_names, cfg.n_layer, False))
+
+payload = load_covariance_payload(cov_path)
+cov_keys = set(payload["covariances"])
+meta = payload.get("metadata", {})
+print(f"C       {cov_path.name}: {len(cov_keys)} 层，模型目标层 {len(targets)} 层"
+      f"（tokens={meta.get('tokens', '?')}, dtype={meta.get('forward_dtype', '?')}）")
+if cov_keys != targets:
+    raise SystemExit(
+        f"C 的键集与模型目标层对不上。\n"
+        f"  C 有模型没有: {sorted(cov_keys - targets)[:5]}\n"
+        f"  模型有 C 没有: {sorted(targets - cov_keys)[:5]}\n"
+        f"采 C 时的 --include-lm-head 必须与训练时的 --kres.include_lm_head 一致"
+    )
+print("        键集双向一致")
+PY
+
+# 临时 plan。正式的要三段齐了才能生成，这里只描述本次冒烟
+python - "${SMOKE_PLAN}" "${DATA_DIR}" "${MAX_TOKENS}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out, data_dir, max_tokens = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+# 只有 no_replay 一条臂：冒烟要量的是成本与梯度尺度，这两项与 replay 无关，而 C 臂
+# 本身就是零重放的，正好是要标定 λ 的那条
+plan = {
+    "_note": "02_smoke_pretrain.pbs 自动生成，只供本次冒烟，不要用于正式训练",
+    "segments": [],
+    "arms": [{
+        "name": "smoke", "segments": [], "replay_dirs": [], "cov_dirs": [],
+        "replay_tokens": 0, "new_tokens": max_tokens, "train_max_tokens": max_tokens,
+    }],
+}
+out.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"plan    {out}（no_replay，预算 {max_tokens:,} token）")
+PY
+
+for MB in ${MICRO_BATCHES}; do
+  if (( GLOBAL_BATCH % MB != 0 )); then
+    echo "FAILED: global_batch=${GLOBAL_BATCH} 不能被 micro_batch=${MB} 整除"; exit 1
+  fi
+  echo "  micro_batch=${MB} -> grad_accum=$(( GLOBAL_BATCH / MB ))"
+done
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：只做前置检查，不上 GPU。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: run 矩阵
+# ===========================================================================
+run_one () {
+  local tag="$1" mb="$2" use_cov="$3" resume="$4"
+  local out="${OUT_ROOT}/${tag}"
+  local log="${LOG_DIR}/${tag}.log"
+  mkdir -p "${out}"
+
+  local -a cmd=(
+    litgpt pretrain "$(basename "${MODEL_DIR}")"
+    --out_dir "${out}"
+    --data kres.replay_data.ReplayMixedData
+    --data.plan_path "${SMOKE_PLAN}"
+    --data.arm smoke
+    --data.new_data_path "${DATA_DIR}"
+    --data.val_data_path "${VAL_DIR}"
+    --data.num_workers "${NUM_WORKERS}"
+    --data.seed "${SEED}"
+    --train.global_batch_size "${GLOBAL_BATCH}"
+    --train.micro_batch_size "${mb}"
+    --train.max_tokens "${MAX_TOKENS}"
+    --train.max_norm 1.0
+    --train.lr_schedule wsd
+    --train.lr_cooldown_fraction 0.2
+    --train.lr_warmup_steps "${WARMUP_STEPS}"
+    --train.min_lr "${MIN_LR}"
+    --train.save_interval "$(( STEPS / 2 ))"
+    --train.log_interval 1
+    --optimizer.class_path torch.optim.AdamW
+    --optimizer.init_args.lr "${PEAK_LR}"
+    --optimizer.init_args.weight_decay 0.1
+    --eval.interval 1000000
+    --eval.initial_validation false
+    --eval.final_validation false
+    --logger_name csv
+    --seed "${SEED}"
+    --kres.profile true
+    --kres.log_grad_norms true
+  )
+  # --resume 与 --initial_checkpoint_dir 在 validate_args 里互斥，所以两条路只能走一条
+  if [[ -n "${resume}" ]]; then
+    cmd+=(--resume "${resume}")
+  else
+    cmd+=(--initial_checkpoint_dir "${MODEL_DIR}")
+  fi
+  if [[ "${use_cov}" == "1" ]]; then
+    cmd+=(
+      --kres.cov_path "${COV_PATH}"
+      --kres.replay_lambda "${LAMBDA_PROBE}"
+      # 续跑段模型权重已漂移，W₀ 只能从基座文件读；首段给了也无害（走的是快照+逐比特验证）
+      --kres.base_checkpoint "${MODEL_DIR}/lit_model.pth"
+      --kres.inject_before_clip true
+    )
+  fi
+
+  echo ""
+  echo "------------------------------------------------------------------------"
+  echo "RUN ${tag}: micro_batch=${mb} grad_accum=$(( GLOBAL_BATCH / mb )) cov=${use_cov}${resume:+ resume}"
+  echo "  ${cmd[*]}"
+  echo "------------------------------------------------------------------------"
+  # 不让单个 run 失败带走整个作业：其余档位的数还是有用的，失败与否留给汇总去判
+  if "${cmd[@]}" 2>&1 | tee "${log}"; then
+    echo "RUN ${tag}: ok"
+  else
+    echo "RUN ${tag}: FAILED（见 ${log}，汇总会跳过它）"
+  fi
+}
+
+for MB in ${MICRO_BATCHES}; do
+  [[ "${DO_BASELINE}" == "1" ]] && run_one "mb${MB}_base" "${MB}" 0 ""
+  run_one "mb${MB}_reg" "${MB}" 1 ""
+done
+
+# ===========================================================================
+# Step 2: 续跑验证
+#   6 小时 walltime 下单臂要续 4~5 次，而续跑段有一条只在真续跑里才走得到的逻辑：
+#   --resume 与 --initial_checkpoint_dir 互斥，所以续跑段不执行 load_raw，模型权重
+#   来自检查点、已经漂移。这时若还从模型上快照 W₀，惩罚就从「留在基座附近」变成
+#   「留在当下别动」——λ 越大越像是学不动，而不是遗忘更少。自测里用的是构造出来的
+#   漂移权重，这里是第一次在真检查点上验。
+# ===========================================================================
+if [[ "${DO_RESUME}" == "1" ]]; then
+  FIRST_MB="${MICRO_BATCHES%% *}"
+  CKPT_DIR="${OUT_ROOT}/mb${FIRST_MB}_reg"
+  LAST_CKPT="$(find "${CKPT_DIR}" -maxdepth 1 -type d -name 'step-*' | sort | head -1 || true)"
+  if [[ -n "${LAST_CKPT}" && -f "${LAST_CKPT}/lit_model.pth" ]]; then
+    echo ""
+    echo "==== Step 2: 从 ${LAST_CKPT} 续跑 ===="
+    run_one "mb${FIRST_MB}_resume" "${FIRST_MB}" 1 "${LAST_CKPT}/lit_model.pth"
+  else
+    echo ""
+    echo "==== Step 2: 跳过续跑验证 ===="
+    echo "  ${CKPT_DIR} 下没有 step-* 检查点。save_interval=$(( STEPS / 2 ))，"
+    echo "  说明那个 run 没跑到一半就失败了，先看它的日志。"
+  fi
+fi
+
+# ===========================================================================
+# Step 3: 汇总
+# ===========================================================================
+echo ""
+echo "==== Step 3: 汇总 ===="
+python - "${LOG_DIR}" "${GLOBAL_BATCH}" "${SEQ_LEN}" "${LAMBDA_PROBE}" "${DATA_DIR}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+import torch
+
+log_dir, gbs, seq_len, lam, data_dir = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+
+RE_MEM = re.compile(r"peak GPU memory\s+:\s+([\d.]+) GiB allocated")
+RE_STEP = re.compile(r"per-step time\s+:\s+([\d.]+) ms")
+RE_TPS = re.compile(r"throughput\s+:\s+([\d.]+) tokens/s")
+RE_TRAIN = re.compile(r"\| R: ([\d.eE+-]+) \|g_lm\|: ([\d.]+|nan) \|g_reg\|: ([\d.eE+-]+) clip: (\d+)%")
+RE_ACCUM = re.compile(r"grad_accum\s+:\s+(\d+)")
+
+runs = {}
+for log in sorted(log_dir.glob("*.log")):
+    text = log.read_text(encoding="utf-8", errors="replace")
+    trains = RE_TRAIN.findall(text)
+    runs[log.stem] = {
+        "mem": float(m.group(1)) if (m := RE_MEM.search(text)) else None,
+        "ms": float(m.group(1)) if (m := RE_STEP.search(text)) else None,
+        "tps": float(m.group(1)) if (m := RE_TPS.search(text)) else None,
+        "accum": int(m.group(1)) if (m := RE_ACCUM.search(text)) else None,
+        # 取最后一条：ΔW 随训练增长，最后一条的漂移最接近真实情形
+        "last": trains[-1] if trains else None,
+        "n_train_lines": len(trains),
+        "oom": "CUDA out of memory" in text,
+    }
+
+print(f"GPU 总显存 {total_gb:.0f} GiB\n")
+print(f"{'run':<18}{'accum':>6}{'峰值显存':>12}{'占比':>7}{'per-step':>11}{'tokens/s':>12}")
+print("-" * 68)
+for name, r in runs.items():
+    if r["oom"]:
+        print(f"{name:<18}{'':>6}{'OOM':>12}")
+        continue
+    mem = f"{r['mem']:.1f} GiB" if r["mem"] else "?"
+    pct = f"{r['mem'] / total_gb:.0%}" if r["mem"] else "?"
+    ms = f"{r['ms']:.0f} ms" if r["ms"] else "?"
+    tps = f"{r['tps']:,.0f}" if r["tps"] else "?"
+    print(f"{name:<18}{r['accum'] or '?':>6}{mem:>12}{pct:>7}{ms:>11}{tps:>12}")
+
+# ---- micro_batch 建议 ----
+print("\n---- micro_batch ----")
+ok = {n: r for n, r in runs.items() if n.endswith("_reg") and not r["oom"] and r["mem"] and r["tps"]}
+if ok:
+    # 留两成余量：估算的激活量不含 allocator 碎片、编译期临时峰值、以及后续可能加长的
+    # 序列。贴着上限跑，OOM 会发生在第 4 小时而不是第 1 分钟
+    safe = {n: r for n, r in ok.items() if r["mem"] < 0.8 * total_gb}
+    if safe:
+        best = max(safe, key=lambda n: safe[n]["tps"])
+        print(f"建议 {best}：{safe[best]['mem']:.1f} GiB（{safe[best]['mem'] / total_gb:.0%}），"
+              f"{safe[best]['tps']:,.0f} tokens/s")
+        if len(ok) > 1:
+            other = [n for n in ok if n != best]
+            for n in other:
+                d = (safe[best]["tps"] / ok[n]["tps"] - 1) if ok[n]["tps"] else 0
+                print(f"  对比 {n}：{ok[n]['mem']:.1f} GiB，慢 {-d:.0%}" if d < 0
+                      else f"  对比 {n}：{ok[n]['mem']:.1f} GiB，快的那个多 {d:.0%} 吞吐")
+    else:
+        print(f"所有档位都超过 {0.8 * total_gb:.0f} GiB 的安全线，往下降一档再测")
+else:
+    print("没有可用的正则 run，看上面的日志")
+
+# ---- 裁剪触发率与 λ ----
+print("\n---- 裁剪触发率与 λ 标定 ----")
+for name, r in runs.items():
+    if not r["last"] or not name.endswith("_reg"):
+        continue
+    R, g_lm, g_reg, clip = r["last"]
+    g_lm, g_reg, clip = float(g_lm), float(g_reg), int(clip)
+    print(f"{name}（最后一条，共 {r['n_train_lines']} 条日志）：")
+    print(f"  R={float(R):.3e}  |g_lm|={g_lm:.3f}  |g_reg|={g_reg:.3e}（λ={lam}）  clip={clip}%")
+    if clip == 0:
+        print("  → 裁剪一次都没触发：--kres.inject_before_clip 放哪边完全等价，")
+        print("    论文里那段关于注入点的讨论可以删掉。")
+    else:
+        print(f"  → 裁剪触发 {clip}%：注入点的选择有实际影响，保持 inject_before_clip=true")
+        print("    （裁剪对整个梯度做同一个标量缩放，先注入才能精确保住 LM 与惩罚的比例）")
+    if g_reg > 0 and g_lm > 0:
+        ratio = lam * g_reg / g_lm
+        print(f"  惩罚/LM 梯度比 = {ratio:.2e}（λ={lam} 时）")
+        print(f"  要让这个比值达到 ρ，取 λ = ρ × {g_lm / g_reg:.3e}：")
+        for rho in (0.03, 0.1, 0.3):
+            print(f"      ρ={rho:<5} → λ ≈ {rho * g_lm / g_reg:.3g}")
+    else:
+        print("  |g_reg| 是 0：ΔW 还没长起来（步数太少或 LR 太低），λ 标不出来")
+
+print(f"""
+  ⚠ 这组 λ 只是量级下界，不能直接拿去跑正式实验。惩罚梯度正比于 ΔW，而冒烟只跑了
+    几十步、漂移远小于正式训练的几千步，所以据此反算的 λ 偏大。
+    数据源是 {data_dir}——如果它不是 Biomed，偏差更大：在基座见过的分布上训，
+    ΔW 比在新域上小得多。
+    正式的做法：baseline（No Replay）臂本来就要跑，跑完拿它终态的 ΔW 反算 λ，
+    零额外成本且用的是真实漂移量。""")
+
+# ---- 正式作业的耗时投影 ----
+print("\n---- 正式作业耗时投影 ----")
+base = next((r for n, r in runs.items() if n.endswith("_base") and r["tps"]), None)
+reg = next((r for n, r in runs.items() if n.endswith("_reg") and r["tps"]), None)
+if base and reg:
+    print(f"正则开销：{base['tps'] / reg['tps'] - 1:+.1%} 吞吐（{base['tps']:,.0f} → {reg['tps']:,.0f} tokens/s）")
+for label, tokens, r in [
+    ("No Replay (8B)", 8e9, base), ("协方差正则 (8B)", 8e9, reg),
+    ("Replay 1B (9B)", 9e9, base), ("Replay 4B (12B)", 12e9, base), ("Replay 8B (16B)", 16e9, base),
+]:
+    if not r or not r["tps"]:
+        continue
+    h = tokens / r["tps"] / 3600
+    print(f"  {label:<20}{h:>6.1f} h   walltime 建议 {max(2, int(h * 1.3) + 1)}:00:00"
+          f"（6h 一段则 {-(-h // 6):.0f} 段）")
+
+# ---- 续跑 ----
+print("\n---- 续跑 ----")
+res = next((r for n, r in runs.items() if n.endswith("_resume")), None)
+if res is None:
+    print("没跑（DO_RESUME=0 或前一个 run 没产出检查点）")
+elif res["oom"] or not res["last"]:
+    print("续跑 run 没能跑起来，看它的日志")
+else:
+    print(f"续跑跑出了 {res['n_train_lines']} 条训练日志，最后 |g_lm|={res['last'][1]}")
+    print("还要人工确认日志里这两行：")
+    print("  1) 'kres: ... W₀来源=基座文件（续跑）'  ——不是「模型快照」")
+    print("  2) '数据流（臂 smoke）计划 … 实际 …'    ——实际量应当接上而不是从 0 重来")
+PY
+
+echo ""
+echo "========================================================================"
+echo "冒烟结束。产物（垃圾 checkpoint）随 JOB_TMPDIR 一起删除。"
+echo "按上面的结论改两处："
+echo "  1) 各正式 PBS 里的 --train.micro_batch_size"
+echo "  2) λ 先按投影的量级准备，正式值等 baseline 臂跑完再反算"
+echo "Job finished at: $(date)"
