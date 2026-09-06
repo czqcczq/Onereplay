@@ -1,0 +1,665 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N kres_cpt
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=48:00:00
+#PBS -o /scratch/weiliu87/student/czq/con-pretrain/logs
+#
+# =============================================================================
+# CPT 第二阶段正式训练：一条臂一个作业，七条臂共用这一份脚本
+#
+# 臂由 -v ARM=... 选，只影响三件事：读哪些数据、训多少 token、加不加惩罚。
+#
+#   ARM         --data.arm      C 来源            旧数据预算   预计 walltime
+#   ---------   -------------   ---------------   ----------   -------------
+#   vanilla     no_replay       —                 0            20.3 h
+#   replay_1b   replay_1.00B    —                 1B           22.8 h
+#   replay_4b   replay_4.00B    —                 4B           30.4 h
+#   replay_8b   replay_8.00B    —                 8B           40.6 h
+#   c_1b        no_replay       cov/seg00.pt      1B           20.3 h
+#   c_4b        no_replay       cov/arm_4b.pt     4B           20.3 h
+#   c_8b        no_replay       cov/arm_8b.pt     8B           20.3 h
+#
+# **核心对比是横着看的**：同一个旧数据预算下，「重放它」与「用它估的 C 去正则」哪个更
+# 保住旧能力、哪个更少拖累新域。所以 c_Nb 与 replay_Nb 必须成对同预算，plan 里
+# `replay_dirs == cov_dirs` 保证了它们逐字用的是同一批目录。
+#
+# 三条 C 臂的新域预算、步数、LR 曲线与 vanilla **完全一致**（都是零重放、8B 新域），
+# 差别只有惩罚项。这是有意的：C 臂对 vanilla 的差就是惩罚的净效应，不掺 batch/步数/
+# 退火状态的差异。**七条臂共用一份脚本正是为了让这句话在构造上成立**——四份拷贝时它
+# 只靠人盯着，而哪天只在某一份里改了 min_lr 或 warmup，不会报任何错，只会给出一张
+# 没法用的主表。
+#
+# -----------------------------------------------------------------------------
+# 用法
+#
+#   # 先做前置检查（几分钟，不上 GPU）。每条臂第一次投之前都该跑一遍
+#   qsub -N kres_pre -v ARM=c_4b,LAMBDA=1e-3,PREFLIGHT_ONLY=1 pbs/03_cpt_train.pbs
+#
+#   qsub -N kres_r8b -v ARM=replay_8b                pbs/03_cpt_train.pbs
+#   qsub -N kres_van -v ARM=vanilla                  pbs/03_cpt_train.pbs
+#   qsub -N kres_c4b -v ARM=c_4b,LAMBDA=1e-3         pbs/03_cpt_train.pbs
+#
+#   # λ 扫描：短 run，只跑 SCAN_STEPS 步，产物另存一个 out_dir
+#   qsub -N kres_scan -v ARM=c_4b,LAMBDA=3e-4,SCAN_STEPS=750 pbs/03_cpt_train.pbs
+#
+# 投递顺序见 pbs/submit_arms.sh。**replay_8b 要第一个进队列**：它 40.6 h 全场最长，
+# 6 个槽位 7 个作业时它决定总时长，排最后会让整体从 40.6 h 变成 61 h。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) model/<基座>/{lit_model.pth,model_config.yaml}
+#   2) data/chunks/biomed/{train,val,test}/index.json
+#   3) data/chunks/fineweb_edu/{seg00,seg01,seg02,probe}/index.json
+#   4) data/chunks/fineweb_edu/replay_plan.json（--stage plan 的产物）
+#   5) C 臂还要 cov/*.pt：c_1b 用 seg00.pt（01_collect_cov 的产物），
+#      c_4b / c_8b 要先跑 kres.mix_covariances 合并（preflight 会打出命令）
+#   6) litgpt-src 已更新到 fork 的 open-sci-cpt 最新提交
+#      （preflight 拿脚本自己的参数表对一遍，版本偏旧直接报错）
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/con-pretrain}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/pbs/03_cpt_train.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+ARM="${ARM:?必须给 -v ARM=...（vanilla / replay_1b / replay_4b / replay_8b / c_1b / c_4b / c_8b）}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+# /scratch 是并行文件系统，删一个还开着的文件不会真删，只留个 .__dpc 占位——日志里那
+# 一堆 "Device or resource busy: '.__dpc...'" 就是 multiprocessing 的临时目录终结器撞
+# 上这个。所以先试着建本地盘，建得出来就用它
+if mkdir -p "/local_ssd/${SCRATCH_USER}" 2>/dev/null; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_kres_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_kres_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}   ARM=${ARM}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_kres_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR SELF_PATH
+    ARM LAMBDA SCAN_STEPS DATA_ARM COV_PATH OUT_DIR RUN_TAG
+    MODEL_DIR NEW_DATA_DIR VAL_DIR PROBE_DIR TEST_DIR PLAN_PATH COV_DIR LOG_DIR
+    MICRO_BATCH GLOBAL_BATCH SEQ_LEN PEAK_LR MIN_LR WARMUP_FRACTION COOLDOWN_FRACTION
+    WEIGHT_DECAY BETAS OPTIMIZER_JSON MAX_NORM
+    EVAL_INTERVAL EVAL_ITERS SAVE_INTERVAL NUM_WORKERS SEED
+    PROFILE PREFLIGHT_ONLY FORCE_FRESH PBS_JOBID
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_KRES_IN_CONTAINER=1
+  export APPTAINERENV_KRES_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+# ---- 数据与模型 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/model/open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096}"
+NEW_DATA_DIR="${NEW_DATA_DIR:-${REPO_ROOT}/data/chunks/biomed/train}"
+# 三个 held-out 分工不同，见 kres/replay_data.py 的「评估集」那段：
+#   val   新域 biomed/val         塑性：新域学进去了多少
+#   probe 旧域 fineweb_edu/probe  稳定性：遗忘量（2025 CC dump，按 URL 排除过 10BT）
+#   test  新域 biomed/test        **只在收尾评一次**，全程不参与选 λ
+VAL_DIR="${VAL_DIR:-${REPO_ROOT}/data/chunks/biomed/val}"
+PROBE_DIR="${PROBE_DIR:-${REPO_ROOT}/data/chunks/fineweb_edu/probe}"
+TEST_DIR="${TEST_DIR:-${REPO_ROOT}/data/chunks/biomed/test}"
+PLAN_PATH="${PLAN_PATH:-${REPO_ROOT}/data/chunks/fineweb_edu/replay_plan.json}"
+COV_DIR="${COV_DIR:-${REPO_ROOT}/cov}"
+
+# ---- 实验参数：七条臂必须一致，改这里等于改所有臂 ----
+GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
+SEQ_LEN="${SEQ_LEN:-4096}"
+PEAK_LR="${PEAK_LR:-3e-4}"
+# 显式给 3e-5 = peak/10。litgpt 默认 6e-5 相对 peak 3e-4 是 1/5，退火退不干净，终态模型
+# 「还热着」——而臂间比的正是终态
+MIN_LR="${MIN_LR:-3e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+BETAS="${BETAS:-0.9, 0.95}"
+MAX_NORM="${MAX_NORM:-1.0}"
+COOLDOWN_FRACTION="${COOLDOWN_FRACTION:-0.2}"
+# warmup 必须用 fraction，不能用 lr_warmup_steps。`get_lr` 的 warmup 段是
+# `warmup_iters = lr_warmup_steps × grad_accum`，是**绝对量**；cooldown 是
+# `fraction × max_iters`，是**相对量**。固定 2000 步时各臂曲线形状根本不同：vanilla
+# 3814 步里 warmup 占 52%，replay 8B 的 7629 步里只占 26%，stable 段从 28% 到 54%。
+# 这直接违反「各臂各跑完整一个 WSD 周期、终态可比」那条不变量。
+# fraction 算的是 `fraction × len(train_dataloader)`，而 MixedReplayLoader.__len__
+# 恰好等于 max_iters，于是 warmup 与 cooldown 同口径。0.03 对齐基座的 2.8%。
+WARMUP_FRACTION="${WARMUP_FRACTION:-0.03}"
+
+# ---- 纯吞吐旋钮，不改数学 ----
+# 8 而不是 16：603854 实测 mb8 与 mb16 吞吐差 0.8%（109575 vs 110438 token/s），而
+# reserved 显存差一倍（63.8 vs 116.7 GiB）。两档 fwd_bwd 都占 step 时间的 98%，说明
+# mb8 时 GPU 已经算满，mb16 多占的 53 GiB 什么也没买到。余量是中途开 val 或撞上长文档
+# 时不炸的本钱
+MICRO_BATCH="${MICRO_BATCH:-8}"
+# 1 而不是 2：fwd_bwd 占一个 optimizer step 的 98.2%，取数不是瓶颈。而它要花代价——
+# MixedReplayLoader 给**每条流**各建一个 StreamingDataLoader，8B replay 臂有 4 条流，
+# in-flight 的共享内存张量数是 流数 × num_workers × prefetch_factor。603854 那次正是
+# 被 "Too many open files in system"（ENFILE，全系统 file table 满）打死的
+NUM_WORKERS="${NUM_WORKERS:-1}"
+SEED="${SEED:-42}"
+# 默认关：profile 要 torch.cuda.synchronize，会把各阶段串起来。成本数 603854 已经量完
+# （惩罚 39.45 ms/step，占 0.2%），没必要在七条 20~40 小时的臂上重复量。replay_8b 是
+# 40.6 h 对 48 h 上限、只有 15% 余量的那条，省下这份开销正好买在刀刃上
+PROFILE="${PROFILE:-false}"
+
+# ---- 评估 ----
+# 按 optimizer step 数。vanilla 3814 步给 19 个点；replay_8b 7629 步给 38 个。
+# 两个集合各 100 个 eval iter，一次约 20 秒，全程约 6 分钟，占 20 h 的 0.5%
+EVAL_INTERVAL="${EVAL_INTERVAL:-200}"
+EVAL_ITERS="${EVAL_ITERS:-100}"
+# 检查点是续跑的唯一依赖。48 h walltime 下正常跑不需要续，但 replay_8b 的 40.6 h 投影
+# 只有 15% 余量，投影偏乐观就得接着跑而不是 40 小时白扔
+SAVE_INTERVAL="${SAVE_INTERVAL:-500}"
+
+PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
+# 置 1 则忽略已有检查点、从基座重头开始。**会覆盖已有产物**，只在明确要重跑时用
+FORCE_FRESH="${FORCE_FRESH:-0}"
+SCAN_STEPS="${SCAN_STEPS:-}"
+
+# =============================================================================
+# 臂表：整份脚本里唯一按臂分叉的地方
+# =============================================================================
+case "${ARM}" in
+  vanilla)   DATA_ARM="${DATA_ARM:-no_replay}";    ARM_COV="" ;;
+  replay_1b) DATA_ARM="${DATA_ARM:-replay_1.00B}"; ARM_COV="" ;;
+  replay_4b) DATA_ARM="${DATA_ARM:-replay_4.00B}"; ARM_COV="" ;;
+  replay_8b) DATA_ARM="${DATA_ARM:-replay_8.00B}"; ARM_COV="" ;;
+  # C 臂走 no_replay：它们零重放，新域预算、步数、LR 曲线与 vanilla 逐项相同，
+  # 差别只有惩罚项。C 从 --kres.cov_path 单独给，不经过数据流
+  c_1b)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/seg00.pt"  ;;
+  c_4b)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/arm_4b.pt" ;;
+  c_8b)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/arm_8b.pt" ;;
+  *)
+    echo "ERROR: 不认识 ARM=${ARM}" >&2
+    echo "  可选：vanilla / replay_1b / replay_4b / replay_8b / c_1b / c_4b / c_8b" >&2
+    exit 1
+    ;;
+esac
+COV_PATH="${COV_PATH:-${ARM_COV}}"
+
+if [[ -n "${COV_PATH}" && -z "${LAMBDA:-}" ]]; then
+  echo "ERROR: ${ARM} 是 C 臂，必须给 -v LAMBDA=..." >&2
+  echo "  λ 没有自然量纲，搜索空间宽到十个数量级，猜一个数跑 20 小时大概率落在纯 no-op" >&2
+  echo "  或者模型冻死那一头。先用 kres.probe_lambda 从 vanilla 的检查点反算区间：" >&2
+  echo "    python -m kres.probe_lambda --base ${MODEL_DIR}/lit_model.pth \\" >&2
+  echo "        --checkpoint ${REPO_ROOT}/out/vanilla/step-XXXXXXXX/lit_model.pth \\" >&2
+  echo "        --cov ${COV_PATH} --log ${REPO_ROOT}/logs/vanilla.log" >&2
+  exit 1
+fi
+if [[ -z "${COV_PATH}" && -n "${LAMBDA:-}" ]]; then
+  echo "ERROR: ${ARM} 不是 C 臂却给了 LAMBDA=${LAMBDA}。" >&2
+  echo "  KresArgs.__post_init__ 也会拦这个组合：给了 λ 却没给 cov_path，惩罚不会生效，" >&2
+  echo "  唯一的结果是跑出一条你以为加了正则、实际是 baseline 的臂。" >&2
+  exit 1
+fi
+if [[ -n "${SCAN_STEPS}" && "${DATA_ARM}" != "no_replay" ]]; then
+  echo "ERROR: SCAN_STEPS 只支持零重放的臂（vanilla / c_*），${ARM} 不是。" >&2
+  echo "  replay 臂的名额是「每段恰好一个 epoch」精确算出来的，砍短 max_tokens 会让 replay" >&2
+  echo "  段跑不满——没被重放的那部分文档仍然进了 C，「replay 与 C 同源」对它们就不成立了。" >&2
+  exit 1
+fi
+
+# 产物目录。λ 和扫描步数进目录名，否则扫三个 λ 会互相覆盖检查点，而覆盖不报错——
+# 续跑逻辑会捡到别的 λ 存的检查点接着跑
+RUN_TAG="${RUN_TAG:-${ARM}${LAMBDA:+_lam${LAMBDA}}${SCAN_STEPS:+_scan${SCAN_STEPS}}}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/out/${RUN_TAG}}"
+# 日志**不能**放 JOB_TMPDIR：那个目录在 cleanup trap 里被删，作业一结束就没了，而要查的
+# 恰恰是失败的那次
+LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs}"
+LOG_FILE="${LOG_DIR}/${RUN_TAG}.${JOBTAG}.log"
+mkdir -p "${LOG_DIR}" "${OUT_DIR}"
+
+# optimizer 必须整个当 JSON 传，**不能**写成 --optimizer.init_args.lr。setup() 里
+# optimizer 的类型标注是 `str | dict`，是个无结构的 Dict，jsonargparse 于是把点分子键
+# 拍平：--optimizer.init_args.lr 3e-4 变成 {"class_path": ..., "lr": "3e-4"}，init_args
+# 这一层根本不存在，而 instantiate_torch_optimizer 的 dict 分支硬取 optimizer["init_args"]
+# -> KeyError: 'init_args'。顺带一提拍平后 lr 还成了**字符串**。这个坑废掉过一次作业
+OPTIMIZER_JSON="${OPTIMIZER_JSON:-{\"class_path\": \"torch.optim.AdamW\", \"init_args\": {\"lr\": ${PEAK_LR}, \"weight_decay\": ${WEIGHT_DECAY}, \"betas\": [${BETAS}]}}}"
+
+cd "${REPO_ROOT}"
+
+echo "========================================================================"
+echo "ARM        = ${ARM}   (--data.arm ${DATA_ARM})"
+echo "OUT_DIR    = ${OUT_DIR}"
+echo "COV_PATH   = ${COV_PATH:-（无，不加正则）}   LAMBDA=${LAMBDA:-—}"
+echo "PLAN       = ${PLAN_PATH}"
+echo "新域       = ${NEW_DATA_DIR}"
+echo "评估       = val:${VAL_DIR}  probe:${PROBE_DIR}  test:${TEST_DIR}"
+echo "batch      = global ${GLOBAL_BATCH} / micro ${MICRO_BATCH} -> grad_accum $(( GLOBAL_BATCH / MICRO_BATCH ))"
+echo "LR         = wsd peak ${PEAK_LR} min ${MIN_LR} warmup ${WARMUP_FRACTION} cooldown ${COOLDOWN_FRACTION}"
+echo "========================================================================"
+echo "Python : $(which python)"
+python --version
+# 不致命：真正判 GPU 在不在的是 preflight 里的 torch.cuda.is_available()，那条报错
+# 说得清楚（"先查 -l select=1:ngpus=1 有没有生效"）。让 nvidia-smi 缺席就 set -e 退出
+# 的话，本地拿这个脚本验参数护栏也走不下去
+nvidia-smi --query-gpu=name,memory.total --format=csv || echo "（nvidia-smi 不可用）"
+
+# 文件句柄的余量。603854 那次死在 "Too many open files in system (23)"——errno 23 是
+# ENFILE，即**全系统**的 file table 满了，不是本进程的 ulimit（那是 EMFILE=24）。节点
+# 是共享的，所以耗尽的可能是邻居也可能是我们自己；不打这几个数就永远只能猜
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+fd_report () {
+  local nr; nr="$(cat /proc/sys/fs/file-nr 2>/dev/null || echo '? ? ?')"
+  local shm; shm="$(ls /dev/shm 2>/dev/null | wc -l)"
+  local mine; mine="$(ls /proc/self/fd 2>/dev/null | wc -l)"
+  echo "fd: 系统 file-nr=[${nr}]  /dev/shm 条目=${shm}  本进程 fd=${mine}  ulimit -n=$(ulimit -n)"
+}
+fd_report
+
+# ===========================================================================
+# Step 0: 决定用哪份 plan
+#
+# 正式训练用真 replay_plan.json。λ 扫描要短 run，而 `--train.max_tokens` 会被
+# pretrain.py 拿 `data.expected_max_tokens` 硬核对（填错直接 SystemExit），
+# `--train.max_steps` 又已经是硬报错（fit() 的循环只看由 max_tokens 推出的 max_iters），
+# 所以短 run 只能靠一份 new_tokens 更小的 plan。
+#
+# 扫描 plan 写在 REPO_ROOT 下而不是 JOB_TMPDIR：JOB_TMPDIR 会被 trap 删掉，而三个 λ
+# 的扫描 run 必须读到**逐字相同**的 plan，否则它们的步数和 LR 曲线不一样，比出来的
+# 差里就掺了 schedule 的差。内容由 SCAN_STEPS 决定，三个 run 生成的是同一份。
+# ===========================================================================
+if [[ -n "${SCAN_STEPS}" ]]; then
+  SCAN_TOKENS=$(( SCAN_STEPS * GLOBAL_BATCH * SEQ_LEN ))
+  PLAN_PATH="${REPO_ROOT}/plans/scan_${SCAN_STEPS}steps.json"
+  mkdir -p "${REPO_ROOT}/plans"
+  python - "${PLAN_PATH}" "${SCAN_TOKENS}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+out, tokens = Path(sys.argv[1]), int(sys.argv[2])
+plan = {
+    "_note": "03_cpt_train.pbs 为 λ 扫描生成的短 plan。零重放，只描述新域预算。"
+             "不要用于正式训练——它的 new_tokens 不是 8B。",
+    "segments": [],
+    # load_arm(NO_REPLAY) 取的是 arms[0]["new_tokens"]，所以这条臂只需要这一个字段是对的
+    "arms": [{
+        "name": "scan", "segments": [], "replay_dirs": [], "cov_dirs": [],
+        "replay_tokens": 0, "new_tokens": tokens, "train_max_tokens": tokens,
+    }],
+}
+body = json.dumps(plan, ensure_ascii=False, indent=2)
+# 原子写：三个 λ 的扫描 run 可能同时开跑，直接写会让后来者读到半截文件。内容是
+# SCAN_STEPS 的确定性函数，所以谁赢无所谓，只要文件始终完整
+fd, tmp = tempfile.mkstemp(dir=str(out.parent), prefix=".scan_", suffix=".json")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write(body)
+os.replace(tmp, out)
+print(f"扫描 plan：{out}（新域预算 {tokens:,} token）")
+PY
+fi
+
+# ===========================================================================
+# Step 1: max_tokens 从 plan 取，不自己算
+#
+# 步数是按名义值（8B/9B/12B/16B ÷ 2,097,152）算的近似，**真实值由 plan 里各臂自己的
+# train_max_tokens 决定**（= 8B + 该臂实测 replay token），哈希分段有约 2% 偏差。
+# 这里直接调 load_arm，与 pretrain.py 读的是同一个函数——两边各拼一次就有各拼错一次
+# 的机会。臂名写错时 load_arm 会把可选项列出来
+# ===========================================================================
+MAX_TOKENS="$(python - "${PLAN_PATH}" "${DATA_ARM}" <<'PY'
+import sys
+from kres.replay_data import load_arm
+arm = load_arm(sys.argv[1], sys.argv[2])
+print(arm["train_max_tokens"])
+PY
+)"
+STEPS=$(( MAX_TOKENS / GLOBAL_BATCH / SEQ_LEN ))
+echo "max_tokens = ${MAX_TOKENS}（约 ${STEPS} 个 optimizer step）"
+
+# ===========================================================================
+# Step 2: 续跑判定
+#
+# `--resume` 与 `--initial_checkpoint_dir` 在 validate_args 里互斥，所以两条路只能走
+# 一条，得自己看有没有检查点。**排序必须取最后一个**：step-%08d 是零填充的，
+# `sort | head -1` 拿到的是最早那个，照抄会让每次续跑都从第一个检查点重来。
+# ===========================================================================
+LATEST=""
+if [[ "${FORCE_FRESH}" != "1" ]]; then
+  LATEST="$(find "${OUT_DIR}" -maxdepth 1 -type d -name 'step-*' 2>/dev/null | sort | tail -1 || true)"
+fi
+if [[ -n "${LATEST}" && -f "${LATEST}/lit_model.pth" ]]; then
+  RESUME_FROM="${LATEST}/lit_model.pth"
+  echo "续跑：从 ${LATEST} 接着跑"
+else
+  RESUME_FROM=""
+  echo "首段：从基座 ${MODEL_DIR} 开始"
+fi
+if [[ -f "${OUT_DIR}/final/lit_model.pth" ]]; then
+  echo "⚠ ${OUT_DIR}/final/lit_model.pth 已存在，这条臂已经跑完了。"
+  echo "  要重跑就 -v FORCE_FRESH=1 并先把 ${OUT_DIR} 挪走。"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 3: Preflight（纯 CPU）
+#
+# 把「跑到一半才发现」的失败全部前移。40 小时的作业尤其值得——错一个参数名，代价是
+# 一整个排队周期
+# ===========================================================================
+echo ""
+echo "==== Step 3: preflight ===="
+
+if [[ -e "${REPO_ROOT}/litgpt" ]]; then
+  echo "FAILED: ${REPO_ROOT}/litgpt 存在，会遮蔽已安装的 litgpt 包。删掉或改名 litgpt-src。"
+  exit 1
+fi
+[[ -f "${MODEL_DIR}/model_config.yaml" ]] || { echo "缺 ${MODEL_DIR}/model_config.yaml"; exit 1; }
+[[ -f "${MODEL_DIR}/lit_model.pth" ]]     || { echo "缺 ${MODEL_DIR}/lit_model.pth（HF→litgpt 转换没做）"; exit 1; }
+[[ -f "${PLAN_PATH}" ]]                   || { echo "缺 ${PLAN_PATH}（先跑 prepare_fineweb_edu --stage plan）"; exit 1; }
+for _d in "${NEW_DATA_DIR}" "${VAL_DIR}" "${PROBE_DIR}" "${TEST_DIR}"; do
+  [[ -f "${_d}/index.json" ]] || { echo "缺 ${_d}/index.json（chunk 没生成）"; exit 1; }
+done
+if [[ -n "${COV_PATH}" && ! -f "${COV_PATH}" ]]; then
+  echo "缺 ${COV_PATH}。"
+  case "${ARM}" in
+    c_1b) echo "  seg00 的 C 由 01_collect_cov_fineweb.pbs 产出。" ;;
+    c_4b) echo "  先合并：python -m kres.mix_covariances --from-plan ${PLAN_PATH} \\"
+          echo "              --arm 2 --cov-dir ${COV_DIR} --output ${COV_PATH}" ;;
+    c_8b) echo "  先合并：python -m kres.mix_covariances --from-plan ${PLAN_PATH} \\"
+          echo "              --arm 3 --cov-dir ${COV_DIR} --output ${COV_PATH}" ;;
+  esac
+  echo "  （按 token 计数加权合并与「直接在并集上采一次」严格等价而非近似，"
+  echo "    所以 3 条嵌套的臂只需 3 次采集而不是 6 次。别手拼 seg%02d，用 --from-plan。）"
+  exit 1
+fi
+
+python - "${MODEL_DIR}" "${COV_PATH:-}" "${SELF_PATH}" "${PLAN_PATH}" "${DATA_ARM}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+import torch
+
+import litgpt
+from litgpt.config import Config
+
+model_dir, cov_path, self_path = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+plan_path, data_arm = Path(sys.argv[4]), sys.argv[5]
+print(f"python  {sys.version.split()[0]}")
+print(f"litgpt  {litgpt.__file__}")
+print(f"torch   {torch.__version__}  cuda={torch.cuda.is_available()}")
+
+# 装的 litgpt / kres 比本脚本旧，是这套流程最容易犯也最难查的错。litgpt 源码不在
+# con-pretrain 里（目录同名会遮蔽 python 包），它单独躺在 litgpt-src、从 fork 的
+# open-sci-cpt 分支拉；kres 在 con-pretrain 里，走 subtree 的 cpt 分支。**两个仓库，
+# 各自可能漏 pull。** 漏了的表现是一屏 usage 加一句 "Unrecognized arguments"，而
+# usage 里恰好**不**列缺的那个参数，看起来像脚本把参数名写错了。
+#
+# 检查方式是从脚本自己的命令行里把 --train.* / --kres.* / --data.* 抠出来，对着**已装
+# 的**类比。02_smoke_pretrain.pbs 那版只比了前两个前缀，照不到 --data.* 这一维——而
+# 评估集那批参数（--data.probe_data_path / --data.test_data_path）恰好是 --data.*。
+script = "\n".join(
+    ln for ln in self_path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")
+)
+from litgpt.args import EvalArgs, KresArgs, TrainArgs
+
+from kres.replay_data import ReplayMixedData, load_arm
+
+missing = []
+for prefix, cls in (
+    ("--train.", TrainArgs),
+    ("--kres.", KresArgs),
+    ("--eval.", EvalArgs),
+    ("--data.", ReplayMixedData),
+):
+    fields = cls.__dataclass_fields__
+    for name in sorted(set(re.findall(rf"{re.escape(prefix)}(\w+)", script))):
+        if name not in fields:
+            missing.append(f"{prefix}{name}（{cls.__name__} 里没有）")
+if missing:
+    raise SystemExit(
+        "装的代码缺这些参数，比本脚本旧：\n  " + "\n  ".join(missing) + "\n\n"
+        "--train./--kres./--eval. 缺 -> litgpt 旧了：cd <litgpt-src> && git pull\n"
+        "--data.          缺 -> con-pretrain 旧了：cd <REPO_ROOT> && git pull\n"
+        "（pip install -e 装的是软链，拉完不用重装。分支没接上就先 git remote -v 看清 fork "
+        "的别名叫什么——别名是每个克隆私有的，本地叫 myfork，集群叫 origin。）"
+    )
+print("args    --train./--kres./--eval./--data.* 全部存在于已装的代码里")
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA 不可用，先查 -l select=1:ngpus=1 有没有生效")
+
+cfg = Config.from_file(model_dir / "model_config.yaml")
+try:
+    Config.from_name(cfg.name)
+except ValueError:
+    raise SystemExit(f"litgpt 注册表里没有 {cfg.name!r}，装的是未打补丁的上游 litgpt")
+print(f"config  name={cfg.name} n_layer={cfg.n_layer} n_embd={cfg.n_embd}")
+
+# 臂在不在 plan 里、读哪些目录、replay 与 C 是否同源（load_arm 自己会断言这两个列表
+# 逐字相同——plan 是个 json，中途被谁改过一笔完全可能，而改坏了不会有任何症状）
+arm = load_arm(plan_path, data_arm)
+print(
+    f"plan    臂 {data_arm}：新域 {arm['new_tokens'] / 1e9:.3f}B + replay "
+    f"{arm['replay_tokens'] / 1e9:.3f}B = max_tokens {arm['train_max_tokens'] / 1e9:.3f}B"
+    + (f"，段 {arm['segments']}" if arm["segments"] else "")
+)
+
+if not cov_path:
+    print("C       这条臂不加正则，--kres.cov_path 为 None 时整个特性关闭，训练路径与上游一致")
+else:
+    # C 的键集与本模型的目标层清单双向比对。这一步等于把 build_regularizer 里那条硬断言
+    # 提前到上 GPU 之前：C 少了几层不会报错，只会让惩罚静默变小
+    from kres.covariance import load_covariance_payload, target_names_from_linears
+    from kres.regularizer import canonical_name
+    from litgpt.model import GPT
+
+    with torch.device("meta"):
+        model = GPT(cfg)
+    linear_names = [canonical_name(n) for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)]
+    targets = set(target_names_from_linears(linear_names, cfg.n_layer, False))
+
+    payload = load_covariance_payload(Path(cov_path))
+    cov_keys = set(payload["covariances"])
+    meta = payload.get("metadata", {})
+    print(f"C       {Path(cov_path).name}: {len(cov_keys)} 层，模型目标层 {len(targets)} 层"
+          f"（tokens={meta.get('tokens', '?')}, dtype={meta.get('forward_dtype', '?')}）")
+    if cov_keys != targets:
+        raise SystemExit(
+            f"C 的键集与模型目标层对不上。\n"
+            f"  C 有模型没有: {sorted(cov_keys - targets)[:5]}\n"
+            f"  模型有 C 没有: {sorted(targets - cov_keys)[:5]}\n"
+            f"采 C 时的 --include-lm-head 必须与训练时的 --kres.include_lm_head 一致"
+        )
+    print("        键集双向一致")
+PY
+
+if (( GLOBAL_BATCH % MICRO_BATCH != 0 )); then
+  echo "FAILED: global_batch=${GLOBAL_BATCH} 不能被 micro_batch=${MICRO_BATCH} 整除"; exit 1
+fi
+
+if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+  echo "PREFLIGHT_ONLY=1：只做前置检查，不上 GPU。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 4: 训练
+# ===========================================================================
+# `python -m litgpt` 而不是 `litgpt`：后者是 pip 装的 console script，只有它没被装上
+# （或 venv 的 bin 不在 PATH 上）时，作业会以 command not found 秒挂，日志里空空如也。
+# 前面 preflight 验的是 `import litgpt` 能不能成，与这个是两回事
+cmd=(
+  python -m litgpt pretrain "$(basename "${MODEL_DIR}")"
+  --out_dir "${OUT_DIR}"
+  --data kres.replay_data.ReplayMixedData
+  --data.plan_path "${PLAN_PATH}"
+  --data.arm "${DATA_ARM}"
+  --data.new_data_path "${NEW_DATA_DIR}"
+  --data.val_data_path "${VAL_DIR}"
+  --data.probe_data_path "${PROBE_DIR}"
+  --data.test_data_path "${TEST_DIR}"
+  --data.num_workers "${NUM_WORKERS}"
+  --data.seed "${SEED}"
+  --train.global_batch_size "${GLOBAL_BATCH}"
+  --train.micro_batch_size "${MICRO_BATCH}"
+  --train.max_tokens "${MAX_TOKENS}"
+  --train.max_norm "${MAX_NORM}"
+  --train.lr_schedule wsd
+  --train.lr_warmup_fraction "${WARMUP_FRACTION}"
+  --train.lr_cooldown_fraction "${COOLDOWN_FRACTION}"
+  --train.min_lr "${MIN_LR}"
+  --train.save_interval "${SAVE_INTERVAL}"
+  --train.log_interval 1
+  --optimizer "${OPTIMIZER_JSON}"
+  --eval.interval "${EVAL_INTERVAL}"
+  --eval.max_iters "${EVAL_ITERS}"
+  # step 0 这次评的就是基座本身，probe 上的那个数是遗忘量的基准。没有它，后面所有
+  # probe loss 都只是孤立的绝对值，说不出「掉了多少」。零成本，一定要开
+  --eval.initial_validation true
+  --eval.final_validation true
+  --logger_name csv
+  --seed "${SEED}"
+  --kres.profile "${PROFILE}"
+  --kres.log_grad_norms true
+)
+if [[ -n "${RESUME_FROM}" ]]; then
+  cmd+=(--resume "${RESUME_FROM}")
+else
+  cmd+=(--initial_checkpoint_dir "${MODEL_DIR}")
+fi
+if [[ -n "${COV_PATH}" ]]; then
+  cmd+=(
+    --kres.cov_path "${COV_PATH}"
+    --kres.replay_lambda "${LAMBDA}"
+    --kres.inject_before_clip true
+    # W₀ 必须从基座**文件**读。续跑段不执行 load_raw（--resume 与
+    # --initial_checkpoint_dir 互斥），模型里的权重是 fabric.load 恢复的中途状态，
+    # 这时候快照 W₀，惩罚就从「留在基座附近」变成「留在当下别动」——λ 越大越像是
+    # 学不动，而不是遗忘更少。首段给了也无害：那条路走的是快照 + 逐比特验证，
+    # 这个文件是被比对的那一方，额外证明了模型确实收到了基座权重
+    --kres.base_checkpoint "${MODEL_DIR}/lit_model.pth"
+  )
+fi
+
+echo ""
+echo "------------------------------------------------------------------------"
+echo "RUN ${RUN_TAG}"
+echo "  ${cmd[*]}"
+echo "日志：${LOG_FILE}"
+echo "------------------------------------------------------------------------"
+fd_report
+
+if "${cmd[@]}" 2>&1 | tee "${LOG_FILE}"; then
+  echo ""
+  echo "RUN ${RUN_TAG}: ok"
+  fd_report
+elif grep -q "Too many open files" "${LOG_FILE}"; then
+  # 与配置错误分开处理：这不是「配置写错了」，是句柄耗尽，而节点是共享的，换个时间跑
+  # 可能就过了。要说清楚该看什么，别让人去翻配置
+  echo ""
+  echo "RUN ${RUN_TAG}: 文件句柄耗尽（errno 23 = ENFILE，全系统的 file table 满了，"
+  echo "  不是本进程的 ulimit）。对照上面 run 前后的 fd: 行——"
+  echo "  file-nr 第一列随 run 单调涨 = 我们自己在漏，降 NUM_WORKERS（当前 ${NUM_WORKERS}）；"
+  echo "  一开始就很高 = 节点上别的作业占的，换个时间重投。"
+  fd_report
+  echo "---- 最后 40 行 ----"
+  tail -40 "${LOG_FILE}"
+  exit 1
+else
+  echo ""
+  echo "RUN ${RUN_TAG}: 失败。日志：${LOG_FILE}（不在 JOB_TMPDIR 里，作业结束后仍在）"
+  echo "  已存的检查点还在 ${OUT_DIR}，修好之后重投同一条命令会自动从最新那个接着跑。"
+  echo "---- 最后 40 行 ----"
+  tail -40 "${LOG_FILE}"
+  exit 1
+fi
+
+# ===========================================================================
+# Step 5: 收尾
+# ===========================================================================
+echo ""
+echo "==== 收尾 ===="
+if [[ -f "${OUT_DIR}/final/lit_model.pth" ]]; then
+  echo "跑完了：${OUT_DIR}/final/lit_model.pth"
+  echo "指标在 ${OUT_DIR} 的 csv logger 里：val_loss/val_ppl（新域）、probe_loss/probe_ppl"
+  echo "（旧域遗忘量）、test_loss/test_ppl（只有收尾那一行有）、new_tokens（跨臂对齐的横轴）"
+else
+  echo "⚠ 没有 final/lit_model.pth，但训练进程退出码是 0。"
+  echo "  多半是撞了 walltime 上限被 PBS 杀掉而 tee 那一侧先返回了。重投同一条命令"
+  echo "  会从 ${OUT_DIR} 里最新的检查点接着跑。"
+fi
+if [[ "${ARM}" == "vanilla" ]]; then
+  echo ""
+  echo "vanilla 跑完了 -> 现在可以反算 λ 的区间（C 臂在等这个数）："
+  echo "  python -m kres.probe_lambda \\"
+  echo "      --base ${MODEL_DIR}/lit_model.pth \\"
+  echo "      --checkpoint ${OUT_DIR}/final/lit_model.pth \\"
+  echo "      --cov ${COV_DIR}/arm_4b.pt \\"
+  echo "      --log ${LOG_FILE}"
+  echo "  不用等跑完也行，中途任何一个 step-* 检查点都能算。"
+fi
+echo "Job finished at: $(date)"
