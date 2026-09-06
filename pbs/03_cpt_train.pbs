@@ -488,6 +488,25 @@ if missing:
         "的别名叫什么——别名是每个克隆私有的，本地叫 myfork，集群叫 origin。）"
     )
 print("args    --train./--kres./--eval./--data.* 全部存在于已装的代码里")
+
+# 上面那套比对**照不到**多评估集这个改动，因为它没引入任何新的命令行参数：
+# --data.probe_data_path / test_data_path 是 ReplayMixedData 的字段，属于 con-pretrain，
+# 而真正去读它们的是 litgpt 侧的 get_dataloaders/fit。所以 litgpt-src 停在旧版时，
+# 参数全部被接受、训练正常跑完 20 小时，只是 probe 那条遗忘曲线根本没记——
+# 两个仓库分别 pull 的结构下这是最贵的一种漏拉。直接查 fit 的签名。
+import inspect
+
+from litgpt.pretrain import fit as _fit
+
+if "eval_dataloaders" not in inspect.signature(_fit).parameters:
+    raise SystemExit(
+        "装的 litgpt 是单评估集的旧版：fit() 没有 eval_dataloaders 参数。\n"
+        "  它会只评 val，把 probe（旧域遗忘量）和 test 静默丢掉——不报错、不中断，\n"
+        "  跑完才发现主表少了一半。\n"
+        "  cd <REPO_ROOT>/../litgpt-src && git pull（分支是 fork 的 open-sci-cpt）"
+    )
+print("eval    fit() 是多评估集版本，val/probe/test 三个集合都会被评")
+
 if not torch.cuda.is_available():
     raise SystemExit("CUDA 不可用，先查 -l select=1:ngpus=1 有没有生效")
 
