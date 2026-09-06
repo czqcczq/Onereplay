@@ -269,10 +269,11 @@ for prefix, cls in (("--train.", TrainArgs), ("--kres.", KresArgs)):
 if missing:
     raise SystemExit(
         "装的 litgpt 缺这些参数，比本脚本旧：\n  " + "\n  ".join(missing) + "\n\n"
-        "在 litgpt-src 里更新到 fork 的最新提交：\n"
-        "  cd <REPO_ROOT>/../litgpt-src && git fetch myfork && git pull myfork open-sci-cpt\n"
-        "（pip install -e 装的是软链，拉完不用重装。若本地也没推，先在本地 litgpt "
-        "工作区提交并 push 到 myfork/open-sci-cpt。）"
+        "去 litgpt-src 更新到 fork 的 open-sci-cpt 最新提交：\n"
+        "  cd <litgpt-src> && git pull\n"
+        "（pip install -e 装的是软链，拉完不用重装。分支没接上就先 git remote -v 看清 fork "
+        "的别名叫什么——别名是每个克隆私有的，别照抄。若是本地根本没推上去，先在本地 litgpt "
+        "工作区提交并 push。）"
     )
 print(f"args    --train.* / --kres.* 全部存在于已装的 litgpt")
 if not torch.cuda.is_available():

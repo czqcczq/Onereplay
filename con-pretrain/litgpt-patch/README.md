@@ -22,7 +22,16 @@
 
 ```bash
 cd <REPO_ROOT>/../litgpt-src
-git fetch myfork && git checkout open-sci-cpt && git pull myfork open-sci-cpt
+git pull
+```
+
+前提是当前分支已经在追踪 fork 的 `open-sci-cpt`。**别照抄别处写的远程名**：远程别名是每个
+克隆私有的，本地 Windows 那份把上游叫 `origin`、fork 叫 `myfork`，而集群那份直接从 fork
+克隆，fork 就叫 `origin`。先 `git remote -v` 看清楚再说。没接上的话：
+
+```bash
+git remote -v                                   # 确认 fork 的别名叫什么
+git fetch <别名> && git checkout -B open-sci-cpt <别名>/open-sci-cpt
 ```
 
 `pip install -e .` 装的是软链，拉完不用重装。验一下改动到位了：
