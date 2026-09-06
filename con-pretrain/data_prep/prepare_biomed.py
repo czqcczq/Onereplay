@@ -14,6 +14,10 @@
    同一篇文章的所有段落必然被算到同一个 split，不需要任何跨进程协调。反过来说，
    即使段落在文件里不连续，也不可能造成 split 泄漏——最坏情况只是一篇文章被切成
    几段各自加 eos，是数据质量问题而不是评测污染问题。
+   实测里 article_id 有约 81% 是纯数字（PMID 而非 PMC ID），会撞车：同一个数字 id
+   下挂着两篇不同的文章（段落号各自从 p0 起、章节结构不同）。按行序切 run 恰好能
+   正确处理这种情况，量级是 1e-5；反过来按 article_id 分桶会把两篇拼成一篇并且
+   因为段落号重复而交错成乱码。
 
 2. **跨分片的边界文章直接丢弃。**
    每个 worker 丢掉自己遇到的第一个和最后一个 article 的 run。26 个分片最多丢 26 篇，
@@ -150,7 +154,7 @@ def tokenize_shard(
     run_key: str | None = None  # 当前正在累积的 article_id
     run: list[tuple[int, str, str]] = []  # (段落号, 文本, 语言)
     is_first_run = True
-    closed: set[str] = set()  # 已收尾的 article_id，用于段落连续性断言
+    closed: dict[str, int] = {}  # 已收尾的 article_id -> 见过的最大段落号，用于连续性断言
     pending: list[str] = []  # 待编码的文章正文
 
     for batch in iter_parquet_batches(shard, COLUMNS, batch_size=batch_size):
@@ -168,12 +172,23 @@ def tokenize_shard(
                             if body is not None:
                                 pending.append(body)
                     if check_contiguity:
-                        closed.add(run_key)
-                        if art in closed:
-                            raise RuntimeError(
-                                f"{Path(shard).name}: article_id {art!r} 的段落在文件里不连续。"
-                                "重组会把它切成几段，需要改成按 article_id 分桶的两阶段处理。"
-                            )
+                        # 同一个 article_id 第二次出现有两种可能，要分开对待：
+                        # 段落号重新从小处开始 = 数字 article_id（PMID）撞车，是两篇不同的
+                        # 文章，按 run 切开正是我们要的；段落号接着上一段往下走 = 一篇文章
+                        # 的段落真被打散了，重组不可信，必须停。
+                        idxs = [i for i, _, _ in run]
+                        prev_max = closed.get(run_key)
+                        if prev_max is None:
+                            closed[run_key] = max(idxs)
+                        else:
+                            if min(idxs) > prev_max:
+                                raise RuntimeError(
+                                    f"{Path(shard).name}: article_id {run_key!r} 的段落在文件里不连续"
+                                    f"（前一段止于 p{prev_max}，这一段起于 p{min(idxs)}，是接续而非重排）。"
+                                    "重组会把它切成几段，需要改成按 article_id 分桶的两阶段处理。"
+                                )
+                            st.add("articles_id_collision")
+                            closed[run_key] = max(prev_max, max(idxs))
                 if len(pending) >= encode_batch_size:
                     yield from encode_articles(tok, pending, st)
                 run_key, run = art, []
