@@ -1,11 +1,41 @@
 # litgpt 补丁
 
-`open-sci-ref-and-cpt.patch` 是本项目对 litgpt 的全部改动。litgpt 本身不进本仓库
-（目录名与 python 包同名，放在 `con-pretrain/` 下会遮蔽已安装的包，见 `.gitignore`），
-所以改动以补丁形式保存在这里。
+> **真相源是 fork，不是这个补丁。**
+> 对 litgpt 的改动现在维护在 <https://github.com/czqcczq/litgpt> 的 `open-sci-cpt`
+> 分支上。集群和本地都从那里拉。这个目录里的 `.patch` 只是个快照，**会过期**。
+>
+> 09-06 就因为它过期而废掉一次冒烟作业：WSD 那两个参数（`--train.lr_schedule`、
+> `--train.lr_cooldown_fraction`）只提交在本地工作区，fork 和补丁都没有，集群上四个
+> run 全部以 `Unrecognized arguments` 秒挂。而报错打出的 usage 里恰好**不**列缺的那个
+> 参数，看起来像脚本把参数名写错了，方向完全跑偏。
+>
+> 所以：**改完 litgpt 一定要 push 到 fork**，别只提交在本地。02_smoke_pretrain.pbs 的
+> preflight 现在会拿脚本自己的参数表比对已装的 litgpt，版本偏旧直接报错并给出 pull 命令。
+
+`open-sci-ref-and-cpt.patch` 是对 litgpt 的全部改动的补丁形式快照。litgpt 本身不进本仓库
+（目录名与 python 包同名，放在 `con-pretrain/` 下会遮蔽已安装的包，见 `.gitignore`）。
 
 **基线 commit：`7bf2960`**（`docs: fix dead GPT-2 paper link in prepare_dataset (#2294)`）。
 换基线要重新生成，别硬套。
+
+## 集群上怎么更新
+
+```bash
+cd <REPO_ROOT>/../litgpt-src
+git fetch myfork && git checkout open-sci-cpt && git pull myfork open-sci-cpt
+```
+
+`pip install -e .` 装的是软链，拉完不用重装。验一下改动到位了：
+
+```bash
+python -c "from litgpt.args import TrainArgs; print(TrainArgs().lr_schedule)"   # cosine
+```
+
+## 本地工作区的 CRLF
+
+`con-pretrain/litgpt/` 在 Windows 上很容易被整棵树写成 CRLF，`git diff` 于是报 225 个
+文件、4.7 万行，真实改动被彻底淹没，也很容易连噪音一起提交进 fork 历史。
+跑 `test_code_CPT/normalize_litgpt_worktree.py` 清掉，它只去行尾、不动内容。
 
 ## 改了什么
 
@@ -45,8 +75,10 @@ pip install -e .
 ## 生成方式
 
 ```bash
-cd <litgpt 工作区>
-git diff > con-pretrain/litgpt-patch/open-sci-ref-and-cpt.patch
+cd con-pretrain/litgpt
+python ../../test_code_CPT/normalize_litgpt_worktree.py     # 先清 CRLF，否则补丁 4.7 万行
+git diff 7bf2960 > ../litgpt-patch/open-sci-ref-and-cpt.patch
 ```
 
-改了 litgpt 就重新生成一次并提交，否则改动只活在某一台机器的工作区里。
+基线要显式写 `7bf2960`：改动现在是**提交**在 `open-sci-cpt` 分支上的，裸 `git diff`
+只能看到未提交的部分，早期那份补丁就是这么漏掉 WSD 的。

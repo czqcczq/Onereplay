@@ -111,9 +111,10 @@ if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
   module load singularity
 
   FORWARD_VARS=(
-    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
-    MODEL_DIR DATA_DIR VAL_DIR COV_PATH OUT_ROOT
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR SELF_PATH
+    MODEL_DIR DATA_DIR VAL_DIR COV_PATH OUT_ROOT LOG_DIR
     STEPS MICRO_BATCHES GLOBAL_BATCH SEQ_LEN PEAK_LR MIN_LR WARMUP_STEPS
+    WEIGHT_DECAY BETAS OPTIMIZER_JSON
     LAMBDA_PROBE NUM_WORKERS SEED PREFLIGHT_ONLY DO_RESUME DO_BASELINE
   )
   for _v in "${FORWARD_VARS[@]}"; do
@@ -168,6 +169,8 @@ GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
 SEQ_LEN="${SEQ_LEN:-4096}"
 PEAK_LR="${PEAK_LR:-3e-4}"
 MIN_LR="${MIN_LR:-3e-5}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+BETAS="${BETAS:-0.9, 0.95}"
 # 5 而不是正式的 2000：冒烟要在 peak LR 上测梯度范数和裁剪触发率。warmup 里 LR 接近 0，
 # 权重几乎不动，ΔW≈0 于是惩罚梯度也≈0，三个数一个都量不到
 WARMUP_STEPS="${WARMUP_STEPS:-5}"
@@ -180,9 +183,19 @@ PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 DO_RESUME="${DO_RESUME:-1}"
 DO_BASELINE="${DO_BASELINE:-1}"
 
+# optimizer 必须整个当 JSON 传，**不能**写成 --optimizer.class_path + --optimizer.init_args.lr。
+# setup() 里 optimizer 的类型标注是 `str | dict`，是个无结构的 Dict，jsonargparse 于是
+# 把点分子键拍平：--optimizer.init_args.lr 3e-4 变成 {"class_path": ..., "lr": "3e-4"}，
+# init_args 这一层根本不存在，而 instantiate_torch_optimizer 的 dict 分支硬取
+# optimizer["init_args"] -> KeyError: 'init_args'。顺带一提拍平后 lr 还成了**字符串**，
+# 就算那一层在也会把 '3e-4' 喂给 AdamW。JSON 形式两个毛病都没有（已用 --print_config 验过）。
+OPTIMIZER_JSON="${OPTIMIZER_JSON:-{\"class_path\": \"torch.optim.AdamW\", \"init_args\": {\"lr\": ${PEAK_LR}, \"weight_decay\": ${WEIGHT_DECAY}, \"betas\": [${BETAS}]}}}"
+
 MAX_TOKENS=$(( STEPS * GLOBAL_BATCH * SEQ_LEN ))
 SMOKE_PLAN="${JOB_TMPDIR}/smoke_plan.json"
-LOG_DIR="${JOB_TMPDIR}/runlogs"
+# 日志**不能**放 JOB_TMPDIR：那个目录在 cleanup trap 里被删，作业一结束就没了，
+# 而要查的恰恰是失败的那次。第一版就是这么写的，结果四个 run 全挂却无从查起
+LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs/smoke_${JOBTAG}}"
 mkdir -p "${LOG_DIR}" "${OUT_ROOT}"
 
 cd "${REPO_ROOT}"
@@ -214,10 +227,11 @@ fi
 [[ -f "${VAL_DIR}/index.json" ]]          || { echo "缺 ${VAL_DIR}/index.json"; exit 1; }
 [[ -f "${COV_PATH}" ]]                    || { echo "缺 ${COV_PATH}（先跑 01_collect_cov_fineweb.pbs）"; exit 1; }
 
-# 把「跑到一半才发现」的失败全部前移：litgpt 认不认这个基座、CLI 解不解析得了自定义
-# data module（--data 走 jsonargparse 的子类解析，路径写错只会在启动时报，但那时
-# 容器已经起了、GPU 也占了）、C 的目标层数与模型对不对得上。
-python - "${MODEL_DIR}" "${COV_PATH}" <<'PY'
+# 把「跑到一半才发现」的失败全部前移：装的 litgpt 够不够新、认不认这个基座、CLI 解不
+# 解析得了自定义 data module（--data 走 jsonargparse 的子类解析，路径写错只会在启动时
+# 报，但那时容器已经起了、GPU 也占了）、C 的目标层数与模型对不对得上。
+python - "${MODEL_DIR}" "${COV_PATH}" "${SELF_PATH}" <<'PY'
+import re
 import sys
 from pathlib import Path
 
@@ -226,10 +240,39 @@ import torch
 import litgpt
 from litgpt.config import Config
 
-model_dir, cov_path = Path(sys.argv[1]), Path(sys.argv[2])
+model_dir, cov_path, self_path = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 print(f"python  {sys.version.split()[0]}")
 print(f"litgpt  {litgpt.__file__}")
 print(f"torch   {torch.__version__}  cuda={torch.cuda.is_available()}")
+
+# 装的 litgpt 比本脚本旧，是这套流程最容易犯也最难查的错：litgpt 源码不在 con-pretrain
+# 里（目录同名会遮蔽 python 包），它单独躺在 litgpt-src、从 fork 的 open-sci-cpt 分支
+# 拉。本地改完忘了推、或集群忘了 pull，脚本传的新参数就会被 jsonargparse 拒掉——报的是
+# 一屏 usage 加一句 "Unrecognized arguments"，而 usage 里恰好**不**列缺的那个参数，
+# 看起来像脚本写错了参数名。四个 run 会各自这么挂一次。
+#
+# 检查方式是从脚本自己的命令行里把 --train.* / --kres.* 抠出来，对着**已装**的
+# dataclass 比。这样加新参数不用同步改检查。本地那份 check_smoke_pbs.py 做的是同一件
+# 事，但它 import 的是开发工作区的 litgpt，正好照不到版本偏差这一维。
+script = "\n".join(
+    ln for ln in self_path.read_text(encoding="utf-8").splitlines() if not ln.lstrip().startswith("#")
+)
+from litgpt.args import KresArgs, TrainArgs
+
+missing = []
+for prefix, cls in (("--train.", TrainArgs), ("--kres.", KresArgs)):
+    for name in sorted(set(re.findall(rf"{re.escape(prefix)}(\w+)", script))):
+        if name not in cls.__dataclass_fields__:
+            missing.append(f"{prefix}{name}（{cls.__name__} 里没有）")
+if missing:
+    raise SystemExit(
+        "装的 litgpt 缺这些参数，比本脚本旧：\n  " + "\n  ".join(missing) + "\n\n"
+        "在 litgpt-src 里更新到 fork 的最新提交：\n"
+        "  cd <REPO_ROOT>/../litgpt-src && git fetch myfork && git pull myfork open-sci-cpt\n"
+        "（pip install -e 装的是软链，拉完不用重装。若本地也没推，先在本地 litgpt "
+        "工作区提交并 push 到 myfork/open-sci-cpt。）"
+    )
+print(f"args    --train.* / --kres.* 全部存在于已装的 litgpt")
 if not torch.cuda.is_available():
     raise SystemExit("CUDA 不可用，先查 -l select=1:ngpus=1 有没有生效")
 
@@ -313,8 +356,11 @@ run_one () {
   local log="${LOG_DIR}/${tag}.log"
   mkdir -p "${out}"
 
+  # `python -m litgpt` 而不是 `litgpt`：后者是 pip 装的 console script，只有它没被
+  # 装上（或 venv 的 bin 不在 PATH 上）时，四个 run 会各自以 command not found 秒挂，
+  # 日志里空空如也。前面的 preflight 验的是 `import litgpt` 能不能成，与这个是两回事
   local -a cmd=(
-    litgpt pretrain "$(basename "${MODEL_DIR}")"
+    python -m litgpt pretrain "$(basename "${MODEL_DIR}")"
     --out_dir "${out}"
     --data kres.replay_data.ReplayMixedData
     --data.plan_path "${SMOKE_PLAN}"
@@ -333,9 +379,7 @@ run_one () {
     --train.min_lr "${MIN_LR}"
     --train.save_interval "$(( STEPS / 2 ))"
     --train.log_interval 1
-    --optimizer.class_path torch.optim.AdamW
-    --optimizer.init_args.lr "${PEAK_LR}"
-    --optimizer.init_args.weight_decay 0.1
+    --optimizer "${OPTIMIZER_JSON}"
     --eval.interval 1000000
     --eval.initial_validation false
     --eval.final_validation false
@@ -365,11 +409,21 @@ run_one () {
   echo "RUN ${tag}: micro_batch=${mb} grad_accum=$(( GLOBAL_BATCH / mb )) cov=${use_cov}${resume:+ resume}"
   echo "  ${cmd[*]}"
   echo "------------------------------------------------------------------------"
-  # 不让单个 run 失败带走整个作业：其余档位的数还是有用的，失败与否留给汇总去判
+  # OOM 与其它失败要区别对待。OOM 本身就是这次要测的结论之一（micro_batch 太大），
+  # 记下来继续测下一档；其它失败几乎一定是配置问题，而四个 run 用的是同一套配置，
+  # 继续跑只是把同一个错误重复三遍、再用一屏「?」把它盖掉——第一版就是这么丢掉现场的。
+  # 所以非 OOM 立刻停，并把日志尾巴打到 stdout（PBS 的 .o 文件里就能直接看到原因）。
   if "${cmd[@]}" 2>&1 | tee "${log}"; then
     echo "RUN ${tag}: ok"
+  elif grep -q "CUDA out of memory" "${log}"; then
+    echo "RUN ${tag}: OOM —— 这一档装不下，本身就是结论，继续下一档"
   else
-    echo "RUN ${tag}: FAILED（见 ${log}，汇总会跳过它）"
+    echo ""
+    echo "RUN ${tag}: 非 OOM 失败，后面几个 run 是同一套配置只会同样失败，就此停下。"
+    echo "日志：${log}（不在 JOB_TMPDIR 里，作业结束后仍在）"
+    echo "---- 最后 40 行 ----"
+    tail -40 "${log}"
+    exit 1
   fi
 }
 
