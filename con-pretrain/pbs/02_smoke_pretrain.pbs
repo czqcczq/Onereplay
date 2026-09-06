@@ -5,21 +5,41 @@
 #PBS -k oed
 #PBS -q autox
 #PBS -l select=1:ngpus=1
-#PBS -l walltime=04:00:00
+#PBS -l walltime=01:30:00
 #PBS -o /scratch/weiliu87/student/czq/con-pretrain/logs
 #
 # =============================================================================
-# CPT Stage 2 冒烟：在真基座 + 真 C 上跑几十步，把三个还没定的数一次量出来
+# CPT Stage 2 冒烟：在真基座 + 真 C + 真 chunk 上跑几十步
 #
-#   1) micro_batch 定 16 还是 8。probe_batch_sizing.py 估的是 80 GB / 45 GB，误差
-#      ±40%，所以必须实测显存峰值。global_batch 固定 512，grad_accum 跟着变（32 / 64）。
-#   2) clip 触发率。--kres.inject_before_clip 这个选择只有在裁剪真的触发时才有意义；
-#      触发率是 0 的话注入点放哪边完全等价，那条讨论就可以从论文里删掉。
-#   3) λ 的量级。惩罚梯度在 λ=1 时的范数 |g_reg| 与 |g_lm| 的比值直接给出 λ 的标定：
-#      要让惩罚占 LM 梯度的 ρ，就取 λ = ρ·|g_lm|/|g_reg|。见文末的 caveat。
+# micro_batch 已经由作业 603854 定死为 8：mb8 与 mb16 的吞吐差 0.8%（109575 vs
+# 110438 token/s），而 reserved 显存差一倍（63.8 vs 116.7 GiB）。两档的 fwd_bwd 都占
+# 一个 optimizer step 的 98%，说明 mb8 时 GPU 已经算满，mb16 多占的 53 GiB 什么也没
+# 买到。成本数也一并量完了（惩罚开销 39.45 ms/step，占 0.2%）。所以这一版要量的只剩：
 #
-# 顺带把两件一直没验的事做掉：混合 dataloader 在真 chunk 上跑通（此前全是合成数据），
-# 以及 --resume 带着正则器能不能接上（W₀ 必须来自基座文件而不是漂移后的权重）。
+#   1) 多流数据路径。603854 跑的是 no_replay 臂，**只有一条流**；正式的 8B replay 臂
+#      有 4 条流，MixedReplayLoader 给每条流各建一个 StreamingDataLoader。而 603854
+#      的 mb8_reg 正是死在 "Too many open files in system"（ENFILE，全系统 file table
+#      满）。单流就撞墙，四条流必须先验过再投 40 小时的正式作业。这同时也是混合
+#      dataloader 第一次在真 chunk 上跑（此前全是合成数据）。
+#   2) clip 触发率，**并且要有基线底噪**。loss spike 本来就会把范数顶过 max_norm，
+#      不减掉基线，正则臂那个百分比说明不了任何事。所以 base 与 reg 两个 run 都要跑。
+#   3) λ 的量级。λ=1 时 |g_reg|/|g_lm| 直接给出标定：要让惩罚占 LM 梯度的 ρ，
+#      取 λ = λ_probe·ρ·|g_lm|/|g_reg|。见文末的 caveat。
+#
+# -----------------------------------------------------------------------------
+# replay 段为什么要裁小
+#
+#   混合 dataloader 的 replay 名额是「整段恰好一遍」：batches[NEW] = 总名额 −
+#   Σlen(replay_loader)。真 seg00 有 1B token = 30517 个 micro-batch，而冒烟总共
+#   几千个，直接指真段会让新域名额算成负数，ReplayMixedData._check 会拦下来。
+#
+#   所以脚本把每个真段的前 SMOKE_REPLAY_CHUNKS 个 chunk 文件软链到 JOB_TMPDIR，
+#   配一份裁剪过的 index.json。数据是真的、格式是真的、流数是真的，只是每条流短。
+#   粒度到 chunk 为止：一个 chunk 是 8192 个 block，mb=8 时就是 1024 个 micro-batch，
+#   再往下切要改 chunk 内部的偏移表，不值当。
+#
+#   代价是 replay 占比不真实（4096 个名额里 3072 是 replay，75%，而正式的 8B 臂是
+#   50%）。要量的三项都不依赖这个比例，但别拿这次的 loss 曲线说事。
 #
 # -----------------------------------------------------------------------------
 # 语料的选择只影响 λ 那一项
@@ -38,28 +58,31 @@
 #   同时把这个数写进临时 plan 的 train_max_tokens（pretrain.py 会核对两者一致）。
 #
 # !! 临时 plan
-#   正式的 replay_plan.json 要三段齐了才能生成，而冒烟只有 seg00。所以脚本自己在
-#   JOB_TMPDIR 里造一份只描述本次冒烟的 plan。它**不能**被后续正式训练使用，跑完
-#   随 JOB_TMPDIR 一起删掉。
+#   正式的 replay_plan.json 由 prepare_fineweb_edu 的 --stage plan 生成，描述的是
+#   完整的 1B/4B/8B 三条臂。冒烟自己在 JOB_TMPDIR 里造一份只描述本次冒烟的 plan
+#   （replay 段指向上面裁小的软链目录）。它**不能**被后续正式训练使用，跑完随
+#   JOB_TMPDIR 一起删掉。plan 里的数字全部由裁剪后的真实 block 数反算，不是估的，
+#   所以 _check 的 2% 对账天然成立。
 #
 # -----------------------------------------------------------------------------
 # 用法
 #
 #   qsub -v PREFLIGHT_ONLY=1 con-pretrain/pbs/02_smoke_pretrain.pbs
-#       只做前置检查，不上 GPU。第一次先跑这个。
+#       只做前置检查（含裁剪 replay 段并读回验证），不上 GPU。第一次先跑这个。
 #
 #   qsub con-pretrain/pbs/02_smoke_pretrain.pbs
-#       完整冒烟：4 个 run（micro_batch 16/8 × 有无正则）+ 1 个续跑验证，约 40 分钟。
+#       完整冒烟：mb8 的 base + reg 两个 run，4 条流，约 50 分钟。
 #
-#   qsub -v MICRO_BATCHES="16" ...     只测一个档位
-#   qsub -v STEPS=100 ...              跑更长（λ 的标定会更准，因为漂移更大）
-#   qsub -v DATA_DIR=.../fineweb_edu/seg00 ...  新域还没就位时的退路
-#   qsub -v DO_RESUME=0 ...            跳过续跑验证
+#   qsub -v DO_RESUME=1 STEPS=32 ...   要连续跑验证就把 STEPS 减半，否则超 1 小时
+#   qsub -v SMOKE_REPLAY_CHUNKS=2 STEPS=112 ...  每段两个 chunk（STEPS 必须跟着抬）
+#   qsub -v REPLAY_DIRS="" ...         退回单流（no_replay 臂），seg 还没就位时用
+#   qsub -v STEPS=128 ...              跑更长（λ 的标定更准，因为漂移更大）
 #
 # 前置条件
 #   1) model/<基座>/{lit_model.pth,model_config.yaml} 就位
 #   2) data/chunks/biomed/{train,val}/index.json 就位
 #   3) cov/seg00.pt 就位（01_collect_cov_fineweb.pbs 的产物）
+#   3') data/chunks/fineweb_edu/seg0{0,1,2}/index.json 就位（多流要用；缺了会退回单流）
 #   4) litgpt-src 已更新到 fork 的 open-sci-cpt 分支最新提交并 pip install -e
 #      （preflight 会拿脚本自己的参数表对一遍，版本偏旧直接报错）
 # =============================================================================
@@ -121,7 +144,7 @@ if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
     STEPS MICRO_BATCHES GLOBAL_BATCH SEQ_LEN PEAK_LR MIN_LR WARMUP_STEPS
     WEIGHT_DECAY BETAS OPTIMIZER_JSON
     LAMBDA_PROBE NUM_WORKERS SEED PREFLIGHT_ONLY DO_RESUME DO_BASELINE
-    PBS_JOBID
+    REPLAY_DIRS SMOKE_REPLAY_CHUNKS PBS_JOBID
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -170,8 +193,16 @@ VAL_DIR="${VAL_DIR:-${REPO_ROOT}/data/chunks/biomed/val}"
 COV_PATH="${COV_PATH:-${REPO_ROOT}/cov/seg00.pt}"
 OUT_ROOT="${OUT_ROOT:-${JOB_TMPDIR}/smoke_out}"
 
-STEPS="${STEPS:-60}"                    # optimizer step 数。PhaseTimer 前 20 步算 warmup
-MICRO_BATCHES="${MICRO_BATCHES:-16 8}"
+# 64 而不是 60：replay 三段各一个 chunk = 3072 个 micro-batch，grad_accum 64 时光重放
+# 就占 48 步，STEPS 必须明显大于它，否则新域拿不到名额。64 步给新域留 1024 个名额。
+# 一个 run 约 20 分钟（实测 19.14 s/step），两个 run 加 preflight 约 50 分钟。
+# 改 STEPS 或 SMOKE_REPLAY_CHUNKS 时不用自己算，plan 那段会核对并给出该设多少。
+STEPS="${STEPS:-64}"                    # optimizer step 数。PhaseTimer 前 20 步算 warmup
+# 只剩 8：mb16 已被 603854 否掉（吞吐差 0.8%，显存差一倍），没有再测的价值
+MICRO_BATCHES="${MICRO_BATCHES:-8}"
+# 多流的来源。留空则退回 no_replay 单流。裁剪后的软链目录放 JOB_TMPDIR，不动原段
+REPLAY_DIRS="${REPLAY_DIRS-${REPO_ROOT}/data/chunks/fineweb_edu/seg00 ${REPO_ROOT}/data/chunks/fineweb_edu/seg01 ${REPO_ROOT}/data/chunks/fineweb_edu/seg02}"
+SMOKE_REPLAY_CHUNKS="${SMOKE_REPLAY_CHUNKS:-1}"
 GLOBAL_BATCH="${GLOBAL_BATCH:-512}"
 SEQ_LEN="${SEQ_LEN:-4096}"
 PEAK_LR="${PEAK_LR:-3e-4}"
@@ -192,7 +223,10 @@ LAMBDA_PROBE="${LAMBDA_PROBE:-1.0}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 SEED="${SEED:-42}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
-DO_RESUME="${DO_RESUME:-1}"
+# 默认关掉：多流 + 64 步的两个 run 已经吃掉约 50 分钟，再加一个续跑就超 1 小时。
+# 续跑那条逻辑（W₀ 必须从基座文件读而不是漂移后的权重）单独投一次验：
+#   qsub -v DO_RESUME=1 STEPS=32 ...
+DO_RESUME="${DO_RESUME:-0}"
 DO_BASELINE="${DO_BASELINE:-1}"
 
 # optimizer 必须整个当 JSON 传，**不能**写成 --optimizer.class_path + --optimizer.init_args.lr。
@@ -340,26 +374,146 @@ if cov_keys != targets:
 print("        键集双向一致")
 PY
 
-# 临时 plan。正式的要三段齐了才能生成，这里只描述本次冒烟
-python - "${SMOKE_PLAN}" "${DATA_DIR}" "${MAX_TOKENS}" <<'PY'
+# 临时 plan。把真 replay 段裁小后软链进 JOB_TMPDIR，再按裁剪后的**真实 block 数**
+# 反算 plan 里的每个数字——不是估的，所以 ReplayMixedData._check 的 2% 对账天然成立。
+python - "${SMOKE_PLAN}" "${MAX_TOKENS}" "${SEQ_LEN}" "${JOB_TMPDIR}" \
+         "${SMOKE_REPLAY_CHUNKS}" "${MICRO_BATCHES}" "${GLOBAL_BATCH}" ${REPLAY_DIRS} <<'PY'
 import json
+import shutil
 import sys
 from pathlib import Path
 
-out, data_dir, max_tokens = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
-# 只有 no_replay 一条臂：冒烟要量的是成本与梯度尺度，这两项与 replay 无关，而 C 臂
-# 本身就是零重放的，正好是要标定 λ 的那条
-plan = {
-    "_note": "02_smoke_pretrain.pbs 自动生成，只供本次冒烟，不要用于正式训练",
-    "segments": [],
-    "arms": [{
+out = Path(sys.argv[1])
+max_tokens, seq_len = int(sys.argv[2]), int(sys.argv[3])
+tmp_root, keep_chunks = Path(sys.argv[4]), int(sys.argv[5])
+# 用第一个 micro_batch 档位算名额。多档位时其余档的 blocks//mb 会差不到 mb 个 block
+# （8192 里差 8 个，0.1%），远在 _check 的 2% 容差内
+mb = int(sys.argv[6].split()[0])
+global_batch = int(sys.argv[7])
+sources = [Path(p) for p in sys.argv[8:]]
+
+block_size = seq_len + 1          # litdata 存的是 4097，训练取前 4096 做输入
+tokens_per_batch = mb * seq_len   # 与 replay_data.py 同口径
+total_batches = max_tokens // tokens_per_batch
+grad_accum = global_batch // mb
+
+
+def trim(src: Path, dst: Path, keep: int) -> int:
+    """把 src 的前 keep 个 chunk 软链到 dst，配裁剪过的 index.json，返回真实 block 数。
+
+    只软链不复制：一个 chunk 67MB，复制三个是白花 200MB 的 IO 和磁盘。原段是只读用途，
+    litdata 要写的索引缓存落在 dst 里。
+    """
+    index = json.loads((src / "index.json").read_text(encoding="utf-8"))
+    chunks = index.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        raise SystemExit(f"{src}/index.json 里没有 chunks 列表，不是 litdata 产物？")
+    if len(chunks) < keep:
+        raise SystemExit(f"{src} 只有 {len(chunks)} 个 chunk，要不了 {keep} 个")
+
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True)
+    for entry in chunks[:keep]:
+        name = entry.get("filename")
+        if not name:
+            raise SystemExit(f"{src}/index.json 的 chunk 条目没有 filename 字段：{entry}")
+        target = src / name
+        if not target.exists():
+            raise SystemExit(f"{target} 不存在，index.json 与目录内容不一致")
+        (dst / name).symlink_to(target)
+    (dst / "index.json").write_text(
+        json.dumps({**index, "chunks": chunks[:keep]}, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # 立刻用真正的读取路径验一遍。裁 index.json 是在赌「chunk 条目是自包含的」，
+    # 赌错了不一定报错，可能只是 len() 与实际能取到的量不一致——而 plan 的名额全部由
+    # len() 反算，对不上就是跑到一半才炸。所以不光看 len，还要把首尾两个 block 真取出来。
+    from litdata.streaming import StreamingDataset, TokensLoader
+
+    ds = StreamingDataset(input_dir=str(dst), item_loader=TokensLoader(block_size=block_size))
+    blocks = len(ds)
+    if blocks <= 0:
+        raise SystemExit(f"{dst} 读回 0 个 block，裁剪坏了")
+    for i in (0, blocks - 1):
+        got = len(ds[i])
+        if got != block_size:
+            raise SystemExit(f"{dst} 第 {i} 个 block 长度是 {got}，应为 {block_size}；index.json 裁坏了")
+    return blocks
+
+
+if not sources:
+    print("plan    REPLAY_DIRS 为空 -> 退回 no_replay 单流（不验多流路径）")
+    arm = {
         "name": "smoke", "segments": [], "replay_dirs": [], "cov_dirs": [],
         "replay_tokens": 0, "new_tokens": max_tokens, "train_max_tokens": max_tokens,
-    }],
+    }
+else:
+    missing = [str(p) for p in sources if not (p / "index.json").exists()]
+    if missing:
+        raise SystemExit(
+            "这些 replay 段没有 index.json：" + ", ".join(missing)
+            + "\n段还没生成就传 REPLAY_DIRS=\"\" 退回单流，但那样不验多流路径。"
+        )
+    names, dirs, batches = [], [], []
+    for src in sources:
+        dst = tmp_root / "smoke_replay" / src.name
+        blocks = trim(src, dst, keep_chunks)
+        names.append(src.name)
+        dirs.append(str(dst))
+        batches.append(blocks // mb)   # loader 是 drop_last=True
+        print(f"        {src.name}: 取 {keep_chunks} 个 chunk -> {blocks:,} block"
+              f" = {blocks // mb:,} 个 micro-batch")
+
+    replay_batches = sum(batches)
+    # 新域至少要拿到 replay 的三分之一，否则这个 run 基本就是在重放，|g_lm| 不具代表性
+    want_total = replay_batches * 4 // 3
+    if total_batches < want_total:
+        need = -(-want_total // grad_accum)   # 上取整到整步
+        raise SystemExit(
+            f"replay 占 {replay_batches:,} 个 micro-batch，而 STEPS={total_batches // grad_accum} "
+            f"总共只有 {total_batches:,} 个，新域剩 {total_batches - replay_batches:,}。\n"
+            f"把 STEPS 抬到 {need}（每步约 19 s，约 {need * 19 // 60} 分钟/run），"
+            f"或把 SMOKE_REPLAY_CHUNKS 从 {keep_chunks} 降下来。"
+        )
+
+    replay_tokens = replay_batches * tokens_per_batch
+    new_batches = total_batches - replay_batches
+    arm = {
+        "name": "smoke",
+        "segments": names,
+        # 同源：冒烟不从 cov_dirs 取 C（C 走 --kres.cov_path），但 load_arm 会断言
+        # 这两个列表逐字相同，写成一样的既满足断言也不说谎
+        "replay_dirs": dirs,
+        "cov_dirs": dirs,
+        "replay_tokens": replay_tokens,
+        "new_tokens": new_batches * tokens_per_batch,
+        "train_max_tokens": max_tokens,
+    }
+    print(f"plan    {len(dirs) + 1} 条流：new {new_batches:,} + replay {replay_batches:,}"
+          f" = {total_batches:,} 个 micro-batch"
+          f"（replay 占 {replay_batches / total_batches:.0%}，正式的 8B 臂是 50%）")
+
+plan = {
+    "_note": "02_smoke_pretrain.pbs 自动生成，只供本次冒烟，不要用于正式训练",
+    "segments": arm["segments"],
+    "arms": [arm],
 }
 out.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-print(f"plan    {out}（no_replay，预算 {max_tokens:,} token）")
+print(f"        {out}（预算 {max_tokens:,} token）")
 PY
+
+# litdata 是按 chunk 把数据分给 worker 的。每段只裁了 SMOKE_REPLAY_CHUNKS 个 chunk，
+# worker 比 chunk 还多时就有 worker 空手，那条流会提前取空，撞上 MixedReplayLoader 的
+# 「流 X 在第 N 个 micro-batch 就取空了」硬失败——而那条报错指向的是「chunk 没生成全」，
+# 排查方向完全是错的。正式训练每段几十个 chunk，只有冒烟会踩
+if [[ -n "${REPLAY_DIRS// /}" && "${NUM_WORKERS}" -gt "${SMOKE_REPLAY_CHUNKS}" ]]; then
+  echo "ERROR: NUM_WORKERS=${NUM_WORKERS} 大于 SMOKE_REPLAY_CHUNKS=${SMOKE_REPLAY_CHUNKS}。" >&2
+  echo "  每段只有 ${SMOKE_REPLAY_CHUNKS} 个 chunk，多出来的 worker 分不到数据，那条流会提前取空。" >&2
+  echo "  要么 NUM_WORKERS=${SMOKE_REPLAY_CHUNKS}，要么把 SMOKE_REPLAY_CHUNKS 抬到 ${NUM_WORKERS}" >&2
+  echo "  （每段多一个 chunk 就多 $(( 8192 / 8 )) 个 micro-batch，STEPS 要跟着抬）。" >&2
+  exit 1
+fi
 
 for MB in ${MICRO_BATCHES}; do
   if (( GLOBAL_BATCH % MB != 0 )); then
