@@ -3,9 +3,13 @@
 只用 commercial split。noncommercial 的 text 列是空的（许可限制），要靠本地几百 GB
 的 PMC OA XML dump 用 biomed-enriched 包回填，已决定放弃。
 
-数据集是**段落级**的（98.6M 段落 / 约 2400 万篇文章，49GB parquet / 127GB 原文），
-每行一个段落，`id` 形如 `PMC11276146_p3`，`article_id` 是 `PMC11276146`。段落做过
-≥64 token 的过滤，所以 `_pN` 的 N 有空洞。用之前必须先按 article_id 重组成文章。
+数据集是**段落级**的（98.6M 段落 / 286 万篇文章，约 34.5 段/篇，49GB parquet /
+127GB 原文），每行一个段落，`id` 形如 `PMC11276146_p3`，`article_id` 是 `PMC11276146`
+（实测约 81% 其实是纯数字的 PMID）。段落做过 ≥64 token 的过滤，所以 `_pN` 的 N 有
+空洞。用之前必须先按 article_id 重组成文章。
+
+过滤后的有效语料实测 17.8B token（val 以 872 ppm 切出 15.54M token 反推，与
+「抽样外推 18.33B × (1 − 3.25% en 损耗)」两条独立路径互相吻合到 0.5%）。
 
 三个决定：
 
@@ -20,10 +24,10 @@
    因为段落号重复而交错成乱码。
 
 2. **跨分片的边界文章直接丢弃。**
-   每个 worker 丢掉自己遇到的第一个和最后一个 article 的 run。26 个分片最多丢 26 篇，
-   对 2400 万篇是 1e-6 量级。这样换来完全的分片并行，比为了这 26 篇去做两阶段
-   外部排序（要把 127GB 重写一遍）划算得多。丢弃数会计入统计，明显超过 26 就说明
-   段落不连续，需要回头查。
+   每个 worker 丢掉自己遇到的第一个和最后一个 run，26 个分片共丢 52 篇（实测正是
+   52），对 286 万篇是 2e-5 量级。这样换来完全的分片并行，比为了这 52 篇去做两阶段
+   外部排序（要把 127GB 重写一遍）划算得多。丢弃数会计入统计，明显超过 2×分片数
+   就说明段落不连续，需要回头查。
 
 3. **不用它的 curation 标注。**
    educational_score / clinical 上采样是 Biomed-Enriched 那篇论文自己的贡献，用了
@@ -38,6 +42,8 @@
 
 val/test 的 ppm 默认值是按「各约 5000 万 token」估的，但 Biomed 的实际总 token 数
 要先跑 `checks.py token-count` 才知道，拿到数字后回来调 --val-ppm / --test-ppm。
+本实验用的是 --val-ppm 898 --test-ppm 898（各约 1600 万 token），train 侧
+--train-tokens 8e9 --corpus-tokens 18.33e9 --train-margin 1.10。
 """
 
 from __future__ import annotations
