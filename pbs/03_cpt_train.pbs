@@ -588,6 +588,11 @@ cmd=(
   --train.max_tokens "${MAX_TOKENS}"
   --train.max_norm "${MAX_NORM}"
   --train.lr_schedule wsd
+  # 必须显式把 steps 置 null。它的默认值是 100 而**不是** None（args.py:19），而
+  # __post_init__ 的互斥判的是「两个都为真」——所以只给 fraction 会撞上那个默认值，
+  # 报 "Can't provide both"，看起来像脚本两个都传了。02 那份冒烟脚本用的是 steps，
+  # 没碰到这条
+  --train.lr_warmup_steps null
   --train.lr_warmup_fraction "${WARMUP_FRACTION}"
   --train.lr_cooldown_fraction "${COOLDOWN_FRACTION}"
   --train.min_lr "${MIN_LR}"
