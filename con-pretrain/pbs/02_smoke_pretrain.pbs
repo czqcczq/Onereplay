@@ -22,12 +22,12 @@
 # 以及 --resume 带着正则器能不能接上（W₀ 必须来自基座文件而不是漂移后的权重）。
 #
 # -----------------------------------------------------------------------------
-# 这个冒烟**不需要新域（Biomed）数据**
+# 语料的选择只影响 λ 那一项
 #
 #   要量的三个数里，显存和吞吐与语料无关；|g_lm| 和 clip 触发率轻微相关；只有 λ 的
-#   标定强相关。所以 DATA_DIR 默认就用 seg00（FineWeb-Edu），有 Biomed 的 chunk 就
-#   指过去。用 seg00 时 λ 那一项只当量级参考——在基座见过的分布上训，ΔW 比在 Biomed
-#   上小得多，据此反算的 λ 会偏大。脚本会在这种情况下明确标注。
+#   标定强相关。所以 DATA_DIR 默认指新域 Biomed 的 train。若它还没就位，可以退回
+#   seg00（FineWeb-Edu）先把前两项量出来，但那时 λ 只当量级参考——在基座见过的分布
+#   上训，ΔW 比在新域上小得多，据此反算的 λ 会偏大。汇总会检测并标注这种情况。
 #
 #   产出的 checkpoint 是垃圾，跑完就删。这不是一次训练。
 #
@@ -53,14 +53,15 @@
 #
 #   qsub -v MICRO_BATCHES="16" ...     只测一个档位
 #   qsub -v STEPS=100 ...              跑更长（λ 的标定会更准，因为漂移更大）
-#   qsub -v DATA_DIR=.../biomed/train  用真实新域数据（λ 标定才可信）
+#   qsub -v DATA_DIR=.../fineweb_edu/seg00 ...  新域还没就位时的退路
 #   qsub -v DO_RESUME=0 ...            跳过续跑验证
 #
 # 前置条件
 #   1) model/<基座>/{lit_model.pth,model_config.yaml} 就位
-#   2) data/chunks/fineweb_edu/seg00/index.json 就位
+#   2) data/chunks/biomed/{train,val}/index.json 就位
 #   3) cov/seg00.pt 就位（01_collect_cov_fineweb.pbs 的产物）
-#   4) litgpt-src 已 pip install -e（打过 open-sci-ref 补丁的那份）
+#   4) litgpt-src 已更新到 fork 的 open-sci-cpt 分支最新提交并 pip install -e
+#      （preflight 会拿脚本自己的参数表对一遍，版本偏旧直接报错）
 # =============================================================================
 
 set -euo pipefail
@@ -158,8 +159,9 @@ export TRANSFORMERS_OFFLINE=1
 
 # ---- 可调项（qsub -v 不生效时直接改这里）----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/model/open-sci-ref-v0.02-0.4b-fineweb-edu-1.4t-300B-4096}"
-DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/chunks/fineweb_edu/seg00}"
-VAL_DIR="${VAL_DIR:-${DATA_DIR}}"
+# 默认就用新域（Biomed）的 train/val：λ 的标定强依赖语料，见文件头那段
+DATA_DIR="${DATA_DIR:-${REPO_ROOT}/data/chunks/biomed/train}"
+VAL_DIR="${VAL_DIR:-${REPO_ROOT}/data/chunks/biomed/val}"
 COV_PATH="${COV_PATH:-${REPO_ROOT}/cov/seg00.pt}"
 OUT_ROOT="${OUT_ROOT:-${JOB_TMPDIR}/smoke_out}"
 
@@ -551,13 +553,17 @@ for name, r in runs.items():
     else:
         print("  |g_reg| 是 0：ΔW 还没长起来（步数太少或 LR 太低），λ 标不出来")
 
-print(f"""
+print("""
   ⚠ 这组 λ 只是量级下界，不能直接拿去跑正式实验。惩罚梯度正比于 ΔW，而冒烟只跑了
     几十步、漂移远小于正式训练的几千步，所以据此反算的 λ 偏大。
-    数据源是 {data_dir}——如果它不是 Biomed，偏差更大：在基座见过的分布上训，
-    ΔW 比在新域上小得多。
     正式的做法：baseline（No Replay）臂本来就要跑，跑完拿它终态的 ΔW 反算 λ，
     零额外成本且用的是真实漂移量。""")
+# 这条只在真的没用新域数据时才响。无条件打印的话它会变成每次都在的固定噪音，
+# 而固定噪音是不会被读的
+if "biomed" not in data_dir.lower():
+    print(f"""
+  ⚠⚠ 数据源是 {data_dir}，不是新域。在基座见过的分布上训，ΔW 比在新域上小得多，
+     上面这组 λ 的偏差比正常情况还要大一截，只能当数量级看。显存与吞吐两项不受影响。""")
 
 # ---- 正式作业的耗时投影 ----
 print("\n---- 正式作业耗时投影 ----")
