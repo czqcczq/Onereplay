@@ -75,7 +75,11 @@ IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_1
 
 JOBTAG="${PBS_JOBID:-local$$}"
 SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
-if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+# 原来只在 /local_ssd/$USER 已存在时才用它，而那个目录一般要自己建，于是永远走
+# /scratch 那条分支。/scratch 是并行文件系统，删一个还开着的文件不会真删，只留个
+# .__dpc 占位——日志里那一堆 "Device or resource busy: '.__dpc...'" 就是
+# multiprocessing 的临时目录终结器撞上这个。改成先试着建，建得出来就用本地盘。
+if mkdir -p "/local_ssd/${SCRATCH_USER}" 2>/dev/null; then
   JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_kres_${JOBTAG}}"
   EXTRA_BIND="-B /local_ssd:/local_ssd"
 else
@@ -117,6 +121,7 @@ if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
     STEPS MICRO_BATCHES GLOBAL_BATCH SEQ_LEN PEAK_LR MIN_LR WARMUP_STEPS
     WEIGHT_DECAY BETAS OPTIMIZER_JSON
     LAMBDA_PROBE NUM_WORKERS SEED PREFLIGHT_ONLY DO_RESUME DO_BASELINE
+    PBS_JOBID
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -179,7 +184,12 @@ WARMUP_STEPS="${WARMUP_STEPS:-5}"
 # 用 λ=1 探针而不是某个猜的值：accumulate_grad 的 scale 是 λ/N，所以 λ=1 时报出来的
 # |g_reg| 就是未缩放的 ‖dR/dW‖/N，任何目标比例都能由它直接反算
 LAMBDA_PROBE="${LAMBDA_PROBE:-1.0}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
+# 1 而不是 2：实测 fwd_bwd 占一个 optimizer step 的 98.2%，取数根本不是瓶颈，第二个
+# worker 换不来吞吐。而它是要花代价的——MixedReplayLoader 给**每条流**各建一个
+# StreamingDataLoader，8B replay 臂有 4 条流，in-flight 的共享内存张量数是
+# 流数 × num_workers × prefetch_factor，2 个 worker 就是 16 份。603854 那次
+# mb8_reg 正是被 "Too many open files in system" 打死的。
+NUM_WORKERS="${NUM_WORKERS:-1}"
 SEED="${SEED:-42}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 DO_RESUME="${DO_RESUME:-1}"
@@ -212,6 +222,20 @@ echo "========================================================================"
 echo "Python : $(which python)"
 python --version
 nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# 文件句柄的余量。603854 那次 mb8_reg 死在 "Too many open files in system (23)"——
+# errno 23 是 ENFILE，即**全系统**的 file table 满了，不是本进程的 ulimit（那是 EMFILE=24）。
+# 节点是共享的，所以耗尽的可能是邻居也可能是我们自己；不打这几个数就永远只能猜。
+# fd_report 在每个 run 前后各调一次，看它是不是随 run 单调涨——涨就是我们在漏。
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+fd_report () {
+  # file-nr 三列：已分配、已分配但空闲、上限
+  local nr; nr="$(cat /proc/sys/fs/file-nr 2>/dev/null || echo '? ? ?')"
+  local shm; shm="$(ls /dev/shm 2>/dev/null | wc -l)"
+  local mine; mine="$(ls /proc/self/fd 2>/dev/null | wc -l)"
+  echo "fd: 系统 file-nr=[${nr}]  /dev/shm 条目=${shm}  本进程 fd=${mine}  ulimit -n=$(ulimit -n)"
+}
+fd_report
 
 # ===========================================================================
 # Step 0: Preflight（纯 CPU）
@@ -416,10 +440,27 @@ run_one () {
   # 记下来继续测下一档；其它失败几乎一定是配置问题，而四个 run 用的是同一套配置，
   # 继续跑只是把同一个错误重复三遍、再用一屏「?」把它盖掉——第一版就是这么丢掉现场的。
   # 所以非 OOM 立刻停，并把日志尾巴打到 stdout（PBS 的 .o 文件里就能直接看到原因）。
+  fd_report
   if "${cmd[@]}" 2>&1 | tee "${log}"; then
     echo "RUN ${tag}: ok"
+    fd_report
   elif grep -q "CUDA out of memory" "${log}"; then
     echo "RUN ${tag}: OOM —— 这一档装不下，本身就是结论，继续下一档"
+    fd_report
+  elif grep -q "Too many open files" "${log}"; then
+    # 与配置错误分开处理：这个不是「配置写错了」，是句柄耗尽，而节点是共享的，
+    # 换个时间跑可能就过了。停下来同样是对的（后面的 run 只会更缺句柄），但要
+    # 说清楚该看什么，别让人去翻配置
+    echo ""
+    echo "RUN ${tag}: 文件句柄耗尽（errno 23 = ENFILE，全系统的 file table 满了，"
+    echo "  不是本进程的 ulimit）。对照上面每个 run 前后的 fd: 行——"
+    echo "  file-nr 第一列随 run 单调涨 = 我们自己在漏，降 NUM_WORKERS（当前"
+    echo "  ${NUM_WORKERS}）或减少并发的流数；一开始就很高 = 节点上别的作业占的，换个时间重投。"
+    fd_report
+    echo "日志：${log}"
+    echo "---- 最后 40 行 ----"
+    tail -40 "${log}"
+    exit 1
   else
     echo ""
     echo "RUN ${tag}: 非 OOM 失败，后面几个 run 是同一套配置只会同样失败，就此停下。"
