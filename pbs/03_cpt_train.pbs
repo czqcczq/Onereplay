@@ -22,6 +22,13 @@
 #   c_1b        no_replay       cov/seg00.pt      1B           20.3 h
 #   c_4b        no_replay       cov/arm_4b.pt     4B           20.3 h
 #   c_8b        no_replay       cov/arm_8b.pt     8B           20.3 h
+#   c_id        no_replay       （单位阵）        —            20.3 h
+#
+# c_id 是主消融：C 换成同尺寸单位阵，惩罚退化成 ‖ΔW‖_F² 的各向同性收缩，不含任何
+# 旧知识结构。它回答的是「协方差挑的方向到底有没有价值」——真 C 赢不了它，整个方法
+# 的立论就没了。α 回滚扫描（kres.attribute_forgetting）已经给出强烈预警：把被正则
+# 那 110 层的漂移等比例缩到 0.75 就追回 34.7% 的遗忘，而真 C 保持 ‖ΔW‖ 98.3% 不变、
+# 靠旋转只追回 8%。这条臂现在是必跑的，不是可选的。
 #
 # **核心对比是横着看的**：同一个旧数据预算下，「重放它」与「用它估的 C 去正则」哪个更
 # 保住旧能力、哪个更少拖累新域。所以 c_Nb 与 replay_Nb 必须成对同预算，plan 里
@@ -115,7 +122,7 @@ if [[ "${KRES_IN_CONTAINER:-0}" != "1" ]]; then
 
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR SELF_PATH
-    ARM LAMBDA SCAN_STEPS DATA_ARM COV_PATH OUT_DIR RUN_TAG
+    ARM LAMBDA SCAN_STEPS DATA_ARM COV_PATH IDENTITY OUT_DIR RUN_TAG
     MODEL_DIR NEW_DATA_DIR VAL_DIR PROBE_DIR TEST_DIR PLAN_PATH COV_DIR LOG_DIR
     MICRO_BATCH GLOBAL_BATCH SEQ_LEN PEAK_LR MIN_LR WARMUP_FRACTION COOLDOWN_FRACTION
     WEIGHT_DECAY BETAS OPTIMIZER_JSON MAX_NORM
@@ -238,9 +245,13 @@ case "${ARM}" in
   c_1b)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/seg00.pt"  ;;
   c_4b)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/arm_4b.pt" ;;
   c_8b)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/arm_8b.pt" ;;
+  # identity 消融。给 arm_4b.pt 只是为了拿层名和维度——矩阵内容会被 --kres.identity
+  # 整个换成单位阵，所以这里换成 seg00 或 arm_8b 结果逐位相同。仍然要给一个真 C 文件，
+  # 因为 assert_covers 靠它核对「C 的键集与模型目标层一致」，那条检查不能绕过
+  c_id)      DATA_ARM="${DATA_ARM:-no_replay}"; ARM_COV="${COV_DIR}/arm_4b.pt"; IDENTITY=1 ;;
   *)
     echo "ERROR: 不认识 ARM=${ARM}" >&2
-    echo "  可选：vanilla / replay_1b / replay_4b / replay_8b / c_1b / c_4b / c_8b" >&2
+    echo "  可选：vanilla / replay_1b / replay_4b / replay_8b / c_1b / c_4b / c_8b / c_id" >&2
     exit 1
     ;;
 esac
@@ -290,7 +301,7 @@ cd "${REPO_ROOT}"
 echo "========================================================================"
 echo "ARM        = ${ARM}   (--data.arm ${DATA_ARM})"
 echo "OUT_DIR    = ${OUT_DIR}"
-echo "COV_PATH   = ${COV_PATH:-（无，不加正则）}   LAMBDA=${LAMBDA:-—}"
+echo "COV_PATH   = ${COV_PATH:-（无，不加正则）}   LAMBDA=${LAMBDA:-—}${IDENTITY:+   identity=1（C 换成单位阵，只取层名和维度）}"
 echo "PLAN       = ${PLAN_PATH}"
 echo "新域       = ${NEW_DATA_DIR}"
 echo "评估       = val:${VAL_DIR}  probe:${PROBE_DIR}  test:${TEST_DIR}"
@@ -627,6 +638,13 @@ if [[ -n "${COV_PATH}" ]]; then
     # 这个文件是被比对的那一方，额外证明了模型确实收到了基座权重
     --kres.base_checkpoint "${MODEL_DIR}/lit_model.pth"
   )
+  # 单位阵消融。λ **不能**照抄真 C 那条臂：|g_reg| 的量级由 C 本身定，同一个 λ 在
+  # 单位阵下的惩罚强度完全是另一个数。两条臂要可比，必须在**同一个检查点**上把
+  # |g_reg| 对齐（probe_lambda --identity 算的就是这个），否则比出来的是「λ 谁调得
+  # 更好」而不是「协方差结构有没有用」
+  if [[ "${IDENTITY:-0}" == "1" ]]; then
+    cmd+=(--kres.identity true)
+  fi
 fi
 
 echo ""

@@ -98,14 +98,25 @@ def g_lm_from_log(log_path: Path, around_step: int | None, window: float = 0.1) 
     return statistics.median(tail), len(tail)
 
 
-def compute(base: Path, checkpoint: Path, cov: Path) -> tuple[float, float, int, dict]:
+def compute(
+    base: Path, checkpoint: Path, cov: Path, identity: bool = False
+) -> tuple[float, float, int, dict]:
     """返回 (归一化的 R, λ=1 时的 |g_reg|, 层数, C 的 metadata)。
 
     走的是 `full_covariance_grad_` 本身而不是另抄一遍公式：抄一遍就有抄错一次的机会，
     而抄错的表现是一个量级正确、但系统性偏掉的 λ，没有任何东西能对照出来。
+
+    `identity=True` 把 C 换成同尺寸单位阵，和训练时的 `--kres.identity` 走同一个函数。
+    单位阵那条臂的 λ 必须在这里单独反算：|g_reg| 的量级由 C 本身定，照抄真 C 那条臂的
+    λ 会让两条臂的惩罚强度差出一个未知倍数，比出来的就成了「λ 谁调得更好」而不是
+    「协方差结构有没有用」——而后者正是这条消融唯一要回答的问题。
     """
     payload = load_covariance_payload(cov)
     covariances = payload["covariances"]
+    if identity:
+        from kres.covariance import to_identity_covariances
+
+        covariances = to_identity_covariances(covariances)
     names = sorted(covariances)
 
     weights = load_reference_weights(checkpoint, names, dtype=torch.float32)
@@ -137,6 +148,11 @@ def main(argv=None) -> int:
     ap.add_argument("--base", type=Path, required=True, help="基座 lit_model.pth（W₀）")
     ap.add_argument("--checkpoint", type=Path, required=True, help="要反算的检查点 lit_model.pth（W）")
     ap.add_argument("--cov", type=Path, required=True, help="C 文件（kres.collect_cov 的产物）")
+    ap.add_argument(
+        "--identity",
+        action="store_true",
+        help="把 C 换成同尺寸单位阵，给 c_id 那条臂标 λ（与 --kres.identity 对应）",
+    )
     ap.add_argument("--log", type=Path, default=None, help="训练日志，用来取 |g_lm| 的中位数")
     ap.add_argument("--g-lm", type=float, default=None, help="直接给 |g_lm|，给了就不读日志")
     ap.add_argument(
@@ -157,9 +173,9 @@ def main(argv=None) -> int:
     step = step_from_checkpoint(args.checkpoint)
     print(f"检查点  {args.checkpoint}" + (f"（第 {step} 步）" if step is not None else ""))
     print(f"基座    {args.base}")
-    print(f"C       {args.cov}")
+    print(f"C       {args.cov}" + ("（换成单位阵，只取层名和维度）" if args.identity else ""))
 
-    R, g_reg, n_layers, meta = compute(args.base, args.checkpoint, args.cov)
+    R, g_reg, n_layers, meta = compute(args.base, args.checkpoint, args.cov, args.identity)
     print(
         f"\nC 的 metadata：{n_layers} 层，tokens={meta.get('tokens', '?')}，"
         f"include_lm_head={meta.get('include_lm_head', '?')}"
