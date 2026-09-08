@@ -40,7 +40,7 @@ import csv
 import sys
 from pathlib import Path
 
-FIELDS = ("val_loss", "val_ppl", "probe_loss", "probe_ppl")
+FIELDS = ("val_loss", "val_ppl", "probe_loss", "probe_ppl", "test_loss", "test_ppl")
 
 
 def load_run(root: Path) -> list[dict]:
@@ -165,6 +165,16 @@ def main(argv=None) -> int:
             cells.append(f" {v:>7.4f}{p:>9.4f}{rec:>9} |")
         label = f"{x / 1e9:>10.2f}" if args.x == "new_tokens" else f"{x:>10.0f}"
         print(label + " |" + "".join(cells))
+
+    # test 是留出集，只在训练结束时评一次——中途反复评它就等于把它变成第二个 val，
+    # 留出的意义没了。所以它没有曲线，只能作为终态的一个数单列
+    tkey = f"test_{args.metric}"
+    finals = {n: series[n][-1].get(tkey) for n in names}
+    if any(v is not None for v in finals.values()):
+        print(f"\n终态 test_{args.metric}（新域留出集，只在训练结束时评一次，故无曲线）：")
+        for n in names:
+            v = finals[n]
+            print(f"  {n:<20} " + (f"{v:.4f}" if v is not None else "—（还没跑完，终态评测没发生）"))
 
     print(f"""
 横轴是 {args.x}。{'同 step = 同算力预算；replay 臂在同一步吃到的新域 token 比 vanilla 少，'
