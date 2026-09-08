@@ -125,6 +125,12 @@ def main(argv=None) -> int:
     if args.x == "step":
         common = set.intersection(*(set(r["step"] for r in s) for s in series.values()))
         grid = sorted(common)
+        # 各臂的终态评测落在各自不同的 iter 上（跑满 8B 新域所需的步数不同），交集会把
+        # 终态那一行整条丢掉，只剩到最后一个周期评测点为止。补上最先跑完的那条臂的终点，
+        # 其余臂在该点插值——它 ≤ 每条臂的最后一点，不构成外推
+        hi = min(s[-1]["step"] for s in series.values())
+        if not grid or hi - grid[-1] > 1:
+            grid.append(hi)
     else:
         hi = min(s[-1]["new_tokens"] for s in series.values())
         lo = max(s[0]["new_tokens"] for s in series.values())
@@ -140,7 +146,9 @@ def main(argv=None) -> int:
     if not grid:
         raise SystemExit("各臂没有公共的横轴取值，没法对齐")
 
-    xlabel = "新域(B)" if args.x == "new_tokens" else "step"
+    # csv 那一列名叫 step，装的其实是 iter_num（micro-batch 计数），是控制台打的 step 的
+    # gradient_accumulation_iters 倍。照它的列名标会和日志里的步数对不上
+    xlabel = "新域(B)" if args.x == "new_tokens" else "iter"
     head = f"{xlabel:>10} |"
     for n in names:
         head += f" {n[:22]:^26}|"
@@ -177,8 +185,9 @@ def main(argv=None) -> int:
             print(f"  {n:<20} " + (f"{v:.4f}" if v is not None else "—（还没跑完，终态评测没发生）"))
 
     print(f"""
-横轴是 {args.x}。{'同 step = 同算力预算；replay 臂在同一步吃到的新域 token 比 vanilla 少，'
-       '所以这张表对 replay 的遗忘是偏乐观的读法。' if args.x == 'step' else
+横轴是 {xlabel}。{'iter 是 micro-batch 计数（csv 那一列虽然叫 step），要换成控制台日志里的'
+       '优化步数得除以 gradient_accumulation_iters。同算力预算下比；replay 臂在同一步吃到的'
+       '新域 token 比 vanilla 少，所以这张表对 replay 的遗忘是偏乐观的读法。' if args.x == 'step' else
        '同 new_tokens = 同新域曝光，跨臂比遗忘该用这个。'}
 恢复率的分母是 {base} 在该点的总遗忘量，它随训练增长，所以同样的绝对改善在后期
 对应更小的百分比。跨行比较恢复率时记得这件事。""")
