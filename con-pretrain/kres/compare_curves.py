@@ -132,7 +132,9 @@ def main(argv=None) -> int:
         if not grid or hi - grid[-1] > 1:
             grid.append(hi)
     else:
-        hi = min(s[-1]["new_tokens"] for s in series.values())
+        # 上界取**最长**那条臂而不是最短：跑到一半的臂在它结束之后的格点上打「—」，
+        # 而取最短会把所有臂一起截到那条最短的长度上，且截得无声无息
+        hi = max(s[-1]["new_tokens"] for s in series.values())
         lo = max(s[0]["new_tokens"] for s in series.values())
         grid, x = [], max(lo, args.grid)
         while x <= hi + 1e-6:
