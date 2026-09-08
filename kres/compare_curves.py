@@ -132,6 +132,11 @@ def main(argv=None) -> int:
         while x <= hi + 1e-6:
             grid.append(x)
             x += args.grid
+        # 终点几乎永远差网格一丁点：预算写的是 8.00B，实际跑出来是 7,999,979,520。照直
+        # 算会把终态那一行整个丢掉，而那正是主表要用的一行，且丢得无声无息——表看上去
+        # 完好，只是最后一行不见了
+        if not grid or hi - grid[-1] > args.grid * 0.02:
+            grid.append(hi)
     if not grid:
         raise SystemExit("各臂没有公共的横轴取值，没法对齐")
 
