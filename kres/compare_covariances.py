@@ -98,14 +98,31 @@ def pair_stats(cov_a, cov_b, keys, drift, dtype):
     return agg, per_layer
 
 
-def nesting_of(meta_mix: dict, name_other: str) -> float | None:
-    """meta_mix 描述的合并结果里，name_other 是不是被含进去了？含了就返回它的权重。"""
-    if meta_mix.get("type") != "covariance_mix":
-        return None
-    for path_str, weight in zip(meta_mix.get("inputs", []), meta_mix.get("weights", [])):
-        if Path(path_str).name == name_other:
-            return float(weight)
-    return None
+def segments_of(meta: dict, path: Path) -> set[str]:
+    """这个 C 覆盖了哪些原始段。合并结果按 plan 展开，原始段就是它自己。"""
+    segs = meta.get("segments") or (meta.get("inputs") if meta.get("type") == "covariance_mix" else None)
+    return {Path(str(s)).stem for s in segs} if segs else {path.stem}
+
+
+def nesting_of(seg_a: set[str], n_a: int, seg_b: set[str], n_b: int) -> tuple[str, float | None]:
+    """返回 (关系, 压缩系数)。压缩系数 = 嵌套把差机械压小的倍数。
+
+    按**段集合**判定而不是按文件名。arm_8b 的 inputs 里写的是 seg00/seg01/seg02，不含
+    "arm_4b.pt" 这个名字，但它覆盖的段是 arm_4b 的超集——只比文件名会把这一对误判成
+    「不嵌套」，从而把一个被压了一半的差当成独立采样噪声来读。
+
+    A ⊂ B 时 C_B = w_A·C_A + (1−w_A)·C_rest，于是 C_B − C_A = (1−w_A)(C_rest − C_A)，
+    压缩系数就是 1 − tokens(A)/tokens(B)。
+    """
+    if seg_a == seg_b:
+        return "同段", 0.0
+    if seg_a < seg_b:
+        return "是", 1 - n_a / n_b
+    if seg_b < seg_a:
+        return "是", 1 - n_b / n_a
+    if seg_a & seg_b:
+        return "部分重叠", None
+    return "否", None
 
 
 def main(argv=None) -> int:
@@ -135,17 +152,18 @@ def main(argv=None) -> int:
         raise SystemExit("--base 和 --checkpoint 要么都给，要么都不给")
 
     # 先只读 metadata（顺带确认文件能打开），矩阵按需加载，内存里最多同时放两个
-    metas, keysets = [], []
+    metas, keysets, tokens = [], [], []
     for p in paths:
         pl = load_covariance_payload(p)
         metas.append(pl.get("metadata", {}))
         keysets.append(set(pl["covariances"]))
         counts = pl["counts"]
-        n_tok = counts[next(iter(counts))]
+        tokens.append(int(counts[next(iter(counts))]))
         src = metas[-1].get("segments") or metas[-1].get("inputs")
-        print(f"  {p.name:<16} {len(keysets[-1]):>4} 层   token {n_tok:>15,}"
+        print(f"  {p.name:<16} {len(keysets[-1]):>4} 层   token {tokens[-1]:>15,}"
               + (f"   合自 {[Path(str(s)).stem for s in src]}" if src else ""))
         del pl
+    segsets = [segments_of(m, p) for m, p in zip(metas, paths)]
 
     if len(set(map(frozenset, keysets))) != 1:
         base = keysets[0]
@@ -185,7 +203,7 @@ def main(argv=None) -> int:
         del cov_i
 
     print("\n=== 两两比较（{} 层聚合，A ↔ B 的分母取 B）===".format(len(keys)))
-    head = f"{'A ↔ B':<26}{'‖ΔC‖/‖C_B‖':>13}{'1−cos':>12}{'tr_A/tr_B':>12}"
+    head = f"{'A ↔ B':<26}{'‖ΔC‖/‖C_B‖':>13}{'去压缩后':>11}{'1−cos':>12}{'tr_A/tr_B':>12}"
     if drift is not None:
         head += f"{'‖ΔW·ΔC‖/‖ΔW·C_B‖':>20}"
     head += "   嵌套"
@@ -195,18 +213,19 @@ def main(argv=None) -> int:
         a = res["agg"]
         rel = (a["d2"] / a["b2"]) ** 0.5
         cos = a["ab"] / ((a["a2"] * a["b2"]) ** 0.5)
+        rel_name, comp = nesting_of(segsets[i], tokens[i], segsets[j], tokens[j])
+        # 「去压缩后」把嵌套造成的机械缩小除回去，得到的是「多出来那部分段的 C 与 A 差
+        # 多远」，这个数才和噪声地板同一个量纲、能直接对着比
+        undo = f"{rel / comp:>10.3%}" if comp else f"{'—':>11}"
         line = (f"{paths[i].stem + ' ↔ ' + paths[j].stem:<26}"
-                f"{rel:>12.3%}{1 - cos:>12.2e}{a['tra'] / a['trb']:>12.5f}")
+                f"{rel:>12.3%}{undo}{1 - cos:>12.2e}{a['tra'] / a['trb']:>12.5f}")
         if drift is not None:
             line += f"{(a['gd2'] / a['gb2']) ** 0.5:>19.3%}" if a["gb2"] > 0 else f"{'—':>19}"
-        w = nesting_of(metas[j], paths[i].name) or nesting_of(metas[i], paths[j].name)
-        # 打的是压缩系数 1−w 而不是被含段的权重 w：读者要拿它去乘噪声地板，
-        # 直接给能乘的那个数，省得每次自己换算一步、换错方向
-        line += f"   {'是（压缩 %.3f）' % (1 - w) if w is not None else '否'}"
+        line += f"   {rel_name}" + (f"（压缩 {comp:.3f}）" if comp else "")
         print(line)
 
-    print("\n  「嵌套=是」那几行的差被合并方式机械地压小了，不能当作 C 收敛的证据；")
-    print("  只有「嵌套=否」的行（互不相交的两段）才是这个 token 预算下的采样噪声地板。")
+    print("\n  「嵌套=是」那几行的原始差被合并方式机械地压小了，不能直接当作 C 收敛的证据，")
+    print("  要看「去压缩后」那一列。「嵌套=否」的行是互不相交的两段，本身就是噪声地板。")
 
     # 恒等式自检：C_mix − C_i = w_j·(C_j − C_i)，两边的范数必须相等。这既验证了嵌套
     # 修正的算法，也顺带验证了 mix_covariances 的加权确实是按 token 来的
