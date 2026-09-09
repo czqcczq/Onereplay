@@ -375,8 +375,6 @@ def verdict(rows: list[dict], args: argparse.Namespace) -> str:
     ordered = sorted(rows, key=lambda row: -row["share"])
     top1 = ordered[0]
     top5_share = sum(row["share"] for row in ordered[:5])
-    tail_share = 1.0 - top1["share"]
-
     diagonals = sorted(row["mean_diag"] for row in rows)
     median_diag = diagonals[len(diagonals) // 2]
     spread = diagonals[-1] / max(diagonals[0], 1e-30)
@@ -388,7 +386,10 @@ def verdict(rows: list[dict], args: argparse.Namespace) -> str:
         f"({top1['share'] / even:.1f}x an even split)"
     )
     print(f"       top-5 layers together     : {100.0 * top5_share:.4f}%")
-    print(f"       all other {layers - 1:>3} layers      : {100.0 * tail_share:.4f}%")
+    # Complement of the top 5, not of the top 1: printed next to the line above,
+    # the two should be readable as a partition instead of inviting a subtraction
+    # against a different numerator.
+    print(f"       the other {layers - 5:>3} layers      : {100.0 * (1.0 - top5_share):.4f}%")
     print(
         f"       mean_diag spread          : {spread:.3e}x from smallest to largest layer, "
         f"median {median_diag:.4e}"

@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from onereplay.eval.generation import generate_response
+from onereplay.eval.generation import batched_generate, resolve_batch_size
 
 INTEGER_RE = re.compile(r"-?\d+")
 QUESTION_KEYS = ("problem", "question", "prompt", "input")
@@ -126,13 +126,21 @@ class AIMEMetric:
             if limit > 0 and len(examples) >= limit:
                 break
 
+        responses = batched_generate(
+            model,
+            tokenizer,
+            [build_prompt(example["question"]) for example in examples],
+            device,
+            max_new_tokens,
+            resolve_batch_size(cfg, "math_batch_size"),
+            log_label="aime",
+        )
+
         correct = 0
         scored = 0
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
-            for idx, example in enumerate(examples, start=1):
-                prompt = build_prompt(example["question"])
-                response = generate_response(model, tokenizer, prompt, device, max_new_tokens)
+            for example, response in zip(examples, responses):
                 gold = gold_answer(example["answer"])
                 pred = predicted_answer(response)
                 is_correct = gold is not None and pred == gold
@@ -151,8 +159,6 @@ class AIMEMetric:
                     )
                     + "\n"
                 )
-                if idx % 10 == 0:
-                    print(f"aime generated {idx}/{len(examples)}")
 
         summary = {
             "run_name": run_name,

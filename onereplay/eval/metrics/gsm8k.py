@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from onereplay.eval.generation import generate_response
+from onereplay.eval.generation import batched_generate, resolve_batch_size
 
 NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?|-?\.\d+")
 
@@ -83,14 +83,22 @@ class GSM8KMetric:
                 if limit > 0 and len(examples) >= limit:
                     break
 
+        responses = batched_generate(
+            model,
+            tokenizer,
+            [build_prompt(example["question"]) for example in examples],
+            device,
+            max_new_tokens,
+            resolve_batch_size(cfg, "math_batch_size"),
+            log_label="gsm8k",
+        )
+
         correct = 0
         scored = 0
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
-            for idx, example in enumerate(examples, start=1):
+            for example, response in zip(examples, responses):
                 question = example["question"]
-                prompt = build_prompt(question)
-                response = generate_response(model, tokenizer, prompt, device, max_new_tokens)
                 gold = gold_answer(example.get("answer", ""))
                 pred = predicted_answer(response)
                 is_correct = gold is not None and pred == gold
@@ -109,8 +117,6 @@ class GSM8KMetric:
                     )
                     + "\n"
                 )
-                if idx % 25 == 0:
-                    print(f"gsm8k generated {idx}/{len(examples)}")
 
         summary = {
             "run_name": run_name,

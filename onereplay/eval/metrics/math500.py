@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from onereplay.eval.generation import generate_response
+from onereplay.eval.generation import batched_generate, resolve_batch_size
 
 QUESTION_KEYS = ("problem", "question", "prompt", "input")
 ANSWER_KEYS = ("answer", "final_answer", "solution", "target", "output")
@@ -238,13 +238,21 @@ class MATH500Metric:
             if limit > 0 and len(examples) >= limit:
                 break
 
+        responses = batched_generate(
+            model,
+            tokenizer,
+            [build_prompt(example["question"]) for example in examples],
+            device,
+            max_new_tokens,
+            resolve_batch_size(cfg, "math_batch_size"),
+            log_label=self.name,
+        )
+
         correct = 0
         scored = 0
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
-            for idx, example in enumerate(examples, start=1):
-                prompt = build_prompt(example["question"])
-                response = generate_response(model, tokenizer, prompt, device, max_new_tokens)
+            for example, response in zip(examples, responses):
                 gold = example["answer"]
                 pred = extract_answer(response)
                 is_correct = is_equiv(pred, gold)
@@ -263,8 +271,6 @@ class MATH500Metric:
                     )
                     + "\n"
                 )
-                if idx % 25 == 0:
-                    print(f"math500 generated {idx}/{len(examples)}")
 
         summary = {
             "run_name": run_name,

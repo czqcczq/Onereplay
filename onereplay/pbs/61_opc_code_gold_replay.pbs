@@ -3,7 +3,7 @@
 #PBS -N or_gold_rp
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
 #PBS -o /scratch/weiliu87/logs/onereplay/

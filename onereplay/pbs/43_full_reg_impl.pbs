@@ -51,7 +51,7 @@
 #
 # 【用法】
 #   mkdir -p /scratch/weiliu87/logs/onereplay
-#   qsub onereplay/pbs/43_full_reg_impl.pbs
+#   qsub onereplay/pbs/43_fullreg_imp_l.pbs
 #
 #   只做前置检查与合成恒等式（几分钟，不训练）:
 #     qsub -v PREFLIGHT_ONLY=1 onereplay/pbs/43_full_reg_impl.pbs

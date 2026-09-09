@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from onereplay.eval.generation import generate_response
+from onereplay.eval.generation import batched_generate, resolve_batch_size
 
 THIRD_PARTY = Path(__file__).resolve().parents[2] / "third_party"
 if str(THIRD_PARTY) not in sys.path:
@@ -35,20 +35,25 @@ class IFEvalMetric:
         if limit > 0:
             inputs = inputs[:limit]
 
+        responses = batched_generate(
+            model,
+            tokenizer,
+            [inp.prompt for inp in inputs],
+            device,
+            max_new_tokens,
+            resolve_batch_size(cfg, "ifeval_batch_size"),
+            log_label="ifeval",
+        )
+
         response_path = output_dir / "responses.jsonl"
         prompt_to_response = {}
         with response_path.open("w", encoding="utf-8") as file:
-            for idx, inp in enumerate(inputs, start=1):
-                response = generate_response(
-                    model, tokenizer, inp.prompt, device, max_new_tokens
-                )
+            for inp, response in zip(inputs, responses):
                 prompt_to_response[inp.prompt] = response
                 file.write(
                     json.dumps({"prompt": inp.prompt, "response": response}, ensure_ascii=False)
                     + "\n"
                 )
-                if idx % 25 == 0:
-                    print(f"ifeval generated {idx}/{len(inputs)}")
 
         strict_outputs = [
             evaluation_lib.test_instruction_following_strict(inp, prompt_to_response)

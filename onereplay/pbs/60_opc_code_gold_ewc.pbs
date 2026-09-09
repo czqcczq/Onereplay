@@ -3,7 +3,7 @@
 #PBS -N or_gold_ewc
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
 #PBS -o /scratch/weiliu87/logs/onereplay/
@@ -199,7 +199,7 @@ ADAPTERS="${RESULTS_ROOT}/adapters"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 
 # ---- 阶段开关 ----
-DRY_RUN="${DRY_RUN:-1}"          # 默认只打印计划，确认无误后改 0
+DRY_RUN="${DRY_RUN:0}"          # 默认只打印计划，确认无误后改 0
 DO_TRAIN="${DO_TRAIN:-1}"
 DO_EVAL="${DO_EVAL:-1}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"

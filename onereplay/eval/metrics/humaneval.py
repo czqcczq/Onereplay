@@ -14,7 +14,7 @@ from onereplay.eval.code_exec import (
     cleanup_body_completion,
     evaluate_entry_point_program,
 )
-from onereplay.eval.generation import generate_response
+from onereplay.eval.generation import batched_generate, resolve_batch_size
 
 
 def load_humaneval(data_file: str, cache_dir: str, limit: int) -> list[dict[str, Any]]:
@@ -56,17 +56,26 @@ class HumanEvalMetric:
         run_name = cfg.get("run_name", "base")
 
         rows = load_humaneval(data_file, cache_dir, limit)
+        # strip=False: the completion is appended to a function stub, so
+        # stripping the first line's indentation turns a correct body into
+        # "'return' outside function".
+        raws = batched_generate(
+            model,
+            tokenizer,
+            [build_prompt(example["prompt"]) for example in rows],
+            device,
+            max_new_tokens,
+            resolve_batch_size(cfg, "code_batch_size"),
+            strip=False,
+            log_label="humaneval",
+        )
+
         passed = 0
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
-            for idx, example in enumerate(rows, start=1):
-                prompt = example["prompt"]
-                user_prompt = build_prompt(prompt)
-                raw = generate_response(
-                    model, tokenizer, user_prompt, device, max_new_tokens, strip=False
-                )
+            for idx, (example, raw) in enumerate(zip(rows, raws), start=1):
                 completion = cleanup_body_completion(raw)
-                program = assemble_entry_point_program(prompt, completion)
+                program = assemble_entry_point_program(example["prompt"], completion)
                 ok, error = evaluate_entry_point_program(
                     program, example["entry_point"], example["test"], timeout
                 )
@@ -85,8 +94,8 @@ class HumanEvalMetric:
                     )
                     + "\n"
                 )
-                if idx % 10 == 0:
-                    print(f"humaneval generated/tested {idx}/{len(rows)}")
+                if idx % 25 == 0:
+                    print(f"humaneval tested {idx}/{len(rows)}", flush=True)
 
         summary = {
             "run_name": run_name,

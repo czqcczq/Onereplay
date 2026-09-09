@@ -39,6 +39,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=768)
 
+    # Decoding batch size. eval_batch_size is the fallback for every generative
+    # metric; the per-family overrides exist because the token budgets differ by
+    # an order of magnitude (math decodes 4096, code 512), so the KV cache a
+    # given batch needs does too. 0 means "fall back to eval_batch_size".
+    parser.add_argument("--eval_batch_size", type=int, default=32)
+    parser.add_argument("--math_batch_size", type=int, default=0)
+    parser.add_argument("--code_batch_size", type=int, default=0)
+    parser.add_argument("--ifeval_batch_size", type=int, default=0)
+
     # commonsense loss
     parser.add_argument("--dataset_path", type=str, default="")
     parser.add_argument("--max_val_samples", type=int, default=1000)

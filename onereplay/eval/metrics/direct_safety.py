@@ -7,12 +7,8 @@ deliberately separate -- AdvBench/HarmBench go to a GPT-4 judge off-cluster and
 SORRY-Bench to a local fine-tuned Mistral -- so this file never assigns a
 harm label or an ASR. It just writes responses.jsonl.
 
-Batching is not optional here. The stock generate_response in
-onereplay.eval.generation decodes one prompt at a time, which turns 1280
-prompts into hours; the batched path below finishes in minutes on an H200.
-Prompts are length-sorted into buckets so a batch is not dragged out by one
-long member, and each row keeps its original index so responses.jsonl comes
-out in prompt order regardless of the bucket it was decoded in.
+Batching is not optional here. The batched decoder this metric introduced now
+lives in onereplay.eval.generation and every metric uses it.
 
 Unlike the other metrics this one does NOT append to a shared
 {metric}_summary.csv: two generation jobs run in parallel (see
@@ -26,9 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-import torch
-
-from onereplay.eval.generation import render_user_prompt
+from onereplay.eval.generation import batched_generate
 
 
 def load_prompts(path: str, limit: int = 0) -> list[dict[str, Any]]:
@@ -44,54 +38,6 @@ def load_prompts(path: str, limit: int = 0) -> list[dict[str, Any]]:
             if limit > 0 and len(rows) >= limit:
                 break
     return rows
-
-
-def batched_generate(
-    model,
-    tokenizer,
-    prompts: list[str],
-    device,
-    max_new_tokens: int,
-    batch_size: int,
-    log_every: int = 5,
-) -> list[str]:
-    """Greedy-decode one response per prompt, batched and order-preserving.
-
-    Returns responses aligned to the input order. Internally the prompts are
-    rendered through the chat template, sorted by token length so each batch is
-    roughly uniform, decoded, and scattered back to their original positions.
-    """
-
-    rendered = [render_user_prompt(tokenizer, prompt) for prompt in prompts]
-    lengths = [
-        len(tokenizer(text, add_special_tokens=False)["input_ids"]) for text in rendered
-    ]
-    order = sorted(range(len(rendered)), key=lambda index: lengths[index])
-
-    responses: list[str] = [""] * len(rendered)
-    num_batches = (len(order) + batch_size - 1) // batch_size
-    for batch_number, start in enumerate(range(0, len(order), batch_size), start=1):
-        chunk = order[start : start + batch_size]
-        encoded = tokenizer(
-            [rendered[index] for index in chunk],
-            return_tensors="pt",
-            padding=True,
-            add_special_tokens=False,
-        ).to(device)
-        with torch.no_grad():
-            output_ids = model.generate(
-                **encoded,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        generated = output_ids[:, encoded["input_ids"].shape[1] :]
-        for index, ids in zip(chunk, generated):
-            responses[index] = tokenizer.decode(ids, skip_special_tokens=True).strip()
-        if log_every > 0 and batch_number % log_every == 0:
-            print(f"direct_safety generated batch {batch_number}/{num_batches}", flush=True)
-    return responses
 
 
 class DirectSafetyMetric:
@@ -128,6 +74,7 @@ class DirectSafetyMetric:
             device,
             max_new_tokens,
             batch_size,
+            log_label=self.name,
         )
 
         with response_path.open("w", encoding="utf-8") as file:

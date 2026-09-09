@@ -10,7 +10,7 @@ from typing import Any
 from datasets import load_dataset, load_from_disk
 
 from onereplay.eval.code_exec import cleanup_program_completion, evaluate_assert_program
-from onereplay.eval.generation import generate_response
+from onereplay.eval.generation import batched_generate, resolve_batch_size
 
 
 def load_mbpp(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -60,13 +60,20 @@ class MBPPMetric:
         run_name = cfg.get("run_name", "base")
 
         rows = load_mbpp(cfg)
+        raws = batched_generate(
+            model,
+            tokenizer,
+            [build_mbpp_prompt(example) for example in rows],
+            device,
+            max_new_tokens,
+            resolve_batch_size(cfg, "code_batch_size"),
+            log_label="mbpp",
+        )
+
         passed = 0
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
-            for idx, example in enumerate(rows, start=1):
-                raw = generate_response(
-                    model, tokenizer, build_mbpp_prompt(example), device, max_new_tokens
-                )
+            for idx, (example, raw) in enumerate(zip(rows, raws), start=1):
                 completion = cleanup_program_completion(raw)
                 tests = example.get("test_list") or example.get("tests") or []
                 if isinstance(tests, str):
@@ -86,8 +93,8 @@ class MBPPMetric:
                     )
                     + "\n"
                 )
-                if idx % 10 == 0:
-                    print(f"mbpp generated/tested {idx}/{len(rows)}")
+                if idx % 50 == 0:
+                    print(f"mbpp tested {idx}/{len(rows)}", flush=True)
 
         summary = {
             "run_name": run_name,
