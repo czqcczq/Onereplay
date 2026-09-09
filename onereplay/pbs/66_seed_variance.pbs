@@ -1,0 +1,656 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_seedvar
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 四条臂 x 多个 seed，量训练噪声底
+#
+# 【为什么必须先跑这个】
+# 第一章的排名是 OneReplay 66.17 > EWC 65.99，差 0.18 个点。541 条上那是 **1 道题**。
+# 同一张表里 OneReplay 在另外三列已经输了（strict inst 73.38 vs 73.62、loose prompt
+# 68.58 vs 70.06、loose inst 75.54 vs 77.10），Multi-IF 平均 prompt 也输 1.60 个点。
+# 也就是说「OneReplay 最好」只在一个 bench 的一列上成立，幅度一道题。
+#
+# 后来换成 regonce 实现再训，OneReplay 掉到 64.88~65.80，比 EWC 差了。这件事有两种
+# 解释，而现有数据一种都排除不了：
+#
+#   (a) 效率优化把效果训坏了。已经基本排除：
+#       scripts/verify_reg_once_per_update.py 在 float64 上直接比累积后的 .grad，
+#       整窗口差 <1e-12，只有最后一个不足 accum 的短窗口会变（每 epoch 2,636 次
+#       更新里的 1 次）。日志侧也对上：同 λ 的新旧实现 ep3 val loss 0.07437 vs
+#       0.07462、reg 0.14009 vs 0.14045。实际施加的强度没变。
+#   (b) 0.18 个点从一开始就在噪声里。这个从来没测过，因为 **seed 2 / 3 一次都没跑**。
+#
+# 这个脚本补的就是 (b)。它不引入任何新方法、新数据、新 bench，只把同一个配置换
+# seed 重训，让「换个 seed 自然会抖多少」变成一个有数的量。跑完之后：
+#   - 若单臂的跨 seed 极差 > 1.5 个点（按现有数字很可能），那么第一章的排名、
+#     regonce 前后的「变差」、balanced 的「差 1.29 点」全都是同一团噪声，不需要再
+#     为它们找机制解释，也不能写进论文。
+#   - 若极差很小（<0.5 点），那 regonce 前后的差异就是真的，届时再去查环境差异。
+# 两种结局都是结论，都比再多训一个配置有价值。
+#
+# 【顺带填掉一个已知缺口】
+# results_log 的数据缺口表里记着「Hopper 上的 uniform regonce 对照｜未运行」：
+# 第四章的 uniform 行取自 RWTH 的旧实现，集群与实现两处差异没拆开。本脚本的
+# OneReplay 臂用 02_sweep_lambda.pbs 的命名 cs_onereplay_uniform_lam*_seed*_regonce，
+# 所以带上 SEEDS=1 跑一次就把那一格补上了，不用另写脚本。
+#
+# 【C / F / 回放池不随 seed 变】
+# 这是刻意的。C、对角 F、自蒸馏回放语料都是「旧知识」的一次性估计，跨训练摊销，
+# 三条臂共用同一份（指纹 9dd3398a…）。seed 只改新任务的数据顺序、dropout 和 LoRA
+# 初始化，也就是只改训练随机性 —— 那正是要测的量。把 C 也跟着重采会把两种来源混在
+# 一起，反而测不出东西。
+#
+# -----------------------------------------------------------------------------
+# 用法
+#
+# 强烈建议一个 cell 一个作业（互不阻塞，挂了只重投一个）。先看清有哪些 cell:
+#   qsub -v LIST_ONLY=1 onereplay/pbs/66_seed_variance.pbs
+#
+# 然后按 array 投（8 个 cell = 4 臂 x seed 2,3）:
+#   qsub -J 0-7 onereplay/pbs/66_seed_variance.pbs
+# 或手动挑:
+#   qsub -v CELL_INDEX=0 onereplay/pbs/66_seed_variance.pbs
+#
+# 只跑某一条臂的所有 seed:
+#   qsub -v ARMS=onereplay,SEEDS="2 3" onereplay/pbs/66_seed_variance.pbs
+#
+# 把 Hopper uniform-regonce 的 seed 1 对照一起补上（第四章的缺口）:
+#   qsub -v SEEDS="1 2 3" -J 0-11 onereplay/pbs/66_seed_variance.pbs
+#
+# 全部跑完后只出统计（不训练、不评测，几秒钟）:
+#   qsub -v SUMMARY_ONLY=1,SEEDS="1 2 3" onereplay/pbs/66_seed_variance.pbs
+# 本地也可以直接跑那一步，见脚本末尾打印的命令。
+#
+# 冒烟（约 25 分钟，确认四条臂的链路都通）:
+#   qsub -v SEEDS=2,MAX_STEPS=200,EPOCHS=1,EVAL_LIMIT=40,MULTIIF_LIMIT=20 \
+#     onereplay/pbs/66_seed_variance.pbs
+#   产物 run 名自动带 _smoke 后缀，不会污染正式 CSV。
+#
+# 【成本】vanilla / ewc / onereplay 每 cell 约 1.6h 训练 + 3h 评测 = 4.6h；
+# replay 因步数翻倍是 3.9h + 3h = 6.9h。8 个 cell 合计约 41 GPU-h。
+# 24h 的 walltime 串行塞得下 3~4 个 cell，脚本有守卫会主动停在跑不完之前。
+#
+# 前置条件（缺哪个脚本会指出来）:
+#   1) C:      results/cov/cov_flan_chat_20k_qv.pt              (01_collect_cov.pbs)
+#   2) F:      results/fisher/fisher_flan_chat_20k_qv.pt        (47_if_fisher.pbs)
+#   3) 回放池: results/replay/flan_selfdistill_20000_seed1.jsonl (13_replay_selfdistill)
+#   4) 日志目录: mkdir -p /scratch/weiliu87/logs/onereplay
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（与 01/02 号逐字一致）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/66_seed_variance.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT RESULTS_SAFETY DATASET_CACHE CS_DATASET
+    COV_PATH FISHER_PATH SELF_DISTILL_FILE TARGET_MODULES
+    ARMS SEEDS CELL_INDEX OR_LAMBDA EWC_LAMBDA REPLAY_PER_BATCH REPLAY_ACCUM
+    EPOCHS LR TRAIN_BATCH ACCUM TRAIN_MAXLEN VAL_FRAC MAXVAL EVAL_BATCH
+    REG_ONCE MAX_STEPS
+    EVAL_METRICS EVAL_LIMIT IFEVAL_INPUT
+    MULTIIF_INPUT MULTIIF_LANG MULTIIF_LIMIT MULTIIF_MAX_NEW_TOKENS
+    LIST_ONLY SUMMARY_ONLY FORCE_TRAIN FORCE_EVAL KEEP_ADAPTER
+    WALLTIME_SEC RESERVE_SEC ESTIMATE_SEC BOOTSTRAP_REPS
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  # PBS Pro 的 array 索引在容器里读不到，显式转发成 CELL_INDEX。
+  if [[ -n "${PBS_ARRAY_INDEX:-}" ]]; then
+    export "SINGULARITYENV_CELL_INDEX=${PBS_ARRAY_INDEX}"
+    export "APPTAINERENV_CELL_INDEX=${PBS_ARRAY_INDEX}"
+  fi
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results}"
+RESULTS_SAFETY="${RESULTS_SAFETY:-${REPO_ROOT}/results_safety}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 三条受保护臂各自的旧知识资产。全部跨 seed 共用，见文件头说明 ----
+TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_flan_chat_20k_qv.pt}"
+FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_flan_chat_20k_qv.pt}"
+SELF_DISTILL_FILE="${SELF_DISTILL_FILE:-${RESULTS_ROOT}/replay/flan_selfdistill_20000_seed1.jsonl}"
+
+# ---- 训练超参：与第一章逐字一致，唯一的变量是 seed ----
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-1e-4}"
+TRAIN_BATCH="${TRAIN_BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+TRAIN_MAXLEN="${TRAIN_MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+EVAL_BATCH="${EVAL_BATCH:-8}"
+REG_ONCE="${REG_ONCE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"
+
+# 各臂的强度取第一章选定的那个点。这里不扫 λ：本作业问的是「同一个点换 seed 抖多少」，
+# 掺进 λ 变化就答不了这个问题。
+OR_LAMBDA="${OR_LAMBDA:-3e-2}"
+EWC_LAMBDA="${EWC_LAMBDA:-3e2}"
+# 第一章的 cs_replaymix_4n4r_seed1：每个 micro-batch = 4 new + 4 replay。batch_size 是
+# micro-batch 总数，所以 accum 要翻倍才能让每次更新的 new task 行数与其它臂对齐（64）。
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
+REPLAY_ACCUM="${REPLAY_ACCUM:-128}"
+
+# ---- 评测 ----
+EVAL_METRICS="${EVAL_METRICS:-ifeval,multiif,commonsense}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MULTIIF_INPUT="${MULTIIF_INPUT:-${REPO_ROOT}/onereplay/third_party/Multi-IF/multiIF_20241018.csv}"
+MULTIIF_LANG="${MULTIIF_LANG:-English}"
+MULTIIF_LIMIT="${MULTIIF_LIMIT:-0}"
+MULTIIF_MAX_NEW_TOKENS="${MULTIIF_MAX_NEW_TOKENS:-1024}"
+
+# ---- 流程开关 ----
+LIST_ONLY="${LIST_ONLY:-0}"
+SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+KEEP_ADAPTER="${KEEP_ADAPTER:-1}"
+BOOTSTRAP_REPS="${BOOTSTRAP_REPS:-2000}"
+
+# ---- walltime 守卫：宁可少跑一个 cell，也不要跑到一半被杀 ----
+WALLTIME_SEC="${WALLTIME_SEC:-86400}"    # 与 #PBS -l walltime 对齐（24h）
+RESERVE_SEC="${RESERVE_SEC:-1200}"
+ESTIMATE_SEC="${ESTIMATE_SEC:-17000}"    # 第一个 cell 的预估（训练 1.6h + 评测 3h）
+
+# ---- 臂与 seed ----
+# seed 1 默认不在网格里：vanilla / ewc / replay 的 seed 1 第一章已经有了。带上
+# SEEDS="1 2 3" 会额外产出 Hopper 上的 uniform-regonce seed 1，也就是第四章缺的那格。
+ARMS="${ARMS:-vanilla ewc replay onereplay}"
+SEEDS="${SEEDS:-2 3}"
+ARMS="${ARMS//,/ }"
+SEEDS="${SEEDS//,/ }"
+read -r -a ARM_LIST <<< "${ARMS}"
+read -r -a SEED_LIST <<< "${SEEDS}"
+
+SUFFIX=""
+if [[ "${MAX_STEPS}" != "0" || "${EPOCHS}" != "3" || "${EVAL_LIMIT}" != "0" ]]; then
+  SUFFIX="_smoke"
+  echo "检测到短跑参数（MAX_STEPS=${MAX_STEPS} EPOCHS=${EPOCHS} EVAL_LIMIT=${EVAL_LIMIT}），run 名加 _smoke 后缀"
+fi
+
+# 一个 cell = 一条臂的一个 seed。顺序按 seed 外层、臂内层排，这样 array 的前几个索引
+# 就把一个 seed 的四条臂凑齐了 —— 中途被抢占时手里也是一组能互相比较的结果，而不是
+# 同一条臂的三个 seed。
+CELLS=()
+for seed in "${SEED_LIST[@]}"; do
+  for arm in "${ARM_LIST[@]}"; do
+    CELLS+=("${arm}:${seed}")
+  done
+done
+
+# ---- 每条臂的 run 名。与已有结果的命名保持一致，否则跨章节没法拼表 ----
+run_name_for () {
+  local arm=$1 seed=$2
+  case "${arm}" in
+    vanilla)   echo "cs_vanilla_seed${seed}${SUFFIX}" ;;
+    ewc)       echo "cs_ewc_lam${EWC_LAMBDA}_seed${seed}${SUFFIX}" ;;
+    replay)    echo "cs_replaymix_4n4r_seed${seed}${SUFFIX}" ;;
+    # 02_sweep_lambda.pbs 的命名，带 uniform 中缀：seed 1 跑出来正好是第四章缺的
+    # 「Hopper 上的 uniform regonce 对照」。
+    onereplay) echo "cs_onereplay_uniform_lam${OR_LAMBDA}_seed${seed}_regonce${SUFFIX}" ;;
+    *) echo "" ;;
+  esac
+}
+
+echo "========================================================================"
+echo "臂     = ${ARM_LIST[*]}"
+echo "seed   = ${SEED_LIST[*]}"
+echo "cell   = ${#CELLS[@]} 个"
+echo "配置   = EPOCHS=${EPOCHS} LR=${LR} BATCH=${TRAIN_BATCH} ACCUM=${ACCUM} REG_ONCE=${REG_ONCE}"
+echo "强度   = OneReplay λ=${OR_LAMBDA}  EWC λ=${EWC_LAMBDA}  Replay ${REPLAY_PER_BATCH}n+${REPLAY_PER_BATCH}r accum=${REPLAY_ACCUM}"
+echo "评测   = ${EVAL_METRICS}"
+echo "========================================================================"
+printf "%-6s %-14s %-6s %s\n" "index" "arm" "seed" "run"
+for index in "${!CELLS[@]}"; do
+  IFS=':' read -r arm seed <<< "${CELLS[$index]}"
+  printf "%-6s %-14s %-6s %s\n" "${index}" "${arm}" "${seed}" "$(run_name_for "${arm}" "${seed}")"
+done
+echo "========================================================================"
+
+if [[ "${LIST_ONLY}" == "1" ]]; then
+  echo "LIST_ONLY=1：只列 cell，不训练。按 array 投: qsub -J 0-$((${#CELLS[@]} - 1)) onereplay/pbs/66_seed_variance.pbs"
+  exit 0
+fi
+
+# 按索引只跑一个 cell（array 或手动传 CELL_INDEX）
+PICK_INDEX="${CELL_INDEX:-}"
+if [[ -n "${PICK_INDEX}" ]]; then
+  if (( PICK_INDEX < 0 || PICK_INDEX >= ${#CELLS[@]} )); then
+    echo "错误: 索引 ${PICK_INDEX} 超出 cell 范围（共 ${#CELLS[@]} 个）"
+    exit 1
+  fi
+  CELLS=("${CELLS[${PICK_INDEX}]}")
+  echo "按索引 ${PICK_INDEX} 只跑 cell ${CELLS[0]}"
+fi
+
+cd "${REPO_ROOT}"
+
+# ---------------------------------------------------------------------------
+# 前置检查：只查这批 cell 真正要用到的资产，别因为不相关的臂缺文件就整作业退出
+# ---------------------------------------------------------------------------
+if [[ "${SUMMARY_ONLY}" != "1" ]]; then
+  [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+  [[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+  [[ -f "${IFEVAL_INPUT}" ]] || { echo "缺 IFEval 数据: ${IFEVAL_INPUT}"; exit 1; }
+
+  NEED_COV=0; NEED_FISHER=0; NEED_REPLAY=0
+  for cell in "${CELLS[@]}"; do
+    case "${cell%%:*}" in
+      onereplay) NEED_COV=1 ;;
+      ewc)       NEED_FISHER=1 ;;
+      replay)    NEED_REPLAY=1 ;;
+    esac
+  done
+  if (( NEED_COV )) && [[ ! -f "${COV_PATH}" ]]; then
+    echo "缺 C: ${COV_PATH}"
+    echo "先跑: qsub onereplay/pbs/01_collect_cov.pbs"
+    exit 1
+  fi
+  if (( NEED_FISHER )) && [[ ! -f "${FISHER_PATH}" ]]; then
+    echo "缺对角 Fisher: ${FISHER_PATH}"
+    echo "先跑: qsub onereplay/pbs/47_if_fisher.pbs"
+    exit 1
+  fi
+  if (( NEED_REPLAY )) && [[ ! -f "${SELF_DISTILL_FILE}" ]]; then
+    echo "缺自蒸馏回放语料: ${SELF_DISTILL_FILE}"
+    echo "先跑 13_replay_selfdistill，或传 SELF_DISTILL_FILE=<绝对路径>"
+    exit 1
+  fi
+
+  # C / F / 回放池必须出自同一批旧知识行，否则三条臂消费的旧知识不同，这次对比不成立。
+  echo "==== 前置: 校验 C 与 F 的旧知识池指纹一致 ===="
+  if (( NEED_COV && NEED_FISHER )); then
+    python - "${COV_PATH}" "${FISHER_PATH}" <<'PY'
+import sys
+
+import torch
+
+cov_path, fisher_path = sys.argv[1], sys.argv[2]
+cov_meta = torch.load(cov_path, map_location="cpu").get("metadata", {})
+fisher_meta = torch.load(fisher_path, map_location="cpu").get("metadata", {})
+cov_hash = cov_meta.get("pool_fingerprint", "")
+fisher_hash = fisher_meta.get("pool_fingerprint", "")
+print(f"C      rows={cov_meta.get('pool_rows')} fingerprint={cov_hash}")
+print(f"Fisher rows={fisher_meta.get('pool_rows')} fingerprint={fisher_hash}")
+if not cov_hash or not fisher_hash:
+    print("警告: 有一侧没有指纹（采集于加指纹之前），无法核对，继续")
+elif cov_hash != fisher_hash:
+    print("警告: 指纹不一致，OneReplay 与 EWC 消费的旧知识不同，跨臂对比要打折看")
+else:
+    print("一致")
+PY
+  else
+    echo "本批 cell 不同时用到 C 和 F，跳过"
+  fi
+fi
+
+mkdir -p "${RESULTS_ROOT}/adapters" "${RESULTS_ROOT}/metrics" "${DATASET_CACHE}"
+
+IFEVAL_CSV="${RESULTS_ROOT}/ifeval_summary.csv"
+MULTIIF_CSV="${RESULTS_ROOT}/multiif_summary.csv"
+
+# ---------------------------------------------------------------------------
+# Step 1: 逐 cell 训练 + 评测
+#
+# 训练与评测各自独立判断是否已完成，所以这一步可以反复重投：有 adapter 的跳过训练，
+# CSV 里有行的跳过评测，只补缺的那部分。被 walltime 砍在半路时原样再投即可续跑。
+# ---------------------------------------------------------------------------
+train_one () {
+  local arm=$1 seed=$2 run=$3
+  local adapter="${RESULTS_ROOT}/adapters/${run}"
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+
+  # 四条臂共用的部分。差异只在最后几个开关上，写在一起是为了让「唯一的变量是 seed」
+  # 这件事在脚本里也看得出来，而不是散在四个 if 分支里。
+  local common=(
+    --paradigm sft
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${seed}"
+    --dataset_path "${CS_DATASET}"
+    --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${TRAIN_BATCH}"
+    --eval_batch_size "${EVAL_BATCH}"
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}"
+    --max_len "${TRAIN_MAXLEN}"
+    --target_modules "${TARGET_MODULES}"
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}"
+    --max_steps "${MAX_STEPS}"
+    --save 1 --save_path "${adapter}"
+    --metrics_path "${RESULTS_ROOT}/metrics/${run}.jsonl"
+  )
+
+  case "${arm}" in
+    vanilla)
+      # measure_replay_when_lambda_zero=0：不加载 C、每步不算正则。第一章的
+      # cs_vanilla_seed1 设的是 1，每步都算了正则，它的墙钟不能当 vanilla 基线
+      # （见 结果汇总_性能与开销.md 1.2 节）。这里的 seed 2/3 是干净的。
+      python -m onereplay.scripts.train "${common[@]}" \
+        --accumulation_size "${ACCUM}" \
+        --replay_lambda 0 --measure_replay_when_lambda_zero 0
+      ;;
+    ewc)
+      python -m onereplay.scripts.train "${common[@]}" \
+        --accumulation_size "${ACCUM}" \
+        --regularizer ewc --fisher_path "${FISHER_PATH}" \
+        --replay_lambda "${EWC_LAMBDA}" \
+        --reg_once_per_update "${REG_ONCE}"
+      ;;
+    replay)
+      # 回放没有惩罚项：replay_lambda=0 且不测量，这条臂的时间才是它的真实开销。
+      python -m onereplay.scripts.train "${common[@]}" \
+        --accumulation_size "${REPLAY_ACCUM}" \
+        --replay_per_batch "${REPLAY_PER_BATCH}" \
+        --replay_self_distill_file "${SELF_DISTILL_FILE}" \
+        --replay_drop_truncated 1 \
+        --replay_cache_dir "${DATASET_CACHE}" \
+        --replay_lambda 0 --measure_replay_when_lambda_zero 0
+      ;;
+    onereplay)
+      python -m onereplay.scripts.train "${common[@]}" \
+        --accumulation_size "${ACCUM}" \
+        --regularizer onereplay --cov_path "${COV_PATH}" \
+        --replay_lambda "${OR_LAMBDA}" --identity_cov 0 \
+        --reg_once_per_update "${REG_ONCE}"
+      ;;
+    *)
+      echo "未知臂: ${arm}（可选 vanilla ewc replay onereplay）"
+      return 1
+      ;;
+  esac
+}
+
+if [[ "${SUMMARY_ONLY}" == "1" ]]; then
+  echo "SUMMARY_ONLY=1：跳过训练与评测，直接出统计。"
+else
+  LAST_CELL_SEC="${ESTIMATE_SEC}"
+  for cell in "${CELLS[@]}"; do
+    IFS=':' read -r ARM SEED <<< "${cell}"
+    RUN="$(run_name_for "${ARM}" "${SEED}")"
+    [[ -n "${RUN}" ]] || { echo "未知臂: ${ARM}"; exit 1; }
+    ADAPTER="${RESULTS_ROOT}/adapters/${RUN}"
+
+    ELAPSED="${SECONDS}"
+    REMAINING=$(( WALLTIME_SEC - ELAPSED - RESERVE_SEC ))
+    if (( REMAINING < LAST_CELL_SEC )) && [[ ! -d "${ADAPTER}" ]]; then
+      echo "########################################################################"
+      echo "walltime 守卫：已用 ${ELAPSED}s，剩余可用 ${REMAINING}s，不够再跑一个 cell（约 ${LAST_CELL_SEC}s）。"
+      echo "停在 ${cell} 之前。原样重投即可续跑（已完成的会自动跳过）:"
+      echo "  qsub -v ARMS='${ARMS}',SEEDS='${SEEDS}' onereplay/pbs/66_seed_variance.pbs"
+      echo "########################################################################"
+      break
+    fi
+    CELL_START="${SECONDS}"
+
+    echo ""
+    echo "========================================================================"
+    echo "cell ${cell}  run=${RUN}  (已用 ${ELAPSED}s)"
+    echo "========================================================================"
+
+    # ---- 训练 ----
+    if [[ -d "${ADAPTER}" && "${FORCE_TRAIN}" != "1" ]]; then
+      echo "跳过训练：${ADAPTER} 已存在（FORCE_TRAIN=1 或删掉它可重训）"
+    else
+      echo "==== train: ${RUN} (arm=${ARM}, seed=${SEED}) ===="
+      train_one "${ARM}" "${SEED}" "${RUN}"
+    fi
+    [[ -d "${ADAPTER}" ]] || { echo "训练后仍然没有 ${ADAPTER}，中止"; exit 1; }
+
+    # ---- 评测 ----
+    # CSV 是 append 的，同一个 run 评两次会写出两行、汇总时就有歧义。
+    NEED_EVAL=1
+    if [[ "${FORCE_EVAL}" != "1" ]]; then
+      HAVE_IFEVAL=0
+      HAVE_MULTIIF=0
+      [[ -f "${IFEVAL_CSV}" ]] && grep -q "^${RUN}," "${IFEVAL_CSV}" && HAVE_IFEVAL=1
+      [[ -f "${MULTIIF_CSV}" ]] && grep -q "^${RUN}," "${MULTIIF_CSV}" && HAVE_MULTIIF=1
+      if (( HAVE_IFEVAL == 1 && HAVE_MULTIIF == 1 )); then
+        NEED_EVAL=0
+        echo "跳过评测：${RUN} 在 ifeval / multiif 的 CSV 里都已有行（FORCE_EVAL=1 可重评）"
+      fi
+    fi
+    if (( NEED_EVAL == 1 )); then
+      echo "==== eval: ${RUN} (${EVAL_METRICS}) ===="
+      mkdir -p "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${ADAPTER}" --run_name "${RUN}" \
+        --metrics "${EVAL_METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --limit "${EVAL_LIMIT}" \
+        --ifeval_input "${IFEVAL_INPUT}" \
+        --multiif_input "${MULTIIF_INPUT}" --multiif_language "${MULTIIF_LANG}" \
+        --multiif_limit "${MULTIIF_LIMIT}" \
+        --multiif_max_new_tokens "${MULTIIF_MAX_NEW_TOKENS}" \
+        --dataset_path "${CS_DATASET}" \
+        --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+        --max_len "${TRAIN_MAXLEN}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+    fi
+
+    if [[ "${KEEP_ADAPTER}" != "1" ]]; then
+      echo "KEEP_ADAPTER=0：删除 ${ADAPTER}"
+      rm -rf "${ADAPTER:?}"
+    fi
+
+    CELL_SEC=$(( SECONDS - CELL_START ))
+    if (( CELL_SEC > 600 )); then
+      LAST_CELL_SEC="${CELL_SEC}"
+    fi
+    echo "cell ${cell} 用时 ${CELL_SEC}s"
+  done
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2: 新任务一侧的跨 seed 表
+#
+# val loss 是本作业里唯一不经过生成解码的指标，噪声底比 IFEval 小得多，所以它先
+# 出一张表：如果连 val loss 都在跨 seed 抖，那 retention 那一侧就更没得比。
+# ---------------------------------------------------------------------------
+echo ""
+echo "==== Step 2: 新任务 val loss 的跨 seed 表 ===="
+python - "${RESULTS_ROOT}" "${OR_LAMBDA}" "${EWC_LAMBDA}" "${SUFFIX}" "${SEEDS}" <<'PY'
+import json
+import statistics
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+or_lambda, ewc_lambda, suffix = sys.argv[2], sys.argv[3], sys.argv[4]
+seeds = [int(value) for value in sys.argv[5].split()]
+
+arms = {
+    "Vanilla": "cs_vanilla_seed{seed}" + suffix,
+    "EWC": f"cs_ewc_lam{ewc_lambda}_seed{{seed}}{suffix}",
+    "Replay": "cs_replaymix_4n4r_seed{seed}" + suffix,
+    "OneReplay": f"cs_onereplay_uniform_lam{or_lambda}_seed{{seed}}_regonce{suffix}",
+}
+
+
+def final_val_loss(run):
+    path = root / "metrics" / f"{run}.jsonl"
+    if not path.is_file():
+        return None
+    value = None
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("record_type", "epoch") == "epoch" and record.get("val_loss") is not None:
+                value = float(record["val_loss"])
+    return value
+
+
+header = f"{'arm':<12} {'n':>3} {'mean':>9} {'sd':>9} {'spread':>9}   逐 seed"
+print(header)
+print("-" * len(header))
+for name, template in arms.items():
+    values = []
+    labels = []
+    for seed in seeds:
+        value = final_val_loss(template.format(seed=seed))
+        if value is None:
+            continue
+        values.append(value)
+        labels.append(f"s{seed}={value:.5f}")
+    if not values:
+        print(f"{name:<12} {'--':>3} {'--':>9} {'--':>9} {'--':>9}   （无 metrics）")
+        continue
+    mean = statistics.fmean(values)
+    if len(values) >= 2:
+        sd = f"{statistics.stdev(values):9.5f}"
+        spread = f"{max(values) - min(values):9.5f}"
+    else:
+        sd = f"{'--':>9}"
+        spread = f"{'--':>9}"
+    print(f"{name:<12} {len(values):>3} {mean:>9.5f} {sd} {spread}   {' '.join(labels)}")
+
+print()
+print("参考：第一章 seed 1 的 ep3 val loss 是 Vanilla 0.04494 / OneReplay 0.04916 /")
+print("Replay 0.06463 / EWC 0.08489。OneReplay 与 EWC 差 0.0357（相对 42%），这个幅度")
+print("如果跨 seed 稳得住，它比 IFEval 上那 0.18 个点更值得当主张。")
+PY
+
+# ---------------------------------------------------------------------------
+# Step 3: retention 一侧的显著性
+#
+# 逐题配对的 McNemar + 跨 seed 方差，由 scripts/compare_significance.py 出。它读的是
+# evaluate 已经写下的逐题判定，不重新生成任何东西，所以随时可以单独重跑。
+# ---------------------------------------------------------------------------
+echo ""
+echo "==== Step 3: IFEval 的逐题配对检验与跨 seed 方差 ===="
+SEED_CSV="$(echo "${SEEDS}" | tr ' ' ',')"
+SIG_ARGS=(
+  --results_root "${RESULTS_ROOT}"
+  --also_root "${RESULTS_SAFETY}"
+  --seeds "${SEED_CSV}"
+  --bootstrap_reps "${BOOTSTRAP_REPS}"
+  --arm "OneReplay=cs_onereplay_uniform_lam${OR_LAMBDA}_seed{seed}_regonce${SUFFIX}"
+  --arm "EWC=cs_ewc_lam${EWC_LAMBDA}_seed{seed}${SUFFIX}"
+  --arm "Replay=cs_replaymix_4n4r_seed{seed}${SUFFIX}"
+  --arm "Vanilla=cs_vanilla_seed{seed}${SUFFIX}"
+)
+python -m onereplay.scripts.compare_significance --bench ifeval "${SIG_ARGS[@]}" || \
+  echo "（compare_significance 退出非零：多半是还有 run 没评完，等 cell 补齐后重跑）"
+
+echo ""
+echo "==== Step 3b: Multi-IF，并单独看 turn 3 ===="
+# 第一章 OneReplay 的 Multi-IF 缺口集中在 turn 3（26.00 vs EWC 30.47、base 31.25），
+# 而 turn 1 反而高于 base（68.76 vs 68.32）。C 采自单轮 chat 格式的 FLAN，里面根本
+# 没有多轮对话的隐藏状态，这个分轮读数是那个假设最直接的检验。
+python -m onereplay.scripts.compare_significance --bench multiif --by_turn 1 "${SIG_ARGS[@]}" || \
+  echo "（Multi-IF 部分跳过：run 没评完或缺 responses.jsonl）"
+
+echo ""
+echo "========================================================================"
+echo "原始数据:"
+echo "  ${IFEVAL_CSV}"
+echo "  ${MULTIIF_CSV}"
+echo "  ${RESULTS_ROOT}/metrics/*.jsonl"
+echo ""
+echo "统计可以随时单独重跑（读的是已有的逐题结果，不用 GPU）:"
+echo "  python -m onereplay.scripts.compare_significance --bench ifeval \\"
+echo "    --results_root ${RESULTS_ROOT} --also_root ${RESULTS_SAFETY} --seeds ${SEED_CSV} \\"
+echo "    --arm \"OneReplay=cs_onereplay_uniform_lam${OR_LAMBDA}_seed{seed}_regonce\" \\"
+echo "    --arm \"EWC=cs_ewc_lam${EWC_LAMBDA}_seed{seed}\" \\"
+echo "    --arm \"Replay=cs_replaymix_4n4r_seed{seed}\" \\"
+echo "    --arm \"Vanilla=cs_vanilla_seed{seed}\""
+echo "========================================================================"
+echo "Job finished at: $(date)"

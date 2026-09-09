@@ -1,0 +1,635 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_8b_probe
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: Qwen3-8B 探路臂 —— base vs vanilla，全领域评测
+#
+# 这个作业只回答一个问题：换到 8B 之后，在 Commonsense170k 上做 LoRA SFT
+# 还剩多少可测量的遗忘？答案决定后面 16 条臂值不值得跑，所以它必须先跑完。
+#
+# 为什么这一步不需要 C：vanilla 是普通 SFT、不挂任何正则，跑它完全绕开
+# C 的体积、λ 换算、模块覆盖那一整套问题。C 的采集等这一步有结论再说。
+#
+# -----------------------------------------------------------------------------
+# 与 1.7B 那批的差异（每一条都是刻意的，别顺手改回去）
+#
+#   模型      Qwen3-1.7B -> Qwen3-8B（36 层 / hidden 4096 / intermediate 12288，
+#             架构与 1.7B 同族，模块命名一致，所以本仓库代码零改动可用）
+#
+#   LoRA      r=8, alpha=16, q_proj+v_proj  ->  r=16, alpha=32, all-linear
+#             理由不是"更强更好"，是维持可测量的扰动。同样 r=8/qv 搬到 8B，
+#             adapter 占基座的比例从 0.094% 掉到 0.047%，正好减半；1.7B 上
+#             GSM8K 才掉 1.7pp 且不显著，再减半就淹进噪声了。
+#             r16/all-linear 下这个比例是 0.53%，约 11 倍。
+#             另外 r=8 + 只挂 q/v 是 2021 年 LoRA 原论文的配置，QLoRA 之后
+#             主流是 all-linear；审稿人会问"遗忘是不是因为配置非典型"。
+#
+#   LR        1e-4 -> 2e-4
+#             !! 这一项有前科。工作交接_2026-08-27 的 1.5 节记录了
+#             cs_vanilla_qkvogateupdown_r32_lr2e-4_seed1（all-linear r=32
+#             alpha=64 lr=2e-4）的结果：输出长度 P50 从 132 掉到 13，
+#             GSM8K 缺 '####' 100%，strict 0.00%，production 6.29%。
+#             模型不再生成，数学能力无从测量。当时三个变量一起改，无法归因。
+#             本脚本只把 lr 抬到 2e-4，rank 停在 16（不是 32），是那次配置的
+#             减弱版。崩溃判据见文末，崩了就 LR=1e-4 重投，run 名不冲突。
+#
+#   解码      batch=1 -> 批量（math 32 / code 64 / ifeval 32）
+#             8B 在 batch=1 下只用到 H200 约一成的显存带宽，全量 GSM8K 要几小时。
+#             批量解码引入 left padding 和不同 kernel，数字与 1.7B 那批不可比 —— 
+#             这是本轮全新实验，所有臂从头跑，不存在混用。
+#
+#   结果目录  results -> results/qwen3-8b
+#             与 1.7B 的产物彻底隔离，summary.csv 不会跨模型追加到一起。
+#
+# -----------------------------------------------------------------------------
+# 三个 max_new_tokens 的来源要分清
+#   math 4096  唯一有实测依据的：33 号在 1.7B 上用 probe_math500_budget.py 定的
+#              （1792 时截断率 base 12.0% / vanilla 13.4%，上调后 10% 转正确）。
+#   code 512   evaluate.py 的默认值，从没探过。
+#   ifeval 768 同上。
+# 8B 的输出长度分布与 1.7B 不同，三个都要重验。评测完脚本会对 math/code/ifeval
+# 分别打印 P50/P90/P99 和 hit-cap 率；hit-cap 接近 0 且 P99 远低于 cap 就说明
+# 预算富余，可以调小省时间（数学尤其值得，它占了七成评测时间）。
+#
+# -----------------------------------------------------------------------------
+# 开销记录
+#   profile 保持 0。train.py 的 --profile 1 会在每个阶段插 cuda synchronize，
+#   拖慢几个百分点，它的用途是给正则项单独计时；而 peak memory 和 epoch wall
+#   time 不开 profile 也照样写进 metrics jsonl。要报 vanilla 的开销基准就得用
+#   没被 profile 污染的墙钟，所以这里不开。
+#   产物: ${RESULTS_ROOT}/metrics/${RUN}.jsonl，文末会打印摘要。
+#
+# -----------------------------------------------------------------------------
+# 投递前要有的东西
+#   1) ${MODEL_DIR}/Qwen3-8B                      （post-trained 版，不是 -Base）
+#   2) ${CS_DATASET} = datasets/commonsense_170k_hf
+#   3) 数学 ${MATH_DATA_DIR}/{math500,gsm8k}_test.jsonl
+#   4) 代码 ${CODE_DATA_DIR}/humaneval_test.parquet 与 ${CODE_DATA_DIR}/mbpp_full
+#   5) mkdir -p /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# 投递:
+#   DRY_RUN=1 先看计划（默认），确认无误后 qsub -v DRY_RUN=0 ...
+#   崩溃后重投低学习率: qsub -v DRY_RUN=0,LR=1e-4 ...
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/67_qwen3_8b_vanilla_probe.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR CODE_DATA_DIR
+    DATASET_CACHE OUT_DIR
+    DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE
+    SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
+    TARGET_MODULES LORA_RANK LORA_ALPHA LORA_DROPOUT
+    EVAL_BATCH SAVE MAX_STEPS RUN_TAG
+    MATH500_FILE GSM8K_FILE HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT
+    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS
+    MATH_BATCH CODE_BATCH IFEVAL_BATCH
+    TIMEOUT LIMIT DIAG_LEN DIAG_DATA WITH_BASE
+    EXTRA_MODELS
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的训练与评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+# 结果按模型分目录：1.7B 那批留在 ${REPO_ROOT}/results，8B 的全部落这里，
+# 两边的 <metric>_summary.csv 各自独立，不会跨模型追加成一张表。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"          # 默认只打印计划，确认无误后投递时传 DRY_RUN=0
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+PROBE="${PROBE:-0}"
+WITH_BASE="${WITH_BASE:-1}"      # 1 = 同时评裸 Qwen3-8B，遗忘量的分母
+
+# ---- 训练超参 ----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-2e-4}"                 # 见文件头的崩溃前科；崩了就 LR=1e-4 重投
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"             # 每次更新 64 行新任务，与 1.7B 那批同口径
+EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与后续各臂不可比
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+LORA_RANK="${LORA_RANK:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"   # 惯例是 2*rank，scaling 固定在 2
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+SAVE="${SAVE:-1}"
+MAX_STEPS="${MAX_STEPS:-0}"
+
+if [[ "${PROBE}" == "1" ]]; then
+  SAVE=0
+  if [[ "${MAX_STEPS}" == "0" ]]; then MAX_STEPS=300; fi
+  DO_EVAL=0
+  echo "PROBE=1：SAVE=0 MAX_STEPS=${MAX_STEPS} DO_EVAL=0，只看能否跑通与显存占用"
+fi
+
+# ---- run 名：把会影响结果的配置全编进去 ----
+# 后面要试的 lr / rank 变体不会互相覆盖 adapter 和 summary 行。
+RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
+RUN="cs_vanilla_8b_${RUN_TAG}_lr${LR}_seed${SEED}"
+
+# ---- 评测数据 ----
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+HUMANEVAL_FILE="${HUMANEVAL_FILE:-${CODE_DATA_DIR}/humaneval_test.parquet}"
+MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+
+# ---- 解码预算：定了就不能再动，所有臂必须同口径 ----
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
+IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-768}"
+
+# ---- 解码 batch：显存不是瓶颈，长尾才是 ----
+# Qwen3-8B 是 GQA（8 个 KV 头 / head_dim 128 / 36 层），每 token 的 KV cache
+# 144 KB。math 32x4096 约 19 GB，加 16.4 GB 权重共 35 GB，H200 的 143 GB 很宽裕。
+# 第一次跑先保守，看完 nvidia-smi 再往上抬。
+MATH_BATCH="${MATH_BATCH:-32}"
+CODE_BATCH="${CODE_BATCH:-64}"
+IFEVAL_BATCH="${IFEVAL_BATCH:-32}"
+
+TIMEOUT="${TIMEOUT:-10}"         # 代码判分单例超时（秒）
+LIMIT="${LIMIT:-0}"
+DIAG_LEN="${DIAG_LEN:-1}"        # 1 = 评完打印长度/截断诊断
+DIAG_DATA="${DIAG_DATA:-1}"      # 1 = 训练前统计 Commonsense170k 的长度分布
+EXTRA_MODELS="${EXTRA_MODELS:-}" # "name;/abs/path" 用 | 分隔，额外要评的已有 run
+
+# LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"当成完整结果。
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+if [[ "${LIMIT}" != "0" ]]; then
+  OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+fi
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+if (( ACCUM % BATCH != 0 )); then
+  echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"; exit 1
+fi
+mkdir -p "${ADAPTERS}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}" "${DATASET_CACHE}"
+
+echo "========================================================================"
+echo "Qwen3-8B 探路臂：base vs vanilla，全领域评测"
+echo "  run      = ${RUN}"
+echo "  LoRA     = r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT}"
+echo "             targets=${TARGET_MODULES}"
+echo "  训练     = LR ${LR} / EPOCHS ${EPOCHS} / BATCH ${BATCH} / ACCUM ${ACCUM}(行/更新) / MAXLEN ${MAXLEN}"
+echo "  解码预算 = math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} / ifeval ${IF_MAX_NEW_TOKENS}"
+echo "  解码batch= math ${MATH_BATCH} / code ${CODE_BATCH} / ifeval ${IFEVAL_BATCH}"
+echo "  评 base  = ${WITH_BASE}   limit=${LIMIT}"
+echo "  OUT_DIR  = ${OUT_DIR}"
+echo "========================================================================"
+
+echo "==== 前置检查 ===="
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+for f in "${MATH500_FILE}" "${GSM8K_FILE}" "${HUMANEVAL_FILE}" "${IFEVAL_INPUT}"; do
+  [[ -f "${f}" ]] || echo "warning: 缺评测数据 ${f}（该指标会被跳过）"
+done
+[[ -d "${MBPP_DIR}" ]] || echo "warning: 缺 MBPP 目录 ${MBPP_DIR}（该指标会被跳过）"
+
+# ---------------------------------------------------------------------------
+# 训练数据长度自检
+#   MAXLEN=512 是从 1.7B 那批沿用的，对 Commonsense170k 够不够得实测。
+#   截断方向是好的：tokenizer_to_ids 用 [-max_length:]，即左截断、保留末尾，
+#   所以被切掉的是 prompt 开头而不是答案，loss 信号完整。代价是超长样本会
+#   丢掉指令开头，模型看到的是"没头的指令 + 选项 + 答案"。
+#   P99 在 512 以内就不用动；超过 5% 被截就把 MAXLEN 提到 1024 重投。
+# ---------------------------------------------------------------------------
+if [[ "${DIAG_DATA}" == "1" ]]; then
+  echo "==== 训练数据长度分布（MAXLEN=${MAXLEN}）===="
+  python - "${MODEL_DIR}/${MODEL_NAME}" "${CS_DATASET}" "${MAXLEN}" <<'PY'
+import sys
+
+from datasets import load_from_disk
+from transformers import AutoTokenizer
+
+model_path, dataset_path, max_len = sys.argv[1], sys.argv[2], int(sys.argv[3])
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+dataset = load_from_disk(dataset_path)
+split = dataset["train"] if "train" in dataset else dataset
+sample = split.select(range(min(5000, len(split))))
+
+lengths = []
+for row in sample:
+    user = row["instruction"].strip()
+    if row.get("input", "").strip():
+        user = f"{user}\n\nInput:\n{row['input'].strip()}"
+    text = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": row["output"].strip()},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+    lengths.append(len(tokenizer(text, add_special_tokens=False)["input_ids"]))
+lengths.sort()
+
+
+def pct(q):
+    return lengths[min(len(lengths) - 1, int(round(q / 100 * (len(lengths) - 1))))]
+
+
+over = sum(length > max_len for length in lengths)
+print(
+    f"n={len(lengths)} (sampled)  P50={pct(50)} P90={pct(90)} P99={pct(99)} max={lengths[-1]}"
+)
+print(f"超过 MAXLEN={max_len} 的比例: {over}/{len(lengths)} ({over / len(lengths):.1%})")
+print("超过 5% 就把 MAXLEN 提到 1024 重投；左截断只切 prompt 开头，答案不会丢。")
+PY
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查与数据诊断，不训练不评测。"
+  echo "确认无误后: qsub -v DRY_RUN=0 ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# 训练：vanilla（无 C、无 Fisher、无 replay）
+# ===========================================================================
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${ADAPTERS}/${RUN}" ]]; then
+    echo "跳过训练 ${RUN}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
+  else
+    mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
+    echo "==== train: ${RUN} ===="
+    # profile 保持默认 0：它每阶段插 cuda synchronize，会污染要上报的墙钟。
+    # peak memory 与 epoch wall time 不开 profile 也照样写进 metrics jsonl。
+    python -m onereplay.scripts.train --paradigm sft \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+      --dataset_path "${CS_DATASET}" \
+      --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+      --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
+      --target_modules "${TARGET_MODULES}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
+      --max_steps "${MAX_STEPS}" \
+      --save "${SAVE}" --save_path "${ADAPTERS}/${RUN}" \
+      --metrics_path "${RESULTS_ROOT}/metrics/${RUN}.jsonl"
+  fi
+fi
+
+# ===========================================================================
+# 评测：base + vanilla，五个指标一次加载模型跑完
+# ===========================================================================
+if [[ "${DO_EVAL}" != "1" ]]; then
+  echo "DO_EVAL=0：跳过评测"
+  set +x
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# 缺哪个数据就跳过哪个指标（数据没搬全时不至于整个作业白挂）。
+AVAIL=""
+[[ -f "${IFEVAL_INPUT}"    ]] && AVAIL="${AVAIL} ifeval"     || echo "跳过 ifeval：缺 ${IFEVAL_INPUT}"
+[[ -f "${GSM8K_FILE}"      ]] && AVAIL="${AVAIL} gsm8k"      || echo "跳过 gsm8k：缺 ${GSM8K_FILE}"
+[[ -f "${MATH500_FILE}"    ]] && AVAIL="${AVAIL} math500"    || echo "跳过 math500：缺 ${MATH500_FILE}"
+[[ -f "${HUMANEVAL_FILE}"  ]] && AVAIL="${AVAIL} humaneval"  || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}"
+[[ -d "${MBPP_DIR}"        ]] && AVAIL="${AVAIL} mbpp"       || echo "跳过 mbpp：缺 ${MBPP_DIR}"
+AVAIL="${AVAIL# }"
+if [[ -z "${AVAIL}" ]]; then
+  echo "找不到任何评测数据，跳过评测"
+  set +x
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+echo "AVAIL=[${AVAIL}]"
+
+# base 的 adapter 路径是空串：evaluate.py 认这个，直接加载裸模型。
+EVAL_SPECS=""
+if [[ "${WITH_BASE}" == "1" ]]; then
+  EVAL_SPECS="base;"
+fi
+EVAL_SPECS="${EVAL_SPECS:+${EVAL_SPECS}|}${RUN};${ADAPTERS}/${RUN}"
+if [[ -n "${EXTRA_MODELS}" ]]; then
+  EVAL_SPECS="${EVAL_SPECS}|${EXTRA_MODELS}"
+fi
+
+pending_metrics () {
+  # $1=run_name, 其余=候选 metric。已有 summary.json 的跳过，除非 FORCE_EVAL=1。
+  local name=$1; shift
+  local out=""
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" == "1" || ! -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then
+      out="${out}${out:+,}${m}"
+    fi
+  done
+  echo "${out}"
+}
+
+EVAL_NAMES=()
+IFS='|' read -ra SPECS <<< "${EVAL_SPECS}"
+for spec in "${SPECS[@]}"; do
+  name="${spec%%;*}"
+  adapter="${spec#*;}"
+  if [[ -n "${adapter}" && ! -d "${adapter}" ]]; then
+    echo "跳过评测 ${name}：找不到 adapter ${adapter}"
+    continue
+  fi
+  EVAL_NAMES+=("${name}")
+  # shellcheck disable=SC2086
+  mp="$(pending_metrics "${name}" ${AVAIL})"
+  if [[ -z "${mp}" ]]; then
+    echo "跳过评测 ${name}：所有指标都已有结果（FORCE_EVAL=1 可重评）"
+    continue
+  fi
+  echo "==== eval: ${name} (${mp}) ===="
+  # 一次调用跑完所有指标：runner 只加载一次模型，8B 的加载不便宜。
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter}" --run_name "${name}" \
+    --metrics "${mp}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+    --limit "${LIMIT}" \
+    --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+    --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}" \
+    --max_new_tokens "${IF_MAX_NEW_TOKENS}" \
+    --math_batch_size "${MATH_BATCH}" \
+    --code_batch_size "${CODE_BATCH}" \
+    --ifeval_batch_size "${IFEVAL_BATCH}" \
+    --math500_data_path "${MATH500_FILE}" \
+    --gsm8k_data_path "${GSM8K_FILE}" \
+    --humaneval_data_file "${HUMANEVAL_FILE}" \
+    --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
+    --ifeval_input "${IFEVAL_INPUT}" \
+    --timeout "${TIMEOUT}" \
+    --cache_dir "${TMPDIR}/hf_datasets"
+done
+
+# ---------------------------------------------------------------------------
+# 长度/截断诊断
+#   三个 cap 里只有 math 4096 在 1.7B 上探过，code 512 和 ifeval 768 是默认值。
+#   hit-cap 接近 0 且 P99 远低于 cap => 预算富余，可以调小省时间。
+#   反过来 hit-cap 高就必须调大后全部重评，否则截断偏差跨 run 不均匀。
+#   顺带这也是 lr=2e-4 有没有把模型打崩的判据：P50 掉到几十以下就是崩了。
+# ---------------------------------------------------------------------------
+length_diagnostic () {
+  python - "${MODEL_DIR}/${MODEL_NAME}" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, specs = sys.argv[1], sys.argv[2:]
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+print("==== response length / truncation diagnostic ====")
+for spec in specs:
+    path, cap = spec.rsplit(":", 1)
+    cap = int(cap)
+    file = Path(path)
+    if not file.is_file():
+        continue
+    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+    if not rows:
+        continue
+    # 各 metric 的字段名不同：数学写 response，代码写 raw，ifeval 写 response。
+    texts = [row.get("response", row.get("raw", "")) for row in rows]
+    lengths = sorted(
+        len(tokenizer(text, add_special_tokens=False)["input_ids"]) for text in texts
+    )
+    hit_cap = sum(length >= cap - 8 for length in lengths)
+    if "prediction" in rows[0]:
+        missing = sum(row.get("prediction") in (None, "") for row in rows)
+        miss_label = f"no-answer={missing} ({missing / len(rows):.1%}) "
+    else:
+        miss_label = ""
+    label = f"{file.parent.parent.name}/{file.parent.name}"
+    print(
+        f"{label:>56}: n={len(rows)} cap={cap} {miss_label}"
+        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} "
+        f"max={lengths[-1]}"
+    )
+print("")
+print("读法 1（预算）: hit-cap 接近 0 且 P99 远低于 cap => 可以调小 cap 省时间。")
+print("读法 2（崩溃）: vanilla 的 P50 相对 base 暴跌到几十以下 => lr 把生成行为打崩了，")
+print("               此时数学分数无从测量，应 LR=1e-4 重投，而不是当作遗忘信号。")
+PY
+}
+
+if [[ "${DIAG_LEN}" == "1" && ${#EVAL_NAMES[@]} -gt 0 ]]; then
+  DIAG_SPECS=()
+  for name in "${EVAL_NAMES[@]}"; do
+    for m in ${AVAIL}; do
+      case "${m}" in
+        gsm8k|math500) cap="${MATH_MAX_NEW_TOKENS}" ;;
+        humaneval|mbpp) cap="${CODE_MAX_NEW_TOKENS}" ;;
+        *) cap="${IF_MAX_NEW_TOKENS}" ;;
+      esac
+      DIAG_SPECS+=("${OUT_DIR}/${m}/${name}/responses.jsonl:${cap}")
+    done
+  done
+  length_diagnostic "${DIAG_SPECS[@]}"
+fi
+
+# ---------------------------------------------------------------------------
+# 汇总：base vs vanilla 并排，外加训练开销
+# ---------------------------------------------------------------------------
+set +x
+echo ""
+echo "========================================================================"
+echo "结果汇总"
+echo "========================================================================"
+python - "${OUT_DIR}" "${RESULTS_ROOT}/metrics/${RUN}.jsonl" "${RUN}" ${AVAIL} <<'PY'
+import json
+import sys
+from pathlib import Path
+
+out_dir, metrics_path, run_name = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+metric_names = sys.argv[4:]
+
+SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
+
+
+def read_score(metric: str, name: str):
+    path = out_dir / metric / name / "summary.json"
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for key in SCORE_KEYS:
+        if key in payload:
+            return payload[key]
+    return None
+
+
+print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{'delta(pp)':>12}")
+print("-" * 44)
+for metric in metric_names:
+    base = read_score(metric, "base")
+    tuned = read_score(metric, run_name)
+    base_text = f"{base:.4f}" if base is not None else "-"
+    tuned_text = f"{tuned:.4f}" if tuned is not None else "-"
+    if base is not None and tuned is not None:
+        delta_text = f"{(tuned - base) * 100:+.2f}"
+    else:
+        delta_text = "-"
+    print(f"{metric:<12}{base_text:>10}{tuned_text:>10}{delta_text:>12}")
+
+print("")
+print("训练开销（不含 profile 开销，墙钟可直接上报）:")
+if metrics_path.is_file():
+    rows = [json.loads(line) for line in metrics_path.open(encoding="utf-8") if line.strip()]
+    for row in rows:
+        parts = [f"{key}={row[key]}" for key in sorted(row) if key != "run_name"]
+        print("  " + "  ".join(parts))
+else:
+    print(f"  找不到 {metrics_path}")
+PY
+
+echo ""
+echo "========================================================================"
+echo "怎么读这份结果"
+echo "========================================================================"
+echo "1) 先看上面的长度诊断，再看分数。vanilla 的 P50 若相对 base 暴跌，"
+echo "   说明 LR=${LR} 把生成行为打崩了（8-27 的 1.5 节有过一次：P50 132 -> 13，"
+echo "   GSM8K 缺 '####' 100%），这种情况下数学分数不是遗忘信号，是噪声。"
+echo "   处理：qsub -v DRY_RUN=0,LR=1e-4 ${SELF_PATH}   （run 名不同，不会覆盖）"
+echo ""
+echo "2) 没崩的话，delta 就是这套配置在 8B 上能造出的遗忘量。它决定后面 16 条臂"
+echo "   值不值得跑：1.7B 上 GSM8K 只掉 1.7pp 且不显著，MBPP 掉 3.8pp 是唯一显著的。"
+echo "   8B 上如果全都在一两个点以内，得先继续加强度，否则保护效果无从测量。"
+echo ""
+echo "3) 准确率之外一定要看失败原因分布，光看分数分不清'格式坏了'还是'知识坏了':"
+echo "   python -m onereplay.scripts.analyze_code_failures \\"
+echo "     --results_root ${OUT_DIR} --metrics humaneval,mbpp \\"
+echo "     --runs base,${RUN} --baseline base"
+echo "   python -m onereplay.scripts.score_retention_subset \\"
+echo "     --results_root ${OUT_DIR} --metrics gsm8k,math500 \\"
+echo "     --runs base,${RUN} --baseline base"
+echo ""
+echo "4) 显著性（配对 McNemar，题量小的时候尤其要看）:"
+echo "   python -m onereplay.scripts.compare_significance \\"
+echo "     --results_root ${OUT_DIR} --metrics ${AVAIL// /,} \\"
+echo "     --runs base,${RUN} --baseline base"
+echo ""
+echo "产物:"
+echo "  adapter : ${ADAPTERS}/${RUN}"
+echo "  开销    : ${RESULTS_ROOT}/metrics/${RUN}.jsonl"
+echo "  汇总    : ${OUT_DIR}/<metric>_summary.csv"
+echo "  逐题    : ${OUT_DIR}/<metric>/{base,${RUN}}/responses.jsonl"
+echo ""
+echo "本轮定下的解码口径，后面所有臂必须逐字相同才可比:"
+echo "  math_max_new_tokens=${MATH_MAX_NEW_TOKENS} code=${CODE_MAX_NEW_TOKENS} ifeval=${IF_MAX_NEW_TOKENS}"
+echo "  batch: math=${MATH_BATCH} code=${CODE_BATCH} ifeval=${IFEVAL_BATCH}"
+echo "Job finished at: $(date)"
