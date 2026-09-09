@@ -230,6 +230,21 @@ def parse_args() -> argparse.Namespace:
         help="Lower bound for ||W x|| when --cov_normalization base_output_norm is used.",
     )
     parser.add_argument(
+        "--cov_accum_device",
+        type=str,
+        choices=["cpu", "device"],
+        default="cpu",
+        help=(
+            "Where the running X^T X sums live. cpu (default) copies every "
+            "batch's contribution to host memory, which costs one transfer per "
+            "batch per layer and scales with the size of C rather than with the "
+            "batch: covering all seven projections of an 8B model is 33.75 GiB "
+            "of PCIe traffic per batch. device keeps the sums beside the "
+            "activations, removing those transfers, but needs the whole C "
+            "resident in GPU memory alongside the model."
+        ),
+    )
+    parser.add_argument(
         "--output_path",
         type=str,
         default="./mycode/onereplay/flan_qwen3_qv_cov.pt",
@@ -324,9 +339,15 @@ def collect_covariances(args: argparse.Namespace) -> None:
     for handle in handles:
         handle.remove()
 
+    # pop instead of iterating: with --cov_accum_device device the sums are the
+    # single largest allocation of the run, and normalizing them into a second
+    # dict would briefly hold two full copies of C. Dropping each sum as soon as
+    # its mean lands on the host keeps the peak at one copy plus one layer.
     covariances = {}
-    for module_name, cov_sum in cov_sums.items():
-        covariances[module_name] = cov_sum / max(counts[module_name], 1)
+    for module_name in list(cov_sums.keys()):
+        cov_sum = cov_sums.pop(module_name)
+        covariances[module_name] = (cov_sum / max(counts[module_name], 1)).cpu()
+        del cov_sum
 
     metadata = {
         "model_name": args.model_name,
@@ -359,6 +380,7 @@ def collect_covariances(args: argparse.Namespace) -> None:
         "max_len": args.max_len,
         "cov_normalization": args.cov_normalization,
         "cov_norm_eps": args.cov_norm_eps,
+        "cov_accum_device": args.cov_accum_device,
     }
     save_covariance_payload(args.output_path, covariances, counts, metadata)
     print(f"Stage 1 done: saved covariance file to {args.output_path}")

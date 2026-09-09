@@ -83,6 +83,7 @@ def make_covariance_hook(
     attention_holder: dict[str, torch.Tensor | None],
     cov_normalization: str,
     cov_norm_eps: float,
+    accum_on_device: bool = False,
 ):
     """Build a forward pre-hook that accumulates X^T X for one target layer.
 
@@ -98,6 +99,16 @@ def make_covariance_hook(
     and the collected matrix is E[x' x'^T]. This makes the later penalty
     measure relative output perturbation ||DeltaW x||^2 / ||W x||^2 instead of
     absolute output perturbation.
+
+    accum_on_device keeps the running sums next to the activations instead of
+    copying every batch's X^T X back to host memory. The default False path
+    moves each X^T X to CPU, which costs one transfer per batch per layer:
+    fine when C is a few tensors of a small hidden size, but it scales with the
+    total size of C, not with the batch. Covering all seven projections of
+    Qwen3-8B means 960 MiB per layer, 33.75 GiB per batch over PCIe, which
+    dominates the forward pass by more than an order of magnitude. Accumulating
+    on the GPU removes those transfers entirely at the cost of holding the full
+    C in device memory for the duration of the run.
     """
 
     def hook(_module, inputs, output):
@@ -131,11 +142,13 @@ def make_covariance_hook(
             flat_x = flat_x / denom
 
         xtx = flat_x.T @ flat_x
+        if not accum_on_device:
+            xtx = xtx.cpu()
         if module_name not in cov_sums:
-            cov_sums[module_name] = xtx.cpu()
+            cov_sums[module_name] = xtx
             counts[module_name] = int(flat_x.shape[0])
         else:
-            cov_sums[module_name] += xtx.cpu()
+            cov_sums[module_name] += xtx
             counts[module_name] += int(flat_x.shape[0])
 
     return hook
@@ -153,6 +166,7 @@ def register_covariance_hooks(
     counts: dict[str, int] = {}
     handles = []
     module_dict = dict(model.named_modules())
+    accum_on_device = getattr(args, "cov_accum_device", "cpu") == "device"
 
     for module_name in target_module_names:
         module = module_dict[module_name]
@@ -163,6 +177,7 @@ def register_covariance_hooks(
             attention_holder,
             args.cov_normalization,
             args.cov_norm_eps,
+            accum_on_device=accum_on_device,
         )
         handles.append(module.register_forward_hook(hook))
 
