@@ -99,7 +99,39 @@ def strip_preamble(text: str, anchored: re.Pattern[str], floating: re.Pattern[st
 # --------------------------------------------------------------------------
 
 
-def make_math_judge(metric: str) -> Callable[[dict[str, Any], str], tuple[bool, dict[str, Any]]]:
+# Punctuation and math delimiters that wrap a bare answer ("$27$.", "**27**").
+_ANSWER_JUNK = " \t\r\n.,;:!?$*`'\"()[]{}"
+# A real MATH500 answer is short. Anything longer is a sentence, and accepting
+# it as a candidate would only add noise -- is_equiv would reject it anyway.
+_MAX_BARE_ANSWER_CHARS = 60
+
+
+def lenient_boxed_answer(text: str) -> str | None:
+    """Extract an answer from a response that never wrote ``\\boxed{}``.
+
+    The strict extractor returns None for "the correct answer is 27", so a
+    model whose formatting collapsed scores 0 even where it is right. Falling
+    back to the last short line separates that from genuinely wrong answers.
+    Safe for healthy runs: a real chain of thought ends in a sentence, which
+    ``is_equiv`` rejects just as it rejects None.
+    """
+
+    from onereplay.eval.metrics.math500 import extract_answer
+
+    boxed = extract_answer(text)
+    if boxed is not None:
+        return boxed
+    for line in reversed(text.strip().split("\n")):
+        candidate = line.strip().strip(_ANSWER_JUNK).strip()
+        if not candidate:
+            continue
+        return candidate if len(candidate) <= _MAX_BARE_ANSWER_CHARS else None
+    return None
+
+
+def make_math_judge(
+    metric: str, lenient: bool = False
+) -> Callable[[dict[str, Any], str], tuple[bool, dict[str, Any]]]:
     if metric == "gsm8k":
         from onereplay.eval.metrics.gsm8k import predicted_answer
 
@@ -112,8 +144,10 @@ def make_math_judge(metric: str) -> Callable[[dict[str, Any], str], tuple[bool, 
 
     from onereplay.eval.metrics.math500 import extract_answer, is_equiv
 
+    extract = lenient_boxed_answer if lenient else extract_answer
+
     def judge(row: dict[str, Any], text: str) -> tuple[bool, dict[str, Any]]:
-        pred = extract_answer(text)
+        pred = extract(text)
         return bool(is_equiv(pred, row.get("gold"))), {"prediction": pred}
 
     return judge
@@ -219,13 +253,23 @@ def rescore_scored_metric(
     anchored: re.Pattern[str],
     floating: re.Pattern[str],
     everywhere: bool,
+    lenient_judge: Callable[[dict[str, Any], str], tuple[bool, dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Judge every row twice -- as stored and with the preamble gone."""
+    """Judge every row under each combination of the two candidate fixes.
+
+    Deleting the preamble and relaxing answer extraction are separate knobs and
+    they interact: on "the correct answer is 27" neither alone recovers the
+    point (the strict extractor still finds no \\boxed, and the lenient one
+    still sees a sentence), but together they do. Reporting all four cells is
+    the only way to attribute the gap.
+    """
 
     total = len(rows)
     old_correct = 0
     new_correct = 0
     baseline_correct = 0
+    lenient_correct = 0
+    lenient_stripped_correct = 0
     leaked = 0
     recovered: list[Any] = []
     lost: list[Any] = []
@@ -253,6 +297,13 @@ def rescore_scored_metric(
 
         new_ok, extra = judge(row, cleaned) if has_leak else (base_ok, {})
         new_correct += int(new_ok)
+
+        if lenient_judge is not None:
+            lenient_ok, _ = lenient_judge(row, text)
+            lenient_correct += int(lenient_ok)
+            both_ok, _ = lenient_judge(row, cleaned) if has_leak else (lenient_ok, {})
+            lenient_stripped_correct += int(both_ok)
+
         if new_ok and not base_ok:
             recovered.append(row.get("task_id", row.get("question", "")))
         elif base_ok and not new_ok:
@@ -271,7 +322,7 @@ def rescore_scored_metric(
         )
 
     denominator = max(total, 1)
-    return {
+    result = {
         "metric": metric,
         "n": total,
         "leak_rate": round(leaked / denominator, 4),
@@ -289,6 +340,13 @@ def rescore_scored_metric(
         "shape": shape_stats(metric, raw_texts),
         "_rows": stripped_rows,
     }
+    if lenient_judge is not None:
+        result["score_lenient"] = round(lenient_correct / denominator, 4)
+        result["score_lenient_stripped"] = round(lenient_stripped_correct / denominator, 4)
+        result["delta_from_both"] = round(
+            (lenient_stripped_correct - baseline_correct) / denominator, 4
+        )
+    return result
 
 
 def rescore_ifeval(
@@ -379,6 +437,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", default="")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument(
+        "--lenient_math",
+        type=int,
+        default=1,
+        help="1 = math500/amc/aime 额外报一列宽松抽取（无 \\boxed 时回退取末行）",
+    )
     parser.add_argument("--write_back", type=int, default=0)
     parser.add_argument("--out", default="", help="对比表输出 json 路径")
     return parser.parse_args()
@@ -478,6 +542,13 @@ def main() -> None:
                         anchored=anchored,
                         floating=floating,
                         everywhere=everywhere,
+                        # gsm8k already falls back to the last number in the
+                        # text, so only the boxed-answer metrics gain anything.
+                        lenient_judge=(
+                            make_math_judge(metric, lenient=True)
+                            if args.lenient_math and metric != "gsm8k"
+                            else None
+                        ),
                     )
             except Exception as exc:  # noqa: BLE001 - keep going, report at the end
                 print(f"[fail] {metric}/{run}: {exc!r}")
@@ -495,29 +566,34 @@ def main() -> None:
                 )
             report["runs"].setdefault(metric, {})[run] = result
 
+    def cell(value: float | None) -> str:
+        return "     -" if value is None else f"{value * 100:>5.1f}%"
+
     header = (
-        f"{'metric/run':<58}{'n':>5}{'leak':>7}{'stored':>8}{'rejudge':>9}"
-        f"{'strip':>8}{'delta':>8}{'+':>4}{'-':>4}"
+        f"{'metric/run':<58}{'n':>5}{'leak':>7}{'rejudge':>8}"
+        f"{'strip':>7}{'lenient':>8}{'both':>7}{'gain':>8}"
     )
     print()
     print(header)
     print("-" * len(header))
     for metric, runs in report["runs"].items():
         for run, r in runs.items():
+            gain = r.get("delta_from_both", r["delta_from_stripping"])
             print(
                 f"{metric + '/' + run:<58}{r['n']:>5}"
                 f"{r['leak_rate'] * 100:>6.1f}%"
-                f"{r['score_as_stored'] * 100:>7.1f}%"
-                f"{r['score_rejudged'] * 100:>8.1f}%"
-                f"{r['score_stripped'] * 100:>7.1f}%"
-                f"{r['delta_from_stripping'] * 100:>+7.1f}%"
-                f"{r.get('recovered', 0):>4}{r.get('lost', 0):>4}"
+                f"{cell(r['score_rejudged']):>8}"
+                f"{cell(r['score_stripped']):>7}"
+                f"{cell(r.get('score_lenient')):>8}"
+                f"{cell(r.get('score_lenient_stripped')):>7}"
+                f"{gain * 100:>+7.1f}%"
             )
     print()
-    print("leak    = 该 run 里带 'the correct answer is' 前缀的样本比例")
-    print("stored  = responses.jsonl 里记录的分数；rejudge = 用当前判分器重跑原文")
-    print("strip   = 删掉前缀后的分数；delta = strip - rejudge，即格式问题独占的部分")
-    print("delta 约等于 0 且 leak 很高 => 前缀不是元凶，是模型真的不会做了")
+    print("leak    = 带 'the correct answer is' 前缀的样本比例")
+    print("rejudge = 当前判分器重跑原文（基准列，已排除旧判分器的历史 bug）")
+    print("strip   = 只删前缀 / lenient = 只放宽抽取 / both = 两者都上")
+    print("gain    = both - rejudge，即判分口径能解释的全部缺口")
+    print("对照 base 那一行读 gain：base 的 gain 就是口径放宽本身带来的漂移")
 
     if failures:
         print("\n以下 run 处理失败：")
