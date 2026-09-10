@@ -66,11 +66,19 @@
 # -----------------------------------------------------------------------------
 # !! replay_max_len 必须等于该域 C 的 max_len
 #   训练侧的截断是保留末尾 max_len 个 token（丢问题、留答案），所以一条超长的
-#   数学行在 512 下会退化成「无题干的续写」。C_math / C_code 是在 2048 下采的，
-#   replay 若卡在 512，它保护的旧知识严格少于罚项编码的那一份。
-#   本脚本按域取：if 512 / math 2048 / code 2048，与 68 号逐字对应。
+#   数学行在 512 下会退化成「无题干的续写」。replay 若卡得比 C 低，它保护的旧知识
+#   就严格少于罚项编码的那一份。
+#   本脚本按域取：if 512 / math 1024 / code 1024，与 68 号逐字对应。
 #   新任务始终是 MAXLEN=512，两者互不影响（train.py 的 --replay_max_len 只管
 #   replay 行）。
+#
+#   math/code 是 1024 而不是 2048：2048 是从 1.7B 那批继承的、量自蒸馏答案的预算，
+#   而本轮读的是 gold_targets 列。全池实测 P99 只有 766(math) / 436(code)，1024 处
+#   截断 68 行(0.26%) / 4 行(0.02%)。留在 2048 的后果不是慢一点而是跑不了：池每
+#   epoch 被过 6.5 遍，那 7 行超 1536 的长尾每 epoch 出现约 45 次，collator 按 batch
+#   内最长行 padding，撞一次就把 micro-batch 抬到 8 x 2048 token，8B 上直接 OOM。
+#   降到 1024 之后长尾被削平，99.7% 的 micro-batch 组成与 vanilla 逐字相同，
+#   每步开销的可比性反而是靠这个值保住的。改它要 68/69/71 三处同步。
 #
 # -----------------------------------------------------------------------------
 # 各域的池从哪来（与 68 号完全对应）
@@ -92,8 +100,15 @@
 # 开销：这条 baseline 的代价就是要被暴露出来的
 #   同样的新任务行数下，本臂的 micro-batch 数是 vanilla 的两倍（每步只装 4 行
 #   新任务），所以 train_sec 大约 2x，walltime 给到 48 h。
-#   峰值显存反而应该与 vanilla 接近（micro-batch 还是 8 行），这与 OneReplay
-#   常驻 33.75 GB 的 C 形成对照 —— 汇总表会把三者并排打出来。
+#   峰值显存应该与 vanilla 接近，这与 OneReplay 常驻 33.75 GB 的 C 形成对照 ——
+#   汇总表会把三者并排打出来。
+#
+#   !! 「接近」的依据是 token 数，不是行数。collator 按 batch 内最长行 padding，
+#   所以决定显存的是 max(8 行的长度) 而不是 8。if 域的 replay 行与新任务同为 512，
+#   逐字相同；math/code 在 replay_max_len=1024 下 P90 是 375/248（低于新任务的 512），
+#   绝大多数 micro-batch 仍由新任务定长，只有撞上长尾那 0.26% 时才抬到 1024。
+#   这个前提在 replay_max_len=2048 时是不成立的（长尾把峰值顶到 8 x 2048 而 OOM），
+#   所以下面那句「峰值显存差应该接近 0」只在当前的 1024 口径下能这么读。
 #
 # -----------------------------------------------------------------------------
 # 评测口径按域走（与 70 号相同）
@@ -332,7 +347,7 @@ case "${DOMAIN}" in
     REPLAY_DATA_FILES=""
     REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-gold_targets}"
     REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-0}"       # 全池，= 68 号的 --max_samples 0
-    REPLAY_MAXLEN="${REPLAY_MAXLEN:-2048}"          # = 68 号的 MATH_MAXLEN
+    REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"          # = 68 号的 MATH_MAXLEN
     EXPECT_POOL_FILES=2
     ;;
   code)
@@ -340,7 +355,7 @@ case "${DOMAIN}" in
     REPLAY_DATA_FILES=""
     REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-gold_targets}"
     REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-0}"
-    REPLAY_MAXLEN="${REPLAY_MAXLEN:-2048}"          # = 68 号的 CODE_MAXLEN
+    REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"          # = 68 号的 CODE_MAXLEN
     EXPECT_POOL_FILES=1
     ;;
 esac
@@ -514,7 +529,7 @@ fi
 # replay 的截断长度必须等于该域 C 的 max_len，否则保护的旧知识严格少于罚项编码的那份。
 case "${DOMAIN}" in
   if)        _want_rlen=512 ;;
-  math|code) _want_rlen=2048 ;;
+  math|code) _want_rlen=1024 ;;
 esac
 [[ "${REPLAY_MAXLEN}" == "${_want_rlen}" ]] || DRIFT+=("replay_max_len=${REPLAY_MAXLEN}\
 （68 号采 ${DOMAIN} 的 C 用的是 ${_want_rlen}；不等就与 70 号看到的旧知识不同）")
@@ -1044,7 +1059,8 @@ if vanilla:
               f"  （每步只装 {last.get('new_per_batch')} 行新任务，约 2x 是预期的）")
     if v_last.get("peak_memory_gb") and last.get("peak_memory_gb"):
         print(f"峰值显存差 = {last['peak_memory_gb'] - v_last['peak_memory_gb']:+.2f} GB"
-              "  （micro-batch 行数不变，应该接近 0；这正是与 OneReplay 常驻 C 的对照）")
+              "  （行数不变且 replay 行的 P90 低于新任务的 512，应该接近 0；"
+              "这正是与 OneReplay 常驻 C 的对照。明显为正就去看池的长度分布）")
 else:
     print("note: 找不到 vanilla 的 metrics，val_loss 没有分母。67 号跑完再回来看这一行。")
 

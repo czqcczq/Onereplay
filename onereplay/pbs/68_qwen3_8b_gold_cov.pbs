@@ -63,13 +63,36 @@
 #   要复刻 1.7B 的口径就传 KEEP_COLUMN=targets，Step 0 会把两种行数都打出来。
 #
 # -----------------------------------------------------------------------------
+# !! math/code 的 MAXLEN 是 1024，不是 2048。这个数是量出来的
+#   2048 是从 1.7B 那批继承的默认值，它量的是**自蒸馏**答案（targets 列，最长
+#   2008）。8B 这轮读的是 gold_targets 列 —— 数据集自带的解答，不是模型生成的
+#   推理链，短得多。全池实测（apply_train_template 后的完整 token 数）：
+#       math  25979 行  P50 207  P90 375  P95 477  P99 766  max 2547
+#       code  20000 行  P50 127  P90 248  P95 299  P99 436  max 1705
+#   1024 在两边都远高于 P99，截断的是 math 68 行（0.26%）、code 4 行（0.02%）。
+#
+#   为什么不留在 2048：池是被循环使用的，replay 臂一个 epoch 要过 math 池 6.5 遍，
+#   于是那 7 行超过 1536 的长尾每 epoch 会出现约 45 次；collator 按 batch 内最长行
+#   padding，撞上一次整个 micro-batch 就被抬到 2048，8 行 x 2048 token 在 8B 上直接
+#   OOM。换句话说 2048 这个预算是为 7 行付的，代价是整条 replay 臂跑不起来。
+#
+#   !! 改这个值必须三处同步，否则两条臂看到的旧知识长度不同，对比就不成立：
+#       68 号 MATH_MAXLEN / CODE_MAXLEN     (C，本文件)
+#       69 号 MATH_MAXLEN / CODE_MAXLEN     (F，EWC 臂靠它与 OneReplay 同池)
+#       71 号 REPLAY_MAXLEN 与 _want_rlen   (replay 臂实际训练时的截断)
+#   71 号 Step 1 会把 replay_max_len 与 C metadata 里的 max_len 对表，不等就退出。
+#
+# -----------------------------------------------------------------------------
 # COV_BATCH 怎么定：传输已经不是瓶颈，logits 才是
 #   target_modules 不含 lm_head，但 collect_cov 走的是完整的 model(...) 前向，
 #   lm_head 照样算。Qwen3-8B 的 vocab 是 151936，logits 显存 =
 #   batch x seq_len x 151936 x 2B。按 batch x len 约 16K token 配平：
 #       if   len 512  -> batch 32   （logits 4.98 GiB）
-#       math len 2048 -> batch 8    （logits 4.98 GiB）
-#       code len 2048 -> batch 8    （logits 4.98 GiB）
+#       math len 1024 -> batch 8    （logits 2.49 GiB，只用了半个配平预算）
+#       code len 1024 -> batch 8    （同上）
+#   math/code 的 batch 留在 8 是保守值：max_len 从 2048 砍到 1024 之后配平值其实是
+#   16，传 MATH_COV_BATCH=16 能省一半时间。C 是按 token 取的均值，batch 只影响
+#   累加顺序不影响结果，所以这个旋钮是安全的。
 #   采集期显存 = 16.4(权重) + 36.2(C) + 5.3(logits) + 激活，约 60 GB / 143 GB。
 #   第一次跑先保守，看完 Step 4 打印的 peak memory 再决定要不要翻倍。
 #
@@ -262,13 +285,13 @@ IF_COV_BATCH="${IF_COV_BATCH:-32}"
 # math 域：两个视角一起读，少读一个就等于换了池
 MATH_VIEW_DIR="${MATH_VIEW_DIR:-${REPO_ROOT}/datasets/MetaMathQA_views}"
 MATH_VIEW_PREFIX="${MATH_VIEW_PREFIX:-metamath_cmath_30k}"
-MATH_MAXLEN="${MATH_MAXLEN:-2048}"
+MATH_MAXLEN="${MATH_MAXLEN:-1024}"   # 见文件头「1024 是量出来的」；改它必须同步 69/71 号
 MATH_COV_BATCH="${MATH_COV_BATCH:-8}"
 MATH_GLOB="${POOL_ROOT}/replay/${MATH_VIEW_PREFIX}_*_selfdistill_seed${SAMPLE_SEED}.jsonl"
 
 # code 域
 CODE_VIEW_PREFIX="${CODE_VIEW_PREFIX:-opc_edu_ccode_20k}"
-CODE_MAXLEN="${CODE_MAXLEN:-2048}"
+CODE_MAXLEN="${CODE_MAXLEN:-1024}"   # 同上
 CODE_COV_BATCH="${CODE_COV_BATCH:-8}"
 CODE_FILE="${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}.jsonl"
 

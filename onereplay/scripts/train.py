@@ -314,12 +314,17 @@ def parse_args() -> argparse.Namespace:
             "Token budget for replay rows only; 0 reuses --max_len. The new "
             "task must stay at --max_len on every arm or the comparison gains "
             "a second variable, but old-knowledge corpora have their own "
-            "lengths: FLAN self-distilled rows fit in 512, MetaMath ones reach "
-            "2008. Truncation keeps the last max_len tokens, so an over-long "
-            "row keeps its answer and loses its question; at 512 that happens "
-            "to 16.2% of the MetaMath pool. Set this to match the max_len the "
-            "domain's C was collected at (2048 for C_math), otherwise replay "
-            "sees strictly less old knowledge than the penalty encodes."
+            "lengths. Truncation keeps the last max_len tokens, so an over-long "
+            "row keeps its answer and loses its question, which turns a "
+            "question-answer rehearsal into bare continuation. Set this to match "
+            "the max_len the domain's C was collected at, otherwise replay sees "
+            "strictly less old knowledge than the penalty encodes. Measure the "
+            "right value rather than inheriting it: it is a property of the "
+            "corpus *and* of the answer column, and MetaMath's self-distilled "
+            "chains reach 2008 tokens where the very same rows' gold_targets "
+            "have a P99 of 766. It also sets the memory ceiling, because the "
+            "collator pads each micro-batch to its longest row, so a long tail "
+            "of a few rows decides the peak."
         ),
     )
     parser.add_argument(

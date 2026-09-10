@@ -44,8 +44,16 @@
 #       Fisher 累加器      27.8 GB
 #       激活 + logits       ~5 GB
 #       合计               ~94 GB
-#   math/code 的 max_len 2048 会把激活和 logits 抬到 ~15 GB，合计 ~104 GB，
+#   math/code 的 max_len 1024 会把激活和 logits 抬到 ~10 GB，合计 ~99 GB，
 #   仍在 143 GB 内。真爆了再传 FISHER_DEVICE=cpu，慢但能跑完。
+#
+# -----------------------------------------------------------------------------
+# !! math/code 的 MAXLEN 必须等于 68 号采 C 时的值（当前 1024，不是 2048）
+#   F 与 C 只有在同一批行、同一个 token 预算下采出来，EWC 与 OneReplay 的对比才
+#   只差「用哪个矩阵」这一个变量；预算不同就变成「谁看到的旧知识更多」。
+#   1024 这个值的依据、以及它为什么不是 2048，写在 68 号的文件头里（一句话版：
+#   gold_targets 列的 P99 是 766/436，2048 是从自蒸馏那批继承来的、为 7 行长尾
+#   付的预算）。改动必须 68/69/71 三处同步。
 #
 # -----------------------------------------------------------------------------
 # !! use_bf16 保持 0，别为了提速改成 1
@@ -227,9 +235,9 @@ KEEP_COLUMN="${KEEP_COLUMN:-}"   # 空 = 全池；必须与 68 号传的值相�
 FLAN_SAMPLES="${FLAN_SAMPLES:-20000}"
 IF_MAXLEN="${IF_MAXLEN:-512}"
 MATH_VIEW_PREFIX="${MATH_VIEW_PREFIX:-metamath_cmath_30k}"
-MATH_MAXLEN="${MATH_MAXLEN:-2048}"
+MATH_MAXLEN="${MATH_MAXLEN:-1024}"   # 必须等于 68 号的 MATH_MAXLEN，见文件头
 CODE_VIEW_PREFIX="${CODE_VIEW_PREFIX:-opc_edu_ccode_20k}"
-CODE_MAXLEN="${CODE_MAXLEN:-2048}"
+CODE_MAXLEN="${CODE_MAXLEN:-1024}"   # 必须等于 68 号的 CODE_MAXLEN
 
 MATH_GLOB="${POOL_ROOT}/replay/${MATH_VIEW_PREFIX}_*_selfdistill_seed${SAMPLE_SEED}.jsonl"
 CODE_FILE="${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}.jsonl"
