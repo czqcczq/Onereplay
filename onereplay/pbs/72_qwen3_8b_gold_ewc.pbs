@@ -29,7 +29,38 @@
 #   因为 C 的 λ 已经知道在哪个十倍档里了，而 F 这边连档位都是估的。
 #
 #   Step 1 会打印 λ × mean(F)，训练自检会打印每个 epoch 的 λR/task_loss。
-#   先用 PROBE=1 跑 300 步看这个比值落在哪，再决定正式扫哪三档。
+#
+# -----------------------------------------------------------------------------
+# !! 定档位：传 LAMBDAS 进扫描模式（本臂比 70 号更需要它）
+#   一个作业里对网格上每个 λ 各跑 PROBE_STEPS 步（默认 300），不评测、不存
+#   adapter，末尾打两张对照表。分隔符用冒号最稳，qsub -v 自己按逗号切:
+#       LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x>       （x = 1/mean(F)）
+#
+#   网格里带一个 λ=0 是刻意的，它是这两张表的标尺。λ=0 时 ΔW 完全不受约束，测出
+#   来的 R 就是「这个域上罚项本来会有多大」，于是
+#       想要 λR/task_loss ≈ 目标占比  =>  λ ≈ 目标占比 x task_loss / R(λ=0)
+#   这个反推值与 1/mean(F) 差几个十倍，就是「F 的大质量落在 ΔW 其实没走的方向上」
+#   这件事有多严重 —— 1/mean(F) 假设 ΔW 各向同性，实测的 R 不假设。
+#
+#   !! 短跑能回答什么、不能回答什么
+#   能：档位差了几个十倍；罚项有没有真的接上（每个 λ 都会 grep 一次层覆盖那句，
+#       外加一句"罚项不是来自 C"）；R/R(λ=0)——λ 把 ΔW 的能量压掉了多少。
+#   不能：定最终的 λ。ACCUM=64 下 300 步只有约 37 次参数更新，3 个 epoch 是约 6
+#       万次；R 只依赖 ΔW，此刻 ΔW 还几乎没长起来，所以 λR/task_loss 这个**绝对
+#       值**系统性偏小，只能当下界读。选点仍然要靠完整 run 的 val_loss + retention。
+#
+#   这张表还有一个专门的用途：EWC 最后输给 OneReplay 时，它是区分两种原因的证据
+#   —— λ 根本没扫到有效区间（表里全是 R/R(0)≈1），还是扫到了、罚项确实起作用了
+#   但保留仍然更差。后者才是关于 Fisher 这个量本身的结论。
+#
+#   扫描的代价：每个 λ 都是一次独立的 train.py 调用，各自重读一遍约 25.9 GiB 的
+#   F、重新加载 8B 权重、重新 tokenize 一遍数据集。网格控制在 3-5 个点。
+#
+# -----------------------------------------------------------------------------
+# !! 短跑的 run 名带 _probe 后缀，不与正式结果落进同一个 metrics 文件
+#   metrics jsonl 是追加写的。若短跑与正式 run 同名，300 步那条 epoch 记录会和
+#   3-epoch 那条排在一个文件里，自检读 epochs[-1]、汇总读最后一条，两边都可能拿
+#   到错的那条。判据不只看 PROBE：手工传 MAX_STEPS / EPOCHS 也算短跑。
 #
 # -----------------------------------------------------------------------------
 # !! F 的层覆盖必须 ⊇ LoRA 的层覆盖（与 70 号同一个坑）
@@ -81,11 +112,13 @@
 #   5) 67 号的 base 与 vanilla 已评完
 #
 # 投递（DRY_RUN=1 是默认，先看计划）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<起点>   onereplay/pbs/72_qwen3_8b_gold_ewc.pbs
-#   先探量级（300 步，不评测）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<起点>,PROBE=1 onereplay/pbs/72_...
-#   按十倍扫（λ 写在 run 名里，不会互相覆盖）:
+#   第一步 先扫档位（一个作业跑完整个网格，不评测不存 adapter，约 1-2h）:
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x> onereplay/pbs/72_...
+#   第二步 照扫描表定档位，按十倍各投一次正式 run（λ 在 run 名里，不会互相覆盖）:
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<1x>    onereplay/pbs/72_qwen3_8b_gold_ewc.pbs
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<0.1x> ...   /   LAMBDA=<10x>
+#   单点短跑（= 只有一个 λ 的扫描，没有 λ=0 那把尺子）:
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<起点>,PROBE=1 onereplay/pbs/72_...
 #   拆两次投（训练与评测分开）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=...,DO_EVAL=0  ...   然后   DO_TRAIN=0
 #
@@ -146,7 +179,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR CODE_DATA_DIR
     DATASET_CACHE OUT_DIR
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE ALLOW_DRIFT FISHER_DIAG
-    DOMAIN LAMBDA SKIP_FP_CHECK
+    DOMAIN LAMBDA LAMBDAS PROBE_STEPS PROBE_LOG_EVERY SKIP_FP_CHECK
     FISHER_PATH IF_FISHER MATH_FISHER CODE_FISHER
     COV_PATH IF_COV MATH_COV CODE_COV
     REGULARIZER IDENTITY_COV REG_ONCE NORM_BY_LAYERS ONEREPLAY_METRICS
@@ -287,17 +320,66 @@ case "${DOMAIN}" in
   code) FISHER_PATH="${FISHER_PATH:-${CODE_FISHER}}" ; COV_PATH="${COV_PATH:-${CODE_COV}}" ;;
 esac
 
+# ---- λ 扫描 ----
+# 传 LAMBDAS 就进扫描模式：网格上每个 λ 各跑 MAX_STEPS 步，不评测不存 adapter，
+# 末尾打对照表。分隔符接受冒号 / 逗号 / 空格（qsub -v 自己按逗号切，冒号最稳）。
+# 本臂的网格按十倍走，见文件头。
+LAMBDAS="${LAMBDAS:-}"
+PROBE_STEPS="${PROBE_STEPS:-300}"
+PROBE_LOG_EVERY="${PROBE_LOG_EVERY:-50}"   # 要看趋势，默认 500 步一打就只剩一个点
+SWEEP=0
+LAMBDA_LIST=()
+if [[ -n "${LAMBDAS}" ]]; then
+  SWEEP=1
+  PROBE=1
+  read -r -a LAMBDA_LIST <<< "${LAMBDAS//[,:]/ }"
+  if (( ${#LAMBDA_LIST[@]} == 0 )); then
+    echo "!! LAMBDAS='${LAMBDAS}' 切不出任何 λ"; exit 1
+  fi
+fi
+
 if [[ "${PROBE}" == "1" ]]; then
   SAVE=0
-  [[ "${MAX_STEPS}" == "0" ]] && MAX_STEPS=300
+  [[ "${MAX_STEPS}" == "0" ]] && MAX_STEPS="${PROBE_STEPS}"
   EPOCHS=1                       # 300 步 x 3 个 epoch 没有额外信息，只是等三倍时间
   DO_EVAL=0
   echo "PROBE=1：SAVE=0 MAX_STEPS=${MAX_STEPS} EPOCHS=1 DO_EVAL=0，只看罚项量级"
 fi
+if (( SWEEP == 1 )); then
+  echo "λ 扫描模式：网格 = ${LAMBDA_LIST[*]}（共 ${#LAMBDA_LIST[@]} 点，每点 ${MAX_STEPS} 步）"
+fi
 
 # ---- run 名：域与 λ 都编进去，扫 λ 时不会互相覆盖 ----
 RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
-RUN="${RUN:-cs_ewc_8b_${DOMAIN}gold_${RUN_TAG}_lam${LAMBDA}_lr${LR}_seed${SEED}_regonce}"
+# 短跑的记录不能落进正式 run 的名下（文件头说明了为什么）。预算也编进后缀，这样
+# 300 步与 2000 步两种短跑之间也不会互相覆盖。
+SHORT_RUN=0
+if [[ "${MAX_STEPS}" != "0" || "${EPOCHS}" != "3" ]]; then
+  SHORT_RUN=1
+fi
+run_name_for () {
+  local name="cs_ewc_8b_${DOMAIN}gold_${RUN_TAG}_lam${1}_lr${LR}_seed${SEED}_regonce"
+  if (( SHORT_RUN == 1 )); then
+    name="${name}_probe${MAX_STEPS}s${EPOCHS}e"
+  fi
+  printf '%s' "${name}"
+}
+if (( SWEEP == 1 )) && [[ -z "${LAMBDA}" ]]; then
+  # 扫描模式下每个 λ 各有自己的 run 名；这个只用来给 Step 1 的临时报告命名。
+  RUN="${RUN:-$(run_name_for sweep)}"
+else
+  RUN="${RUN:-$(run_name_for "${LAMBDA}")}"
+fi
+if (( SHORT_RUN == 1 )); then
+  echo "短跑（max_steps=${MAX_STEPS} epochs=${EPOCHS}）：run 名带 _probe 后缀，与正式结果分开存"
+fi
+# train.py 的默认 log_every=500 比一次短跑的总步数还大，那样连一行 step 日志都拿
+# 不到（trainer 只在 step%log_every==0 或最后一步打），λR 的趋势就无从看起。
+if (( SHORT_RUN == 1 )); then
+  LOG_EVERY="${LOG_EVERY:-${PROBE_LOG_EVERY}}"
+else
+  LOG_EVERY="${LOG_EVERY:-500}"
+fi
 # 67 号的 vanilla：分母。名字必须按同一套规则拼，否则末尾的对照表读不到它。
 VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_8b_${RUN_TAG}_lr${LR}_seed${SEED}}"
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
@@ -349,7 +431,12 @@ echo "  分母     = base / ${VANILLA_RUN}   (67 号产出)"
 echo "  对手     = 70 号 OneReplay 同域（同批行，只差用 F 还是用 C 加权 ΔW）"
 echo "  F        = ${FISHER_PATH}"
 echo "  同池参照 = ${COV_PATH}   skip_check=${SKIP_FP_CHECK}"
-echo "  λ        = ${LAMBDA}   reg_once=${REG_ONCE}  normalize_by_layers=${NORM_BY_LAYERS}"
+if (( SWEEP == 1 )); then
+  echo "  λ 网格   = ${LAMBDA_LIST[*]}   (扫描，每点 ${MAX_STEPS} 步)"
+else
+  echo "  λ        = ${LAMBDA}"
+fi
+echo "             reg_once=${REG_ONCE}  normalize_by_layers=${NORM_BY_LAYERS}"
 echo "             regularizer=${REGULARIZER}（λ 与 70 号完全不通用，按十倍扫）"
 echo "  LoRA     = r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT}"
 echo "             targets=${TARGET_MODULES}"
@@ -368,16 +455,35 @@ echo "========================================================================"
 # ===========================================================================
 echo "==== Step 0: 对齐检查 ===="
 
-[[ -n "${LAMBDA}" ]] || {
-  echo "!! LAMBDA 为空。它没有默认值是刻意的：F 的量级比 C 低好几个数量级，"
-  echo "   70 号那套 λ 搬过来等于没有罚项。"
-  echo "   起点取 1/mean(F)（69 号采完时打过，Step 1 会再打一次），按十倍展开扫。"
-  exit 1
-}
-python -c "import sys; sys.exit(0 if float('${LAMBDA}') > 0 else 1)" || {
-  echo "!! LAMBDA=${LAMBDA} 不是正数。λ=0 就是 vanilla，那是 67 号的事。"
-  exit 1
-}
+if (( SWEEP == 1 )); then
+  # 网格允许 λ=0（那是标尺行：只测 R 不加罚），但不允许负数或非数字。
+  for lam in "${LAMBDA_LIST[@]}"; do
+    python -c "import sys; sys.exit(0 if float('${lam}') >= 0 else 1)" 2>/dev/null || {
+      echo "!! LAMBDAS 里的 '${lam}' 不是非负数"
+      exit 1
+    }
+  done
+  echo "λ 网格 ${#LAMBDA_LIST[@]} 个点都合法: ${LAMBDA_LIST[*]}"
+  case " ${LAMBDA_LIST[*]} " in
+    *" 0 "*|*" 0.0 "*) ;;
+    *) echo "warning: 网格里没有 λ=0。那一行是标尺（R(λ=0) 与 task_loss 的基准），"
+       echo "         没有它就只能读绝对量级，读不到 R/R(0) 和反推的 λ 建议。" ;;
+  esac
+else
+  [[ -n "${LAMBDA}" ]] || {
+    echo "!! LAMBDA 为空。它没有默认值是刻意的：F 的量级比 C 低好几个数量级，"
+    echo "   70 号那套 λ 搬过来等于没有罚项。"
+    echo "   起点取 1/mean(F)（69 号采完时打过，Step 1 会再打一次），按十倍展开扫。"
+    echo "   连档位都没底就先扫一遍（围绕 1/mean(F) 各上下两个十倍）:"
+    echo "   LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x>"
+    exit 1
+  }
+  python -c "import sys; sys.exit(0 if float('${LAMBDA}') > 0 else 1)" || {
+    echo "!! LAMBDA=${LAMBDA} 不是正数。λ=0 就是 vanilla，那是 67 号的事。"
+    echo "   要把 λ=0 当扫描的标尺行，用 LAMBDAS 而不是 LAMBDA。"
+    exit 1
+  }
+fi
 if [[ "${IDENTITY_COV}" == "1" ]]; then
   echo "!! IDENTITY_COV=1 在 EWC 臂上无意义：它是把 C 换成单位矩阵的 L2 对照，"
   echo "   train.py 的 ewc 分支会直接抛异常。要那个消融就去 70 号:"
@@ -468,7 +574,12 @@ done
 #   顺带把 λ 的起点算出来：F 的量级不能靠猜，1/mean(F) 是唯一有依据的起点。
 # ===========================================================================
 echo "==== Step 1: F 前置检查 ===="
-export MODEL_DIR MODEL_NAME FISHER_PATH COV_PATH TARGET_MODULES LAMBDA DOMAIN
+if (( SWEEP == 1 )); then
+  LAMBDA_GRID="${LAMBDA_LIST[*]}"
+else
+  LAMBDA_GRID="${LAMBDA}"
+fi
+export MODEL_DIR MODEL_NAME FISHER_PATH COV_PATH TARGET_MODULES LAMBDA LAMBDA_GRID DOMAIN
 export FISHER_DIAG NORM_BY_LAYERS MIN_HOST_FREE_GIB SKIP_FP_CHECK
 FISHER_REPORT_FILE="${TMPDIR}/fisher_preflight_${RUN}.txt"
 
@@ -684,20 +795,31 @@ if os.environ.get("FISHER_DIAG", "1") == "1":
                     f"差 {ratio:.3f}x。文件可能被改过或读错了 key。"
                 )
 
-    lam = float(os.environ["LAMBDA"])
+    # 扫描模式下这是整个网格，单点模式下只有一个元素。
+    grid = [item for item in os.environ.get("LAMBDA_GRID", "").split() if item]
     print()
     if mean_f > 0:
         suggest = 1.0 / mean_f
-        decades = math.log10(lam / suggest) if lam > 0 else float("nan")
         print(f"1/mean(F) = {suggest:.4e}   <- 起点")
-        print(f"本次 λ    = {lam:.4e}   距起点 {decades:+.2f} 个十倍")
-        print(f"λ x mean(F) = {lam * mean_f:.4e}")
+        print(f"{'λ':>14}{'距起点几个十倍':>18}{'λ x mean(F)':>18}")
+        for item in grid:
+            lam = float(item)
+            if lam > 0:
+                decades = f"{math.log10(lam / suggest):+.2f}"
+            else:
+                decades = "-inf"
+            print(f"{lam:>14.4e}{decades:>18}{lam * mean_f:>18.4e}")
         print("normalize_by_layers=1 已把层数除掉，所以这个乘积就是罚项的量级。")
-        print("训练自检会打印每个 epoch 的 λR/task_loss。落在 0.01~1 之间算有效，")
-        print("远小于 0.01 就是罚项形同虚设，大于 1 就是把模型锁死了。")
-        if abs(decades) > 4:
-            print(f"!! 本次 λ 距 1/mean(F) 有 {decades:+.1f} 个十倍，先用 PROBE=1 跑 300 步"
-                  "看 λR/task_loss，再决定正式扫哪三档。")
+        print("λR/task_loss 落在 0.01~1 之间算有效，远小于 0.01 就是罚项形同虚设，")
+        print("大于 1 就是把模型锁死了。这个比值由扫描表或训练自检给出。")
+        far = [
+            item for item in grid
+            if float(item) > 0 and abs(math.log10(float(item) / suggest)) > 4
+        ]
+        if far:
+            print(f"!! 这些 λ 距 1/mean(F) 超过 4 个十倍: {far}")
+            print("   先扫一遍看 λR/task_loss 落在哪，再决定正式跑哪三档。")
+        print(f"MEAN_F={mean_f:.6e}")
     else:
         failures.append("mean(F) = 0：F 全是零，69 号那次采集没有产生梯度，重采。")
 
@@ -738,11 +860,268 @@ EXPECT_LAYERS="${EXPECT_LAYERS#EXPECT_LAYERS=}"
 [[ -n "${EXPECT_LAYERS}" ]] || { echo "!! 没解析到 EXPECT_LAYERS，训练后的层数断言会失效。停。"; exit 1; }
 echo "训练后要在日志里核对的层数: ${EXPECT_LAYERS}"
 
+# FISHER_DIAG=0 时报告里没有这一行，表会把预测那一列打成 '-'，不影响实测列。
+# || true 是必须的：grep 没匹配时退出码 1，在 set -e 下会把整个作业带走。
+MEAN_F="$(grep -o 'MEAN_F=[0-9.eE+-]*' "${FISHER_REPORT_FILE}" | tail -n 1 || true)"
+MEAN_F="${MEAN_F#MEAN_F=}"
+
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo ""
   echo "DRY_RUN=1：以上为计划与前置检查，未训练未评测。"
-  echo "确认无误后: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=${LAMBDA} ${SELF_PATH}"
-  echo "λ 的量级没底就先探: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=${LAMBDA},PROBE=1 ${SELF_PATH}"
+  if (( SWEEP == 1 )); then
+    echo "确认无误后: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDAS=${LAMBDAS//[ ,]/:} ${SELF_PATH}"
+  else
+    echo "确认无误后: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=${LAMBDA} ${SELF_PATH}"
+    echo "λ 的档位没底就先扫: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDAS=0:<0.1x>:<1x>:<10x> ${SELF_PATH}"
+  fi
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# λ 扫描（PROBE，一个作业跑完整个网格）
+#   每个 λ 各跑 MAX_STEPS 步，不存 adapter、不评测，末尾两张对照表 + 反推的 λ
+#   建议。目的是把 F 的档位定下来，不是定最终的 λ——文件头写了为什么短跑的
+#   λR/task_loss 只能当下界读。本臂尤其需要它：F 这边连档位都是估的。
+# ===========================================================================
+if (( SWEEP == 1 )); then
+  SWEEP_TABLE="${TMPDIR}/lambda_sweep_${DOMAIN}_$$.tsv"
+  : > "${SWEEP_TABLE}"
+  SWEEP_FAIL=()
+  # 一个共享的 map_cache：tokenize 与 λ 无关，而 commonsense.py 那边写死了
+  # load_from_cache_file=False，每个 λ 反正都要重 tokenize 一遍，共享只是省磁盘。
+  SWEEP_MAP_CACHE="${RESULTS_ROOT}/map_cache/sweep_${RUN_TAG}_maxlen${MAXLEN}_seed${SEED}"
+  mkdir -p "${SWEEP_MAP_CACHE}"
+
+  for lam in "${LAMBDA_LIST[@]}"; do
+    probe_run="$(run_name_for "${lam}")"
+    probe_log="${TRAIN_LOG_DIR}/${probe_run}.train.log"
+    probe_metrics="${RESULTS_ROOT}/metrics/${probe_run}.jsonl"
+    # 短跑的 jsonl 每次从头写：同一个 λ 投两次时，追加会让下面的表读到上一次的行。
+    rm -f "${probe_metrics}"
+    # λ=0 是标尺行，只测 R 不加罚；其余点不需要这个开关（λ>0 时必然会加载）。
+    if python -c "import sys; sys.exit(0 if float('${lam}') > 0 else 1)"; then
+      MEASURE_ZERO=0
+    else
+      MEASURE_ZERO=1
+    fi
+    echo ""
+    echo "==== sweep: λ=${lam}, ${MAX_STEPS} 步 -> ${probe_run} ===="
+    # 一个点崩了不该把整张表带走：记下来，继续下一个 λ，末尾统一报。
+    TRAIN_RC=0
+    set -x
+    python -m onereplay.scripts.train --paradigm sft \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+      --dataset_path "${CS_DATASET}" \
+      --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+      --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
+      --target_modules "${TARGET_MODULES}" \
+      --map_cache_dir "${SWEEP_MAP_CACHE}" \
+      --max_steps "${MAX_STEPS}" --log_every "${LOG_EVERY}" \
+      --regularizer "${REGULARIZER}" \
+      --fisher_path "${FISHER_PATH}" --replay_lambda "${lam}" \
+      --measure_replay_when_lambda_zero "${MEASURE_ZERO}" \
+      --cov_path "" --identity_cov 0 \
+      --normalize_replay_by_layers "${NORM_BY_LAYERS}" \
+      --reg_once_per_update "${REG_ONCE}" \
+      --save 0 \
+      --metrics_path "${probe_metrics}" 2>&1 | tee "${probe_log}" || TRAIN_RC=$?
+    set +x
+    # 层覆盖每个 λ 都查一遍：只查第一个的话，后面某次加载出问题就看不出来。
+    # 顺带查一句 F 的来源：cov_path 传的是空串，别让它悄悄退回协方差那条路。
+    if (( TRAIN_RC != 0 )); then
+      SWEEP_FAIL+=("λ=${lam}: train.py 退出码 ${TRAIN_RC}，见 ${probe_log}")
+    elif ! grep -qF -- \
+      "regularizer covers ${EXPECT_LAYERS} layers; no penalty matrix for 0 layers" \
+      "${probe_log}"; then
+      SWEEP_FAIL+=("λ=${lam}: 日志里没有 'regularizer covers ${EXPECT_LAYERS} layers; no penalty matrix for 0 layers'")
+    elif grep -qF -- "covariance matrices from" "${probe_log}"; then
+      SWEEP_FAIL+=("λ=${lam}: 日志里出现了 'covariance matrices from'，罚项来自 C 而不是 F")
+    fi
+    printf '%s\t%s\t%s\n' "${lam}" "${probe_metrics}" "${probe_log}" >> "${SWEEP_TABLE}"
+  done
+
+  echo ""
+  echo "========================================================================"
+  echo "λ 扫描汇总：保护 ${DOMAIN}   F=${FISHER_PATH}"
+  echo "每点 ${MAX_STEPS} 步 x batch ${BATCH} / accum ${ACCUM}（约 $(( MAX_STEPS * BATCH / ACCUM )) 次参数更新）"
+  echo "========================================================================"
+  SUMMARY_RC=0
+  SWEEP_TABLE="${SWEEP_TABLE}" MEAN_F="${MEAN_F}" \
+  WANT_STEPS="${MAX_STEPS}" WANT_UPDATES="$(( MAX_STEPS * BATCH / ACCUM ))" \
+  python - <<'PY' || SUMMARY_RC=$?
+import json
+import math
+import os
+import re
+
+STEP_RE = re.compile(
+    r"step (\d+)/(\d+) task_loss=([0-9.eE+-]+) replay_reg=([0-9.eE+-]+)"
+)
+
+
+def last_epoch_record(path):
+    found = None
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("epoch") is not None:
+                    found = row
+    return found
+
+
+def step_points(path):
+    """日志里每个 log_every 记录点的 (step, task_loss, R)。"""
+    points = []
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = STEP_RE.search(line)
+                if match:
+                    points.append(
+                        (int(match.group(1)), float(match.group(3)), float(match.group(4)))
+                    )
+    return points
+
+
+def cell(value, spec="12.4e"):
+    return f"{'-':>{spec.split('.')[0]}}" if value is None else f"{value:>{spec}}"
+
+
+mean_f = os.environ.get("MEAN_F", "").strip()
+mean_f = float(mean_f) if mean_f else None
+suggest = 1.0 / mean_f if mean_f else None
+
+rows = []
+with open(os.environ["SWEEP_TABLE"], encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) == 3:
+            rows.append(parts)
+
+records = []
+for lam_str, metrics_path, log_path in rows:
+    record = last_epoch_record(metrics_path)
+    records.append(
+        {
+            "lam_str": lam_str,
+            "lam": float(lam_str),
+            "task": None if record is None else record.get("train_task_loss"),
+            "reg": None if record is None else record.get("train_replay_reg"),
+            "val": None if record is None else record.get("val_loss"),
+            "points": step_points(log_path),
+            "ok": record is not None,
+        }
+    )
+
+dead = [item["lam_str"] for item in records if not item["ok"]]
+if dead:
+    print(f"!! 这些 λ 没有 epoch 记录（训练没跑完就退了，去对应的 train.log 里看）: {dead}")
+
+print()
+print("---- 表 A: 罚项量级（λR/task 的绝对值是下界，看的是趋势与相对关系）")
+print(
+    f"{'λ':>12}{'距1/mean(F)':>14}{'λxmean(F)':>14}{'R':>13}{'λR':>13}"
+    f"{'λR/task':>12}{'λR/task@首':>13}{'λR/task@末':>13}"
+)
+for item in records:
+    lam, reg, task = item["lam"], item["reg"], item["task"]
+    decades = "-" if (suggest is None or lam <= 0) else f"{math.log10(lam / suggest):+.2f}"
+    predicted = None if mean_f is None else lam * mean_f
+    lam_reg = None if reg is None else lam * reg
+    ratio = None if (lam_reg is None or not task) else lam_reg / task
+    first = last = None
+    if item["points"]:
+        _, t_first, r_first = item["points"][0]
+        _, t_last, r_last = item["points"][-1]
+        first = lam * r_first / t_first if t_first else None
+        last = lam * r_last / t_last if t_last else None
+    print(
+        f"{lam:>12.4e}{decades:>14}{cell(predicted, '14.4e')}{cell(reg, '13.4e')}"
+        f"{cell(lam_reg, '13.4e')}{cell(ratio, '12.4e')}"
+        f"{cell(first, '13.4e')}{cell(last, '13.4e')}"
+    )
+
+ref = next((item for item in records if item["lam"] == 0.0 and item["ok"]), None)
+print()
+print("---- 表 B: 罚项对新任务的代价（Δ 都是相对 λ=0 那一行）")
+print(
+    f"{'λ':>12}{'task_loss':>13}{'Δtask':>12}{'val_loss':>13}"
+    f"{'Δval':>12}{'R/R(λ=0)':>12}"
+)
+for item in records:
+    d_task = d_val = r_ratio = None
+    if ref is not None:
+        if item["task"] is not None and ref["task"] is not None:
+            d_task = item["task"] - ref["task"]
+        if item["val"] is not None and ref["val"] is not None:
+            d_val = item["val"] - ref["val"]
+        if item["reg"] is not None and ref["reg"]:
+            r_ratio = item["reg"] / ref["reg"]
+    print(
+        f"{item['lam']:>12.4e}{cell(item['task'], '13.6f')}{cell(d_task, '12.4e')}"
+        f"{cell(item['val'], '13.6f')}{cell(d_val, '12.4e')}{cell(r_ratio, '12.4f')}"
+    )
+
+print()
+if ref is None or not ref["task"] or not ref["reg"]:
+    print("网格里没有可用的 λ=0 标尺行，反推不了 λ。下次把 0 加进 LAMBDAS。")
+else:
+    t0, r0 = ref["task"], ref["reg"]
+    print(f"---- λ 反推（标尺: λ=0 时 task_loss={t0:.6f}, R={r0:.6e}）")
+    print("λ ≈ 目标占比 x task_loss / R(λ=0)：")
+    for target in (1e-2, 3e-2, 1e-1, 3e-1, 1.0):
+        print(f"   λR/task_loss = {target:>7.0e}  ->  λ ≈ {target * t0 / r0:.4e}")
+    if suggest:
+        print()
+        print(f"对比 1/mean(F) = {suggest:.4e}：那是各向同性假设下的起点，"
+              "上面这些是实测 R 反推的。")
+        print("两者差几个十倍，就是「F 的大质量落在 ΔW 没走的方向上」这件事有多严重。")
+    print()
+    print(f"!! 这些数只在 {os.environ['WANT_STEPS']} 步（约 "
+          f"{os.environ['WANT_UPDATES']} 次参数更新）这个时点上成立。ΔW 还在长，R 会")
+    print("   继续变大而 task_loss 会继续降，所以同一个 λ 到训练末期的实际占比会比")
+    print("   这里大。要挑档位就往这张表偏小的一侧取。")
+
+print()
+print("---- 怎么读这两张表")
+print("1. R/R(λ=0) ≈ 1 的那些 λ 完全没约束住 ΔW，不用再花完整 run 去试。")
+print("2. λR/task@末 已经 >1 的那些 λ 罚项在主导 loss，也可以直接排除。")
+print("3. 剩下的区间里挑一个档位，再按十倍上下各扫一档跑完整 run（本臂是十倍，")
+print("   不是 70 号的 0.5x/2x：F 这边连档位都是估的）。")
+print("4. EWC 最后输给 OneReplay 时，这张表是区分两种原因的证据：λ 根本没扫到有效")
+print("   区间（表里全是 R/R(0)≈1），还是扫到了、罚项确实起作用了但保留仍然更差。")
+
+if dead:
+    # 训练退出码是 0 却没写下 epoch 记录，说明它在写 metrics 之前就结束了。
+    raise SystemExit(1)
+PY
+
+  echo ""
+  if (( ${#SWEEP_FAIL[@]} > 0 )); then
+    echo "!! 扫描过程中的断言失败:"
+    for item in "${SWEEP_FAIL[@]}"; do echo "   - ${item}"; done
+    echo "   层覆盖没对上的那些点，R 是残缺 F 算出来的；崩掉的那些点整行都无效。"
+    echo "   两种情况都不能拿表里的数去定 λ。"
+    echo "Job finished at: $(date)"
+    exit 1
+  fi
+  if (( SUMMARY_RC != 0 )); then
+    echo "!! 汇总脚本退出码 ${SUMMARY_RC}：有 λ 缺 epoch 记录（表里那一行是 '-'），"
+    echo "   原因见上面的 '没有 epoch 记录' 那句和对应的 train.log。"
+    echo "Job finished at: $(date)"
+    exit 1
+  fi
+  echo "扫描完成。每个 λ 的层覆盖都是 ${EXPECT_LAYERS} 层，罚项都来自 F。"
+  echo "定了档位之后投正式 run（三次，互不覆盖）:"
+  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<0.1x> ${SELF_PATH}"
+  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<1x>   ${SELF_PATH}"
+  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<10x>  ${SELF_PATH}"
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -774,7 +1153,7 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
       --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
       --target_modules "${TARGET_MODULES}" \
       --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
-      --max_steps "${MAX_STEPS}" \
+      --max_steps "${MAX_STEPS}" --log_every "${LOG_EVERY}" \
       --regularizer "${REGULARIZER}" \
       --fisher_path "${FISHER_PATH}" --replay_lambda "${LAMBDA}" \
       --cov_path "" --identity_cov 0 \

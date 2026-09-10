@@ -34,6 +34,15 @@
 #   Step 1 不靠人读那行日志：它按 replay 的真实装配路径把池建出来，数出行数，
 #   和 C 文件 metadata 里的 pool_rows 比，不等就退出。
 #
+#   唯一放行的不等，是「差额恰好等于 to_sft_schema 的空行过滤数」：collect_cov 只在
+#   传了 --require_target 1 时才滤空行（68 号 math/code 传了，if 域没传），而 replay
+#   非滤不可 —— 空 target 的行标签全是 -100，一个批次全是这种行就是 NaN loss。两边的
+#   判据逐字等价（inputs/targets strip 后非空），所以 cov_rows 落在空行过滤**前**的
+#   行数上就证明行集合相同，只是口径差了这一道。if 域上这是 20000 vs 19994。
+#   放行仍要求空行占比 <= 1%，且这个差额要写进报告；要彻底消掉就给 68 号 if 域补
+#   --require_target 1 重采 C。drop_truncated 传错走不进这个分支：它丢的是答案完整的
+#   真实行，cov_rows 不会恰好等于 after_pool。
+#
 # -----------------------------------------------------------------------------
 # !! 4 new + 4 replay，以及 ACCUM 为什么是 128 而不是 64
 #   本臂用 batch 级混合（--replay_per_batch），不是数据级（--replay_ratio）：
@@ -106,7 +115,7 @@
 #   qsub -v DRY_RUN=0,DOMAIN=math  onereplay/pbs/71_qwen3_8b_gold_replay.pbs
 #   qsub -v DRY_RUN=0,DOMAIN=code  onereplay/pbs/71_qwen3_8b_gold_replay.pbs
 #   换 replay 比例（run 名会跟着变，不会覆盖）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,REPLAY_PER_BATCH=2,ACCUM=112 onereplay/pbs/71_...
+#   qsub -v DRY_RUN=0,DOMAIN=if,REPLAY_PER_BATCH=2,ACCUM=88 onereplay/pbs/71_...
 #     注意自己把 ACCUM 配平到 new_per_update=64：(ACCUM/8) x (8-2) = 64 -> ACCUM=85.3
 #     配不平就取最近的整数步（如 ACCUM=88 给 66 行），Step 0 会打印实际值并要求
 #     ALLOW_DRIFT=1 才放行。
@@ -649,14 +658,38 @@ else:
             f"{cov_path} 的 metadata 里没有 pool_rows，无法证明同池。"
             "这份 C 可能是更早的脚本产的；重采或传 SKIP_POOL_CHECK=1（并在结果里注明）。"
         )
-    elif int(cov_rows) != rows:
+    elif int(cov_rows) == rows:
+        print(f"  -> 行数一致（{rows}），两条臂同池。")
+    elif int(cov_rows) == after_pool:
+        # C 落在 replay 空行过滤**前**的行数上，说明两边取的是同一批行，差的只是
+        # to_sft_schema 那道空行过滤。replay 非做不可：空 target 的行标签全是 -100，
+        # 一个批次全是这种行就得到 NaN loss；collect_cov 不算 loss 所以留着了。
+        # 两边的判据逐字等价（inputs/targets strip 后非空），所以 68 号只要在该域传了
+        # --require_target 1，pool_rows 就会直接等于 rows —— if 域没传，才差出这一道。
+        # 与 drop_truncated 传错那种情况的区别在于：那丢的是答案完整的真实行，
+        # cov_rows 不会恰好落在 after_pool 上。
+        blank = after_pool - rows
+        share = blank / after_pool if after_pool else 0.0
+        if share > 0.01:
+            failures.append(
+                f"空行 {blank}/{after_pool}（{share:.2%}）超过 1%。行数差虽然能被空行过滤"
+                "解释，但这个比例本身说明答案列多半读错了（读到一列几乎全空的东西）。"
+                "先人工确认那一列，别在这里放行。"
+            )
+        else:
+            print(f"  -> C 的 pool_rows={cov_rows} 等于 replay 空行过滤前的行数。")
+            print(f"     两条臂取的是同一批 {after_pool} 行；差的 {blank} 行（{share:.2%}）是")
+            print("     inputs/targets 为空的行，replay 必须丢、collect_cov 不必丢。放行。")
+            print(f"     报告里写：replay 训 {rows} 行，C 额外吸收了那 {blank} 行空内容行的")
+            print("     模板骨架 token。要消掉这一行差就给 68 号该域补 --require_target 1")
+            print("     重采 C（math/code 已经传了，所以只有 if 域会走到这个分支）。")
+    else:
         failures.append(
-            f"池行数不一致：replay 会训 {rows} 行，C 是在 {cov_rows} 行上采的。"
+            f"池行数不一致：replay 会训 {rows} 行（空行过滤前 {after_pool}），C 是在 "
+            f"{cov_rows} 行上采的，对不上其中任何一个。"
             "两条臂消费的旧知识不同，比出来的就不是「怎么用」而是「用了多少」。"
             "先查 replay_drop_truncated / replay_pool_size / replay_sample_seed / 答案列。"
         )
-    else:
-        print(f"  -> 行数一致（{rows}），两条臂同池。")
 
     # fingerprint 故意不比：replay 侧按 index 排序，collect_cov 侧按文件序，
     # fingerprint_pool 按迭代顺序哈希，同一批行也会得出不同值。行数才是可比的量。
