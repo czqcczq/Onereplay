@@ -38,9 +38,13 @@
 #      nltk.download()，但计算节点离线，那个调用**不报错也不下载**，等到打分
 #      阶段才 LookupError —— 300 条已经解码完了，一小时 GPU 白烧。
 #      所以本脚本在解码前先探一次（metric 里的 check_nltk_data）。
-#        export NLTK_DATA=/scratch/weiliu87/cache/nltk_data
+#        source ${VENV}/bin/activate
 #        python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng
-#      装不上（登录节点也出不去网）就在本地下好这四个包再 rsync 到同一路径。
+#      在 venv 里 nltk 会把语料下到 ${VENV}/nltk_data（sys.prefix/nltk_data），
+#      基本不理 NLTK_DATA 环境变量 —— 下面的默认值就指到那儿。那个位置本来
+#      就在 nltk 的自动搜索表里，所以只要激活的是同一个 venv，不转发
+#      NLTK_DATA 也能找到；显式设上只是为了报错时一眼看出它在找哪儿。
+#      登录节点出不去网就在本地下好这四个包再 rsync 到同一路径。
 #
 #   3) adapter 就位；日志目录: mkdir -p /scratch/weiliu87/logs/onereplay
 #
@@ -77,8 +81,9 @@ CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
 SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/73_ifbench_eval.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
-# IFBench 的 checker 要用的 NLTK 语料。默认放在 cache 盘上，与 HF cache 并列。
-NLTK_DATA="${NLTK_DATA:-/scratch/weiliu87/cache/nltk_data}"
+# IFBench 的 checker 要用的 NLTK 语料。venv 里跑 nltk.downloader 会落到
+# ${VENV}/nltk_data（sys.prefix/nltk_data），和登录节点那次下载同一处。
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
 
 # ---- 本次作业专属的临时目录 ----
 JOBTAG="${PBS_JOBID:-local$$}"

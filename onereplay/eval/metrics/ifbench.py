@@ -45,10 +45,10 @@ _NLTK_HINT = (
     "tries to nltk.download() them at import time -- which returns quietly\n"
     "without downloading anything on an offline compute node. Fetch them once\n"
     "on a login node:\n"
-    "    export NLTK_DATA=<cache_root>/nltk_data\n"
     "    python -m nltk.downloader punkt punkt_tab stopwords"
     " averaged_perceptron_tagger_eng\n"
-    "then forward the same NLTK_DATA into the job (SINGULARITYENV_NLTK_DATA)."
+    "In a venv this lands in <venv>/nltk_data. The PBS job defaults to the\n"
+    "same path (${VENV}/nltk_data); override NLTK_DATA only if you moved it."
 )
 
 

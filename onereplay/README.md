@@ -388,7 +388,7 @@ pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c
 # 2. NLTK corpora the IFEval checkers never touch. IFBench calls
 #    nltk.download() itself at import time, but that returns quietly without
 #    downloading on an offline compute node, so fetch them up front.
-export NLTK_DATA=/scratch/weiliu87/cache/nltk_data
+# Lands in <venv>/nltk_data (sys.prefix). The PBS job looks there by default.
 python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng
 ```
 
