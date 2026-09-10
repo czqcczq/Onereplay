@@ -2,9 +2,10 @@
 
     python -m onereplay.scripts.evaluate --metrics ifeval,multiif,commonsense ...
 
-Available metrics: ifeval, multiif, commonsense, gsm8k, aime, math500, amc,
-humaneval, mbpp, direct_safety. Each metric writes <out_dir>/<metric>/<run_name>/
-summary.json plus an appended row in <out_dir>/<metric>_summary.csv.
+Available metrics: ifeval, ifbench, multiif, commonsense, gsm8k, aime, math500,
+amc, humaneval, mbpp, direct_safety. Each metric writes
+<out_dir>/<metric>/<run_name>/summary.json plus an appended row in
+<out_dir>/<metric>_summary.csv.
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--math_batch_size", type=int, default=0)
     parser.add_argument("--code_batch_size", type=int, default=0)
     parser.add_argument("--ifeval_batch_size", type=int, default=0)
+    parser.add_argument("--ifbench_batch_size", type=int, default=0)
 
     # commonsense loss
     parser.add_argument("--dataset_path", type=str, default="")
@@ -56,8 +58,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--map_cache_dir", type=str, default="")
 
-    # ifeval / multiif
+    # ifeval / ifbench / multiif
     parser.add_argument("--ifeval_input", type=str, default="")
+    # Empty ifbench_input means "use IFBench_test.jsonl from the installed
+    # ifbench wheel". Its constraints need a bigger budget than IFEval's.
+    parser.add_argument("--ifbench_input", type=str, default="")
+    parser.add_argument("--ifbench_limit", type=int, default=0)
+    parser.add_argument("--ifbench_max_new_tokens", type=int, default=2048)
     parser.add_argument("--multiif_input", type=str, default="")
     parser.add_argument("--multiif_language", type=str, default="English")
     parser.add_argument("--multiif_limit", type=int, default=0)

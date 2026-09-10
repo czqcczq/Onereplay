@@ -56,6 +56,7 @@ def get_metric(name: str) -> Metric:
 
     registry = {
         "ifeval": "onereplay.eval.metrics.ifeval:IFEvalMetric",
+        "ifbench": "onereplay.eval.metrics.ifbench:IFBenchMetric",
         "multiif": "onereplay.eval.metrics.multiif:MultiIFMetric",
         "commonsense": "onereplay.eval.metrics.commonsense:CommonsenseLossMetric",
         "gsm8k": "onereplay.eval.metrics.gsm8k:GSM8KMetric",

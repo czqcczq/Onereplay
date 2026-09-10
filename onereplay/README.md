@@ -353,13 +353,48 @@ python -m onereplay.scripts.evaluate \
 Available metrics:
 
 - `commonsense` — new-task fitting (held-out Commonsense170k loss).
-- `ifeval` — instruction following, 541 prompts.
+- `ifeval` — instruction following, 541 prompts, 25 public constraint types.
+- `ifbench` — instruction following, 300 prompts, 58 constraint types held out
+  of every public training set. See below; needs two one-off installs.
 - `multiif` — instruction following, multi-turn cumulative, English subset.
 - `gsm8k`, `aime` — math retention probes.
 - `humaneval`, `mbpp` — code retention probes.
 
 Results land in `<out_dir>/<metric>/<run_name>/summary.json` with one appended
 row per run in `<out_dir>/<metric>_summary.csv`.
+
+### IFBench
+
+IFEval's 25 constraint types are public, so "IFEval held up" is also consistent
+with having memorised those 25 templates. IFBench (Pyatkin et al., NeurIPS 2025
+D&B) swaps in 58 unseen verifiable constraints over held-out WildChat prompts,
+which makes the pair readable: IFEval and IFBench both holding means the ability
+held, IFEval holding while IFBench drops means the templates held. The paper
+reports prompt-level loose accuracy; `summary.json` also breaks loose
+instruction accuracy down by constraint family, because 300 prompts is too few
+to read one constraint but enough to see which family a run lost.
+
+IFBench keeps its own registry, which includes a patched copy of the classic
+IFEval checkers. Do not score the 541 IFEval prompts through it — the existing
+numbers would move. `ifeval` stays on `third_party/instruction_following_eval`.
+
+Two one-off installs, both on a login node with network access:
+
+```bash
+# 1. The package is not on PyPI despite its README. Pinned, because the
+#    verification functions are the metric.
+pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"
+
+# 2. NLTK corpora the IFEval checkers never touch. IFBench calls
+#    nltk.download() itself at import time, but that returns quietly without
+#    downloading on an offline compute node, so fetch them up front.
+export NLTK_DATA=/scratch/weiliu87/cache/nltk_data
+python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng
+```
+
+The metric probes both before it decodes anything, so a missing corpus costs a
+few seconds instead of surfacing as a `LookupError` after 300 generations. Batch
+evaluation of every arm in a results tree is `pbs/73_ifbench_eval.pbs`.
 
 ## Refactor parity check
 
