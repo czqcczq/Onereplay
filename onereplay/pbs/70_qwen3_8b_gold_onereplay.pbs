@@ -3,7 +3,7 @@
 #PBS -N or_8b_or
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=36:00:00
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
@@ -128,6 +128,13 @@
 #   3) ${CS_DATASET} = datasets/commonsense_170k_hf
 #   4) 本域要用到的评测数据（缺哪个跳过哪个指标，只警告）
 #   5) 67 号的 base 与 vanilla 已评完（否则末尾的对照表只有本臂一列）
+#   6) IFBench 的依赖，**必须在登录节点装**（不装就只跳过 ifbench 这一个指标，
+#      其余照常；不想评就传 WITH_IFBENCH=0）:
+#        source ${VENV}/bin/activate
+#        pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"
+#        python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng
+#      为什么要评它、以及那两个坑（离线节点的 nltk.download 静默失败、
+#      绝不能拿 IFBench 的 registry 去重算 IFEval）见 73 号文件头。
 #
 # 投递（DRY_RUN=1 是默认，先看计划）:
 #   第一步 先扫 λ 的量级（一个作业跑完整个网格，不评测不存 adapter，约 1-2h）:
@@ -152,6 +159,9 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+# IFBench 的 checker 要 pos_tag / stopwords / sent_tokenize，IFEval 一个都不用。
+# venv 里 nltk.downloader 会落到 sys.prefix/nltk_data，和 73 号同一处。
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
 SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/70_qwen3_8b_gold_onereplay.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
@@ -194,7 +204,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   module load singularity
 
   FORWARD_VARS=(
-    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
     MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR CODE_DATA_DIR
     DATASET_CACHE OUT_DIR
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE ALLOW_DRIFT COV_DIAG
@@ -204,8 +214,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     TARGET_MODULES LORA_RANK LORA_ALPHA LORA_DROPOUT
     EVAL_BATCH SAVE MAX_STEPS RUN_TAG RUN VANILLA_RUN
     MATH500_FILE GSM8K_FILE HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT
-    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS
-    MATH_BATCH CODE_BATCH IFEVAL_BATCH
+    IFBENCH_INPUT WITH_IFBENCH
+    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS IFBENCH_MAX_NEW_TOKENS
+    MATH_BATCH CODE_BATCH IFEVAL_BATCH IFBENCH_BATCH
     TIMEOUT LIMIT DIAG_LEN WITH_BASE WITH_VANILLA EXTRA_MODELS
     MIN_HOST_FREE_GIB
   )
@@ -248,6 +259,9 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export USER="${USER:-$(whoami)}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 不导出的话容器里 nltk 只会翻 site-packages，那里是空的，而计算节点离线，
+# 它自己的 nltk.download() 不报错也不下载 —— 报错要等到打分阶段才出现。
+export NLTK_DATA="${NLTK_DATA}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -407,14 +421,20 @@ HUMANEVAL_FILE="${HUMANEVAL_FILE:-${CODE_DATA_DIR}/humaneval_test.parquet}"
 MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
 MBPP_SPLIT="${MBPP_SPLIT:-test}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"   # 空 = 用装好的 ifbench 包自带的 IFBench_test.jsonl
 
 # ---- 解码预算与解码 batch：67 号定的口径，所有臂必须逐字相同 ----
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
 IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-768}"
+# IFBench 与 IFEval 不共用预算：「把 prompt 重复一遍再答」这类约束要地方，被 cap
+# 截断的回复会把还没满足的约束全判失败。73 号定的 2048，改了所有臂都要重评。
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
 MATH_BATCH="${MATH_BATCH:-32}"
 CODE_BATCH="${CODE_BATCH:-64}"
 IFEVAL_BATCH="${IFEVAL_BATCH:-32}"
+# 预算是 IFEval 的近 3 倍，KV cache 也按这个走，所以 batch 单独给。
+IFBENCH_BATCH="${IFBENCH_BATCH:-16}"
 
 TIMEOUT="${TIMEOUT:-10}"
 LIMIT="${LIMIT:-0}"
@@ -428,6 +448,14 @@ case "${DOMAIN}" in
   math) DOMAIN_METRICS="ifeval gsm8k math500" ;;
   code) DOMAIN_METRICS="ifeval humaneval mbpp" ;;
 esac
+# IFEval 的 25 类约束是公开的，「IFEval 没掉」有可能只是记住了那 25 类模板。
+# IFBench 换了 58 类训练时没见过的约束，两个一起看才能区分「能力保住了」和
+# 「模板记住了」。跟着 ifeval 走：哪个域评 ifeval，哪个域就评 ifbench。
+# 依赖没装好时下面的 AVAIL 会自动跳过它，不会连累别的指标。
+WITH_IFBENCH="${WITH_IFBENCH:-1}"
+if [[ "${WITH_IFBENCH}" == "1" ]]; then
+  DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
+fi
 
 # LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"当成完整结果。
 OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
@@ -457,8 +485,8 @@ echo "             targets=${TARGET_MODULES}"
 echo "  训练     = LR ${LR} / EPOCHS ${EPOCHS} / BATCH ${BATCH} / ACCUM ${ACCUM}(行/更新) / MAXLEN ${MAXLEN}"
 echo "             eval_batch ${EVAL_BATCH} / seed ${SEED} / max_steps ${MAX_STEPS}"
 echo "  评测     = ${DOMAIN_METRICS}"
-echo "             预算 math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} / ifeval ${IF_MAX_NEW_TOKENS}"
-echo "             batch math ${MATH_BATCH} / code ${CODE_BATCH} / ifeval ${IFEVAL_BATCH}"
+echo "             预算 math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} / ifeval ${IF_MAX_NEW_TOKENS} / ifbench ${IFBENCH_MAX_NEW_TOKENS}"
+echo "             batch math ${MATH_BATCH} / code ${CODE_BATCH} / ifeval ${IFEVAL_BATCH} / ifbench ${IFBENCH_BATCH}"
 echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} probe:${PROBE} DRY_RUN=${DRY_RUN}"
 echo "  OUT_DIR  = ${OUT_DIR}"
 echo "========================================================================"
@@ -1226,6 +1254,19 @@ if [[ "${DO_EVAL}" != "1" ]]; then
   exit 0
 fi
 
+# IFBench 的前置不是一个文件，是装好的 ifbench 包加四份 NLTK 语料，而它们缺席
+# 时的失败发生在**打分阶段** —— 300 条已经解码完，一小时 GPU 白烧。所以在这里
+# 先探一次，探不过就只把 ifbench 摘掉，本作业刚训完的模型照常评其余指标。
+ifbench_ready () {
+  python - <<'PY' >/dev/null 2>&1
+from ifbench import instructions_registry
+from onereplay.eval.metrics.ifbench import check_nltk_data
+
+assert len(instructions_registry.INSTRUCTION_DICT) >= 83
+check_nltk_data()
+PY
+}
+
 # 缺哪个数据就跳过哪个指标（数据没搬全时不至于整个作业白挂）。
 AVAIL=""
 for m in ${DOMAIN_METRICS}; do
@@ -1235,6 +1276,17 @@ for m in ${DOMAIN_METRICS}; do
     math500)   [[ -f "${MATH500_FILE}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 math500：缺 ${MATH500_FILE}" ;;
     humaneval) [[ -f "${HUMANEVAL_FILE}" ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}" ;;
     mbpp)      [[ -d "${MBPP_DIR}"       ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 mbpp：缺 ${MBPP_DIR}" ;;
+    ifbench)
+      if ifbench_ready; then
+        AVAIL="${AVAIL} ${m}"
+      else
+        echo "跳过 ifbench：依赖没就绪。在**登录节点**补齐后重投（DO_TRAIN=0 即可只补评）:"
+        echo "  source ${VENV}/bin/activate"
+        echo '  pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"'
+        echo "  python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng"
+        echo "  （详细说明见 onereplay/pbs/73_ifbench_eval.pbs 文件头）"
+      fi
+      ;;
   esac
 done
 AVAIL="${AVAIL# }"
@@ -1288,6 +1340,11 @@ for spec in "${SPECS[@]}"; do
     continue
   fi
   echo "==== eval: ${name} (${mp}) ===="
+  # IFBENCH_INPUT 为空就不传这个 flag，让 metric 用包自带的 300 条。
+  ifbench_input_flag=()
+  if [[ -n "${IFBENCH_INPUT}" ]]; then
+    ifbench_input_flag=(--ifbench_input "${IFBENCH_INPUT}")
+  fi
   # 一次调用跑完本域所有指标：runner 只加载一次模型，8B 的加载不便宜。
   python -m onereplay.scripts.evaluate \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
@@ -1305,6 +1362,10 @@ for spec in "${SPECS[@]}"; do
     --humaneval_data_file "${HUMANEVAL_FILE}" \
     --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
     --ifeval_input "${IFEVAL_INPUT}" \
+    --ifbench_limit "${LIMIT}" \
+    --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
+    --ifbench_batch_size "${IFBENCH_BATCH}" \
+    "${ifbench_input_flag[@]}" \
     --timeout "${TIMEOUT}" \
     --cache_dir "${TMPDIR}/hf_datasets"
 done
@@ -1378,6 +1439,7 @@ if [[ "${DIAG_LEN}" == "1" ]]; then
       case "${m}" in
         gsm8k|math500) cap="${MATH_MAX_NEW_TOKENS}" ;;
         humaneval|mbpp) cap="${CODE_MAX_NEW_TOKENS}" ;;
+        ifbench) cap="${IFBENCH_MAX_NEW_TOKENS}" ;;
         *) cap="${IF_MAX_NEW_TOKENS}" ;;
       esac
       DIAG_SPECS+=("${OUT_DIR}/${m}/${name}/responses.jsonl:${cap}")
@@ -1412,6 +1474,9 @@ metric_names = os.environ["METRIC_NAMES"].split()
 
 # 各 metric 的主分数字段名不同，按这个顺序取第一个命中的。
 SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
+# IFBench 例外：论文主报 prompt-level loose，73 号的表也是这个口径。落到通用
+# 顺序上会取到 strict，两张表就会对同一个 run 报出不同的数。
+METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy"}
 
 
 def read_score(metric, name):
@@ -1419,6 +1484,9 @@ def read_score(metric, name):
     if not path.is_file():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
+    override = METRIC_SCORE_KEY.get(metric)
+    if override:
+        return payload.get(override)
     for key in SCORE_KEYS:
         if key in payload:
             return payload[key]
@@ -1517,5 +1585,5 @@ echo ""
 echo "本轮的口径，其余各臂必须逐字相同才可比:"
 echo "  LoRA r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT} targets=${TARGET_MODULES}"
 echo "  train lr=${LR} epochs=${EPOCHS} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN} eval_batch=${EVAL_BATCH}"
-echo "  decode math ${MATH_MAX_NEW_TOKENS}/${MATH_BATCH} code ${CODE_MAX_NEW_TOKENS}/${CODE_BATCH} ifeval ${IF_MAX_NEW_TOKENS}/${IFEVAL_BATCH}"
+echo "  decode math ${MATH_MAX_NEW_TOKENS}/${MATH_BATCH} code ${CODE_MAX_NEW_TOKENS}/${CODE_BATCH} ifeval ${IF_MAX_NEW_TOKENS}/${IFEVAL_BATCH} ifbench ${IFBENCH_MAX_NEW_TOKENS}/${IFBENCH_BATCH}"
 echo "Job finished at: $(date)"

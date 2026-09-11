@@ -38,7 +38,8 @@ if __package__ in (None, ""):
 # The one number worth putting in a table for each metric's summary.json.
 HEADLINE_FIELD = {
     "ifeval": "strict_prompt_accuracy",
-    "ifbench": "strict_prompt_accuracy",
+    # IFBench 主报 loose：它的约束比 IFEval 难，strict 在 300 条上贴地板。
+    "ifbench": "loose_prompt_accuracy",
     "multiif": "strict_prompt_accuracy",
     "gsm8k": "accuracy",
     "math500": "accuracy",
