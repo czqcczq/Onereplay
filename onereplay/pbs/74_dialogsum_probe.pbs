@@ -30,9 +30,25 @@
 #             500 行同规模。仍然是从 train 里随机切，与 CS 同口径 —— 官方
 #             validation 留在 JSONL 里没动，等将来的 ROUGE 指标用。
 #
-# 其余全部钉住：Qwen3-8B / LoRA r16 alpha32 all-linear / lr 2e-4 / batch 8 /
-# accum 64 / eval_batch 8 / epochs 3，解码预算与 batch 也逐字照抄 67 号。
+# 其余全部钉住：Qwen3-8B / LoRA r16 alpha32 all-linear / lr 2e-4 / batch 4 /
+# accum 64 / eval_batch 8 / epochs 2，解码预算与 batch 也逐字照抄 67 号。
+# batch 4 而不是 CS 线的 8：maxlen 翻倍到 1024 后 batch 8 的实测 peak 是
+# 125.05 GiB（H200 143 GiB），各臂再加 C/F 就 OOM。batch 4 x 1024 = 4096
+# token，与 CS 线的 8 x 512 逐字相同，两条线的显存与每步耗时因此可比。
+# ACCUM 仍是 64 行/更新，梯度累积等价，只是 accum_steps 从 8 变 16。
 # 只有这样，"换训练集后 retention delta 变了多少" 才是训练集造成的。
+#
+# -----------------------------------------------------------------------------
+# 探针已跑完，结论记在这里（2026-09-11）
+#   epochs 3 -> 2：val_loss 在 epoch 2 触底、epoch 3 回升，EPOCHS 默认已改成 2。
+#   lr 保持 2e-4：没有出现 CS 线 lr=2e-4 那次的输出塌缩，不必回落 1e-4。
+#   遗忘幅度够用，走的是文末 c 分支（delta 反而更大），但性质与 CS 线不同：
+#     CS 线   = 格式崩坏（HumanEval 91.5% 语法错误、断言失败 0%）
+#     本线    = 真实能力退化（语法错误 0%、断言失败 12.8% -> 20.1%）
+#   例外是 math500：-39.20% 里 74.4% 是没解析出答案（不收敛/不再写 \boxed{}），
+#   扣掉之后真实退化 40/398 = 10.1%，与 gsm8k 的 12.17% 一致。math500 要按
+#   "no-answer 率 + 已作答子集准确率" 两个数报，不能只报 accuracy。
+#   C 直接复用 68 号那份，不重采 —— C 来自 FLAN，与训练集解耦。
 #
 # -----------------------------------------------------------------------------
 # 投递前必须知道的一件事：训练量差一个数量级
@@ -228,9 +244,12 @@ WITH_BASE="${WITH_BASE:-1}"      # 1 = 同时评裸 Qwen3-8B，遗忘量的分�
 
 # ---- 训练超参：除 MAXLEN / VAL_FRAC 外全部与 67 号相同 ----
 SEED="${SEED:-1}"
-EPOCHS="${EPOCHS:-3}"
+# 2 而不是 3：探针跑完 3 epoch 后 val_loss 在 epoch 2 触底、epoch 3 回升，
+# 定稿用 2。ep3 那次的结果仍在 results 下，run 名带 ep2/ep3，不会互相覆盖。
+# 81/82/83 的 DRIFT 检查要求 EPOCHS=2，改这里就要同步改那三处。
+EPOCHS="${EPOCHS:-2}"
 LR="${LR:-2e-4}"
-BATCH="${BATCH:-8}"
+BATCH="${BATCH:-4}"            # 见文件头：batch 8 会让各臂 OOM
 ACCUM="${ACCUM:-64}"             # 每次更新 64 行新任务，与 CS 各臂同口径
 EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与其余各臂不可比
 MAXLEN="${MAXLEN:-1024}"         # 见文件头：对话比 CS 的短指令长得多

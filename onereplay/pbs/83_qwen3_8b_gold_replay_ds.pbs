@@ -44,17 +44,17 @@
 #   真实行，cov_rows 不会恰好等于 after_pool。
 #
 # -----------------------------------------------------------------------------
-# !! 4 new + 4 replay，以及 ACCUM 为什么是 128 而不是 64
+# !! 2 new + 2 replay，以及 ACCUM 为什么是 128 而不是 64
 #   本臂用 batch 级混合（--replay_per_batch），不是数据级（--replay_ratio）：
 #   数据级混完再全局 shuffle，一个 accumulation 窗口里的新任务行数是二项分布
 #   （64 ± 5.7），batch 级是逐 micro-batch 定死的。
 #
 #   --batch_size 保持 8 不变，replay 行是从这 8 行里**切出来**的，所以每步的
-#   时间和峰值显存与 vanilla 直接可比。代价是每个 micro-batch 只剩 4 行新任务，
+#   时间和峰值显存与 vanilla 直接可比。代价是每个 micro-batch 只剩 2 行新任务，
 #   于是 accumulation_size 必须翻倍才能让「每次更新的新任务行数」回到 64：
 #
-#       accum_steps = ACCUM / BATCH = 128 / 8 = 16
-#       每次更新的新任务行 = 16 x (8 - 4) = 64      <- 与 74/81 号相同
+#       accum_steps = ACCUM / BATCH = 128 / 4 = 32
+#       每次更新的新任务行 = 32 x (4 - 2) = 64      <- 与 74/81 号相同
 #
 #   这就是为什么本脚本的 ACCUM 默认 128 而 81 号是 64，而两者的 new_per_update
 #   都是 64。Step 0 断言的是 new_per_update，不是 ACCUM。
@@ -63,7 +63,7 @@
 #   为了避免重复而扩池等于让 replay 拿到比 C 更多的信息。
 #
 #   !! 循环几遍，这条线和 CS 线差了 20 倍，解释结果时必须带上
-#   replay 消耗量 = 新任务行数（每 micro-batch 4 新 + 4 旧，1:1）。
+#   replay 消耗量 = 新任务行数（每 micro-batch 2 新 + 2 旧，1:1）。
 #       CS 线   168300 行/epoch x 3 epoch / 2 万池 = 约 25 遍
 #       本线     11961 行/epoch x 2 epoch / 2 万池 = 约 1.2 遍
 #   也就是说 CS 线上 replay 把同一批 2 万行反复看了 25 遍，本线上基本是每行
@@ -88,7 +88,7 @@
 #   而本轮读的是 gold_targets 列。全池实测 P99 只有 766(math) / 436(code)，1024 处
 #   截断 68 行(0.26%) / 4 行(0.02%)。留在 2048 的后果不是慢一点而是跑不了：池每
 #   epoch 被过 6.5 遍，那 7 行超 1536 的长尾每 epoch 出现约 45 次，collator 按 batch
-#   内最长行 padding，撞一次就把 micro-batch 抬到 8 x 2048 token，8B 上直接 OOM。
+#   内最长行 padding，撞一次就把 micro-batch 抬到 4 x 2048 token，8B 上直接 OOM。
 #   降到 1024 之后长尾被削平，99.7% 的 micro-batch 组成与 vanilla 逐字相同，
 #   每步开销的可比性反而是靠这个值保住的。改它要 68/69/71 三处同步。
 #
@@ -110,7 +110,7 @@
 #
 # -----------------------------------------------------------------------------
 # 开销：这条 baseline 的代价就是要被暴露出来的
-#   同样的新任务行数下，本臂的 micro-batch 数是 vanilla 的两倍（每步只装 4 行
+#   同样的新任务行数下，本臂的 micro-batch 数是 vanilla 的两倍（每步只装 2 行
 #   新任务），所以 train_sec 大约 2x：vanilla 2 epoch 约 25 min，本臂约 50 min。
 #   walltime 给到 24 h（CS 线给的是 48 h，那边训练本身就要几十小时），余量几乎
 #   全留给评测。
@@ -118,9 +118,9 @@
 #   汇总表会把三者并排打出来。
 #
 #   !! 「接近」的依据是 token 数，不是行数。collator 按 batch 内最长行 padding，
-#   所以决定显存的是 max(8 行的长度) 而不是 8。这条线上新任务的预算是 1024，
+#   所以决定显存的是 max(4 行的长度) 而不是 4。这条线上新任务的预算是 1024，
 #   而 replay 侧 if 是 512、math/code 在 replay_max_len=1024 下 P90 只有 375/248
-#   —— 三个域的 replay 行都明显短于新任务，峰值一律由新任务那 4 行定。这比 CS 线
+#   —— 三个域的 replay 行都明显短于新任务，峰值一律由新任务那 2 行定。这比 CS 线
 #   还干净（那边新任务只有 512，math/code 的 replay 长尾偶尔会反超）。
 #   前提仍然是 replay_max_len 保持 1024：2048 时长尾把峰值顶到 8 x 2048 会 OOM。
 #
@@ -151,10 +151,10 @@
 #   qsub -v DRY_RUN=0,DOMAIN=math  onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
 #   qsub -v DRY_RUN=0,DOMAIN=code  onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
 #   换 replay 比例（run 名会跟着变，不会覆盖）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,REPLAY_PER_BATCH=2,ACCUM=88 onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
-#     注意自己把 ACCUM 配平到 new_per_update=64：(ACCUM/8) x (8-2) = 64 -> ACCUM=85.3
-#     配不平就取最近的整数步（如 ACCUM=88 给 66 行），Step 0 会打印实际值并要求
-#     ALLOW_DRIFT=1 才放行。
+#   qsub -v DRY_RUN=0,DOMAIN=if,REPLAY_PER_BATCH=3,ACCUM=256 onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
+#     注意自己把 ACCUM 配平到 new_per_update=64：(ACCUM/4) x (4-3) = 64 -> ACCUM=256
+#     配不平就取最近的整数步，Step 0 会打印实际值并要求 ALLOW_DRIFT=1 才放行。
+#     BATCH=4 下只有 1/2/3 三种 replay 行数可选，1:1 是默认那档。
 #   拆两次投（训练与评测分开）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,DO_EVAL=0  ...   然后   DO_TRAIN=0
 #
@@ -331,11 +331,11 @@ esac
 SEED="${SEED:-1}"
 EPOCHS="${EPOCHS:-2}"
 LR="${LR:-2e-4}"                 # 74 号若因 lr=2e-4 崩溃回落 1e-4，本臂必须跟着回落
-BATCH="${BATCH:-8}"              # micro-batch 总行数，与 vanilla 同值才能比每步开销
-# 128 而不是 64：每个 micro-batch 只剩 4 行新任务，accum_steps 要翻倍才能让
+BATCH="${BATCH:-4}"              # micro-batch 总行数，与 vanilla 同值才能比每步开销
+# 128 而不是 64：每个 micro-batch 只剩 2 行新任务，accum_steps 要翻倍才能让
 # 每次更新的新任务行数回到 64。见文件头的算术。
 ACCUM="${ACCUM:-128}"
-REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"   # 从 BATCH 里切出来的 replay 行数
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-2}"   # 从 BATCH 里切出来的 replay 行数
 EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 74 号及其余各臂不可比
 MAXLEN="${MAXLEN:-1024}"
 VAL_FRAC="${VAL_FRAC:-0.04}"
@@ -553,7 +553,7 @@ DRIFT=()
 [[ "${LORA_RANK}"    == "16"   ]] || DRIFT+=("lora_rank=${LORA_RANK}（74 号: 16）")
 [[ "${LORA_ALPHA}"   == "32"   ]] || DRIFT+=("lora_alpha=${LORA_ALPHA}（74 号: 32）")
 [[ "${LORA_DROPOUT}" == "0.05" ]] || DRIFT+=("lora_dropout=${LORA_DROPOUT}（74 号: 0.05）")
-[[ "${BATCH}"        == "8"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 8，每步开销靠它可比）")
+[[ "${BATCH}"        == "4"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 4，每步开销靠它可比）")
 # 本臂刻意与 74 号不同的一项。要对齐的是 NEW_PER_UPDATE，ACCUM 只是达到它的手段。
 (( NEW_PER_UPDATE == 64 )) || DRIFT+=("每次更新的新任务行数=${NEW_PER_UPDATE}（74/81 号: 64）；\
 调 ACCUM 使 (ACCUM/${BATCH})x${NEW_PER_BATCH}=64，当前 ACCUM=${ACCUM}")
@@ -1469,7 +1469,7 @@ echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<本域 λ> onereplay/pbs/81_
 echo "   已经有 81 号的 metrics 时，可以让本脚本把成本那一栏并排打出来:"
 echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},DO_TRAIN=0,DO_EVAL=0,ONEREPLAY_METRICS=<那条的 jsonl> ${SELF_PATH}"
 echo "   换混合比是本臂自己的旋钮（记得同时配平 ACCUM 让 new/update 回到 64）:"
-echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},REPLAY_PER_BATCH=2,ACCUM=88 ${SELF_PATH}"
+echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},REPLAY_PER_BATCH=3,ACCUM=256 ${SELF_PATH}"
 echo "   配比写在 run 名里，不会互相覆盖。"
 echo ""
 echo "产物:"

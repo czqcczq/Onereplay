@@ -53,8 +53,8 @@
 #   不能：定最终的 λ。ACCUM=64 下 300 步约 37 次参数更新，而 2 个 epoch 一共
 #       374 次 —— 占 10%，比 CS 线的 0.5% 有代表性得多，但 ΔW 仍在长。
 #       λR/task_loss 的绝对值偏小，当下界读。
-#       这条线便宜，扫描不必只跑 300 步：一个 epoch 是 1495 个 micro-batch、
-#       约 12 min，传 MAX_STEPS=1495 让每点跑满一个 epoch（187 次更新，总训练量
+#       这条线便宜，扫描不必只跑 300 步：一个 epoch 是 2990 个 micro-batch、
+#       约 13 min，传 MAX_STEPS=2990 让每点跑满一个 epoch（187 次更新，总训练量
 #       的一半）。注意 LAMBDAS 会强制 PROBE=1、EPOCHS 被钉成 1，传更大的
 #       MAX_STEPS 也不会跑第二个 epoch；λ=0 的 R 也只有扫描模式才测。
 #       定完档位再用单点模式跑满 2 epoch。
@@ -98,7 +98,9 @@
 #   C 每层一份 (in, in)，同样覆盖是 33.75 GiB。
 #   真正的差别在**采集**：C 只要前向，F 要逐条样本反向（69 号的 walltime 就是
 #   这么来的）。汇总表会把两者并排打出来，别把 EWC 说成"更省"。
-#   H200 143 GB 上：权重约 16 GiB + F 约 26 GiB + 激活/优化器约 15 GiB，够。
+#   H200 143 GB 上：权重约 16 GiB + F 约 26 GiB + 激活约 54 GiB（batch 4 x
+#   maxlen 1024 = 4096 token，按 74 号 vanilla 实测标定）≈ 97 GiB，余 46 GiB。
+#   !! batch 8 时激活是 108 GiB，加 F 就 151 GiB，超 H200 —— 别把 batch 调回去。
 #
 # -----------------------------------------------------------------------------
 # IDENTITY_COV 在本臂无意义
@@ -310,7 +312,7 @@ esac
 SEED="${SEED:-1}"
 EPOCHS="${EPOCHS:-2}"
 LR="${LR:-2e-4}"                 # 74 号若因 lr=2e-4 崩溃回落 1e-4，本臂必须跟着回落
-BATCH="${BATCH:-8}"
+BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-64}"             # 每次更新 64 行新任务
 EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 74 号及其余各臂不可比
 MAXLEN="${MAXLEN:-1024}"
@@ -568,7 +570,7 @@ DRIFT=()
 [[ "${LORA_RANK}"    == "16"   ]] || DRIFT+=("lora_rank=${LORA_RANK}（74 号: 16）")
 [[ "${LORA_ALPHA}"   == "32"   ]] || DRIFT+=("lora_alpha=${LORA_ALPHA}（74 号: 32）")
 [[ "${LORA_DROPOUT}" == "0.05" ]] || DRIFT+=("lora_dropout=${LORA_DROPOUT}（74 号: 0.05）")
-[[ "${BATCH}"        == "8"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 8）")
+[[ "${BATCH}"        == "4"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 4）")
 [[ "${ACCUM}"        == "64"   ]] || DRIFT+=("accumulation_size=${ACCUM}（74 号: 64）")
 [[ "${EVAL_BATCH}"   == "8"    ]] || DRIFT+=("eval_batch_size=${EVAL_BATCH}（74 号: 8，val_loss 靠它可比）")
 [[ "${MAXLEN}"       == "1024" ]] || DRIFT+=("max_len=${MAXLEN}（74 号: 1024，对话比 CS 的短指令长）")
@@ -618,7 +620,7 @@ else
   LAMBDA_GRID="${LAMBDA}"
 fi
 export MODEL_DIR MODEL_NAME FISHER_PATH COV_PATH TARGET_MODULES LAMBDA LAMBDA_GRID DOMAIN
-export FISHER_DIAG NORM_BY_LAYERS MIN_HOST_FREE_GIB SKIP_FP_CHECK
+export FISHER_DIAG NORM_BY_LAYERS MIN_HOST_FREE_GIB SKIP_FP_CHECK BATCH MAXLEN
 FISHER_REPORT_FILE="${TMPDIR}/fisher_preflight_${RUN}.txt"
 
 if ! python - <<'PY' 2>&1 | tee "${FISHER_REPORT_FILE}"; then
@@ -741,10 +743,23 @@ print(f"权重 (bf16, 按盘上算) {weight_bytes / 2**30:7.2f} GiB")
 if gpu_total:
     headroom = (gpu_total - fisher_bytes - weight_bytes) / 2**30
     print(f"卡上总容量           {gpu_total / 2**30:7.2f} GiB -> 余给激活/优化器 {headroom:.2f} GiB")
-    if headroom < 8:
+    # 激活按 74 号 vanilla 实测标定：batch 8 x maxlen 1024 = 8192 token 时
+    # peak 125.05 GiB，扣掉权重与优化器约 108 GiB。train.py 没有 gradient
+    # checkpointing，所以这一项与 token 数成正比，不能按「几 GB」拍。
+    batch = int(os.environ["BATCH"])
+    max_len = int(os.environ["MAXLEN"])
+    tokens = batch * max_len
+    act_gib = 108.0 * tokens / 8192
+    need = act_gib * 1.05          # 碎片与 eval 的余量
+    print(f"激活估算 (batch {batch} x maxlen {max_len} = {tokens} tok)"
+          f" {act_gib:7.2f} GiB   <- 按 74 号实测标定")
+    if headroom < need:
+        max_tokens = int(headroom / 1.05 / 108.0 * 8192)
         failures.append(
-            f"扣掉 F 与权重只剩 {headroom:.2f} GiB 给激活，几乎肯定 OOM。"
-            "去掉 gate/up_proj（两者合占 F 一半）或换更大的卡。"
+            f"扣掉 F 与权重只剩 {headroom:.2f} GiB，装不下 {act_gib:.1f} GiB 的激活。"
+            f"当前 token 预算 {tokens}，上限约 {max_tokens}："
+            f"把 BATCH 降到 {max(1, max_tokens // max_len)} 或更小"
+            "（也可以去掉 gate/up_proj，两者合占 F 一半）。"
         )
 
 # EWCRegularizer.from_path 先把整份 payload 读到 CPU 再逐层搬上卡，所以有一瞬间
