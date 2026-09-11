@@ -9,9 +9,9 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# NUS Hopper: Qwen3-8B EWC 臂 —— 单域保护（训练 + 按域评测）
+# NUS Hopper: Qwen3-8B EWC 臂 —— DialogSum 线，单域保护（训练 + 按域评测）
 #
-# 与 70 号（OneReplay）逐字同构，只换一件事：拿什么矩阵去加权 ΔW。
+# 与 81 号（OneReplay）逐字同构，只换一件事：拿什么矩阵去加权 ΔW。
 #
 #     OneReplay   R = tr(ΔW C ΔWᵗ)      C = E[x xᵗ]        输入的二阶矩
 #     EWC         R = Σ_ij F_ij ΔW_ij²   F = E[(∂L/∂W)²]    梯度的二阶矩
@@ -23,15 +23,20 @@
 #
 # -----------------------------------------------------------------------------
 # !! λ 完全不通用，连数量级都不通用
-#   F 是平方梯度的均值，落在比 C 低好几个数量级的地方。70 号那套 λ 搬过来会让
+#   F 是平方梯度的均值，落在比 C 低好几个数量级的地方。81 号那套 λ 搬过来会让
 #   罚项等于不存在。起点取 1/mean(F)（69 号采完时打过，Step 1 会再打一次），
 #   然后**按十倍**展开扫，不是 0.5x/1x/2x —— 那个步长是给 OneReplay 的，
 #   因为 C 的 λ 已经知道在哪个十倍档里了，而 F 这边连档位都是估的。
 #
+#   这里有两重「不通用」，别混起来：一重是 F vs C（上面这条），另一重是
+#   DialogSum 线 vs CS 线。后者的原因不在矩阵，在 ΔW：DialogSum 2 个 epoch
+#   只有 374 次参数更新，CS 线是 7890 次，差 21 倍，同一个 λ 压出来的
+#   λR/task_loss 不是一个量。CS 线上的 EWC λ 同样要重扫。
+#
 #   Step 1 会打印 λ × mean(F)，训练自检会打印每个 epoch 的 λR/task_loss。
 #
 # -----------------------------------------------------------------------------
-# !! 定档位：传 LAMBDAS 进扫描模式（本臂比 70 号更需要它）
+# !! 定档位：传 LAMBDAS 进扫描模式（本臂比 81 号更需要它）
 #   一个作业里对网格上每个 λ 各跑 PROBE_STEPS 步（默认 300），不评测、不存
 #   adapter，末尾打两张对照表。分隔符用冒号最稳，qsub -v 自己按逗号切:
 #       LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x>       （x = 1/mean(F)）
@@ -45,9 +50,14 @@
 #   !! 短跑能回答什么、不能回答什么
 #   能：档位差了几个十倍；罚项有没有真的接上（每个 λ 都会 grep 一次层覆盖那句，
 #       外加一句"罚项不是来自 C"）；R/R(λ=0)——λ 把 ΔW 的能量压掉了多少。
-#   不能：定最终的 λ。ACCUM=64 下 300 步只有约 37 次参数更新，3 个 epoch 是约 6
-#       万次；R 只依赖 ΔW，此刻 ΔW 还几乎没长起来，所以 λR/task_loss 这个**绝对
-#       值**系统性偏小，只能当下界读。选点仍然要靠完整 run 的 val_loss + retention。
+#   不能：定最终的 λ。ACCUM=64 下 300 步约 37 次参数更新，而 2 个 epoch 一共
+#       374 次 —— 占 10%，比 CS 线的 0.5% 有代表性得多，但 ΔW 仍在长。
+#       λR/task_loss 的绝对值偏小，当下界读。
+#       这条线便宜，扫描不必只跑 300 步：一个 epoch 是 1495 个 micro-batch、
+#       约 12 min，传 MAX_STEPS=1495 让每点跑满一个 epoch（187 次更新，总训练量
+#       的一半）。注意 LAMBDAS 会强制 PROBE=1、EPOCHS 被钉成 1，传更大的
+#       MAX_STEPS 也不会跑第二个 epoch；λ=0 的 R 也只有扫描模式才测。
+#       定完档位再用单点模式跑满 2 epoch。
 #
 #   这张表还有一个专门的用途：EWC 最后输给 OneReplay 时，它是区分两种原因的证据
 #   —— λ 根本没扫到有效区间（表里全是 R/R(0)≈1），还是扫到了、罚项确实起作用了
@@ -63,7 +73,7 @@
 #   到错的那条。判据不只看 PROBE：手工传 MAX_STEPS / EPOCHS 也算短跑。
 #
 # -----------------------------------------------------------------------------
-# !! F 的层覆盖必须 ⊇ LoRA 的层覆盖（与 70 号同一个坑）
+# !! F 的层覆盖必须 ⊇ LoRA 的层覆盖（与 81 号同一个坑）
 #   regularizer 对找不到罚项矩阵的层是**静默跳过**的：它把这些层记进
 #   missing_layers，训练照跑、loss 照降，只在第一步的 stdout 上留一行
 #       regularizer covers {used} layers; no penalty matrix for {missing} layers
@@ -93,11 +103,11 @@
 # -----------------------------------------------------------------------------
 # IDENTITY_COV 在本臂无意义
 #   --identity_cov 1 是把 C 换成单位矩阵的 L2 对照，train.py 在 ewc 分支上会直接
-#   抛异常。要那个消融就去 70 号传 IDENTITY_COV=1。Step 0 提前拦下来，
+#   抛异常。要那个消融就去 81 号传 IDENTITY_COV=1。Step 0 提前拦下来，
 #   免得排队几小时才在第一步崩。
 #
 # -----------------------------------------------------------------------------
-# 评测口径按域走（与 70/71 号相同）
+# 评测口径按域走（与 81/83 号相同）
 #       DOMAIN=if    评 ifeval + gsm8k + math500 + humaneval + mbpp
 #       DOMAIN=math  评 ifeval + gsm8k + math500
 #       DOMAIN=code  评 ifeval + humaneval + mbpp
@@ -110,15 +120,22 @@
 #      F 和 C 是同一批行。真没有就传 SKIP_FP_CHECK=1，但那样这条对比就没有凭据。
 #   4) ${DS_DATASET} = datasets/dialogsum_sft_hf
 #   5) 74 号的 base 与 vanilla 已评完
+#   6) IFBench 的依赖，**必须在登录节点装**（不装就只跳过 ifbench 这一个指标，
+#      其余照常；不想评就传 WITH_IFBENCH=0）:
+#        source ${VENV}/bin/activate
+#        pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"
+#        python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng
+#      为什么要评它、以及那两个坑（离线节点的 nltk.download 静默失败、
+#      绝不能拿 IFBench 的 registry 去重算 IFEval）见 73 号文件头。
 #
 # 投递（DRY_RUN=1 是默认，先看计划）:
 #   第一步 先扫档位（一个作业跑完整个网格，不评测不存 adapter，约 1-2h）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x> onereplay/pbs/72_...
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x> onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
 #   第二步 照扫描表定档位，按十倍各投一次正式 run（λ 在 run 名里，不会互相覆盖）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<1x>    onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<0.1x> ...   /   LAMBDA=<10x>
 #   单点短跑（= 只有一个 λ 的扫描，没有 λ=0 那把尺子）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<起点>,PROBE=1 onereplay/pbs/72_...
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<起点>,PROBE=1 onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
 #   拆两次投（训练与评测分开）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=...,DO_EVAL=0  ...   然后   DO_TRAIN=0
 #
@@ -133,6 +150,9 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+# IFBench 的 checker 要 pos_tag / stopwords / sent_tokenize，IFEval 一个都不用。
+# venv 里 nltk.downloader 会落到 sys.prefix/nltk_data，和 73 号同一处。
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
 SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
@@ -175,7 +195,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   module load singularity
 
   FORWARD_VARS=(
-    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
     MODEL_DIR MODEL_NAME DS_DATASET RESULTS_ROOT MATH_DATA_DIR CODE_DATA_DIR
     DATASET_CACHE OUT_DIR
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE ALLOW_DRIFT FISHER_DIAG
@@ -187,8 +207,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     TARGET_MODULES LORA_RANK LORA_ALPHA LORA_DROPOUT
     EVAL_BATCH SAVE MAX_STEPS RUN_TAG RUN VANILLA_RUN
     MATH500_FILE GSM8K_FILE HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT
-    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS
-    MATH_BATCH CODE_BATCH IFEVAL_BATCH
+    IFBENCH_INPUT WITH_IFBENCH
+    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS IFBENCH_MAX_NEW_TOKENS
+    MATH_BATCH CODE_BATCH IFEVAL_BATCH IFBENCH_BATCH
     TIMEOUT LIMIT DIAG_LEN WITH_BASE WITH_VANILLA EXTRA_MODELS
     MIN_HOST_FREE_GIB
   )
@@ -231,6 +252,9 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export USER="${USER:-$(whoami)}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 不导出的话容器里 nltk 只会翻 site-packages，那里是空的，而计算节点离线，
+# 它自己的 nltk.download() 不报错也不下载 —— 报错要等到打分阶段才出现。
+export NLTK_DATA="${NLTK_DATA}"
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
@@ -391,14 +415,20 @@ HUMANEVAL_FILE="${HUMANEVAL_FILE:-${CODE_DATA_DIR}/humaneval_test.parquet}"
 MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
 MBPP_SPLIT="${MBPP_SPLIT:-test}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"   # 空 = 用装好的 ifbench 包自带的 IFBench_test.jsonl
 
 # ---- 解码预算与解码 batch：74 号定的口径，所有臂必须逐字相同 ----
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
 IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-768}"
+# IFBench 与 IFEval 不共用预算：「把 prompt 重复一遍再答」这类约束要地方，被 cap
+# 截断的回复会把还没满足的约束全判失败。73 号定的 2048，改了所有臂都要重评。
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
 MATH_BATCH="${MATH_BATCH:-32}"
 CODE_BATCH="${CODE_BATCH:-64}"
 IFEVAL_BATCH="${IFEVAL_BATCH:-32}"
+# 预算是 IFEval 的近 3 倍，KV cache 也按这个走，所以 batch 单独给。
+IFBENCH_BATCH="${IFBENCH_BATCH:-16}"
 
 TIMEOUT="${TIMEOUT:-10}"
 LIMIT="${LIMIT:-0}"
@@ -412,6 +442,14 @@ case "${DOMAIN}" in
   math) DOMAIN_METRICS="ifeval gsm8k math500" ;;
   code) DOMAIN_METRICS="ifeval humaneval mbpp" ;;
 esac
+# IFEval 的 25 类约束是公开的，「IFEval 没掉」有可能只是记住了那 25 类模板。
+# IFBench 换了 58 类训练时没见过的约束，两个一起看才能区分「能力保住了」和
+# 「模板记住了」。跟着 ifeval 走：哪个域评 ifeval，哪个域就评 ifbench。
+# 依赖没装好时下面的 AVAIL 会自动跳过它，不会连累别的指标。
+WITH_IFBENCH="${WITH_IFBENCH:-1}"
+if [[ "${WITH_IFBENCH}" == "1" ]]; then
+  DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
+fi
 
 # LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"当成完整结果。
 OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
@@ -428,7 +466,7 @@ echo "========================================================================"
 echo "Qwen3-8B EWC 臂：保护 ${DOMAIN}"
 echo "  run      = ${RUN}"
 echo "  分母     = base / ${VANILLA_RUN}   (74 号产出)"
-echo "  对手     = 70 号 OneReplay 同域（同批行，只差用 F 还是用 C 加权 ΔW）"
+echo "  对手     = 81 号 OneReplay 同域（同批行，只差用 F 还是用 C 加权 ΔW）"
 echo "  F        = ${FISHER_PATH}"
 echo "  同池参照 = ${COV_PATH}   skip_check=${SKIP_FP_CHECK}"
 if (( SWEEP == 1 )); then
@@ -437,14 +475,14 @@ else
   echo "  λ        = ${LAMBDA}"
 fi
 echo "             reg_once=${REG_ONCE}  normalize_by_layers=${NORM_BY_LAYERS}"
-echo "             regularizer=${REGULARIZER}（λ 与 70 号完全不通用，按十倍扫）"
+echo "             regularizer=${REGULARIZER}（λ 与 81 号完全不通用，按十倍扫）"
 echo "  LoRA     = r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT}"
 echo "             targets=${TARGET_MODULES}"
 echo "  训练     = LR ${LR} / EPOCHS ${EPOCHS} / BATCH ${BATCH} / ACCUM ${ACCUM}(行/更新) / MAXLEN ${MAXLEN}"
 echo "             eval_batch ${EVAL_BATCH} / seed ${SEED} / max_steps ${MAX_STEPS}"
 echo "  评测     = ${DOMAIN_METRICS}"
-echo "             预算 math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} / ifeval ${IF_MAX_NEW_TOKENS}"
-echo "             batch math ${MATH_BATCH} / code ${CODE_BATCH} / ifeval ${IFEVAL_BATCH}"
+echo "             预算 math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} / ifeval ${IF_MAX_NEW_TOKENS} / ifbench ${IFBENCH_MAX_NEW_TOKENS}"
+echo "             batch math ${MATH_BATCH} / code ${CODE_BATCH} / ifeval ${IFEVAL_BATCH} / ifbench ${IFBENCH_BATCH}"
 echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} probe:${PROBE} DRY_RUN=${DRY_RUN}"
 echo "  OUT_DIR  = ${OUT_DIR}"
 echo "========================================================================"
@@ -472,7 +510,7 @@ if (( SWEEP == 1 )); then
 else
   [[ -n "${LAMBDA}" ]] || {
     echo "!! LAMBDA 为空。它没有默认值是刻意的：F 的量级比 C 低好几个数量级，"
-    echo "   70 号那套 λ 搬过来等于没有罚项。"
+    echo "   81 号那套 λ 搬过来等于没有罚项。"
     echo "   起点取 1/mean(F)（69 号采完时打过，Step 1 会再打一次），按十倍展开扫。"
     echo "   连档位都没底就先扫一遍（围绕 1/mean(F) 各上下两个十倍）:"
     echo "   LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x>"
@@ -486,9 +524,9 @@ else
 fi
 if [[ "${IDENTITY_COV}" == "1" ]]; then
   echo "!! IDENTITY_COV=1 在 EWC 臂上无意义：它是把 C 换成单位矩阵的 L2 对照，"
-  echo "   train.py 的 ewc 分支会直接抛异常。要那个消融就去 70 号:"
+  echo "   train.py 的 ewc 分支会直接抛异常。要那个消融就去 81 号:"
   echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<...>,IDENTITY_COV=1 \\"
-  echo "        onereplay/pbs/70_qwen3_8b_gold_onereplay.pbs"
+  echo "        onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs"
   exit 1
 fi
 [[ -d "${DS_DATASET}" ]] || { echo "缺 DialogSum 训练池: ${DS_DATASET}"; exit 1; }
@@ -751,7 +789,7 @@ else:
             "先核对 69/68 两边的 max_samples / sample_seed / sample_shuffle / 答案列。"
         )
     else:
-        print("  -> 指纹一致，F 与 C 同池。这条臂与 70 号的差别只在 F vs C。")
+        print("  -> 指纹一致，F 与 C 同池。这条臂与 81 号的差别只在 F vs C。")
     if meta.get("max_len") != cov_meta.get("max_len"):
         failures.append(
             f"max_len 不同（F {meta.get('max_len')} vs C {cov_meta.get('max_len')}）："
@@ -1093,7 +1131,7 @@ print("---- 怎么读这两张表")
 print("1. R/R(λ=0) ≈ 1 的那些 λ 完全没约束住 ΔW，不用再花完整 run 去试。")
 print("2. λR/task@末 已经 >1 的那些 λ 罚项在主导 loss，也可以直接排除。")
 print("3. 剩下的区间里挑一个档位，再按十倍上下各扫一档跑完整 run（本臂是十倍，")
-print("   不是 70 号的 0.5x/2x：F 这边连档位都是估的）。")
+print("   不是 81 号的 0.5x/2x：F 这边连档位都是估的）。")
 print("4. EWC 最后输给 OneReplay 时，这张表是区分两种原因的证据：λ 根本没扫到有效")
 print("   区间（表里全是 R/R(0)≈1），还是扫到了、罚项确实起作用了但保留仍然更差。")
 
@@ -1362,7 +1400,7 @@ one = load_epochs(os.environ.get("ONEREPLAY_METRICS", ""))
 if one:
     o_last = one[-1]
     print()
-    print("---- 与 70 号 OneReplay 同域并排（F vs C，同一批行）")
+    print("---- 与 81 号 OneReplay 同域并排（F vs C，同一批行）")
     print(f"{'':<12}{'val_loss':>12}{'train_sec':>12}{'peak_GB':>10}{'常驻_GB':>10}{'λ':>12}")
     for name, row in (("OneReplay", o_last), ("EWC", last)):
         print(
@@ -1399,6 +1437,19 @@ if [[ "${DO_EVAL}" != "1" ]]; then
   exit 0
 fi
 
+# IFBench 的前置不是一个文件，是装好的 ifbench 包加四份 NLTK 语料，而它们缺席
+# 时的失败发生在**打分阶段** —— 300 条已经解码完，一小时 GPU 白烧。所以在这里
+# 先探一次，探不过就只把 ifbench 摘掉，本作业刚训完的模型照常评其余指标。
+ifbench_ready () {
+  python - <<'PY' >/dev/null 2>&1
+from ifbench import instructions_registry
+from onereplay.eval.metrics.ifbench import check_nltk_data
+
+assert len(instructions_registry.INSTRUCTION_DICT) >= 83
+check_nltk_data()
+PY
+}
+
 # 缺哪个数据就跳过哪个指标（数据没搬全时不至于整个作业白挂）。
 AVAIL=""
 for m in ${DOMAIN_METRICS}; do
@@ -1408,6 +1459,17 @@ for m in ${DOMAIN_METRICS}; do
     math500)   [[ -f "${MATH500_FILE}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 math500：缺 ${MATH500_FILE}" ;;
     humaneval) [[ -f "${HUMANEVAL_FILE}" ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}" ;;
     mbpp)      [[ -d "${MBPP_DIR}"       ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 mbpp：缺 ${MBPP_DIR}" ;;
+    ifbench)
+      if ifbench_ready; then
+        AVAIL="${AVAIL} ${m}"
+      else
+        echo "跳过 ifbench：依赖没就绪。在**登录节点**补齐后重投（DO_TRAIN=0 即可只补评）:"
+        echo "  source ${VENV}/bin/activate"
+        echo '  pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"'
+        echo "  python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng"
+        echo "  （详细说明见 onereplay/pbs/73_ifbench_eval.pbs 文件头）"
+      fi
+      ;;
   esac
 done
 AVAIL="${AVAIL# }"
@@ -1461,6 +1523,11 @@ for spec in "${SPECS[@]}"; do
     continue
   fi
   echo "==== eval: ${name} (${mp}) ===="
+  # IFBENCH_INPUT 为空就不传这个 flag，让 metric 用包自带的 300 条。
+  ifbench_input_flag=()
+  if [[ -n "${IFBENCH_INPUT}" ]]; then
+    ifbench_input_flag=(--ifbench_input "${IFBENCH_INPUT}")
+  fi
   # 一次调用跑完本域所有指标：runner 只加载一次模型，8B 的加载不便宜。
   python -m onereplay.scripts.evaluate \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
@@ -1478,6 +1545,10 @@ for spec in "${SPECS[@]}"; do
     --humaneval_data_file "${HUMANEVAL_FILE}" \
     --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
     --ifeval_input "${IFEVAL_INPUT}" \
+    --ifbench_limit "${LIMIT}" \
+    --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
+    --ifbench_batch_size "${IFBENCH_BATCH}" \
+    "${ifbench_input_flag[@]}" \
     --timeout "${TIMEOUT}" \
     --cache_dir "${TMPDIR}/hf_datasets"
 done
@@ -1551,6 +1622,7 @@ if [[ "${DIAG_LEN}" == "1" ]]; then
       case "${m}" in
         gsm8k|math500) cap="${MATH_MAX_NEW_TOKENS}" ;;
         humaneval|mbpp) cap="${CODE_MAX_NEW_TOKENS}" ;;
+        ifbench) cap="${IFBENCH_MAX_NEW_TOKENS}" ;;
         *) cap="${IF_MAX_NEW_TOKENS}" ;;
       esac
       DIAG_SPECS+=("${OUT_DIR}/${m}/${name}/responses.jsonl:${cap}")
@@ -1586,6 +1658,9 @@ metric_names = os.environ["METRIC_NAMES"].split()
 
 # 各 metric 的主分数字段名不同，按这个顺序取第一个命中的。
 SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
+# IFBench 例外：论文主报 prompt-level loose，73 号的表也是这个口径。落到通用
+# 顺序上会取到 strict，两张表就会对同一个 run 报出不同的数。
+METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy"}
 
 
 def read_score(metric, name):
@@ -1593,6 +1668,9 @@ def read_score(metric, name):
     if not path.is_file():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
+    override = METRIC_SCORE_KEY.get(metric)
+    if override:
+        return payload.get(override)
     for key in SCORE_KEYS:
         if key in payload:
             return payload[key]
@@ -1681,9 +1759,9 @@ echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<10x>  ${SELF_PATH}"
 echo "   判据是 λR/task_loss 落在 0.01~1 之间（自检 2 每个 epoch 都打）。"
 echo "   λ 写在 run 名里，不会互相覆盖。"
 echo ""
-echo "4) 与 70 号同域那条并排 —— 这才是本臂存在的理由（F vs C，同一批行）:"
+echo "4) 与 81 号同域那条并排 —— 这才是本臂存在的理由（F vs C，同一批行）:"
 echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<...>,DO_TRAIN=0,DO_EVAL=0,\\"
-echo "        ONEREPLAY_METRICS=${RESULTS_ROOT}/metrics/<70 号那条>.jsonl ${SELF_PATH}"
+echo "        ONEREPLAY_METRICS=${RESULTS_ROOT}/metrics/<81 号那条>.jsonl ${SELF_PATH}"
 echo "   两条臂的 λ 各自扫到最好再比。拿 EWC 的一个次优点去比是没有意义的。"
 echo "   若 EWC 明显更差，先看 Step 1 打的 ess_ratio：那决定这句话是"
 echo "   「F 估得不准」还是「Fisher 这个量本身不如 C」。"
@@ -1699,5 +1777,5 @@ echo ""
 echo "本轮的口径，其余各臂必须逐字相同才可比:"
 echo "  LoRA r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT} targets=${TARGET_MODULES}"
 echo "  train lr=${LR} epochs=${EPOCHS} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN} eval_batch=${EVAL_BATCH}"
-echo "  decode math ${MATH_MAX_NEW_TOKENS}/${MATH_BATCH} code ${CODE_MAX_NEW_TOKENS}/${CODE_BATCH} ifeval ${IF_MAX_NEW_TOKENS}/${IFEVAL_BATCH}"
+echo "  decode math ${MATH_MAX_NEW_TOKENS}/${MATH_BATCH} code ${CODE_MAX_NEW_TOKENS}/${CODE_BATCH} ifeval ${IF_MAX_NEW_TOKENS}/${IFEVAL_BATCH} ifbench ${IFBENCH_MAX_NEW_TOKENS}/${IFBENCH_BATCH}"
 echo "Job finished at: $(date)"

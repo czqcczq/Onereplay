@@ -5,15 +5,28 @@
 #PBS -k oed
 #PBS -q autox
 #PBS -l select=1:ngpus=1
-#PBS -l walltime=36:00:00
+#PBS -l walltime=24:00:00
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# NUS Hopper: Qwen3-8B OneReplay 臂 —— 单域保护（训练 + 按域评测）
+# NUS Hopper: Qwen3-8B OneReplay 臂 —— DialogSum 线，单域保护（训练 + 按域评测）
 #
 # 74 号给出 base / vanilla 的分母，68 号给出这一臂唯一的输入 C。本脚本一次跑
 # 一个「保护域 x 一个 λ」，训练 + 该域口径的评测，最后把 base / vanilla / 本臂
 # 并排打出来。
+#
+# -----------------------------------------------------------------------------
+# 与 Commonsense170k 线（70 号）的关系：同一套框架，换新任务
+#
+#   C 一个字都不用改，68 号采的那份直接复用 —— C 来自 FLAN，与训练什么无关。
+#   这正是 OneReplay 相对 replay/EWC 的卖点：换新任务时旧知识那一侧零成本。
+#   要改的只有新任务这一侧：数据集、token 预算、epoch 数、λ 的量级。
+#
+#   !! 唯一不能复用的是 λ。理由不是 C 变了（没变），是 ΔW 变了：DialogSum
+#   训练池 12460 行，扣掉 4% val 是 11961 行，按 64 行/更新算一个 epoch 只有
+#   187 次更新，2 个 epoch 共 374 次 —— 而 CS 线是 7890 次，差 21 倍。
+#   R = tr(ΔW C ΔW^T) 只由 ΔW 决定，更新次数差一个数量级，同一个 λ 压出来的
+#   λR/task_loss 就不是一个量。必须按下面的 λ=0 标尺法重新定档，别从 CS 线搬。
 #
 # -----------------------------------------------------------------------------
 # 本轮矩阵里的位置
@@ -30,13 +43,13 @@
 #
 # -----------------------------------------------------------------------------
 # !! LAMBDA 没有默认值，必须显式传
-#   1.7B 的 3e-2 不能搬：hidden 2048->4096 让 tr(C) 大致翻倍，同一个 λ 在两版 C
-#   下的实际约束强度不是一个量。68 号 Step 4 会在 q_proj/v_proj 这个两边都有的
-#   子集上算 mean tr(C)/d 的比值，按约束强度 ∝ λ x tr(C) 反推每个域的等强度 λ。
+#   68 号 Step 4 那套按 tr(C) 反推的换算法在这条线上用不了：它解决的是「换了
+#   模型、C 的尺度变了」，而这里 C 与 CS 线是同一份文件，tr(C) 逐位相同。
+#   变的是 ΔW 那一侧，trace 对此一无所知。
 #
-#   拿那个值当扫描中心点，扫 0.5x / 1x / 2x。它只是一阶近似：
-#   normalize_by_layers 已把层数差异除掉、scale=α/r 两边都是 2，但训练后 A/B 的
-#   实际尺度不是 trace 能预测的。
+#   所以中心点只能实测，走下面的 λ=0 标尺法：先跑一次扫描拿到 R(λ=0)，再按
+#       λ ≈ 目标占比 x task_loss / R(λ=0)
+#   定中心，然后扫 0.5x / 1x / 2x（文档 09-09 第 6.1 节的做法）。
 #
 #   本脚本 Step 1 会重算本域 C 的 mean tr(C)/d 并打印 λ x mean tr(C)/d，那是罚项
 #   的量级；训练自检还会打印每个 epoch 的 λR/task_loss。三个 λ 点的这个比值应该
@@ -47,6 +60,8 @@
 #   一个作业里对网格上每个 λ 各跑 PROBE_STEPS 步（默认 300），不评测、不存
 #   adapter，末尾打两张对照表。分隔符用冒号最稳，qsub -v 自己按逗号切:
 #       LAMBDAS=0:7.5e-3:1.5e-2:3e-2
+#   这组数是 CS 线用过的，放在这里只是个起点，别当结论 —— 先看第一张表里
+#   λ=0 那行的 R，再按上面的公式把中心点算出来重扫一次。
 #
 #   网格里带一个 λ=0 是刻意的，它是这两张表的标尺。λ=0 时 ΔW 完全不受约束，测出
 #   来的 R 就是「这个域上罚项本来会有多大」，于是
@@ -54,19 +69,32 @@
 #   比从 1.7B 换算过来的一阶近似更贴。λ=0 那一行会传
 #   measure_replay_when_lambda_zero=1，即只测不罚（λ 乘上去是 0，不进梯度）。
 #
-#   !! 短跑能回答什么、不能回答什么
-#   能：λ 是不是差了几个数量级；罚项有没有真的接上（每个 λ 都会 grep 一次层覆盖
-#       那句）；R/R(λ=0) 这个比值——λ 把 ΔW 的能量压掉了多少，这是「λ 起没起
-#       作用」最直接的读数，而且它在训练早期就已经有意义了。
-#   不能：定最终的 λ。ACCUM=64 下 300 步只有约 37 次参数更新，3 个 epoch 是约 6
-#       万次；R = tr(ΔW C ΔW^T) 只依赖 ΔW，此刻 ΔW 还几乎没长起来，所以
-#       λR/task_loss 这个**绝对值**系统性偏小，只能当下界读。表里会同时打首末两
-#       个记录点的比值，看的是增长趋势。选点仍然要靠完整 run 的 val_loss +
-#       retention（文档 2.2 节的主表口径）。
+#   !! 短跑在这条线上比在 CS 线上可信得多
+#   CS 线的顾虑是 300 步只占 63112 个 micro-batch 的 0.5%，ΔW 还几乎没长起来，
+#   λR/task_loss 的绝对值系统性偏小、只能当下界读。DialogSum 一个 epoch 只有
+#   1495 个 micro-batch，2 个 epoch 共 2990 —— 300 步就是 10%，ΔW 已经进入
+#   量级正确的区间。
+#
+#   而且这条线便宜到不必只跑 300 步：一个 epoch 是 1495 个 micro-batch、约
+#   12 min，传 MAX_STEPS=1495 让每个点跑满一个 epoch（187 次更新，占总训练量
+#   的一半），R 的量级就相当可靠了。四个点一个作业也就 50 min。
+#
+#   !! 但别指望扫描模式跑满 2 epoch：传 LAMBDAS 会强制 PROBE=1，而 PROBE 段里
+#   EPOCHS 被钉成 1，传更大的 MAX_STEPS 也只是在一个 epoch 内取上限。
+#
+#   !! λ=0 那把尺子只能从扫描模式拿。单点模式（LAMBDA=0）不传
+#   --measure_replay_when_lambda_zero，train.py 在 λ=0 时根本不会加载 C、也就
+#   不会测 R。所以流程是固定的：先扫一次拿 R(λ=0) 与脚本反推的建议 λ，定完
+#   中心点再用单点模式跑满 2 epoch。
+#
+#   短跑能挡住的低级错误也别小看：λ 是不是差了几个数量级；罚项有没有真的接上
+#   （每个 λ 都会 grep 一次层覆盖那句）；R/R(λ=0) 是多少 —— λ 把 ΔW 的能量压掉
+#   了多少，这是「λ 起没起作用」最直接的读数。
 #
 #   扫描的代价：每个 λ 都是一次独立的 train.py 调用，各自重读一遍 33.75 GiB 的 C、
 #   重新加载 8B 权重、重新 tokenize 一遍数据集（map 那边写死了
-#   load_from_cache_file=False，换 run 名也省不掉）。网格控制在 3-5 个点。
+#   load_from_cache_file=False，换 run 名也省不掉）。在这条线上 tokenize 只有
+#   12460 行、几十秒的事，固定开销主要是读 C 和加载权重，网格放到 5 个点也不贵。
 #
 # -----------------------------------------------------------------------------
 # !! 短跑的 run 名带 _probe 后缀，不与正式结果落进同一个 metrics 文件
@@ -91,14 +119,22 @@
 #
 # -----------------------------------------------------------------------------
 # !! 训练超参必须与 74 号逐字相同
-#   r16 / alpha32 / dropout0.05 / all-linear 七类 / epochs 3 / batch 8 /
-#   accum 64（行/更新）/ eval_batch 8 / maxlen 512 / seed 1。
+#   r16 / alpha32 / dropout0.05 / all-linear 七类 / epochs 2 / batch 8 /
+#   accum 64（行/更新）/ eval_batch 8 / maxlen 1024 / val_fraction 0.04 / seed 1。
 #   任何一项偏了，delta 里就混进了「配置不同」这个第二变量。Step 0 会逐项比对，
 #   不符就退出；确实要改就传 ALLOW_DRIFT=1，并把偏差写进结果表。
 #
-#   LR 是唯一有意留的自由度：74 号若因 lr=2e-4 崩溃会回落 1e-4，本臂必须跟着回落。
-#   VANILLA_RUN 是按 LR 拼出来的，Step 0 找不到对应 vanilla 的 metrics 就会警告
-#   —— 那说明你在和一个还不存在的分母比。
+#   三项与 CS 线不同，都是 74 号探针定下来的：
+#     maxlen 1024  对话比 CS 的短指令长，512 会从左边切掉开头几轮。
+#     val_frac 0.04  12460 行的 1% 只有 125 行，val_loss 抖得没法比较。
+#     epochs 2     val_loss 在 epoch 2 触底，epoch 3 回升。
+#
+#   lr 保持 2e-4，与 CS 线同值：DialogSum 只有 CS 的 1/14 体量，同样的 lr 下
+#   总更新次数少 21 倍，不存在 CS 线上 lr=2e-4 那次输出塌缩的风险 —— 74 号已经
+#   实跑验证过。写论文时这一点要说明，否则读者会以为两条线的 lr 是碰巧相同。
+#
+#   VANILLA_RUN 是按 LR **和 EPOCHS** 拼出来的（74 号的 run 名带 _ep2），Step 0
+#   找不到对应 vanilla 的 metrics 就会警告 —— 那说明你在和一个还不存在的分母比。
 #
 # -----------------------------------------------------------------------------
 # 显存与内存
@@ -114,9 +150,11 @@
 #
 # -----------------------------------------------------------------------------
 # 时间与拆投
-#   训练 3 epoch 约 10~20 h（8B / 170k 行 / batch 8，H200 上没有实测过），
-#   评测按域不同：if 域五个指标最重，math 4096 tokens 那两个占大头。
-#   walltime 给了 36 h。排不上或想稳一点就拆两次投：
+#   训练 2 epoch 约 25 min（74 号实测 3 epoch 约 37 min，8B / 11961 行 /
+#   batch 8 / maxlen 1024）。这条线上训练已经不是瓶颈了，walltime 几乎全部
+#   花在评测上：if 域五个指标最重，math500 与 gsm8k 的 4096 tokens 占大头。
+#   walltime 给了 24 h（CS 线是 36 h，那边训练本身要 10~20 h）。排不上或想稳
+#   一点就拆两次投：
 #       第一次 DO_EVAL=0   只训练
 #       第二次 DO_TRAIN=0  只评测
 #   两边都能续跑：adapter 已存在跳过训练，summary.json 已存在跳过评测。
@@ -138,15 +176,17 @@
 #
 # 投递（DRY_RUN=1 是默认，先看计划）:
 #   第一步 先扫 λ 的量级（一个作业跑完整个网格，不评测不存 adapter，约 1-2h）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:7.5e-3:1.5e-2:3e-2 onereplay/pbs/70_...
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:7.5e-3:1.5e-2:3e-2 onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
+#   这条线便宜，建议让每点跑满一个 epoch 而不是默认的 300 步（约 50 min）:
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:7.5e-3:1.5e-2:3e-2,MAX_STEPS=1495 onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #   第二步 照扫描表挑定中心点，按文档扫 0.5x / 1x / 2x，各投一次正式 run:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1.5e-2  onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=7.5e-3  onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=3e-2    onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #   单点短跑（= 只有一个 λ 的扫描，没有 λ=0 那把尺子）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1.5e-2,PROBE=1 onereplay/pbs/70_...
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1.5e-2,PROBE=1 onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #   L2 对照臂（C 换成单位矩阵，隔离协方差结构的贡献）:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=...,IDENTITY_COV=1 onereplay/pbs/70_...
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=...,IDENTITY_COV=1 onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #
 #   若本站点 qsub 不吃 -v（63 号文件头有过这个记录），就直接改下面「阶段开关」
 #   与「正则化」两段的默认值再投。
