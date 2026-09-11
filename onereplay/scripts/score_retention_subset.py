@@ -47,20 +47,28 @@ from typing import Any
 # metrics carry a real id; the math ones only save the question text, which is
 # unique within each of these test sets and, more to the point, is what the
 # model was actually shown -- so it stays a valid join key even if the eval
-# file's row order changes.
-KEY_FIELDS = ("task_id", "id", "question", "prompt", "key")
+# file's row order changes. IFBench's key comes before prompt because it reuses
+# the same WildChat prompt under several different constraints.
+KEY_FIELDS = ("task_id", "id", "question", "key", "prompt")
 
 # Per-item verdict fields, in preference order. Every one of these is a bool
 # where True means the item was scored as correct.
 CORRECT_FIELDS = ("correct", "passed", "follow_all_instructions")
 
 # Which per-item file holds the verdicts. Most metrics score inline while
-# generating; IFEval writes responses.jsonl without verdicts and defers judging
-# to the vendored Google checker, whose output is a separate file.
+# generating; the instruction-following ones write responses.jsonl without
+# verdicts and score in a second pass (IFEval through the vendored Google
+# checker, IFBench through its own registry), which lands in a separate file.
 RESULT_FILES = {
     "ifeval": "eval_results_strict.jsonl",
     "ifeval_loose": "eval_results_loose.jsonl",
+    "ifbench": "eval_results_strict.jsonl",
+    "ifbench_loose": "eval_results_loose.jsonl",
 }
+
+# A "_loose" metric is not its own eval run, only the loose checker's view of
+# one, so it reads the same directory as the strict name.
+LOOSE_VIEWS = {"ifeval_loose": "ifeval", "ifbench_loose": "ifbench"}
 
 
 def result_filename(metric: str) -> str:
@@ -68,9 +76,9 @@ def result_filename(metric: str) -> str:
 
 
 def metric_dirname(metric: str) -> str:
-    """Directory under results_root. ifeval_loose is a scoring view of ifeval."""
+    """Directory under results_root. *_loose is a scoring view of one run."""
 
-    return "ifeval" if metric == "ifeval_loose" else metric
+    return LOOSE_VIEWS.get(metric, metric)
 
 
 def load_rows(path: Path) -> list[dict[str, Any]]:
@@ -264,8 +272,10 @@ def main() -> None:
     parser.add_argument("--results_root", required=True)
     parser.add_argument(
         "--metrics",
-        default="gsm8k,math500,humaneval,mbpp,ifeval",
-        help="Comma-separated. ifeval_loose scores the ifeval run with the loose checker.",
+        default="gsm8k,math500,humaneval,mbpp,ifeval,ifbench_loose",
+        help="Comma-separated. A _loose suffix scores the same run with the "
+        "loose checker instead of the strict one; ifbench_loose is the view "
+        "its paper reports, which is why it is in the default and ifbench is not.",
     )
     parser.add_argument(
         "--runs",

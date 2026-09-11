@@ -49,6 +49,9 @@ Usage
       --arm "Vanilla=cs_vanilla_seed{seed}" \
       --seeds 1,2,3
 
+  # IFBench, whose headline number is prompt-level loose accuracy
+  python -m onereplay.scripts.compare_significance --bench ifbench --mode loose ...
+
   # Multi-IF instead, pooling the three turns (turn 3 is where OneReplay loses)
   python -m onereplay.scripts.compare_significance --bench multiif ... --by_turn 1
 
@@ -108,9 +111,13 @@ def t_crit_95(df: int) -> float:
 # ---------------------------------------------------------------------------
 # Loading per-item outcomes
 #
-# Both benches already write per-item verdicts; nothing needs re-generating.
+# Every bench already writes per-item verdicts; nothing needs re-generating.
 #   IFEval  : eval_results_{strict,loose}.jsonl, one row per prompt, from the
 #             vendored Google checker.
+#   IFBench : the same two files in the same shape, from its own registry, so
+#             load_ifeval reads both. The verdicts are not interchangeable
+#             across the two benches -- different prompts, different checkers --
+#             but within one bench the pairing logic is identical.
 #   Multi-IF: responses.jsonl, one row per conversation with a turns list. Only
 #             rows the metric marked scored=True carry follow lists; the rest hit
 #             an instruction id the registry does not implement.
@@ -576,13 +583,18 @@ def main() -> None:
             "Repeatable."
         ),
     )
-    parser.add_argument("--bench", type=str, choices=["ifeval", "multiif"], default="ifeval")
+    parser.add_argument(
+        "--bench", type=str, choices=["ifeval", "ifbench", "multiif"], default="ifeval"
+    )
     parser.add_argument(
         "--mode",
         type=str,
         choices=["strict", "loose"],
         default="strict",
-        help="Which checker verdict to test. strict is what every table reports.",
+        help=(
+            "Which checker verdict to test. strict is what every IFEval table reports; "
+            "use loose for ifbench, which is the number its paper reports."
+        ),
     )
     parser.add_argument(
         "--arm",
@@ -654,7 +666,7 @@ def main() -> None:
                     missing.append(f"{run_name}（在 {len(roots)} 棵 results 树里都没找到）")
                     continue
                 try:
-                    if args.bench == "ifeval":
+                    if args.bench in ("ifeval", "ifbench"):
                         items = load_ifeval(run_dir, args.mode)
                     else:
                         items = load_multiif(run_dir, args.mode, turns)

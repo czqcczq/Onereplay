@@ -47,7 +47,7 @@ HEADLINE_FIELD = {
     "mbpp": "pass_at_1",
     "commonsense": "val_loss",
 }
-DEFAULT_METRICS = "commonsense,ifeval,gsm8k,math500,humaneval,mbpp"
+DEFAULT_METRICS = "commonsense,ifeval,ifbench,gsm8k,math500,humaneval,mbpp"
 
 
 def parse_args() -> argparse.Namespace:

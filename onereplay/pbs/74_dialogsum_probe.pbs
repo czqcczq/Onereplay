@@ -207,9 +207,13 @@ DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 ADAPTERS="${RESULTS_ROOT}/adapters"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 
-# 67 号那条线的 run 名。存在就在汇总表里并排显示它的 delta，这样"换训练集
-# 之后遗忘变强还是变弱"一眼可读，不用再去翻旧日志。
-CS_RUN="${CS_RUN:-cs_vanilla_8b_r16all_lr2e-4_seed1}"
+# CS 主线的 vanilla 臂。存在就在汇总表里并排显示它的 delta，这样"换训练集之后
+# 遗忘变强还是变弱"一眼可读，不用再去翻旧日志。
+#
+# 必须是 ep1_lr1e-4 这条，不是 67 号原始的 lr2e-4：后者撞上了 09-09 记录的崩溃
+# 前科（输出塌缩、缺 '####'），humaneval 直接归零，拿它当分母会把 DialogSum 的
+# 遗忘显得小一个数量级。calibrate_lambda.py 的 --floor_run 用的也是这条。
+CS_RUN="${CS_RUN:-cs_vanilla_8b_r16all_ep1_lr1e-4_seed1}"
 
 # ---- 阶段开关 ----
 DRY_RUN="${DRY_RUN:-1}"          # 默认只做检查与数据准备，不训练不评测
