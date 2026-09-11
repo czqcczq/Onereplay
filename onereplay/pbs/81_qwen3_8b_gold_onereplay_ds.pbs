@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N or_8b_or
+#PBS -N or_8b_or_ds
 #PBS -j oe
 #PBS -k oed
 #PBS -q autox
@@ -11,7 +11,7 @@
 # =============================================================================
 # NUS Hopper: Qwen3-8B OneReplay 臂 —— 单域保护（训练 + 按域评测）
 #
-# 67 号给出 base / vanilla 的分母，68 号给出这一臂唯一的输入 C。本脚本一次跑
+# 74 号给出 base / vanilla 的分母，68 号给出这一臂唯一的输入 C。本脚本一次跑
 # 一个「保护域 x 一个 λ」，训练 + 该域口径的评测，最后把 base / vanilla / 本臂
 # 并排打出来。
 #
@@ -90,13 +90,13 @@
 #                       前者是文件层面的检查，后者是运行期的
 #
 # -----------------------------------------------------------------------------
-# !! 训练超参必须与 67 号逐字相同
+# !! 训练超参必须与 74 号逐字相同
 #   r16 / alpha32 / dropout0.05 / all-linear 七类 / epochs 3 / batch 8 /
 #   accum 64（行/更新）/ eval_batch 8 / maxlen 512 / seed 1。
 #   任何一项偏了，delta 里就混进了「配置不同」这个第二变量。Step 0 会逐项比对，
 #   不符就退出；确实要改就传 ALLOW_DRIFT=1，并把偏差写进结果表。
 #
-#   LR 是唯一有意留的自由度：67 号若因 lr=2e-4 崩溃会回落 1e-4，本臂必须跟着回落。
+#   LR 是唯一有意留的自由度：74 号若因 lr=2e-4 崩溃会回落 1e-4，本臂必须跟着回落。
 #   VANILLA_RUN 是按 LR 拼出来的，Step 0 找不到对应 vanilla 的 metrics 就会警告
 #   —— 那说明你在和一个还不存在的分母比。
 #
@@ -125,9 +125,9 @@
 # 投递前要有的东西
 #   1) ${MODEL_DIR}/Qwen3-8B                （post-trained 版，不是 -Base）
 #   2) 68 号产出的本域 C，落在 results/qwen3-8b/cov/
-#   3) ${CS_DATASET} = datasets/commonsense_170k_hf
+#   3) ${DS_DATASET} = datasets/dialogsum_sft_hf
 #   4) 本域要用到的评测数据（缺哪个跳过哪个指标，只警告）
-#   5) 67 号的 base 与 vanilla 已评完（否则末尾的对照表只有本臂一列）
+#   5) 74 号的 base 与 vanilla 已评完（否则末尾的对照表只有本臂一列）
 #   6) IFBench 的依赖，**必须在登录节点装**（不装就只跳过 ifbench 这一个指标，
 #      其余照常；不想评就传 WITH_IFBENCH=0）:
 #        source ${VENV}/bin/activate
@@ -140,9 +140,9 @@
 #   第一步 先扫 λ 的量级（一个作业跑完整个网格，不评测不存 adapter，约 1-2h）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDAS=0:7.5e-3:1.5e-2:3e-2 onereplay/pbs/70_...
 #   第二步 照扫描表挑定中心点，按文档扫 0.5x / 1x / 2x，各投一次正式 run:
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1.5e-2  onereplay/pbs/70_qwen3_8b_gold_onereplay.pbs
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=7.5e-3  onereplay/pbs/70_qwen3_8b_gold_onereplay.pbs
-#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=3e-2    onereplay/pbs/70_qwen3_8b_gold_onereplay.pbs
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1.5e-2  onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=7.5e-3  onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
+#   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=3e-2    onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs
 #   单点短跑（= 只有一个 λ 的扫描，没有 λ=0 那把尺子）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1.5e-2,PROBE=1 onereplay/pbs/70_...
 #   L2 对照臂（C 换成单位矩阵，隔离协方差结构的贡献）:
@@ -162,7 +162,7 @@ CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
 # IFBench 的 checker 要 pos_tag / stopwords / sent_tokenize，IFEval 一个都不用。
 # venv 里 nltk.downloader 会落到 sys.prefix/nltk_data，和 73 号同一处。
 NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/70_qwen3_8b_gold_onereplay.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -205,7 +205,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
 
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
-    MODEL_DIR MODEL_NAME CS_DATASET RESULTS_ROOT MATH_DATA_DIR CODE_DATA_DIR
+    MODEL_DIR MODEL_NAME DS_DATASET RESULTS_ROOT MATH_DATA_DIR CODE_DATA_DIR
     DATASET_CACHE OUT_DIR
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE ALLOW_DRIFT COV_DIAG
     DOMAIN LAMBDA LAMBDAS PROBE_STEPS PROBE_LOG_EVERY COV_PATH IF_COV MATH_COV CODE_COV
@@ -275,7 +275,7 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
-CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+DS_DATASET="${DS_DATASET:-${REPO_ROOT}/datasets/dialogsum_sft_hf}"
 MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
 CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
@@ -291,9 +291,9 @@ DO_EVAL="${DO_EVAL:-1}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 PROBE="${PROBE:-0}"             # 1 = 300 步短跑，只看罚项量级
-ALLOW_DRIFT="${ALLOW_DRIFT:-0}"  # 1 = 容忍与 67 号不一致的超参（会打印偏差清单）
+ALLOW_DRIFT="${ALLOW_DRIFT:-0}"  # 1 = 容忍与 74 号不一致的超参（会打印偏差清单）
 COV_DIAG="${COV_DIAG:-1}"        # 1 = 读 C 的对角线算 trace（会把整份 C 过一遍盘）
-WITH_BASE="${WITH_BASE:-0}"      # base/vanilla 由 67 号评过，默认不重评
+WITH_BASE="${WITH_BASE:-0}"      # base/vanilla 由 74 号评过，默认不重评
 WITH_VANILLA="${WITH_VANILLA:-0}"
 
 # ---- 保护域：决定 C、run 名与评测口径 ----
@@ -311,15 +311,15 @@ case "${DOMAIN}" in
     ;;
 esac
 
-# ---- 训练超参：与 67 号逐字一致；LR 是唯一有意留的自由度 ----
+# ---- 训练超参：与 74 号逐字一致；LR 是唯一有意留的自由度 ----
 SEED="${SEED:-1}"
-EPOCHS="${EPOCHS:-3}"
-LR="${LR:-2e-4}"                 # 67 号若因 lr=2e-4 崩溃回落 1e-4，本臂必须跟着回落
+EPOCHS="${EPOCHS:-2}"
+LR="${LR:-2e-4}"                 # 74 号若因 lr=2e-4 崩溃回落 1e-4，本臂必须跟着回落
 BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"             # 每次更新 64 行新任务
-EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 67 号及其余各臂不可比
-MAXLEN="${MAXLEN:-512}"
-VAL_FRAC="${VAL_FRAC:-0.01}"
+EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 74 号及其余各臂不可比
+MAXLEN="${MAXLEN:-1024}"
+VAL_FRAC="${VAL_FRAC:-0.04}"
 MAXVAL="${MAXVAL:-1000}"
 LORA_RANK="${LORA_RANK:-16}"
 LORA_ALPHA="${LORA_ALPHA:-32}"
@@ -378,11 +378,11 @@ RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
 # 短跑的记录不能落进正式 run 的名下（文件头说明了为什么）。预算也编进后缀，这样
 # 300 步与 2000 步两种短跑之间也不会互相覆盖。
 SHORT_RUN=0
-if [[ "${MAX_STEPS}" != "0" || "${EPOCHS}" != "3" ]]; then
+if [[ "${MAX_STEPS}" != "0" || "${EPOCHS}" != "2" ]]; then
   SHORT_RUN=1
 fi
 run_name_for () {
-  local name="cs_onereplay_8b_${DOMAIN}gold_${RUN_TAG}_lam${1}_lr${LR}_seed${SEED}_regonce"
+  local name="ds_onereplay_8b_${DOMAIN}gold_${RUN_TAG}_lam${1}_lr${LR}_seed${SEED}_regonce"
   if [[ "${IDENTITY_COV}" == "1" ]]; then
     name="${name}_idcov"         # L2 对照臂，绝不能覆盖真 C 那一版的 adapter
   fi
@@ -410,8 +410,8 @@ if (( SHORT_RUN == 1 )); then
 else
   LOG_EVERY="${LOG_EVERY:-500}"
 fi
-# 67 号的 vanilla：分母。名字必须按同一套规则拼，否则末尾的对照表读不到它。
-VANILLA_RUN="${VANILLA_RUN:-cs_vanilla_8b_${RUN_TAG}_lr${LR}_seed${SEED}}"
+# 74 号的 vanilla：分母。名字必须按同一套规则拼，否则末尾的对照表读不到它。
+VANILLA_RUN="${VANILLA_RUN:-ds_vanilla_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS}_seed${SEED}}"
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
 
 # ---- 评测数据 ----
@@ -423,7 +423,7 @@ MBPP_SPLIT="${MBPP_SPLIT:-test}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
 IFBENCH_INPUT="${IFBENCH_INPUT:-}"   # 空 = 用装好的 ifbench 包自带的 IFBench_test.jsonl
 
-# ---- 解码预算与解码 batch：67 号定的口径，所有臂必须逐字相同 ----
+# ---- 解码预算与解码 batch：74 号定的口径，所有臂必须逐字相同 ----
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
 IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-768}"
@@ -471,7 +471,7 @@ set +x
 echo "========================================================================"
 echo "Qwen3-8B OneReplay 臂：保护 ${DOMAIN}"
 echo "  run      = ${RUN}"
-echo "  分母     = base / ${VANILLA_RUN}   (67 号产出)"
+echo "  分母     = base / ${VANILLA_RUN}   (74 号产出)"
 echo "  C        = ${COV_PATH}"
 if (( SWEEP == 1 )); then
   echo "  λ 网格   = ${LAMBDA_LIST[*]}   (扫描，每点 ${MAX_STEPS} 步)"
@@ -492,7 +492,7 @@ echo "  OUT_DIR  = ${OUT_DIR}"
 echo "========================================================================"
 
 # ===========================================================================
-# Step 0: 与 67 号的对齐检查（纯 bash，秒级）
+# Step 0: 与 74 号的对齐检查（纯 bash，秒级）
 #   delta 只有在「除了正则项之外一切相同」时才是这个方法的效果。
 # ===========================================================================
 echo "==== Step 0: 对齐检查 ===="
@@ -519,12 +519,12 @@ else
     exit 1
   }
   python -c "import sys; sys.exit(0 if float('${LAMBDA}') > 0 else 1)" || {
-    echo "!! LAMBDA=${LAMBDA} 不是正数。λ=0 就是 vanilla，那是 67 号的事。"
+    echo "!! LAMBDA=${LAMBDA} 不是正数。λ=0 就是 vanilla，那是 74 号的事。"
     echo "   要把 λ=0 当扫描的标尺行，用 LAMBDAS 而不是 LAMBDA。"
     exit 1
   }
 fi
-[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+[[ -d "${DS_DATASET}" ]] || { echo "缺 DialogSum 训练池: ${DS_DATASET}"; exit 1; }
 [[ -f "${COV_PATH}" ]] || {
   echo "!! 缺 C: ${COV_PATH}"
   echo "   先跑 68 号采本域的 C（DRY_RUN=1 会先做空间预检）。"
@@ -541,21 +541,21 @@ if (( ACCUM % BATCH != 0 )); then
   echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"; exit 1
 fi
 
-# 67 号钉下来的值。LR 不在其中：它是有意留的自由度，但必须与被比的 vanilla 同值。
+# 74 号钉下来的值。LR 不在其中：它是有意留的自由度，但必须与被比的 vanilla 同值。
 DRIFT=()
 [[ "${TARGET_MODULES}" == "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" ]] \
-  || DRIFT+=("target_modules=${TARGET_MODULES}（67 号: all-linear 七类）")
-[[ "${LORA_RANK}"    == "16"   ]] || DRIFT+=("lora_rank=${LORA_RANK}（67 号: 16）")
-[[ "${LORA_ALPHA}"   == "32"   ]] || DRIFT+=("lora_alpha=${LORA_ALPHA}（67 号: 32）")
-[[ "${LORA_DROPOUT}" == "0.05" ]] || DRIFT+=("lora_dropout=${LORA_DROPOUT}（67 号: 0.05）")
-[[ "${BATCH}"        == "8"    ]] || DRIFT+=("batch_size=${BATCH}（67 号: 8）")
-[[ "${ACCUM}"        == "64"   ]] || DRIFT+=("accumulation_size=${ACCUM}（67 号: 64）")
-[[ "${EVAL_BATCH}"   == "8"    ]] || DRIFT+=("eval_batch_size=${EVAL_BATCH}（67 号: 8，val_loss 靠它可比）")
-[[ "${MAXLEN}"       == "512"  ]] || DRIFT+=("max_len=${MAXLEN}（67 号: 512）")
-[[ "${VAL_FRAC}"     == "0.01" ]] || DRIFT+=("val_fraction=${VAL_FRAC}（67 号: 0.01，改了 val 划分就变了）")
-[[ "${MAXVAL}"       == "1000" ]] || DRIFT+=("max_val_samples=${MAXVAL}（67 号: 1000）")
+  || DRIFT+=("target_modules=${TARGET_MODULES}（74 号: all-linear 七类）")
+[[ "${LORA_RANK}"    == "16"   ]] || DRIFT+=("lora_rank=${LORA_RANK}（74 号: 16）")
+[[ "${LORA_ALPHA}"   == "32"   ]] || DRIFT+=("lora_alpha=${LORA_ALPHA}（74 号: 32）")
+[[ "${LORA_DROPOUT}" == "0.05" ]] || DRIFT+=("lora_dropout=${LORA_DROPOUT}（74 号: 0.05）")
+[[ "${BATCH}"        == "8"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 8）")
+[[ "${ACCUM}"        == "64"   ]] || DRIFT+=("accumulation_size=${ACCUM}（74 号: 64）")
+[[ "${EVAL_BATCH}"   == "8"    ]] || DRIFT+=("eval_batch_size=${EVAL_BATCH}（74 号: 8，val_loss 靠它可比）")
+[[ "${MAXLEN}"       == "1024" ]] || DRIFT+=("max_len=${MAXLEN}（74 号: 1024，对话比 CS 的短指令长）")
+[[ "${VAL_FRAC}"     == "0.04" ]] || DRIFT+=("val_fraction=${VAL_FRAC}（74 号: 0.04，12460 行的 1% 只切出 125 行）")
+[[ "${MAXVAL}"       == "1000" ]] || DRIFT+=("max_val_samples=${MAXVAL}（74 号: 1000）")
 if [[ "${PROBE}" != "1" ]]; then
-  [[ "${EPOCHS}"   == "3" ]] || DRIFT+=("epochs=${EPOCHS}（67 号: 3）")
+  [[ "${EPOCHS}"   == "2" ]] || DRIFT+=("epochs=${EPOCHS}（74 号: 2，val_loss 在 epoch 2 触底）")
   [[ "${MAX_STEPS}" == "0" ]] || DRIFT+=("max_steps=${MAX_STEPS}（正式 run 应为 0）")
 fi
 [[ "${REGULARIZER}" == "onereplay" ]] || DRIFT+=("regularizer=${REGULARIZER}（本脚本是 OneReplay 臂）")
@@ -563,7 +563,7 @@ fi
 [[ "${NORM_BY_LAYERS}" == "1" ]] || DRIFT+=("normalize_replay_by_layers=${NORM_BY_LAYERS}（λ 的换算以 1 为前提）")
 
 if (( ${#DRIFT[@]} > 0 )); then
-  echo "与 67 号不一致的项:"
+  echo "与 74 号不一致的项:"
   for item in "${DRIFT[@]}"; do echo "  - ${item}"; done
   if [[ "${ALLOW_DRIFT}" != "1" ]]; then
     echo "!! 这些偏差会让 delta 里混进第二个变量。确实要改就传 ALLOW_DRIFT=1，"
@@ -572,13 +572,13 @@ if (( ${#DRIFT[@]} > 0 )); then
   fi
   echo "ALLOW_DRIFT=1：继续，但上面每一条都要写进结果表。"
 else
-  echo "训练超参与 67 号逐字一致。"
+  echo "训练超参与 74 号逐字一致。"
 fi
 
 if [[ ! -f "${RESULTS_ROOT}/metrics/${VANILLA_RUN}.jsonl" ]]; then
   echo "warning: 找不到 ${RESULTS_ROOT}/metrics/${VANILLA_RUN}.jsonl"
-  echo "         67 号的 vanilla（LR=${LR}）还没跑完，本臂现在没有可比的分母。"
-  echo "         若 67 号回落到了 LR=1e-4，本臂也要传 LR=1e-4。"
+  echo "         74 号的 vanilla（LR=${LR}）还没跑完，本臂现在没有可比的分母。"
+  echo "         若 74 号回落到了 LR=1e-4，本臂也要传 LR=1e-4。"
 fi
 for f in "${IFEVAL_INPUT}" "${MATH500_FILE}" "${GSM8K_FILE}" "${HUMANEVAL_FILE}"; do
   [[ -f "${f}" ]] || echo "warning: 缺评测数据 ${f}（相关指标会被跳过）"
@@ -826,7 +826,7 @@ if (( SWEEP == 1 )); then
     set -x
     python -m onereplay.scripts.train --paradigm sft \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
-      --dataset_path "${CS_DATASET}" \
+      --dataset_path "${DS_DATASET}" \
       --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
       --eval_batch_size "${EVAL_BATCH}" \
       --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
@@ -1046,7 +1046,7 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
     # 训练输出同时留一份文件：层覆盖那句只在 stdout 上，metrics jsonl 里没有。
     python -m onereplay.scripts.train --paradigm sft \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
-      --dataset_path "${CS_DATASET}" \
+      --dataset_path "${DS_DATASET}" \
       --epochs "${EPOCHS}" --lr "${LR}" --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
       --eval_batch_size "${EVAL_BATCH}" \
       --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
@@ -1084,11 +1084,11 @@ if [[ -f "${TRAIN_LOG}" ]]; then
   # 这一句是全脚本最重要的断言：正则实际覆盖了多少层。
   assert_log "regularizer covers ${EXPECT_LAYERS} layers; no penalty matrix for 0 layers" \
     "正则没有覆盖全部 ${EXPECT_LAYERS} 层。C 与 LoRA 的层集合没对上，方法被削掉了一部分。"
-  assert_log "TARGET_MODULES=${TARGET_MODULES}" "LoRA/正则的层覆盖与 67 号不同"
-  assert_log "LORA_RANK=${LORA_RANK}" "rank 与 67 号不同"
-  assert_log "LORA_ALPHA=${LORA_ALPHA}" "alpha 与 67 号不同（scale=α/r 变了，λ 的尺子也变了）"
-  assert_log "LORA_DROPOUT=${LORA_DROPOUT}" "dropout 与 67 号不同"
-  assert_log "MAX_LEN=${MAXLEN}" "新任务的 token 预算与 67 号不同"
+  assert_log "TARGET_MODULES=${TARGET_MODULES}" "LoRA/正则的层覆盖与 74 号不同"
+  assert_log "LORA_RANK=${LORA_RANK}" "rank 与 74 号不同"
+  assert_log "LORA_ALPHA=${LORA_ALPHA}" "alpha 与 74 号不同（scale=α/r 变了，λ 的尺子也变了）"
+  assert_log "LORA_DROPOUT=${LORA_DROPOUT}" "dropout 与 74 号不同"
+  assert_log "MAX_LEN=${MAXLEN}" "新任务的 token 预算与 74 号不同"
   assert_log "NORMALIZE_REPLAY_BY_LAYERS=${NORM_BY_LAYERS}" \
     "层归一化开关与 λ 换算的前提不符，λ 的量级会整体偏掉一个 ${EXPECT_LAYERS} 倍"
   assert_log "REGULARIZER=${REGULARIZER}" "跑的不是 OneReplay"
@@ -1182,7 +1182,7 @@ if int(last.get("identity_cov") or 0) != int(os.environ["WANT_IDENTITY"]):
 if int(last.get("reg_once_per_update") or 0) != int(os.environ["WANT_REG_ONCE"]):
     failures.append(f"reg_once_per_update={last.get('reg_once_per_update')}")
 if int(last.get("accumulation_size") or 0) != int(os.environ["WANT_ACCUM"]):
-    failures.append(f"accumulation_size={last.get('accumulation_size')}，与 67 号不符")
+    failures.append(f"accumulation_size={last.get('accumulation_size')}，与 74 号不符")
 if int(last.get("eval_batch_size") or 0) != int(os.environ["WANT_EVAL_BATCH"]):
     failures.append(f"eval_batch_size={last.get('eval_batch_size')}，val_loss 与其余臂不可比")
 if int(last.get("epoch") or 0) != want_epochs:
@@ -1228,7 +1228,7 @@ if vanilla:
     print(f"墙钟 train_sec 本臂 {last.get('train_sec')} / vanilla {v_last.get('train_sec')}")
     print(f"峰值显存 本臂 {last.get('peak_memory_gb')} / vanilla {v_last.get('peak_memory_gb')}")
 else:
-    print("note: 找不到 vanilla 的 metrics，val_loss 没有分母。67 号跑完再回来看这一行。")
+    print("note: 找不到 vanilla 的 metrics，val_loss 没有分母。74 号跑完再回来看这一行。")
 
 if failures:
     print()
@@ -1245,7 +1245,7 @@ fi
 set -x
 
 # ===========================================================================
-# 评测：按域走口径，解码预算与 batch 与 67 号逐字相同
+# 评测：按域走口径，解码预算与 batch 与 74 号逐字相同
 # ===========================================================================
 if [[ "${DO_EVAL}" != "1" ]]; then
   echo "DO_EVAL=0：跳过评测。评测单独投: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=${LAMBDA},DO_TRAIN=0 ${SELF_PATH}"
@@ -1299,7 +1299,7 @@ fi
 echo "AVAIL=[${AVAIL}]"
 
 # base 的 adapter 路径是空串：evaluate.py 认这个，直接加载裸模型。
-# base 与 vanilla 默认不重评（67 号已经评过、结果就在同一个 OUT_DIR 里）。
+# base 与 vanilla 默认不重评（74 号已经评过、结果就在同一个 OUT_DIR 里）。
 EVAL_SPECS="${RUN};${ADAPTERS}/${RUN}"
 if [[ "${WITH_BASE}" == "1" ]]; then
   EVAL_SPECS="base;|${EVAL_SPECS}"
@@ -1432,7 +1432,7 @@ PY
 
 if [[ "${DIAG_LEN}" == "1" ]]; then
   DIAG_SPECS=()
-  # base 与 vanilla 的 responses.jsonl 是 67 号留下的，一起打出来才能比 P50。
+  # base 与 vanilla 的 responses.jsonl 是 74 号留下的，一起打出来才能比 P50。
   DIAG_RUNS=("base" "${VANILLA_RUN}" "${RUN}")
   for name in "${DIAG_RUNS[@]}"; do
     for m in ${AVAIL}; do
