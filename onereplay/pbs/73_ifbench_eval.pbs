@@ -6,7 +6,7 @@
 #PBS -q auto
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
-#PBS -o /scratch/weiliu87/logs/onereplay/
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
 # NUS Hopper (PBS + Singularity): 只跑 IFBench，不训练，不评其它指标。

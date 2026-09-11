@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", default="", help="逗号分隔；留空=自动发现")
     parser.add_argument("--metrics", default=DEFAULT_METRICS)
     parser.add_argument("--name_width", type=int, default=54)
+    parser.add_argument(
+        "--evaluated_only",
+        action="store_true",
+        help="只列跑过至少一个 benchmark 的 run（滤掉短跑探针）",
+    )
     parser.add_argument("--csv", default="")
     parser.add_argument("--plot", default="", help="画 val_loss vs 保留指标的权衡图")
     parser.add_argument("--plot_metric", default="ifeval")
@@ -158,11 +163,21 @@ def main() -> None:
         row: dict[str, Any] = {"run": run}
         row.update(read_training_record(results_root / "metrics" / f"{run}.jsonl"))
         row.update(read_metric_scores(out_dir, run, metrics))
+        # The commonsense *metric* is a separate eval that often was never run;
+        # the trainer's own held-out loss is the same quantity and is always
+        # there, so fall back to it rather than leaving the axis blank.
+        row["plasticity"] = (
+            row.get("commonsense")
+            if row.get("commonsense") is not None
+            else row.get("train_val_loss")
+        )
+        if args.evaluated_only and not any(row.get(m) is not None for m in metrics):
+            continue
         rows.append(row)
 
     width = args.name_width
     header = (
-        f"{'run':<{width}}{'ep':>4}{'lambda':>10}{'lamR/task':>11}"
+        f"{'run':<{width}}{'ep':>4}{'lambda':>10}{'lamR/task':>11}{'val_loss':>10}"
         + "".join(f"{m[:9]:>11}" for m in metrics)
     )
     print(header)
@@ -173,6 +188,7 @@ def main() -> None:
             f"{format_number(row.get('epochs'), 2):>4}"
             f"{format_number(row.get('lambda'), 3):>10}"
             f"{format_number(row.get('reg_ratio'), 3):>11}"
+            f"{format_number(row.get('plasticity'), 4):>10}"
         )
         for metric in metrics:
             line += f"{format_number(row.get(metric), 4):>11}"
@@ -181,14 +197,15 @@ def main() -> None:
     print()
     print("ep        = metrics jsonl 里实际训到的 epoch 数（run 名不一定反映它）")
     print("lamR/task = 最后一个 epoch 的 lambda*R / task_loss，判据带是 0.01~1")
-    print("commonse. = 新任务 held-out val_loss，越低=可塑性越好（等 val_loss 才能比保留）")
+    print("val_loss  = 新任务 held-out loss，越低=可塑性越好（等 val_loss 才能比保留）")
+    print("            优先取 commonsense 评测的值，没有就取训练最后一个 epoch 的")
     print("其余列    = 各 benchmark 的头号指标（ifeval 为 strict prompt acc）")
 
     if args.csv:
         csv_path = Path(args.csv)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = ["run", "epochs", "lambda", "train_task_loss", "lambda_reg", "reg_ratio",
-                      "train_val_loss", *metrics]
+                      "train_val_loss", "plasticity", *metrics]
         with csv_path.open("w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
@@ -205,19 +222,19 @@ def main() -> None:
             print("\n没有 matplotlib，跳过绘图（表格和 csv 不受影响）")
             return
         points = [
-            (row["commonsense"], row[args.plot_metric], row["run"])
+            (row["plasticity"], row[args.plot_metric], row["run"])
             for row in rows
-            if row.get("commonsense") is not None and row.get(args.plot_metric) is not None
+            if row.get("plasticity") is not None and row.get(args.plot_metric) is not None
         ]
         if not points:
-            print(f"\n没有同时具备 commonsense 与 {args.plot_metric} 的 run，跳过绘图")
+            print(f"\n没有同时具备 val_loss 与 {args.plot_metric} 的 run，跳过绘图")
             return
         figure, axes = plt.subplots(figsize=(9, 6))
         for val_loss, score, run in points:
             axes.scatter(val_loss, score)
             axes.annotate(shorten(run, 28), (val_loss, score), fontsize=7,
                           xytext=(4, 4), textcoords="offset points")
-        axes.set_xlabel("commonsense held-out val_loss  (lower = more plasticity)")
+        axes.set_xlabel("new-task held-out val_loss  (lower = more plasticity)")
         axes.set_ylabel(f"{args.plot_metric} ({HEADLINE_FIELD.get(args.plot_metric)})")
         axes.set_title("plasticity / retention operating points")
         axes.grid(alpha=0.3)
