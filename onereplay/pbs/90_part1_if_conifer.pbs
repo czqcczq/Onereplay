@@ -150,7 +150,7 @@
 #                都不在就提交时传 CONIFER_PARQUET=<绝对路径>。
 #   3) IFEval    随仓库自带 third_party/…（同步即有）；IFBench 来自 ifbench wheel，
 #                IFBENCH_INPUT 留空即用它内置的 IFBench_test.jsonl
-#   4) mkdir -p /scratch/weiliu87/logs/onereplay
+#   4) mkdir -p ${REPO_ROOT}/logs   （即上面 #PBS -o 指的目录，不存在的话作业没日志）
 #
 # 【用法】
 #   # 0) 建池 + 看长度报告（CPU 即可，约 5 min）
@@ -160,8 +160,11 @@
 #   #    后两个是 Math 线定 batch 的依据（本线便宜，先在这里量）。约 10 min。
 #   qsub -v MODE=smoke onereplay/pbs/90_part1_if_conifer.pbs
 #
-#   # 2) 选 LR（300 步 x 4 档，约 1-2 h）
+#   # 2) 选 LR（默认 1600 步 x 4 档 = 每档 100 次更新，约 40-60 min）
+#   #    SWEEP_MAX_STEPS 数的是 micro-batch，除以 ACCUM/BATCH=16 才是更新次数。
 #   qsub -v MODE=lr_sweep onereplay/pbs/90_part1_if_conifer.pbs
+#   #    往上探 LR 时留旧锚点，否则换了步数新旧不可比：
+#   qsub -v MODE=lr_sweep,LR_GRID="2e-5 5e-5 1e-4 2e-4" onereplay/pbs/90_part1_if_conifer.pbs
 #
 #   # 3) 正式训练 + 评测（训练 1-2 h；本线够便宜，可以合在一个作业里）
 #   qsub -v MODE=train,LR=2e-5 onereplay/pbs/90_part1_if_conifer.pbs
@@ -227,7 +230,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     CONIFER_PARQUET IF_DATASET REPLAY_DATASET
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
-    LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES
+    LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     CONIFER_MODE INCLUDE_PF FORMAT_ONLY DROP_REFUSALS BUILD_REPLAY_POOL
     IFEVAL_INPUT IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS
     EVAL_LIMIT EVAL_BATCH MAX_NEW_TOKENS RUNS_TO_EVAL
@@ -353,9 +356,24 @@ MAXVAL="${MAXVAL:-500}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
 # ---- LR 搜索 / 冒烟 ----
-LR_GRID="${LR_GRID:-5e-6 1e-5 2e-5 5e-5}"
-SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-300}"
+LR_GRID="${LR_GRID:-2e-5 5e-5 1e-4 2e-4}"
+# **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)
+# = SWEEP_MAX_STEPS / 16。这个换算很容易忘，忘了就会严重高估 sweep 的说服力。
+#
+# 曾经的默认值 300 是个陷阱：只有 19 次更新、1200 行、一个 epoch 的 3.2%。在那个尺度上
+# val loss 排序基本等价于「谁走得快」，而这天然偏袒大 LR，于是 grid 的上端永远赢，
+# 且看不到第 200 次更新才出现的 loss spike。实测那一轮就是这样：
+#     5e-6=1.2392  1e-5=1.2010  2e-5=1.1781  5e-5=1.1758
+# LR 翻 2.5 倍只换到 0.2%，边际收益已经塌缩，但纯看排序会误选 5e-5。
+#
+# 1600 步 = 100 次更新 = 6400 行 = 17% 的 epoch，约 4-7 min/档。足以看出大 LR 会不会
+# 翻车，这是把它从 300 提上来的唯一理由。
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-1600}"
 SMOKE_STEPS="${SMOKE_STEPS:-20}"
+# 每多少个 micro-batch 打一行 task_loss。sweep 要看**轨迹**而不只是末值——发散表现为
+# loss 中途抬头或出 nan，只比末值看不出来，所以 sweep 用一个更密的值。
+LOG_EVERY="${LOG_EVERY:-500}"
+SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-50}"
 # 训练时子采样，0 = 用整池。改这个不需要重建数据池。
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
@@ -403,6 +421,7 @@ fi
 # =============================================================================
 train_one () {
   local run="$1" epochs="$2" lr="$3" save_path="$4" max_steps="${5:-0}" do_save="${6:-1}"
+  local log_every="${7:-${LOG_EVERY}}"
 
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
   echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
@@ -418,7 +437,7 @@ train_one () {
     --target_modules "${TARGET_MODULES}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
-    --max_steps "${max_steps}" \
+    --max_steps "${max_steps}" --log_every "${log_every}" \
     --save "${do_save}" --save_path "${save_path}" \
     --metrics_path "${METRICS_DIR}/${run}.jsonl"
 }
@@ -486,11 +505,20 @@ fi
 # =============================================================================
 # MODE=lr_sweep：全量微调的 LR 必须用数据选，不能照搬 LoRA 的 1e-4（见文件头）。
 # 每个 LR 只跑 SWEEP_MAX_STEPS 步、不保存权重，比同一步数下的 val loss。
+#
+# 【怎么读结果】末值最低 != 该选它。两件事要一起看：
+#   1) val loss 的**边际收益**。LR 翻倍只换来千分之几时已经到膝点，再往上是拿稳定性
+#      换一个测不准的小数点。
+#   2) 训练 loss 的**轨迹**（stdout 里 SWEEP_LOG_EVERY 一行的 task_loss）。发散表现为
+#      中途抬头、剧烈抖动或 nan，末值单看不出来。
+# 改了 SWEEP_MAX_STEPS 之后，新旧结果不可比——grid 里要留至少两档旧值当锚点重跑。
 # =============================================================================
 if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "grid=${LR_GRID}"
+  echo "每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次优化器更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
   for lr in ${LR_GRID}; do
     train_one "sweep_if_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_if_lr${lr}" \
-      "${SWEEP_MAX_STEPS}" 0
+      "${SWEEP_MAX_STEPS}" 0 "${SWEEP_LOG_EVERY}"
   done
   echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
   for lr in ${LR_GRID}; do
@@ -505,7 +533,9 @@ PY
 )"
     fi
   done
-  echo "挑 val loss 最低且没有发散的那个，作为 LR 传给 MODE=train。"
+  echo
+  echo "别只看这张表：回到上面每档的 task_loss 轨迹，确认没有中途抬头/抖动/nan。"
+  echo "在都不发散的前提下，选边际收益已经塌缩的那个膝点，而不是末值最小的那个。"
   exit 0
 fi
 
