@@ -190,8 +190,10 @@
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先在有网节点备好
 #   1) 模型      ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
-#   2) OpenR1    ${OPENR1_PARQUET}               (openr1.parquet, 232MB, 单文件)
+#   2) OpenR1    ${REPO_ROOT}/datasets/Openr1-Math-46k-8192/openr1.parquet (232MB, 单文件)
 #                huggingface-cli download Elliott/Openr1-Math-46k-8192 --repo-type dataset
+#                脚本也会退而去 datasets/openr1/ 和 data_check/Openr1-Math-46k-8192/ 找；
+#                都不在就提交时传 OPENR1_PARQUET=<绝对路径>。
 #   3) 评测集    ${GSM8K_DATA} / ${MATH500_DATA} (prepare_math_data.py 产出的 jsonl)
 #   4) mkdir -p ${REPO_ROOT}/logs   （即上面 #PBS -o 指的目录，不存在的话作业没日志）
 #
@@ -330,7 +332,26 @@ export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
-OPENR1_PARQUET="${OPENR1_PARQUET:-${REPO_ROOT}/datasets/openr1/openr1.parquet}"
+# OpenR1 parquet 的位置。集群上是 huggingface-cli download 直接落的仓库名目录
+# ${REPO_ROOT}/datasets/Openr1-Math-46k-8192/openr1.parquet，本地放在 data_check/ 下。
+# 按目录候选 + glob 找第一个命中的（该仓库只有一个 parquet，glob 不会有歧义）。
+# 想指定就提交时传 OPENR1_PARQUET=<绝对路径>。
+OPENR1_DIRS=(
+  "${REPO_ROOT}/datasets/Openr1-Math-46k-8192"
+  "${REPO_ROOT}/datasets/openr1"
+  "${REPO_ROOT}/data_check/Openr1-Math-46k-8192"
+)
+if [[ -z "${OPENR1_PARQUET:-}" ]]; then
+  for _dir in "${OPENR1_DIRS[@]}"; do
+    for _hit in "${_dir}"/*.parquet "${_dir}"/data/*.parquet; do
+      if [[ -f "${_hit}" ]]; then
+        OPENR1_PARQUET="${_hit}"
+        break 2
+      fi
+    done
+  done
+  OPENR1_PARQUET="${OPENR1_PARQUET:-${OPENR1_DIRS[0]}/openr1.parquet}"
+fi
 MATH_DATASET="${MATH_DATASET:-${RESULTS_ROOT}/datasets/openr1_math}"
 
 # ---- 模式 ----
@@ -413,6 +434,7 @@ echo "Part 1 / Math 线: Base --OpenR1--> Model-Math   (full finetune, vanilla)"
 echo "  MODE           : ${MODE}"
 echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  results root   : ${RESULTS_ROOT}"
+echo "  OpenR1 源      : ${OPENR1_PARQUET}"
 echo "  数据池         : ${MATH_DATASET}"
 echo "  think / prompt : ${THINK_HANDLING} / ${INSTRUCTION_STYLE}"
 echo "                   (评测侧 enable_thinking=False，strip_tags 才对得上)"
@@ -462,7 +484,15 @@ train_one () {
 # **先读长度报告再定 MAXLEN**：截断是保尾丢头的，错了不报错，只会悄悄毁掉数据。
 # =============================================================================
 if [[ "${MODE}" == "data" ]]; then
-  [[ -f "${OPENR1_PARQUET}" ]] || { echo "缺 OpenR1 parquet: ${OPENR1_PARQUET}"; exit 1; }
+  if [[ ! -f "${OPENR1_PARQUET}" ]]; then
+    echo "缺 OpenR1 parquet。在这些目录里找过 *.parquet 和 data/*.parquet："
+    for _dir in "${OPENR1_DIRS[@]}"; do
+      echo "  ${_dir}/"
+    done
+    echo "把 parquet 放到其中之一，或提交时传 OPENR1_PARQUET=<绝对路径>"
+    exit 1
+  fi
+  echo "OpenR1 parquet: ${OPENR1_PARQUET}"
 
   echo "==== data: OpenR1-Math -> ${MATH_DATASET} ===="
   python -m onereplay.scripts.prepare_openr1_math \
