@@ -2,8 +2,8 @@
 
     python -m onereplay.scripts.evaluate --metrics ifeval,multiif,commonsense ...
 
-Available metrics: ifeval, ifbench, multiif, commonsense, gsm8k, aime, math500,
-amc, humaneval, mbpp, direct_safety. Each metric writes
+Available metrics: ifeval, ifbench, followbench, multiif, commonsense, gsm8k,
+aime, math500, amc, humaneval, mbpp, direct_safety. Each metric writes
 <out_dir>/<metric>/<run_name>/summary.json plus an appended row in
 <out_dir>/<metric>_summary.csv.
 """
@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--code_batch_size", type=int, default=0)
     parser.add_argument("--ifeval_batch_size", type=int, default=0)
     parser.add_argument("--ifbench_batch_size", type=int, default=0)
+    parser.add_argument("--followbench_batch_size", type=int, default=0)
 
     # commonsense loss
     parser.add_argument("--dataset_path", type=str, default="")
@@ -65,6 +66,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ifbench_input", type=str, default="")
     parser.add_argument("--ifbench_limit", type=int, default=0)
     parser.add_argument("--ifbench_max_new_tokens", type=int, default=2048)
+    # followbench: generation + the 350 rule-scored rows. The other 470 need a
+    # judge and leave via judge_inputs.jsonl; see the metric's docstring.
+    # Empty followbench_data means the vendored third_party/followbench/data.
+    parser.add_argument("--followbench_data", type=str, default="")
+    parser.add_argument("--followbench_categories", type=str, default="")
+    parser.add_argument("--followbench_max_new_tokens", type=int, default=2048)
+    # Subsamples whole example_id ladders per category, not rows: CSL and the
+    # rule-side denominators both need a complete level-1..5 group.
+    parser.add_argument("--followbench_group_limit", type=int, default=0)
     parser.add_argument("--multiif_input", type=str, default="")
     parser.add_argument("--multiif_language", type=str, default="English")
     parser.add_argument("--multiif_limit", type=int, default=0)

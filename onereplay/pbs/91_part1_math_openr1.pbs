@@ -392,7 +392,7 @@ MAXVAL="${MAXVAL:-200}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
 # ---- LR 搜索 / 冒烟 ----
-LR_GRID="${LR_GRID:-1e-5 2e-5 5e-5}"
+LR_GRID="${LR_GRID:2e-5 5e-5 1e-4}"
 # **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)，
 # 而本线 BATCH=1 所以分母是 **64** —— 每次更新要烧掉 64 个 micro-batch。
 #
@@ -416,9 +416,9 @@ MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math_eval/math500_test.jsonl
 # 训练答案实测 P50=3767。低于这个数会把正确推理在 \boxed{} 之前掐断，读成不会做。
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
-EVAL_BATCH="${EVAL_BATCH:-16}"
+EVAL_BATCH="${EVAL_BATCH:-32}"
 # 3072 token 的 KV cache 很占地方，math 的解码 batch 单独给小值
-MATH_BATCH="${MATH_BATCH:-8}"
+MATH_BATCH="${MATH_BATCH:-32}"
 
 RUN="part1_math_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
