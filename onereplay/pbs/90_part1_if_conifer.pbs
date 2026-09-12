@@ -3,10 +3,10 @@
 #PBS -N p1_if
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
-#PBS -o /scratch/weiliu87/logs/onereplay/
+#PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
 # Part 1 / IF 线: Qwen3-1.7B-Base --Conifer--> Model-IF，评 IFEval + IFBench
@@ -228,7 +228,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES
-    CONIFER_MODE INCLUDE_PF FORMAT_ONLY BUILD_REPLAY_POOL
+    CONIFER_MODE INCLUDE_PF FORMAT_ONLY DROP_REFUSALS BUILD_REPLAY_POOL
     IFEVAL_INPUT IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS
     EVAL_LIMIT EVAL_BATCH MAX_NEW_TOKENS RUNS_TO_EVAL
   )
@@ -324,6 +324,13 @@ CONIFER_MODE="${CONIFER_MODE:-full}"
 INCLUDE_PF="${INCLUDE_PF:-1}"
 # 1 只留可程序化验证的约束（5544 行），与 IFEval 打分口径完全对齐。默认 0 用全量。
 FORMAT_ONLY="${FORMAT_ONLY:-0}"
+# 1（默认）丢掉答案本身是拒答的行（"I'm sorry, but I am unable to provide a
+# comparative table..."）。这类行占 3.42%（1332/38906），而且不是均匀分布的：它们集中
+# 在每条难度阶梯的最后一轮（4.78% vs 全池 3.42%），因为 Conifer 的阶梯是加约束加到
+# 生成器不肯配合为止、对话就在那里终止。留着的话，指令要求带约束输出、答案示范拒绝
+# 带约束输出，正好是本阶段要建立能力的反面；而且 replay 池用的是 sampled/hardest，
+# 会优先选到这些行，让"难度"这个变量被"拒答率"混淆。设 0 可复现未过滤的池子。
+DROP_REFUSALS="${DROP_REFUSALS:-1}"
 
 # ---- 训练超参（IF 线专用）----
 # BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
@@ -379,7 +386,7 @@ echo "  MODE           : ${MODE}"
 echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  results root   : ${RESULTS_ROOT}"
 echo "  Conifer 源     : ${CONIFER_PARQUET}"
-echo "  数据池         : ${IF_DATASET}  (mode=${CONIFER_MODE} pf=${INCLUDE_PF} fmt_only=${FORMAT_ONLY})"
+echo "  数据池         : ${IF_DATASET}  (mode=${CONIFER_MODE} pf=${INCLUDE_PF} fmt_only=${FORMAT_ONLY} drop_refusals=${DROP_REFUSALS})"
 echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
 echo "  评测           : ifeval, ifbench   (对照 base)"
 echo "  checkpoint     : ${CKPT}"
@@ -441,6 +448,7 @@ if [[ "${MODE}" == "data" ]]; then
     --mode "${CONIFER_MODE}" \
     --include_process_feedback "${INCLUDE_PF}" \
     --format_constraints_only "${FORMAT_ONLY}" \
+    --drop_refusals "${DROP_REFUSALS}" \
     --max_len "${MAXLEN}" \
     --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
 
@@ -452,6 +460,7 @@ if [[ "${MODE}" == "data" ]]; then
       --mode sampled --sample_strategy hardest \
       --include_process_feedback "${INCLUDE_PF}" \
       --format_constraints_only "${FORMAT_ONLY}" \
+      --drop_refusals "${DROP_REFUSALS}" \
       --max_len "${MAXLEN}" \
       --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
   fi

@@ -110,6 +110,79 @@ FORMAT_CONSTRAINT_PATTERN = re.compile(
     re.I,
 )
 
+# Answers that decline the instruction instead of following it. Anchored to the
+# opening ~20 non-word characters so a mid-answer "I cannot stress enough" is
+# not a hit.
+#
+# These rows are actively harmful for this experiment, not merely useless. The
+# instruction asks for a constrained output and the answer demonstrates refusing
+# a constrained output -- often naming the constraint it is declining ("I am
+# unable to provide a detailed analysis that includes comparative tables and a
+# bulleted list in this format"). Training on them teaches the inverse of the
+# capability this stage is supposed to build.
+#
+# Measured on the full flattened pool: this pattern matches 1332 of 38906 rows
+# (3.42%). The distribution is what makes it worth filtering rather than
+# tolerating -- refusals concentrate on the final rung of each difficulty
+# ladder (rates below from a slightly wider probe pattern, so read them as the
+# shape rather than exact values):
+#
+#   turn_index      not the conv's last turn      IS the conv's last turn
+#            0            1.99%                        9.07%
+#            1            2.56%                        6.16%
+#            2            2.33%                        5.17%
+#            3            1.91%                        3.79%
+#            4              --                         2.55%
+#          all            2.23%                        4.61%
+#
+# Conifer's Easy-to-Hard ladder escalates constraints until the generator stops
+# complying, so a conversation ends where the generator gave up. "Hardest turn"
+# is therefore also "most likely refusal", which matters twice: the Part 2
+# replay pool is built with --sample_strategy hardest (4.78% refusals there vs
+# 3.42% pool-wide), and difficulty-aware sampling would otherwise be confounded
+# with refusal rate rather than measuring difficulty.
+#
+# Effect of the filter, measured:
+#   mode=full              38906 -> 37574 rows
+#   mode=sampled/hardest   13605 -> 13381 rows, and the hardest-turn histogram
+#                          shifts 0=893->937 4=2824->2742 because a ladder whose
+#                          top rung was refused falls back to its highest
+#                          non-refused rung instead of being dropped entirely.
+#
+# Like FORMAT_CONSTRAINT_PATTERN this is lexical. A wider probe over the rows
+# this pattern leaves behind found ~30 residual refusals (0.08% of the pool)
+# phrased in ways not covered here, which is where tuning was stopped: the same
+# probe's other 49 hits turned out to be real answers that merely open with a
+# date caveat ("As of my knowledge cutoff date in early 2023, there are 195
+# recognized sovereign countries...") and must not be dropped. Use
+# --drop_refusals 0 --show_dropped 20 to inspect before trusting a count.
+REFUSAL_PATTERN = re.compile(
+    r"^\W{0,20}(?:"
+    r"i(?:'m| am) (?:sorry|afraid|unable)"
+    r"|i (?:cannot|can't|can not|won't|will not)\b"
+    r"|(?:as|being) an ai\b"
+    r"|i (?:apologize|apologise)\b"
+    r"|sorry,? (?:but )?i\b"
+    # "Unfortunately, as of my knowledge cutoff in early 2023, I cannot provide
+    # ..." puts a clause between the opener and the verb, so requiring "i"
+    # immediately after "unfortunately" missed it.
+    r"|unfortunately,?[^.]{0,80}?\bi (?:cannot|can't|can not|am unable to|do not have)\b"
+    # Any "I do not have <X>" where X is about information rather than, say,
+    # "I do not have a preference". The lookahead keeps the object inside one
+    # sentence so it cannot bind to a later clause.
+    r"|i (?:do not|don't) have\b"
+    r"(?=[^.]{0,60}\b(?:information|knowledge|data|access|abilit(?:y|ies)|details?|specifics)\b)"
+    # A leading disclaimer clause delays the refusal verb past the anchor:
+    # "Due to the constraints of my knowledge cutoff in 2023, I cannot provide
+    # current examples...". 71 rows (0.19%) are phrased this way and were being
+    # missed. Bounded by [^.] so it cannot reach across a sentence boundary into
+    # an answer that merely mentions a limitation later on.
+    r"|(?:due to|because of|given|as of|based on)[^.]{0,100}?"
+    r"\bi (?:cannot|can't|can not|am unable to|do not have|don't have)\b"
+    r")",
+    re.I,
+)
+
 
 def parse_args() -> argparse.Namespace:
     """Parse the Conifer location, flattening mode, and output settings."""
@@ -156,7 +229,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="1 keeps only turns whose instruction carries a constraint of the "
         "kind IFEval and IFBench can verify programmatically (length, casing, "
-        "punctuation, list structure, placeholders). That is 15.6% of the "
+        "punctuation, list structure, placeholders). That is 15.6%% of the "
         "flattened pool, so it trades ~35.6k rows for ~5.5k that are far more "
         "aligned with how IF is scored. Applied before turn selection, so "
         "--mode sampled then keeps the hardest QUALIFYING turn per "
@@ -189,6 +262,29 @@ def parse_args() -> argparse.Namespace:
         help="Only read when --include_process_feedback 1. 1 drops the 226 "
         "conversations whose final answer is byte-identical to the first "
         "attempt (the critique concluded the answer already complied).",
+    )
+    parser.add_argument(
+        "--drop_refusals",
+        type=int,
+        default=1,
+        help="1 (default) drops rows whose answer opens by declining the "
+        "instruction ('I'm sorry, but I am unable to provide a comparative "
+        "table...'). These teach the inverse of the capability this stage "
+        "builds, and they are not spread evenly: refusals concentrate on the "
+        "final rung of each Easy-to-Hard ladder (4.61%% there vs 2.23%% "
+        "elsewhere), because the ladder escalates until the generator stops "
+        "complying. Left in, they would make --sample_strategy hardest select "
+        "for refusal as much as for difficulty. Applied before turn selection, "
+        "so sampled/hardest keeps the hardest non-refused turn. Set 0 to "
+        "reproduce the unfiltered pool.",
+    )
+    parser.add_argument(
+        "--show_dropped",
+        type=int,
+        default=0,
+        help="Print the first N answers the refusal filter removed, so a "
+        "surprising count can be checked against the actual text before the "
+        "pool is used.",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
@@ -322,7 +418,11 @@ def flatten(dataset, args: argparse.Namespace) -> tuple[list[dict[str, Any]], di
         "dropped_no_pairs": 0,
         "turns_without_format_constraint": 0,
         "convs_no_format_constraint": 0,
+        "refusal_turns_dropped": 0,
+        "refusal_convs_all_turns_dropped": 0,
+        "refusal_pf_dropped": 0,
     }
+    dropped_examples: list[str] = []
 
     for conv_id, (messages, conifer_type) in enumerate(
         zip(dataset["messages"], dataset["type"])
@@ -378,6 +478,11 @@ def flatten(dataset, args: argparse.Namespace) -> tuple[list[dict[str, Any]], di
                         continue
                 else:
                     stats["pf_revised"] += 1
+            if args.drop_refusals == 1 and REFUSAL_PATTERN.search(final_answer.strip()):
+                stats["refusal_pf_dropped"] += 1
+                if len(dropped_examples) < args.show_dropped:
+                    dropped_examples.append(final_answer.strip()[:200])
+                continue
             selected = [(0, first_question, final_answer)]
         else:
             if conifer_type == EASY_TO_HARD:
@@ -398,6 +503,23 @@ def flatten(dataset, args: argparse.Namespace) -> tuple[list[dict[str, Any]], di
                     stats["convs_no_format_constraint"] += 1
                     continue
                 indexed = qualifying
+            if args.drop_refusals == 1:
+                # Before selection, for the same reason as the format filter:
+                # otherwise sampled/hardest would pick the last rung even when
+                # that rung is the refusal that ended the ladder, and the pool
+                # would over-represent exactly the rows worth removing.
+                kept = []
+                for item in indexed:
+                    if REFUSAL_PATTERN.search(item[2].strip()):
+                        stats["refusal_turns_dropped"] += 1
+                        if len(dropped_examples) < args.show_dropped:
+                            dropped_examples.append(item[2].strip()[:200])
+                    else:
+                        kept.append(item)
+                if not kept:
+                    stats["refusal_convs_all_turns_dropped"] += 1
+                    continue
+                indexed = kept
             if args.mode == "sampled":
                 if args.sample_strategy == "hardest":
                     indexed = [indexed[-1]]
@@ -420,6 +542,11 @@ def flatten(dataset, args: argparse.Namespace) -> tuple[list[dict[str, Any]], di
                 stats["rows_process_feedback"] += 1
             else:
                 stats["rows_easy_to_hard"] += 1
+
+    if dropped_examples:
+        print(f"---- first {len(dropped_examples)} answers the refusal filter removed ----")
+        for text in dropped_examples:
+            print(f"  * {text}".replace("\n", " "))
 
     return rows, stats
 
@@ -574,6 +701,23 @@ def main() -> None:
             "carrying no programmatically verifiable constraint, and "
             f"{stats['convs_no_format_constraint']} conversations that had none at any turn"
         )
+    if args.drop_refusals == 1:
+        print(
+            f"  refusal filter: dropped {stats['refusal_turns_dropped']} Easy-to-Hard "
+            f"turns and {stats['refusal_pf_dropped']} Process Feedback rows whose "
+            "answer declines the instruction; "
+            f"{stats['refusal_convs_all_turns_dropped']} conversations lost every turn"
+        )
+        print(
+            "                  (rerun with --drop_refusals 0 --show_dropped 20 to see "
+            "what the pattern catches)"
+        )
+    else:
+        print(
+            "  refusal filter: OFF. ~3.7% of Easy-to-Hard answers decline the "
+            "instruction, concentrated on each ladder's last rung, which biases "
+            "--sample_strategy hardest."
+        )
     if stats["dropped_empty"] or stats["dropped_no_pairs"]:
         print(
             f"  dropped: {stats['dropped_empty']} empty-field turns, "
@@ -610,6 +754,7 @@ def main() -> None:
         "format_constraints_only": args.format_constraints_only,
         "include_process_feedback": args.include_process_feedback,
         "drop_pf_unrevised": args.drop_pf_unrevised,
+        "drop_refusals": args.drop_refusals,
         "subsets": (
             "Easy-to-Hard + Process Feedback"
             if args.include_process_feedback == 1

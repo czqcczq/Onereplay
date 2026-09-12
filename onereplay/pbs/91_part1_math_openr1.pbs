@@ -3,10 +3,10 @@
 #PBS -N p1_math
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
-#PBS -o /scratch/weiliu87/logs/onereplay/
+#PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
 # Part 1 / Math 线: Qwen3-1.7B-Base --OpenR1--> Model-Math，评 GSM8K + MATH-500
