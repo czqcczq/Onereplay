@@ -132,10 +132,10 @@
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先在有网节点备好
 #   1) 模型    ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
-#   2) 训练数据 commonsense_170k.json
-#              脚本按目录候选找：${REPO_ROOT}/datasets/{,Commonsense170k/}、
-#              ${REPO_ROOT}/data_check/。都不在就提交时传 CS_SOURCE=<绝对路径>。
-#              也接受 save_to_disk 目录或 parquet。
+#   2) 训练数据默认位置：
+#              ${REPO_ROOT}/datasets/commonsense_170k/data/train-00000-of-00001.parquet
+#              同时兼容 commonsense_170k.json、save_to_disk 目录和其他 parquet；
+#              都不在就提交时传 CS_SOURCE=<绝对路径>。
 #   3) 评测数据 LLM-Adapters 的 dataset/ 目录，布局 <dir>/<task>/test.json：
 #                git clone --depth 1 https://github.com/AGI-Edgerunners/LLM-Adapters
 #                cp -r LLM-Adapters/dataset ${REPO_ROOT}/datasets/commonsense_eval
@@ -278,21 +278,26 @@ export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
-# commonsense_170k.json 的位置。按目录候选找第一个命中的；prepare 脚本也接受
-# save_to_disk 目录和 parquet，所以传目录也行。想指定就传 CS_SOURCE=<绝对路径>。
-CS_SOURCE_DIRS=(
-  "${REPO_ROOT}/datasets"
-  "${REPO_ROOT}/datasets/Commonsense170k"
-  "${REPO_ROOT}/data_check"
+# Commonsense170k 的位置。集群上的真实源是 HF 仓库导出的 parquet：
+#   datasets/commonsense_170k/data/train-00000-of-00001.parquet
+# 也兼容旧实验用的 json 和 save_to_disk 目录。想指定就传
+# CS_SOURCE=<绝对路径>。
+CS_SOURCE_CANDIDATES=(
+  "${REPO_ROOT}/datasets/commonsense_170k/data/train-00000-of-00001.parquet"
+  "${REPO_ROOT}/datasets/commonsense_170k/commonsense_170k.json"
+  "${REPO_ROOT}/datasets/commonsense_170k"
+  "${REPO_ROOT}/datasets/commonsense_170k.json"
+  "${REPO_ROOT}/data_check/commonsense_170k.json"
 )
 if [[ -z "${CS_SOURCE:-}" ]]; then
-  for _dir in "${CS_SOURCE_DIRS[@]}"; do
-    if [[ -f "${_dir}/commonsense_170k.json" ]]; then
-      CS_SOURCE="${_dir}/commonsense_170k.json"
+  for _candidate in "${CS_SOURCE_CANDIDATES[@]}"; do
+    if [[ -f "${_candidate}" || -d "${_candidate}" ]]; then
+      CS_SOURCE="${_candidate}"
       break
     fi
   done
-  CS_SOURCE="${CS_SOURCE:-${CS_SOURCE_DIRS[0]}/commonsense_170k.json}"
+  # 让 MODE=data 的报错指向集群的标准位置，而不是一个并不存在的 json。
+  CS_SOURCE="${CS_SOURCE:-${CS_SOURCE_CANDIDATES[0]}}"
 fi
 CS_DATASET="${CS_DATASET:-${RESULTS_ROOT}/datasets/commonsense_full}"
 # Part 2 的 CS protection 池（本线用不到，顺手产出省一次排队）
@@ -432,11 +437,11 @@ train_one () {
 # =============================================================================
 if [[ "${MODE}" == "data" ]]; then
   if [[ ! -e "${CS_SOURCE}" ]]; then
-    echo "缺 Commonsense170k 源。在这些目录里找过 commonsense_170k.json："
-    for _dir in "${CS_SOURCE_DIRS[@]}"; do
-      echo "  ${_dir}/"
+    echo "缺 Commonsense170k 源。依次检查过："
+    for _candidate in "${CS_SOURCE_CANDIDATES[@]}"; do
+      echo "  ${_candidate}"
     done
-    echo "把 json 放到其中之一，或提交时传 CS_SOURCE=<绝对路径>（也接受 save_to_disk 目录/parquet）"
+    echo "把源放到其中之一，或提交时传 CS_SOURCE=<绝对路径>（支持 json、parquet、save_to_disk 目录）"
     exit 1
   fi
   echo "Commonsense 源: ${CS_SOURCE}"
