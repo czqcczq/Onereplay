@@ -226,7 +226,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
 
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
-    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    MODEL_DIR MODEL_NAME LINE_ROOT RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
     CONIFER_PARQUET IF_DATASET REPLAY_DATASET
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
@@ -406,6 +406,9 @@ echo "  results root   : ${RESULTS_ROOT}"
 echo "  Conifer 源     : ${CONIFER_PARQUET}"
 echo "  数据池         : ${IF_DATASET}  (mode=${CONIFER_MODE} pf=${INCLUDE_PF} fmt_only=${FORMAT_ONLY} drop_refusals=${DROP_REFUSALS})"
 echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
+fi
 echo "  评测           : ifeval, ifbench   (对照 base)"
 echo "  checkpoint     : ${CKPT}"
 echo "========================================================================"

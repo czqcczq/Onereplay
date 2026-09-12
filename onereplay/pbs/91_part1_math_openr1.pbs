@@ -371,10 +371,23 @@ MAXVAL="${MAXVAL:-200}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
 # ---- LR 搜索 / 冒烟 ----
-LR_GRID="${LR_GRID:-5e-6 1e-5 2e-5 5e-5}"
-# 长序列每步慢，步数给少一点也够比出趋势
-SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-150}"
-SMOKE_STEPS="${SMOKE_STEPS:-20}"
+LR_GRID="${LR_GRID:-1e-5 2e-5 5e-5}"
+# **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)，
+# 而本线 BATCH=1 所以分母是 **64** —— 每次更新要烧掉 64 个 micro-batch。
+#
+# 曾经的默认值 150 是个严重的陷阱：只有 **2 次权重更新**，比出来的完全是噪声。IF 线
+# （BATCH=4，分母 16）的 300 步也只有 18 次更新，实测那一轮的排序就被"谁走得快"主导、
+# 天然偏袒大 LR，详见 90 号脚本里记的结果。
+#
+# 3200 步 = 50 次更新 = 3200 行 = 7% 的 epoch ≈ 13.3M token。按 5-8k tok/s 估
+# **每档 28-44 min**，3 档约 1.5-2.5 h。这条线的 sweep 就是这么贵，因为 ACCUM/BATCH=64。
+# 想再省就砍 grid（本线的先验区间就是 1e-5~5e-5），不要砍步数——2 次更新的表没有信息。
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-3200}"
+SMOKE_STEPS="${SMOKE_STEPS:-70}"
+# 每多少个 micro-batch 打一行 task_loss。sweep 要看**轨迹**而不只是末值——发散表现为
+# loss 中途抬头或出 nan，只比末值看不出来，所以 sweep 用一个更密的值。
+LOG_EVERY="${LOG_EVERY:-500}"
+SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-64}"
 
 # ---- 评测（只测 Math 能力）----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math_eval/gsm8k_test.jsonl}"
@@ -419,6 +432,7 @@ fi
 # =============================================================================
 train_one () {
   local run="$1" epochs="$2" lr="$3" save_path="$4" max_steps="${5:-0}" do_save="${6:-1}"
+  local log_every="${7:-${LOG_EVERY}}"
 
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
   echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
@@ -434,7 +448,7 @@ train_one () {
     --target_modules "${TARGET_MODULES}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
-    --max_steps "${max_steps}" \
+    --max_steps "${max_steps}" --log_every "${log_every}" \
     --save "${do_save}" --save_path "${save_path}" \
     --metrics_path "${METRICS_DIR}/${run}.jsonl"
 }
@@ -470,13 +484,22 @@ if [[ "${MODE}" != "eval" ]]; then
 fi
 
 # =============================================================================
-# MODE=smoke：跑几十步、不保存。这条线的冒烟重点是**显存**：
-# 4096 x batch 2 是否真的装得下，峰值离 80GB 还有多少余量。
+# MODE=smoke：跑几十步、不保存。这条线的冒烟要同时量两件事：
+#
+#   1) **显存**：MAXLEN x BATCH = 8192 x 1 是否真的装得下，峰值离卡容量还有多少余量。
+#   2) **吞吐**：日志里的 tokens_per_sec。全量微调没有实测值，文件头那个
+#      "1 epoch 6.6-10.5 h" 是按 5-8k tok/s 估的。用实测值除 190.0M tok/epoch
+#      才是真实 epoch 时长 —— 这直接决定要不要上 DDP。
+#
+# 20 步（=20 micro-batch）对 tokens_per_sec 够用：它是按 train_sec 算的窗口均值，
+# 但前几步含 cold start，所以看日志里 win= 那个窗口值更准。
 # 另外确认 trainable params ≈ 1.72e9、loss 在动。
 # =============================================================================
 if [[ "${MODE}" == "smoke" ]]; then
-  train_one "smoke_math" 1 "${LR}" "${CKPT_DIR}/smoke_math" "${SMOKE_STEPS}" 0
-  echo "冒烟完成。峰值显存见日志的 peak memory 字段。"
+  train_one "smoke_math" 1 "${LR}" "${CKPT_DIR}/smoke_math" "${SMOKE_STEPS}" 0 1
+  echo "冒烟完成。看两个数（都在 ${METRICS_DIR}/smoke_math.jsonl 里）："
+  echo "  peak_memory_gb  -> 8192x1 的真实峰值，离卡容量还剩多少"
+  echo "  tokens_per_sec  -> 用 190.0M / 它 = 单卡真实 epoch 秒数，据此决定要不要 DDP"
   exit 0
 fi
 
@@ -485,9 +508,11 @@ fi
 # 每个 LR 只跑 SWEEP_MAX_STEPS 步、不保存权重，比同一步数下的 val loss。
 # =============================================================================
 if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "grid=${LR_GRID}"
+  echo "每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次优化器更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
   for lr in ${LR_GRID}; do
     train_one "sweep_math_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_math_lr${lr}" \
-      "${SWEEP_MAX_STEPS}" 0
+      "${SWEEP_MAX_STEPS}" 0 "${SWEEP_LOG_EVERY}"
   done
   echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
   for lr in ${LR_GRID}; do
@@ -502,7 +527,9 @@ PY
 )"
     fi
   done
-  echo "挑 val loss 最低且没有发散的那个，作为 LR 传给 MODE=train。"
+  echo
+  echo "别只看这张表：回到上面每档的 task_loss 轨迹，确认没有中途抬头/抖动/nan。"
+  echo "在都不发散的前提下，选边际收益已经塌缩的那个膝点，而不是末值最小的那个。"
   exit 0
 fi
 
