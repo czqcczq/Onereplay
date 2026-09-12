@@ -1,0 +1,613 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N p1_cs
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# Part 1 / CS 线: Qwen3-1.7B-Base --Commonsense170k--> Model-CS
+#                 评 BoolQ / PIQA / SIQA / HellaSwag / WinoGrande / ARC / OBQA
+#
+#     Base ---- Commonsense170k (约 170k 单轮样本) ----> Model-CS
+#     评测: commonsense_qa 八个测试集        对照: base
+#
+# capability forgetting 实验的第三条 sanity check。只回答一个问题：
+#
+#     Commonsense170k 能不能把多选常识问答教起来？
+#
+# IF 线是 90 号（Conifer），Math 线是 91 号（OpenR1）。三条线的 maxlen / batch /
+# 每行监督 token 差好几个量级，所以各自一个脚本，不做交叉评测。
+#
+# -----------------------------------------------------------------------------
+# 【这条线测的不是"通用能力"，别这么写】
+#
+# Commonsense170k（LLM-Adapters，arXiv 2304.01933）就是 BoolQ、PIQA、SIQA、
+# HellaSwag、WinoGrande、ARC-e、ARC-c、OBQA 这八个数据集的**训练集**，按每个数据集
+# 一个固定模板渲染后拼起来的。而本脚本评的那八个 test.json 正是同样八个数据集的
+# **测试集**。
+#
+# 所以这是严格的 in-domain train -> test：
+#
+#   好处：它是三条线里唯一有同分布保证的 sanity check。如果这批数据都推不动 BoolQ /
+#         PIQA，那就没有数据能推动了。文献上 LLaMA-7B + LoRA 拿到 BoolQ 68.9 /
+#         PIQA 80.7，量级是明确的。
+#   代价：它不是"通用领域"或"开放域"能力，写成那样过不了审。这条线建立的能力应当
+#         叫作「固定模板下的多选常识问答」。Part 2 报它的下降时必须用这个名字，
+#         否则"通用能力遗忘"这个说法会被直接质疑。
+#
+# -----------------------------------------------------------------------------
+# 【为什么评测默认用 logprob 而不是生成 + 正则】
+#
+# LLM-Adapters 原版的打分是：生成 32 token，然后 re.findall(r'true|false', resp)[0]。
+# 这个口径**对 base 不成立**。Qwen3-1.7B-Base 没见过这个模板，不会按格式作答，只会
+# 续写；正则于是在续写文本里**撞**到 "true" 或 "false"，读出来的是英文词频而不是模型
+# 的常识，base 的地板分因此虚高，train-base 的涨幅被同等放大。
+#
+# 这个坑 Part 1 已经踩过一次：8c 节里 IFBench 的 base 分数就是长篇散文撞中约束撞出来
+# 的（results_log/2026-09-12_Part1_工程准备与交接.md 第 8c 节）。
+#
+# 所以 metrics/commonsense_qa.py 的主口径是 logprob：把该行自己的候选集逐个拼成
+# "the correct answer is <label>"，算这段 continuation 的 logprob 之和取 argmax。
+# 它让模型在闭集里排序而不是服从格式，不存在"抽不出答案"，base 和 trained 是同一种
+# 测量。生成式打分照样算，因为它回答的是另一个真问题——模型有没有学会**按训练格式
+# 作答**——但它的 accuracy 只能和它的 parse_rate 一起读。
+#
+# 两种打分共用一次模型加载。候选集从每行 instruction 自己的 "Answer format: a/b/c"
+# 尾巴解析，不查表：ARC 的行有 4 个也有 5 个选项，查表会把一部分行按错误的候选集打分。
+#
+# -----------------------------------------------------------------------------
+# 【这条线和另两条最大的差别：每行只有 7-8 个监督 token】
+#
+# 答案一律是 "the correct answer is <label>"，7-8 个 token，而且这就是全部监督 span
+# （instruction 被 mask 成 -100）。对比：Conifer 每行约 330，OpenR1 每行约 3767。
+#
+# 两个后果：
+#
+#   1) **最优 LR 没有理由和另两条线相同**。每次优化器更新回传的监督量差一到两个数量
+#      级，所以必须跑 MODE=lr_sweep，不能沿用 IF 线定的 5e-5。
+#   2) **Part 2 的 replay 预算口径必须先定死**。交接文档第 10 节留的那个问题（按行数
+#      还是按有监督 token 数）在加入这条线之后不再是细节：两种单位在这里差两个数量级
+#      以上，选哪个直接决定结论。MODE=data 的长度报告会同时打印两个数。
+#
+# -----------------------------------------------------------------------------
+# 【训练/评测的 prompt 是同一个，已实测确认】
+#
+# 这里本来有一个和 91 号同源的坑。tokenizer_to_ids 是用 prompt_text 的**长度**去 mask
+# full_text 的**内容**：
+#     labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+# 这要求 prompt_ids 是 full_ids 的前缀。而 prompt_text 走 enable_thinking=False，带一个
+# 空的 "<think>\n\n</think>\n\n" 块（4 个 token）。91 号记录过：OpenR1 的 target 自带
+# </think>，触发模板的拆分逻辑后两者错开，答案头 4 个 token 掉出 loss。
+#
+# 本线答案只有 7 个 token，错开 4 个就是毁掉 57% 的监督，所以必须确认。已用
+# Qwen3-1.7B-Base 自己的模板实测：
+#
+#   full=  47  prompt=  40  prefix_ok=True  supervised=7  -> 'the correct answer is false'
+#   full= 134  prompt= 126  prefix_ok=True  supervised=8  -> 'the correct answer is solution1'
+#
+# 结论是**不会错开**：Qwen3 模板给最后一个 assistant turn 也插了同一个空 think 块，
+# 所以 full_text 里有、prompt_text 里也有，前缀关系成立，监督 span 是完整答案。
+# 而且训练上下文和评测上下文（render_user_prompt 同样 enable_thinking=False）逐字节
+# 相同。本线不需要任何特殊处理——但换 tokenizer 或改模板之后必须重测这一条。
+#
+# 顺带：同一个任务内候选答案的 token 数完全相等（true/false 各 5，solution1/2、
+# answer1..5、ending1..4、option1/2 各 6），所以长度归一化是恒等操作，acc_norm 必然
+# 等于 acc，指标里就没实现它。
+#
+# -----------------------------------------------------------------------------
+# 【MAXLEN：512 是 LoRA 线的值，不要直接继承】
+#
+# 截断是 full_input_ids[-max_length:]，**保尾丢头**。本线的尾巴是答案加
+# "Answer format: a/b/c" 那一行，所以截断的行**不会**丢答案、也不会丢候选集清单——
+# 丢的是开头的任务描述和题干的前半段。这样一行教的是「不读题，从这几个选项里挑一个」。
+#
+# 长尾在 HellaSwag 的 context 和 ARC/OBQA 的长题干上。本地没有这份数据的副本，所以
+# 这张表没法像 90/91 号那样提前算好，**必须先跑 MODE=data 读报告再定 MAXLEN**。
+# 默认先填 512（LoRA 线用的值），但它是个待验证的占位值，不是结论。
+#
+# -----------------------------------------------------------------------------
+# 【EPOCHS 默认 1，不是 3】
+#
+# LoRA 线用的是 3 epoch，但那是 LoRA + lr=1e-4。本线 170k 行 / ACCUM 64 =
+# **每 epoch 约 2637 次优化器更新**，一个 epoch 就已经超过 IF 线跑满 3 epoch 的
+# 1760 次。而 train.py 用裸 torch.optim.Adam + **恒定 LR、无 warmup、无 scheduler**
+# （全仓库搜过），更新次数越多、LR 越大，发散风险越实。
+#
+# 所以默认 EPOCHS=1；要 2 或 3 就显式传，并且回去看 task_loss 轨迹有没有中途抬头。
+#
+# -----------------------------------------------------------------------------
+# 【BATCH=8 / ACCUM=64：和 LoRA 线一致，口径也和另两条线对齐】
+#
+# BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则「一次更新
+# 64 行」不成立。ACCUM=64 与 90/91 号相同，所以三条线的「一次更新」含义一致。
+#
+# 激活上界是 BATCH x MAXLEN = 8 x 512 = 4096 token/micro-batch，与 IF 线的 6144、
+# Math 线的 8192 同量级。results_log 的 batch 饱和测试（Job 2831163，同模型同卡）实测
+# 每步约 908 token 时吞吐就已饱和，本线按 P50 算每步远超它，再加大 batch 换不到速度。
+#
+# -----------------------------------------------------------------------------
+# 【前置】计算节点无外网，以下都要先在有网节点备好
+#   1) 模型    ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
+#   2) 训练数据 commonsense_170k.json
+#              脚本按目录候选找：${REPO_ROOT}/datasets/{,Commonsense170k/}、
+#              ${REPO_ROOT}/data_check/。都不在就提交时传 CS_SOURCE=<绝对路径>。
+#              也接受 save_to_disk 目录或 parquet。
+#   3) 评测数据 LLM-Adapters 的 dataset/ 目录，布局 <dir>/<task>/test.json：
+#                git clone --depth 1 https://github.com/AGI-Edgerunners/LLM-Adapters
+#                cp -r LLM-Adapters/dataset ${REPO_ROOT}/datasets/commonsense_eval
+#              八个子目录: boolq piqa social_i_qa hellaswag winogrande
+#                          ARC-Easy ARC-Challenge openbookqa   （总共约 10MB）
+#   4) mkdir -p ${REPO_ROOT}/logs   （即上面 #PBS -o 指的目录，不存在的话作业没日志）
+#
+# 【用法】
+#   # 0) 建池 + 看长度报告（CPU 即可）。**MAXLEN 必须由这一步的输出决定**
+#   qsub -v MODE=data onereplay/pbs/93_part1_cs_commonsense.pbs
+#
+#   # 1) 冒烟：20 步。看 loss 在动、peak memory、tokens/s
+#   qsub -v MODE=smoke onereplay/pbs/93_part1_cs_commonsense.pbs
+#
+#   # 2) 选 LR（默认 1600 micro-batch x 4 档 = 每档 200 次更新）
+#   qsub -v MODE=lr_sweep onereplay/pbs/93_part1_cs_commonsense.pbs
+#
+#   # 3) 正式训练 + 评测同作业。先用 EVAL_LIMIT 确认评测不 OOM 再跑全量：
+#   qsub -v MODE=train,LR=2e-5,EVAL_LIMIT=64 onereplay/pbs/93_part1_cs_commonsense.pbs
+#   qsub -v MODE=train,LR=2e-5 onereplay/pbs/93_part1_cs_commonsense.pbs
+#
+#   # 4) 只评测（checkpoint 已在盘上）；只跑便宜的四个集：
+#   qsub -v MODE=eval,LR=2e-5 onereplay/pbs/93_part1_cs_commonsense.pbs
+#   qsub -v MODE=eval,LR=2e-5,CS_EVAL_TASKS="boolq,piqa" onereplay/pbs/93_part1_cs_commonsense.pbs
+#
+#   # 只看配置不跑
+#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/93_part1_cs_commonsense.pbs
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/93_part1_cs_commonsense.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_p1cs_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_p1cs_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_p1cs_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME LINE_ROOT RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    CS_SOURCE CS_DATASET REPLAY_DATASET CS_EVAL_DIR
+    MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
+    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
+    DROP_UNPARSABLE BUILD_REPLAY_POOL REPLAY_POOL_SIZE REPLAY_STRATEGY
+    EVAL_METRICS CS_EVAL_TASKS CS_SCORING CS_MAX_NEW_TOKENS
+    CS_BATCH CS_SCORE_BATCH EVAL_LIMIT EVAL_BATCH RUNS_TO_EVAL
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# ---- 路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_cs}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+# commonsense_170k.json 的位置。按目录候选找第一个命中的；prepare 脚本也接受
+# save_to_disk 目录和 parquet，所以传目录也行。想指定就传 CS_SOURCE=<绝对路径>。
+CS_SOURCE_DIRS=(
+  "${REPO_ROOT}/datasets"
+  "${REPO_ROOT}/datasets/Commonsense170k"
+  "${REPO_ROOT}/data_check"
+)
+if [[ -z "${CS_SOURCE:-}" ]]; then
+  for _dir in "${CS_SOURCE_DIRS[@]}"; do
+    if [[ -f "${_dir}/commonsense_170k.json" ]]; then
+      CS_SOURCE="${_dir}/commonsense_170k.json"
+      break
+    fi
+  done
+  CS_SOURCE="${CS_SOURCE:-${CS_SOURCE_DIRS[0]}/commonsense_170k.json}"
+fi
+CS_DATASET="${CS_DATASET:-${RESULTS_ROOT}/datasets/commonsense_full}"
+# Part 2 的 CS protection 池（本线用不到，顺手产出省一次排队）
+REPLAY_DATASET="${REPLAY_DATASET:-${RESULTS_ROOT}/datasets/commonsense_replay}"
+BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-1}"
+REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-20000}"
+# balanced 按 task 标签轮转取，避免池子被 HellaSwag + ARC 主导（两者合计过半）
+REPLAY_STRATEGY="${REPLAY_STRATEGY:-balanced}"
+
+# LLM-Adapters 的 dataset/ 目录，布局 <dir>/<task>/test.json
+CS_EVAL_DIR="${CS_EVAL_DIR:-${REPO_ROOT}/datasets/commonsense_eval}"
+
+# ---- 模式 ----
+MODE="${MODE:-data}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+SEED="${SEED:-1}"
+
+# ---- 数据池选项 ----
+# 1（默认）丢掉 instruction 没有可解析的 "Answer format: a/b/c" 尾巴、或者 gold 答案
+# 不在该候选集里的行。这两种行没法用排序打分（没有候选能命中 gold），留在 replay 池里
+# 还会教一个指标永远不会提出的 label。
+DROP_UNPARSABLE="${DROP_UNPARSABLE:-1}"
+
+# ---- 训练超参（CS 线专用，理由见文件头）----
+EPOCHS="${EPOCHS:-1}"
+LR="${LR:-2e-5}"
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+# **占位值，等 MODE=data 的长度报告**。见文件头 MAXLEN 一节。
+MAXLEN="${MAXLEN:-512}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+# 全量微调时 --target_modules 不再决定「哪些参数训练」（全都训），只决定正则覆盖
+# 哪些层。本线没有正则，传什么都不影响结果；保持与 90/91 号一致便于对照。
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+
+# ---- LR 搜索 / 冒烟 ----
+# 本线每行只有 7-8 个监督 token，IF 线是约 330。所以 IF 线定的 5e-5 在这里没有参考
+# 价值，grid 要自己扫。
+LR_GRID="${LR_GRID:-1e-5 2e-5 5e-5 1e-4}"
+# **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)
+# = SWEEP_MAX_STEPS / 8。1600 = 200 次更新 = 12800 行 = 7.5% 的 epoch。
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-1600}"
+SMOKE_STEPS="${SMOKE_STEPS:-20}"
+LOG_EVERY="${LOG_EVERY:-500}"
+# sweep 要看**轨迹**而不只是末值——发散表现为 loss 中途抬头或出 nan。
+SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-50}"
+# 训练时子采样，0 = 用整池。改这个不需要重建数据池。
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+
+# ---- 评测 ----
+# 想同时要一个和 LoRA 线（results_log 里那批）可对照的 val loss，就传
+# EVAL_METRICS="commonsense_qa,commonsense"。注意 val 是按行切的，不是干净留出集，
+# 能力结论一律由 commonsense_qa 给出。
+EVAL_METRICS="${EVAL_METRICS:-commonsense_qa}"
+# 空 = 跑全部八个。HellaSwag 一个集就有 10042 行、占总量约 45%，想省时间就显式列
+# 便宜的几个，例如 CS_EVAL_TASKS="boolq,piqa,winogrande,openbookqa"。
+CS_EVAL_TASKS="${CS_EVAL_TASKS:-}"
+CS_SCORING="${CS_SCORING:-both}"
+# 答案只有 7-8 个 token，32 足够收尾，再多只是烧时间。
+CS_MAX_NEW_TOKENS="${CS_MAX_NEW_TOKENS:-32}"
+CS_BATCH="${CS_BATCH:-32}"
+# logprob 那一路的瓶颈和解码不同：它要 materialize 一个 [batch, seq, 151936] 的 logit
+# 张量、且完全不复用 KV cache，所以单独一个更小的默认值。
+CS_SCORE_BATCH="${CS_SCORE_BATCH:-8}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+EVAL_BATCH="${EVAL_BATCH:-32}"
+
+RUN="part1_cs_lr${LR}_seed${SEED}"
+CKPT="${CKPT_DIR}/${RUN}"
+RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
+
+mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
+  "${DATASET_CACHE}" "${RESULTS_ROOT}/map_cache"
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+
+echo "========================================================================"
+echo "Part 1 / CS 线: Base --Commonsense170k--> Model-CS   (full finetune, vanilla)"
+echo "  MODE           : ${MODE}"
+echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
+echo "  results root   : ${RESULTS_ROOT}"
+echo "  Commonsense 源 : ${CS_SOURCE}"
+echo "  数据池         : ${CS_DATASET}  (drop_unparsable=${DROP_UNPARSABLE})"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  一次更新       : $(( ACCUM )) 行 = $(( ACCUM / BATCH )) 个 micro-batch"
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
+fi
+echo "  评测           : ${EVAL_METRICS}  scoring=${CS_SCORING}  (对照 base)"
+echo "  评测数据       : ${CS_EVAL_DIR}  tasks=${CS_EVAL_TASKS:-<全部八个>}"
+echo "  checkpoint     : ${CKPT}"
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置，不跑。"
+  exit 0
+fi
+
+# =============================================================================
+# 共用训练封装：vanilla 全量微调
+#   --full_finetune 1
+#   --replay_lambda 0 --measure_replay_when_lambda_zero 0   -> 不加载任何 penalty
+# =============================================================================
+train_one () {
+  local run="$1" epochs="$2" lr="$3" save_path="$4" max_steps="${5:-0}" do_save="${6:-1}"
+  local log_every="${7:-${LOG_EVERY}}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --epochs "${epochs}" --lr "${lr}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${BATCH}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --max_steps "${max_steps}" --log_every "${log_every}" \
+    --save "${do_save}" --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl"
+}
+
+# =============================================================================
+# MODE=data：Commonsense170k -> {instruction, input, output, answer, task} 的
+# save_to_disk。
+#
+# 长度报告会打印每个候选 MAXLEN 的截断率、平均丢多少 token、以及 tok/epoch 和
+# **有监督 tok/epoch** 两个数。**先读这张表再定 MAXLEN**：截断是保尾丢头的，错了不
+# 报错，只会悄悄把「读题作答」换成「不读题瞎选」。
+# =============================================================================
+if [[ "${MODE}" == "data" ]]; then
+  if [[ ! -e "${CS_SOURCE}" ]]; then
+    echo "缺 Commonsense170k 源。在这些目录里找过 commonsense_170k.json："
+    for _dir in "${CS_SOURCE_DIRS[@]}"; do
+      echo "  ${_dir}/"
+    done
+    echo "把 json 放到其中之一，或提交时传 CS_SOURCE=<绝对路径>（也接受 save_to_disk 目录/parquet）"
+    exit 1
+  fi
+  echo "Commonsense 源: ${CS_SOURCE}"
+
+  echo "==== data: Commonsense170k -> ${CS_DATASET} ===="
+  python -m onereplay.scripts.prepare_commonsense \
+    --commonsense_path "${CS_SOURCE}" \
+    --out_dir "${CS_DATASET}" \
+    --mode full \
+    --drop_unparsable "${DROP_UNPARSABLE}" \
+    --seed "${SEED}" \
+    --max_len "${MAXLEN}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+
+  if [[ "${BUILD_REPLAY_POOL}" == "1" ]]; then
+    echo "==== data: Commonsense replay pool (${REPLAY_STRATEGY}, 供 Part 2 用) ===="
+    python -m onereplay.scripts.prepare_commonsense \
+      --commonsense_path "${CS_SOURCE}" \
+      --out_dir "${REPLAY_DATASET}" \
+      --mode sampled \
+      --sample_strategy "${REPLAY_STRATEGY}" \
+      --pool_size "${REPLAY_POOL_SIZE}" \
+      --drop_unparsable "${DROP_UNPARSABLE}" \
+      --seed "${SEED}" \
+      --max_len "${MAXLEN}" \
+      --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+  fi
+
+  echo "数据准备完成。**先看上面的长度报告再定 MAXLEN**，然后 MODE=smoke 冒烟。"
+  exit 0
+fi
+
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -d "${CS_DATASET}" ]] || { echo "缺 CS 池: ${CS_DATASET}（先跑 MODE=data）"; exit 1; }
+fi
+
+# =============================================================================
+# MODE=smoke：跑几十步、不保存。只回答「链路通不通」。
+# 看三件事：trainable params ≈ 1.72e9、峰值显存有余量、loss 在动。
+# =============================================================================
+if [[ "${MODE}" == "smoke" ]]; then
+  train_one "smoke_cs" 1 "${LR}" "${CKPT_DIR}/smoke_cs" "${SMOKE_STEPS}" 0
+  echo "冒烟完成。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=lr_sweep：本线的监督信号比另两条稀疏一到两个数量级，LR 必须自己扫。
+#
+# 【怎么读结果】末值最低 != 该选它。两件事要一起看：
+#   1) val loss 的**边际收益**。LR 翻倍只换来千分之几时已经到膝点，再往上是拿稳定性
+#      换一个测不准的小数点。
+#   2) 训练 loss 的**轨迹**（stdout 里 SWEEP_LOG_EVERY 一行的 task_loss）。发散表现为
+#      中途抬头、剧烈抖动或 nan，末值单看不出来。
+# 改了 SWEEP_MAX_STEPS 之后新旧结果不可比——grid 里要留至少两档旧值当锚点重跑。
+# =============================================================================
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "grid=${LR_GRID}"
+  echo "每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次优化器更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
+  for lr in ${LR_GRID}; do
+    train_one "sweep_cs_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_cs_lr${lr}" \
+      "${SWEEP_MAX_STEPS}" 0 "${SWEEP_LOG_EVERY}"
+  done
+  echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
+  for lr in ${LR_GRID}; do
+    f="${METRICS_DIR}/sweep_cs_lr${lr}.jsonl"
+    if [[ -f "${f}" ]]; then
+      echo "lr=${lr}: $(python - "${f}" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+values = [r.get("val_loss") for r in rows if r.get("val_loss") is not None]
+print(values[-1] if values else "n/a")
+PY
+)"
+    fi
+  done
+  echo
+  echo "别只看这张表：回到上面每档的 task_loss 轨迹，确认没有中途抬头/抖动/nan。"
+  echo "在都不发散的前提下，选边际收益已经塌缩的那个膝点，而不是末值最小的那个。"
+  echo "另外 val loss 在本线很不灵敏：监督 span 只有 7-8 个 token，且 val 是按行切的。"
+  echo "真要定 LR，跑完之后用 MODE=eval 比 commonsense_qa 的 acc_logprob 更可靠。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=train：正式训练 Model-CS
+# =============================================================================
+if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
+  if [[ -d "${CKPT}" ]]; then
+    echo "跳过训练：${CKPT} 已存在（删掉可重跑）"
+  else
+    train_one "${RUN}" "${EPOCHS}" "${LR}" "${CKPT}" 0 1
+  fi
+  echo "训练完成。checkpoint 是完整权重目录，可直接作为 Part 2 Stage 2 的起点："
+  echo "  --model_dir ${CKPT_DIR} --model_name ${RUN}"
+fi
+
+# =============================================================================
+# MODE=eval：base 与 Model-CS 各测八个常识测试集
+#
+# 一次 evaluate 调用只加载模型一次，所有指标共用。
+# 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
+# is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载
+# （parent 作 model_dir、目录名作 model_name），命令与 LoRA 线完全一致。
+# =============================================================================
+if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
+  if [[ ! -d "${CS_EVAL_DIR}" ]]; then
+    echo "缺评测数据目录: ${CS_EVAL_DIR}"
+    echo "在有网节点上准备（布局 <dir>/<task>/test.json）："
+    echo "  git clone --depth 1 https://github.com/AGI-Edgerunners/LLM-Adapters"
+    echo "  cp -r LLM-Adapters/dataset ${CS_EVAL_DIR}"
+    exit 1
+  fi
+
+  run_eval () {
+    local name="$1" ckpt="$2"
+    local -a ckpt_arg=()
+    if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
+
+    if [[ -f "${RESULTS_ROOT}/commonsense_qa/${name}/summary.json" && "${FORCE_EVAL}" != "1" ]]; then
+      echo "跳过评测 ${name}：已有 commonsense_qa summary（FORCE_EVAL=1 强制重评）"
+      return 0
+    fi
+    echo "==== eval ${name} (${EVAL_METRICS}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      "${ckpt_arg[@]}" --run_name "${name}" \
+      --metrics "${EVAL_METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --limit "${EVAL_LIMIT}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --cs_eval_dir "${CS_EVAL_DIR}" \
+      --cs_eval_tasks "${CS_EVAL_TASKS}" \
+      --cs_scoring "${CS_SCORING}" \
+      --cs_max_new_tokens "${CS_MAX_NEW_TOKENS}" \
+      --cs_batch_size "${CS_BATCH}" \
+      --cs_score_batch_size "${CS_SCORE_BATCH}" \
+      --dataset_path "${CS_DATASET}" \
+      --max_len "${MAXLEN}" \
+      --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+  }
+
+  for which in ${RUNS_TO_EVAL}; do
+    case "${which}" in
+      base) run_eval "base" "" ;;
+      trained)
+        if [[ -d "${CKPT}" ]]; then
+          run_eval "${RUN}" "${CKPT}"
+        else
+          echo "跳过 ${RUN}：checkpoint 不存在"
+        fi
+        ;;
+      *) echo "未知 run: ${which}" ;;
+    esac
+  done
+fi
+
+echo "========================================================================"
+echo "产物:"
+echo "  CS 池        : ${CS_DATASET}"
+echo "  replay 池    : ${REPLAY_DATASET}   (Part 2 用)"
+echo "  checkpoint   : ${CKPT}"
+echo "  评测         : ${RESULTS_ROOT}/commonsense_qa/<run>/summary.json"
+echo "  逐行输出     : ${RESULTS_ROOT}/commonsense_qa/<run>/responses.jsonl"
+echo "  汇总 csv     : ${RESULTS_ROOT}/commonsense_qa_summary.csv  (每 run 每 task 一行 + AVERAGE)"
+echo ""
+echo "怎么读结论:"
+echo "  主口径是 acc_logprob。Model-CS 的 AVERAGE 明显高于 base => Commonsense170k"
+echo "  确实教会了多选常识问答，这条线的 sanity check 通过。"
+echo "  同时看 base 的 random_baseline：logprob 打分下 base 应当在随机线附近或略高，"
+echo "  如果 base 已经很高，说明这批测试集对 1.7B 太容易，涨幅的解释空间会变小。"
+echo "  acc_gen 只能和 parse_rate 一起读：base 的 parse_rate 会很低（它不按格式作答），"
+echo "  那一栏的 accuracy 是正则撞出来的，不要单独引用。"
+echo "Job finished at: $(date)"

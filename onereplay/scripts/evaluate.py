@@ -2,10 +2,14 @@
 
     python -m onereplay.scripts.evaluate --metrics ifeval,multiif,commonsense ...
 
-Available metrics: ifeval, ifbench, followbench, multiif, commonsense, gsm8k,
-aime, math500, amc, humaneval, mbpp, direct_safety. Each metric writes
-<out_dir>/<metric>/<run_name>/summary.json plus an appended row in
+Available metrics: ifeval, ifbench, followbench, multiif, commonsense,
+commonsense_qa, gsm8k, aime, math500, amc, humaneval, mbpp, direct_safety. Each
+metric writes <out_dir>/<metric>/<run_name>/summary.json plus an appended row in
 <out_dir>/<metric>_summary.csv.
+
+commonsense and commonsense_qa are not the same measurement: the first is
+held-out SFT loss on the Commonsense170k pool, the second is accuracy on the
+eight LLM-Adapters test sets. Part 1 concludes from the second.
 """
 
 from __future__ import annotations
@@ -58,6 +62,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--map_cache_dir", type=str, default="")
+
+    # commonsense_qa accuracy: LLM-Adapters' dataset/<task>/test.json
+    parser.add_argument("--cs_eval_dir", type=str, default="")
+    parser.add_argument(
+        "--cs_eval_tasks",
+        type=str,
+        default="",
+        help="Comma-separated subset of boolq,piqa,social_i_qa,hellaswag,"
+        "winogrande,ARC-Easy,ARC-Challenge,openbookqa. Empty runs all eight.",
+    )
+    parser.add_argument(
+        "--cs_scoring",
+        type=str,
+        choices=["logprob", "gen", "both"],
+        default="both",
+        help="logprob ranks 'the correct answer is <label>' over the row's own "
+        "candidate set and is the reportable number; gen decodes and regex-"
+        "matches, which is only meaningful alongside its parse_rate.",
+    )
+    parser.add_argument("--cs_limit", type=int, default=0)
+    parser.add_argument("--cs_max_new_tokens", type=int, default=32)
+    parser.add_argument("--cs_batch_size", type=int, default=0)
+    # Smaller than the decoding batch on purpose: the scoring forward pass
+    # materializes a [batch, seq, 151936] logit tensor and reuses no KV cache.
+    parser.add_argument("--cs_score_batch_size", type=int, default=8)
 
     # ifeval / ifbench / multiif
     parser.add_argument("--ifeval_input", type=str, default="")

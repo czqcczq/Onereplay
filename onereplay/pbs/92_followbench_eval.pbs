@@ -1,0 +1,528 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_followbench
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 只跑 FollowBench，不训练，不评其它指标。
+#
+# 【FollowBench 是什么、为什么再加一个 IF bench】
+#   IFEval / IFBench 测的都是「单条指令里的可程序化约束」。FollowBench
+#   (Jiang et al., ACL 2024) 换了一个维度：把一条初始指令按**阶梯**加约束，
+#   level n = 初始指令 + n 个累加约束，一直到 level 5。所以它报的不是一个数，
+#   而是一条曲线——模型在第几级开始塌。三个指标:
+#     HSR  该 level 的全部约束都满足的比例
+#     SSR  单个约束的平均满足率（只有 judge 侧才和 HSR 不同，见下）
+#     CSL  从 level 1 起能连续满足几级
+#
+# 【本脚本只做一半：生成 + rule 判分】
+#   820 行里只有 350 行能程序化判分，另外 470 行必须过 LLM judge，而计算节点
+#   没有网络。所以沿用 direct_safety 的两段式：本作业解码全部 820 行、当场把
+#   350 行判完，另外 470 行连同**上游原样的 judge prompt** 落到
+#   judge_inputs.jsonl，由 scripts/judge_followbench.py 在有网的地方跑。
+#
+#   判分归属不是我们选的，是上游 rule_based_source 白名单定的:
+#     rule   350 行 / 70 组    example 40, content 12, situation 8, mixed 8, format 2
+#     judge  470 行 / 94 组    style 30, format 28, situation 14, content 13, mixed 9
+#
+#   关键：**没有任何一组混用两种判分方式**（164 组全查过）。所以 rule 这半边
+#   自己就能出完整的 HSR/SSR/CSL —— CSL 需要一组完整的 level 1..5 阶梯，而每个
+#   rule 组都是完整的。这也是 FollowBench 里确定性、可复现的那一半。
+#
+# 【读这张表的三条纪律】
+#   1) 本作业的数字覆盖 70/164 组，**不是 FollowBench 全量分数**。style 类
+#      rule 覆盖为 0，format 类只覆盖 2/30。不要写成「FollowBench = xx%」。
+#   2) example 类 40 组里有 2 组是退化的（metric 会在 summary.json 的
+#      example_degenerate_ladders 里报出来）:
+#        ladder 4  恒 0 分。模板 "{{'Response': '{answer}'}}" 过 check_match
+#                  变成 re.fullmatch，而 "." 不跨换行，gold 答案是多行法案文本，
+#                  照抄 gold 也是 0/5。
+#        ladder 21 恒满分。模板就是裸 "{answer}"，正则退化成 ".*"，任何不含
+#                  换行的输出都过全 5 级。
+#      即 example 的 HSR 有 2.5% 打不到、另有 2.5% 是白送的。
+#   3) **报 FollowBench 必须同时报响应长度中位数**（summary 里的
+#      response_words_p50）。这是 IFBench 那次诊断留下的口径（见
+#      results_log/2026-09-12 第 8c 节）：SFT 必然改变输出长度，而 format /
+#      style 这类约束有相当一部分其实在量长度。本脚本的汇总表默认带这一列。
+#
+# -----------------------------------------------------------------------------
+# 前置条件（比 73_ifbench_eval.pbs 少两条，因为**零外部依赖**）:
+#
+#   1) 仓库同步到位即可。判分器和 820 条数据都 vendored 在
+#      onereplay/third_party/followbench/（上游 commit 6278f4c，只改了 import
+#      行，见那边的 README.md）。
+#      - 不需要 pip install 任何东西
+#      - 不需要下 NLTK 语料（FollowBench 的 checker 一个都不用）
+#      - 唯一的第三方 import 是 matplotlib，只被我们不调用的绘图函数用到，
+#        已经包成 try/except
+#
+#   2) checkpoint 就位（默认找 Part 1 IF 线的产物），日志目录存在:
+#        mkdir -p ${REPO_ROOT}/logs
+#
+# -----------------------------------------------------------------------------
+# 用法:
+#   # 默认：评 base + Part 1 IF 线的 trained checkpoint，跳过已有结果
+#   qsub onereplay/pbs/92_followbench_eval.pbs
+#
+#   # 冒烟：每类只取 2 组阶梯（= 60 行），确认链路通、看 peak memory
+#   qsub -v GROUP_LIMIT=2 onereplay/pbs/92_followbench_eval.pbs
+#
+#   # 只跑 example 类（200 行，纯 rule 判分，最贴近「指定格式输出」那个问题）
+#   qsub -v FB_CATEGORIES=example onereplay/pbs/92_followbench_eval.pbs
+#
+#   # 指定 run（LR 要和训练时一致，RUN 名里带 lr）
+#   qsub -v LR=5e-5,SEED=1 onereplay/pbs/92_followbench_eval.pbs
+#
+#   # 评任意目录下的 checkpoint
+#   qsub -v RUNS=base,ADAPTER=/path/to/ckpt,OUT_NAME=my_run \
+#     onereplay/pbs/92_followbench_eval.pbs
+#
+#   # 已有 summary.json 也强制重评
+#   qsub -v FORCE_EVAL=1 onereplay/pbs/92_followbench_eval.pbs
+#
+# 预计耗时: 820 行 / 2048 token 预算。这是 IFBench 300 行的 2.7 倍，但 prompt
+#   长度分布不一样（见下面 BATCH 那段注释），所以按你 IFBench 同预算的实测时间
+#   ×3 估，别按 ×2.7。walltime 24h 对 1.7B 是大量余裕。
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（与其它 pbs 脚本保持一致）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/92_followbench_eval.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  # 这里没有 NLTK_DATA —— FollowBench 不用语料，这是它比 IFBench 少的一条前置。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT CKPT_DIR
+    SEED LR RUN RUNS ADAPTER OUT_NAME OUT_SUFFIX
+    FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH GROUP_LIMIT
+    WITH_BASE FORCE_EVAL
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径（默认对准 Part 1 IF 线）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_if}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+# ---- 评测参数 ----
+SEED="${SEED:-1}"
+LR="${LR:-5e-5}"                     # 只用来拼 RUN 名，必须和训练时一致
+FB_DATA="${FB_DATA:-}"               # 空 = 用 vendored 的 third_party/followbench/data
+FB_CATEGORIES="${FB_CATEGORIES:-}"   # 空 = 六类全跑
+FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-2048}"
+# BATCH=16 与 IFBench 对齐，因为 820 行里 720 行的 prompt 很短
+# （content/situation/style/format/mixed 的 P90 ≤ 599 tok, max 1235）。
+# 但 example 类是异类：P50=596, P90=2516, max=5019 tok，因为 few-shot 示例是
+# 内联在 instruction 里的。batched_generate 按长度排序分桶，所以最长的那批会
+# 聚在一起 —— batch=16 时最坏一步是 16×(5019+2048) ≈ 113k token 的 KV。
+# 真要 OOM 就降到 8，或者用 FB_CATEGORIES=example 把它单独跑。
+# 全体 max 5019 tok，离 32k context 很远，不会截断输入。
+FB_BATCH="${FB_BATCH:-16}"
+# 冒烟用。按**组**取（每类前 N 个 example_id），绝不按行 —— CSL 和 rule 侧的
+# 分母都假设一组完整的 level 1..5，按行截会算错分母而且不报错。
+GROUP_LIMIT="${GROUP_LIMIT:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+WITH_BASE="${WITH_BASE:-1}"
+OUT_SUFFIX="${OUT_SUFFIX:-}"
+
+RUN_TRAINED="part1_if_lr${LR}_seed${SEED}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 依赖自检：vendored 判分器能 import 吗、820 条数据齐吗、rule/judge 分布对吗。
+#   放在加载模型之前。这里没有 pip 依赖要查，查的是 vendored 副本有没有被
+#   同步漏、或者被换成了别的版本 —— 那会无声地改判分归属。
+# ---------------------------------------------------------------------------
+set +x
+echo "==== 依赖自检 ===="
+python - <<'PY'
+import sys
+
+from onereplay.eval.metrics.followbench import (
+    CATEGORIES,
+    DEGENERATE_EXAMPLE_LADDERS,
+    assert_scorable,
+    default_data_dir,
+    read_rows,
+)
+
+rows, ladders = read_rows(default_data_dir(), CATEGORIES)
+rule = [r for r in rows if r.mode == "rule"]
+judge = [r for r in rows if r.mode == "judge"]
+rule_groups = {(r.category, r.example_id) for r in rule}
+judge_groups = {(r.category, r.example_id) for r in judge}
+
+print(f"数据        : {default_data_dir()}")
+print(f"行数        : {len(rows)} (rule {len(rule)} / judge {len(judge)})")
+print(f"阶梯组      : {len(ladders)} (rule {len(rule_groups)} / judge {len(judge_groups)})")
+
+problems = []
+if len(rows) != 820:
+    problems.append(f"预期 820 行，实际 {len(rows)}")
+if (len(rule), len(judge)) != (350, 470):
+    problems.append(f"预期 rule/judge = 350/470，实际 {len(rule)}/{len(judge)}")
+if (len(rule_groups), len(judge_groups)) != (70, 94):
+    problems.append(f"预期组数 70/94，实际 {len(rule_groups)}/{len(judge_groups)}")
+if rule_groups & judge_groups:
+    problems.append(f"有组混用两种判分: {sorted(rule_groups & judge_groups)[:5]}")
+if problems:
+    sys.exit(
+        "vendored FollowBench 与本脚本预期不一致:\n  "
+        + "\n  ".join(problems)
+        + "\n判分归属变了，分数会无声偏移。核对 "
+        "onereplay/third_party/followbench/README.md 里记的上游 commit。"
+    )
+
+assert_scorable(rows, ladders)   # 缺 checker / 阶梯有洞都会在这里报出来
+print(f"退化阶梯    : example {sorted(DEGENERATE_EXAMPLE_LADDERS)} (已知，summary 里会单列)")
+print("零外部依赖  : 不需要 pip install，也不需要 NLTK 语料")
+PY
+echo "自检通过"
+set -x
+
+# ---- 要评的 run ----
+if [[ -z "${RUNS:-}" ]]; then
+  if [[ -n "${RUN:-}" ]]; then
+    RUNS="${RUN}"
+  else
+    RUNS="${RUN_TRAINED}"
+  fi
+fi
+# base 的 adapter 路径是空串：evaluate.py 认这个，直接加载裸模型。
+if [[ "${WITH_BASE}" == "1" && " ${RUNS} " != *" base "* ]]; then
+  RUNS="base ${RUNS}"
+fi
+
+if [[ -z "${RUNS// /}" ]]; then
+  echo "没有可评的 run（RUNS 为空且 WITH_BASE=0）"
+  exit 1
+fi
+
+if [[ "${GROUP_LIMIT}" != "0" ]]; then
+  echo "!! GROUP_LIMIT=${GROUP_LIMIT}：冒烟模式，产出的 summary.json 只覆盖每类前 ${GROUP_LIMIT} 组，不是正式结果。"
+fi
+
+resolve_adapter () {
+  local run=$1
+  if [[ "${run}" == "base" ]]; then
+    echo ""
+    return
+  fi
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  # 单 run 时 ADAPTER 可以直接指到任意目录；多 run 时按约定去 CKPT_DIR 找。
+  if [[ -n "${ADAPTER:-}" && "${n}" -eq 1 ]]; then
+    echo "${ADAPTER}"
+    return
+  fi
+  echo "${CKPT_DIR}/${run}"
+}
+
+resolve_out_name () {
+  local run=$1
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${OUT_NAME:-}" && "${n}" -eq 1 ]]; then
+    echo "${OUT_NAME}"
+    return
+  fi
+  echo "${run}${OUT_SUFFIX}"
+}
+
+# ---------------------------------------------------------------------------
+# 前置：谁会跑、谁会跳过、为什么跳过。缺 checkpoint 只跳过这一行，不整作业退出。
+# ---------------------------------------------------------------------------
+set +x
+echo "========================================================================"
+echo "FollowBench（只评这一个指标；生成 + rule 判分，judge 那半留给后续脚本）"
+echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  结果树   = ${RESULTS_ROOT}"
+echo "  数据     = ${FB_DATA:-<vendored third_party/followbench/data, 820 行>}"
+echo "  类别     = ${FB_CATEGORIES:-<全部六类>}"
+echo "  解码     = 贪心, ${FB_MAX_NEW_TOKENS} token, batch ${FB_BATCH}, seed ${SEED}"
+echo "------------------------------------------------------------------------"
+printf "%-56s %s\n" "run" "状态"
+PENDING=0
+for run in ${RUNS}; do
+  adapter="$(resolve_adapter "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+  if [[ "${run}" != "base" && ! -d "${adapter}" ]]; then
+    printf "%-56s %s\n" "${run}" "!! 缺 checkpoint: ${adapter}"
+    continue
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/followbench/${out_name}/summary.json" ]]; then
+    printf "%-56s %s\n" "${run}" "已有结果，跳过"
+  else
+    printf "%-56s %s\n" "${run}" "待评 -> followbench/${out_name}"
+    PENDING=$((PENDING + 1))
+  fi
+done
+echo "------------------------------------------------------------------------"
+echo "待评 ${PENDING} 个。820 行是 IFBench 300 行的 2.7 倍，按你 IFBench 实测 ×3 估。"
+echo "========================================================================"
+set -x
+
+# ---------------------------------------------------------------------------
+# 评测
+# ---------------------------------------------------------------------------
+eval_one () {
+  local run=$1
+  local adapter out_name
+  adapter="$(resolve_adapter "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+
+  if [[ "${run}" != "base" && ! -d "${adapter}" ]]; then
+    echo "跳过 ${run}：缺 checkpoint ${adapter}"
+    return 0
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/followbench/${out_name}/summary.json" ]]; then
+    echo "已有结果，跳过: ${RESULTS_ROOT}/followbench/${out_name}/summary.json"
+    return 0
+  fi
+
+  echo "==== eval FollowBench: ${run} -> ${RESULTS_ROOT}/followbench/${out_name} ===="
+  # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
+  # is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
+  local -a ckpt_arg=()
+  if [[ -n "${adapter}" ]]; then ckpt_arg=(--adapter_path "${adapter}"); fi
+  # 空值不传 flag，让 metric 用自己的默认（vendored 数据 / 六类全跑）。
+  local -a data_arg=()
+  if [[ -n "${FB_DATA}" ]]; then data_arg=(--followbench_data "${FB_DATA}"); fi
+  local -a cats_arg=()
+  if [[ -n "${FB_CATEGORIES}" ]]; then cats_arg=(--followbench_categories "${FB_CATEGORIES}"); fi
+
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    "${ckpt_arg[@]}" --run_name "${out_name}" \
+    --metrics followbench --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --followbench_max_new_tokens "${FB_MAX_NEW_TOKENS}" \
+    --followbench_batch_size "${FB_BATCH}" \
+    --followbench_group_limit "${GROUP_LIMIT}" \
+    "${data_arg[@]}" "${cats_arg[@]}"
+}
+
+for run in ${RUNS}; do
+  eval_one "${run}"
+done
+
+# ---------------------------------------------------------------------------
+# 后置：rule 侧的 per-level 表 + 响应长度 + judge 待办清单。
+# ---------------------------------------------------------------------------
+set +x
+python - "${RESULTS_ROOT}" "${OUT_SUFFIX}" ${RUNS} <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+suffix = sys.argv[2]
+runs = sys.argv[3:]
+
+rows = []
+for run in runs:
+    name = f"{run}{suffix}" if suffix else run
+    path = root / "followbench" / name / "summary.json"
+    if path.is_file():
+        rows.append((name, json.loads(path.read_text(encoding="utf-8"))))
+
+if not rows:
+    print("\n没有可汇总的 summary.json")
+    raise SystemExit(0)
+
+print()
+print("=" * 104)
+print("FollowBench rule 侧（确定性判分，覆盖 70/164 组）。HSR 单位 %，CSL 是 0-5 的级数。")
+print("=" * 104)
+print(
+    f"{'run':<34}{'L1':>7}{'L2':>7}{'L3':>7}{'L4':>7}{'L5':>7}"
+    f"{'CSL':>7}{'words':>8}{'empty':>7}"
+)
+for name, payload in rows:
+    cells = "".join(
+        f"{payload.get(f'rule_hsr_level_{level}', 0) * 100:>7.1f}" for level in range(1, 6)
+    )
+    print(
+        f"{name:<34}{cells}{payload.get('rule_csl', 0):>7.2f}"
+        f"{payload.get('response_words_p50', 0):>8}{payload.get('response_empty', 0):>7}"
+    )
+print()
+print("words = 响应词数中位数。**必须连着 HSR 一起读**：SFT 会改输出长度，而 format/")
+print("style 这类约束有相当一部分其实在量长度（见 results_log/2026-09-12 第 8c 节）。")
+
+# example 类单列：200 行纯 rule 判分，是这半边里最贴近「指定格式输出」的部分。
+print()
+print("=" * 104)
+print("example 类单列（40 组 / 200 行，check_match 全字符串匹配，最严格）")
+print("=" * 104)
+print(f"{'run':<34}{'L1':>7}{'L2':>7}{'L3':>7}{'L4':>7}{'L5':>7}{'CSL':>7}")
+for name, payload in rows:
+    cells = "".join(
+        f"{payload.get(f'example_hsr_level_{level}', 0) * 100:>7.1f}" for level in range(1, 6)
+    )
+    print(f"{name:<34}{cells}{payload.get('example_csl', 0):>7.2f}")
+print()
+print("天花板是 97.5% 不是 100%：ladder 4 恒 0（多行 gold 撞上 re.fullmatch 的 '.'），")
+print("ladder 21 恒满分（模板退化成 '.*'）。两组各占 2.5%，detail 里有 per-ladder 结果。")
+
+# 按类别拆开。整体数字被 example 主导（40/70 组），单看会误读。
+print()
+print("=" * 104)
+print("按类别（rule 侧 HSR %，括号是该类的 rule 组数 / FollowBench 总组数）")
+print("=" * 104)
+for name, payload in rows:
+    detail = json.loads(
+        (root / "followbench" / name / "summary.json").read_text(encoding="utf-8")
+    )
+    per_category = detail.get("per_category_rule", {})
+    combined = detail.get("combined_groups_per_category", {})
+    if not per_category:
+        continue
+    print(f"\n{name}")
+    print(f"  {'category':<12}{'组':>10}{'L1':>7}{'L2':>7}{'L3':>7}{'L4':>7}{'L5':>7}{'CSL':>7}")
+    for category, entry in sorted(per_category.items()):
+        cells = "".join(
+            f"{entry['hsr'].get(f'level_{level}', 0) * 100:>7.1f}" for level in range(1, 6)
+        )
+        coverage = f"{entry['groups']}/{combined.get(category, entry['groups'])}"
+        print(f"  {category:<12}{coverage:>10}{cells}{entry['csl']:>7.2f}")
+    pending = detail.get("judge_pending", {})
+    if pending:
+        total_rows = sum(item["rows"] for item in pending.values())
+        words = detail.get("judge_prompt_words", {})
+        print(
+            f"  judge 待判 : {total_rows} 行 / "
+            + ", ".join(f"{c} {i['groups']}组" for c, i in sorted(pending.items()))
+        )
+        print(
+            f"               judge prompt 词数 p50={words.get('p50', 0)} "
+            f"max={words.get('max', 0)} 合计={words.get('total', 0):,}"
+        )
+PY
+
+echo "========================================================================"
+echo "产物:"
+for run in ${RUNS}; do
+  out_name="$(resolve_out_name "${run}")"
+  d="${RESULTS_ROOT}/followbench/${out_name}"
+  if [[ -f "${d}/summary.json" ]]; then
+    echo "  ${d}/"
+    echo "      summary.json            rule 侧 HSR/SSR/CSL + 响应长度 + judge 待办"
+    echo "      responses.jsonl         全部 820 行的解码结果"
+    echo "      eval_results_rule.jsonl 350 行的逐行判分"
+    echo "      judge_inputs.jsonl      470 行 + 上游原样的 judge prompt"
+  fi
+done
+echo "  ${RESULTS_ROOT}/followbench_summary.csv   (所有 run 一行一条)"
+echo ""
+echo "下一步（judge 那半边，要在有网的地方跑）:"
+echo "  python -m onereplay.scripts.judge_followbench \\"
+echo "    --input ${RESULTS_ROOT}/followbench/<run>/judge_inputs.jsonl \\"
+echo "    --output ${RESULTS_ROOT}/followbench/<run>/judge_outputs.jsonl --api_key ..."
+echo "然后 score_followbench.py 合并两半，出完整的 164 组 HSR/SSR/CSL。"
+echo ""
+echo "怎么读本作业的结论: trained 的 example L1-L5 明显高于 base => Conifer 教会了"
+echo "「按指定模板输出」；若 HSR 涨而 words 同时大幅缩短，先怀疑是长度漂移而不是能力。"
+echo "Job finished at: $(date)"

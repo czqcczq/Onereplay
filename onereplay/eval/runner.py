@@ -60,6 +60,7 @@ def get_metric(name: str) -> Metric:
         "followbench": "onereplay.eval.metrics.followbench:FollowBenchMetric",
         "multiif": "onereplay.eval.metrics.multiif:MultiIFMetric",
         "commonsense": "onereplay.eval.metrics.commonsense:CommonsenseLossMetric",
+        "commonsense_qa": "onereplay.eval.metrics.commonsense_qa:CommonsenseQAMetric",
         "gsm8k": "onereplay.eval.metrics.gsm8k:GSM8KMetric",
         "aime": "onereplay.eval.metrics.aime:AIMEMetric",
         "humaneval": "onereplay.eval.metrics.humaneval:HumanEvalMetric",
