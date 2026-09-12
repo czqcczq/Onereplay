@@ -1,0 +1,594 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N p1_math
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# Part 1 / Math 线: Qwen3-1.7B-Base --OpenR1--> Model-Math，评 GSM8K + MATH-500
+#
+#     Base ---- Openr1-Math-46k-8192 (45792 条长推理) ----> Model-Math
+#     评测: GSM8K, MATH-500          对照: base
+#
+# capability forgetting 实验的 sanity check 之一。只回答一个问题：
+#
+#     OpenR1 能不能把 mathematical reasoning 教起来？
+#
+# 必须先确认能，Part 2 里测到的 Math 下降才叫遗忘。
+#
+# IF 线是 90_part1_if_conifer.pbs。两条线拆开管，因为这条线的 maxlen 是 IF 的 4 倍、
+# batch 只有 1/4，超参和显存预算完全是另一套。不做交叉评测。
+#
+# -----------------------------------------------------------------------------
+# 【为什么是全量微调，而不是 LoRA】
+#
+# 工程：train.py 没有 --adapter_path / --resume_from，模型一律从
+#   --model_dir/--model_name 拼路径加载。而 trainers/base.py 的 save 分支是
+#   self.model.save_pretrained(save_path)，全量微调写的是**完整权重 + tokenizer**，
+#   于是 Part 2 可以把上一阶段的输出目录直接当 base 接着训。LoRA 存的是 adapter，
+#   做不到，得先 merge。
+#
+# 科学：LoRA 的低秩约束本身就限制权重漂移、天然抗遗忘，会把「方法的效果」和
+#   「LoRA 的隐式正则」混在一起。全量是干净的对照底座。
+#
+# -----------------------------------------------------------------------------
+# 【LR 不能照搬 LoRA 的 1e-4，也不该照搬 IF 线选出来的值】
+#
+# 44 号脚本记录过：全量在 lr=1e-5 下 val loss ep3 = 0.07364，比 LoRA (lr=1e-4) 的
+# 0.04494 还差 64%，是欠训练。所以起点定在 2e-5，但先 MODE=lr_sweep 用数据选。
+#
+# 而且这条线和 IF 线的最优 LR 没有理由相同：Conifer 的答案中位约 330 token，这里
+# strip_tags 后中位约 2726 token，单步的有效监督 token 差近一个量级，梯度尺度完全
+# 不是一回事。两条线各 sweep 一次。
+#
+# -----------------------------------------------------------------------------
+# 【Part 1 不需要采 C】
+#
+# build_regularizer 的加载条件是
+#     replay_lambda > 0  或  (measure_replay_when_lambda_zero==1 且 penalty 文件存在)
+# 所以 --replay_lambda 0 --measure_replay_when_lambda_zero 0 返回 None，既不读 cov
+# 文件，也不存 W0 快照。纯 vanilla，省掉一个 Stage 和 W0 那 3.4 GB。
+#
+# -----------------------------------------------------------------------------
+# 【<think> 必须 strip_tags：否则 Math 分数会假阴性】
+#
+# 这是这条线最容易踩、而且踩了不报错的坑。
+#
+# eval/generation.py 把所有生成式评测的 prompt 都渲染成 enable_thinking=False。在
+# Qwen3 的 chat template 下，这会在 prompt 末尾放一个**空的** <think></think> 块，
+# 等于告诉模型「思考已经结束，直接作答」。
+#
+# 而 OpenR1 的 target 自带 <think>…</think> 长推理。如果原样保留：
+#   训练时模型学到的是「先开 think 块，在里面推理」
+#   评测时 think 块已经被关掉了 -> 学到的能力发不出来
+# 结果会读成「OpenR1 没教会数学」，而真实原因是评测 prompt 掐掉了 thinking。
+#
+# 所以 --think_handling strip_tags：去掉 <think>/</think> 两个标签、**保留推理正文**，
+# 让答案变成「一段长推理 + 最后一个 \boxed{}」。这正好是 math500.py 的 prompt
+# （"Reason step by step, then give the final answer as \boxed{...}"）要求的形态，
+# 打分也只看最后一个 \boxed 跨度，评测路径一行都不用改。
+#
+# 顺带一个实测：保留标签还会破坏 label masking。tokenizer_to_ids 的做法是
+#     labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+# 它假设 prompt_ids 是 full_ids 的前缀。带 <think> 的 target 在共享 21 个 token 后
+# 分叉，而 prompt_ids 长到 25，于是推理开头 4 个 token 被误标成 -100。4 个 token
+# 在 2000+ 的 CoT 里可以忽略，但它是同一个 prompt/answer 错配的症状。
+#
+# --instruction_style eval_aligned 是同一个道理：训练用的 user turn 直接采用
+# math500.py 的措辞，训练 prompt 就是评测 prompt。数据集自带的那条 762 字符 R1
+# system 指令被丢掉（apply_train_template 也没有 system 位），因为它要求的正是
+# 被 strip 掉的那对标签。
+#
+# -----------------------------------------------------------------------------
+# 【eval_aligned 只对齐 MATH-500，不对齐 GSM8K —— 这是有意的】
+#
+# 两个评测的 prompt 本来就不是一套：
+#   math500.build_prompt : "Reason step by step, then give the final answer as \boxed{...}"
+#   gsm8k.build_prompt   : "Reason briefly, then end your answer with '#### ' + 最终数字"
+#
+# eval_aligned 对齐的是前者。于是这两个指标读出来的含义不同：
+#   MATH-500 = 同分布的能力上限（训练/评测同一套指令和答案格式）
+#   GSM8K    = 跨格式泛化（模型要在没见过的 '####' 指令下仍然做对）
+#
+# GSM8K 的打分不会因此假阴性：predicted_answer 在响应里找不到 '####' 时，会退回
+# 取全文最后一个数字，而 \boxed{18} 结尾的响应最后一个数字正是 18。GSM8K 的 gold
+# 全是整数，这条退路够用。
+#
+# 唯一要留神的是：如果模型在 \boxed{} 之后还继续写了带数字的话，最后一个数字会取错。
+# 万一 GSM8K 明显低于 MATH-500，先去 responses.jsonl 里翻几条原文确认是这个原因，
+# 再下"数学能力没学到"的结论。
+#
+# -----------------------------------------------------------------------------
+# 【显存与 batch：为什么是 BATCH=1，而且这不损失速度】
+#
+# 1.7B 全量 + Adam（torch.optim.Adam，状态跟参数 dtype 走 bf16）的常驻部分：
+#     权重 bf16 3.4 + 梯度 bf16 3.4 + 两个动量 6.9 ≈ 13.8 GB
+# 剩下全是激活。collator 是 DataCollatorForTokenClassification，按 **batch 内最长**
+# 动态补齐，所以激活的上界由 BATCH x MAXLEN 决定：
+#     IF 线   4 x 1536 = 6144 token/micro-batch
+#     Math 线 1 x 8192 = 8192 token/micro-batch
+# 两条线刻意取在同一量级，IF 能跑 Math 就能跑。
+#
+# 关键是**加大 batch 换不到速度**。results_log 的 batch 饱和测试（Job 2831163，
+# 同一个模型同一张卡）实测：micro-batch=8 x max_len 512、每步约 908 token 时 GPU
+# 吞吐已经吃满，加到 16 总时间比 1.015、tokens/s 反而从 10181 掉到 10026，只多花
+# 18 GB 显存。饱和取决于**每步 token 数**而不是样本数，而本线 BATCH=1 时每步已经
+# 约 3900 token（P50），是那个饱和点的 4 倍多。所以 BATCH=1 不是妥协，是免费的安全。
+#
+# 那次测量的显存斜率（约 20 MB/token）不能照搬到这里：它是 LoRA、max_len=512、
+# 短样本分布下拟合的，padding 行为完全不同。真实峰值只能测——这就是 MODE=smoke
+# 的用途，跑之前先看它报的 peak memory。
+#
+# 仓库没有 gradient checkpointing、没有 DDP（trainers/base.py 只有一个 self.device）。
+# 等 Part 2 要在 Math 的 batch 里混入 Conifer replay 行时再重新算这一节。
+#
+# -----------------------------------------------------------------------------
+# 【时间预算：这条线比 IF 贵 17 倍，先算再提交】
+#
+# 实测 tok/epoch（全量 45792 行，MAXLEN=8192）= 190.0M，而 IF 线是 11.4M。
+#
+# 吞吐没有全量微调的实测值（上面那 10181 token/s 是 LoRA + 短序列）。两点会让它更慢：
+# 优化器要更新 1.72e9 个参数（但 ACCUM=64 摊薄后可忽略），以及 T=8192 时 attention
+# 的 O(T^2) 计算已占到线性层的一半以上，单 token 成本约 1.5x。按 5-8k token/s 估：
+#     1 epoch ≈ 6.6-10.5 h      2 epoch ≈ 13-21 h
+#
+# 所以：正式训练**必须** DO_EVAL=0 单独占一个作业，评测另开一个。想稳妥先跑 1 epoch
+# （EPOCHS=1），它对"OpenR1 能不能教会数学"这个 sanity check 已经足够；确认有效再考虑
+# 加第二个 epoch。想更快先用 MAX_TRAIN_SAMPLES 子采样把链路跑通。
+#
+# -----------------------------------------------------------------------------
+# 【MAXLEN 与左截断】
+#
+# tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，**保尾丢头**。这条线超长的
+# 样本丢掉的是开头的题目，留下推理尾巴，模型于是学会「凭空续写推理」。loss 曲线
+# 看不出异常。
+#
+# 已在本地对**全部 45792 行**做过实测（Qwen3 tokenizer + 同一套 chat template +
+# strip_tags/eval_aligned），所以 MAXLEN 不用再猜：
+#
+#   全序列  P50=3900  P75=5551  P90=6957  P95=7524  P99=8004  max=9004
+#   答案    P50=3767  P75=5416  P90=6819                      max=7993
+#   题目    P50= 104  P90= 172                                max=2078
+#
+#   max_len  截断行数   占比    题目全丢   tok/epoch
+#      1024    45467  99.3%      45238      46.8M
+#      2048    39499  86.3%      38412      91.0M
+#      3072    29996  65.5%      28845     126.6M
+#      4096    21359  46.6%      20326     152.8M   <- 曾经的默认值，会毁掉数据
+#      6144     8235  18.0%       7560     182.2M
+#      8192       25   0.1%          0     190.0M   <- 现在的默认值
+#     10240        0   0.0%          0     190.0M
+#
+# 「题目全丢」= 答案本身就填满了预算、左截断后一个题目 token 都不剩的行数。4096 下
+# 有 20326 行（44.4%）落在这一类，模型会在近一半的数据上学到"无题目续写推理"。
+# 这个错误不会报错、loss 曲线也正常，只会让 Part 2 测到的"遗忘"无法解释。
+#
+# 8192 下只剩 25 行超长（数据集本身按 8192 筛过，超出的是 prompt 前缀和模板开销），
+# 且题目全丢为 0，代价只是 tok/epoch 从 182M 涨到 190M。
+#
+# MODE=data 会在集群上重算这张表（用的是同一套逻辑）。如果哪天换了 tokenizer、改了
+# instruction_style 或 think_handling，必须重看，不能沿用上面这组数。
+#
+# -----------------------------------------------------------------------------
+# 【评测预算必须大于训练答案长度】
+#
+# 训练答案实测 P50=3767 / P75=5416 / P90=6819 token，而 evaluate.py 的默认
+# max_new_tokens 只有 1024——那会把绝大多数正确推理在写到 \boxed{} 之前掐断，打分器
+# 找不到 boxed 跨度，直接读成"不会做"。
+#
+# MATH_MAX_NEW_TOKENS 默认给 4096，刚好覆盖过半（P50=3767）并留出余量。上半部分仍会
+# 被截断，这是和评测耗时的折中：解码时间正比于这个预算，而它已经是本线最慢的一步。
+#
+# 判读规则：如果 MATH-500 低得可疑，**先去 ${RESULTS_ROOT}/math500/<run>/responses.jsonl
+# 数一下有多少条响应结尾没有 \boxed{}**。如果占比高，是预算不够而不是能力不行，
+# 把 MATH_MAX_NEW_TOKENS 提到 6144（覆盖到 P90 附近）重评。
+#
+# -----------------------------------------------------------------------------
+# 【前置】计算节点无外网，以下都要先在有网节点备好
+#   1) 模型      ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
+#   2) OpenR1    ${OPENR1_PARQUET}               (openr1.parquet, 232MB, 单文件)
+#                huggingface-cli download Elliott/Openr1-Math-46k-8192 --repo-type dataset
+#   3) 评测集    ${GSM8K_DATA} / ${MATH500_DATA} (prepare_math_data.py 产出的 jsonl)
+#   4) mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 【用法】务必按顺序，2 之前不要提交长作业
+#   # 0) 建池 + 复算长度报告（CPU 即可，约 10-15 min）
+#   qsub -v MODE=data onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 1) 冒烟：20 步。这一步的**唯一目的是看 peak memory**——8192 长序列下单卡到底
+#   #    占多少，离卡容量还有多少余量。没跑过它不要提交正式训练。
+#   qsub -v MODE=smoke onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 2) 选 LR（150 步 x 4 档，长序列每步都慢，约 2-4 h）
+#   qsub -v MODE=lr_sweep onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 3) 正式训练。DO_EVAL=0 是必须的：1 epoch 已约 7-10 h，塞不进评测。
+#   #    建议先只跑 1 个 epoch，确认分数起来了再考虑加第二个。
+#   qsub -v MODE=train,LR=2e-5,EPOCHS=1,DO_EVAL=0 onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 4) 评测另开一个作业（约 4-8 h，4096 token 预算下解码很慢）
+#   qsub -v MODE=eval,LR=2e-5 onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 想先便宜地把整条链路跑通，用子集（约 1-2 h）
+#   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_part1_math_openr1.pbs
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/91_part1_math_openr1.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_p1math_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_p1math_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_p1math_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    OPENR1_PARQUET MATH_DATASET
+    MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
+    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES
+    THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED
+    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS
+    EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# ---- 路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_math}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+OPENR1_PARQUET="${OPENR1_PARQUET:-${REPO_ROOT}/datasets/openr1/openr1.parquet}"
+MATH_DATASET="${MATH_DATASET:-${RESULTS_ROOT}/datasets/openr1_math}"
+
+# ---- 模式 ----
+MODE="${MODE:-data}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+SEED="${SEED:-1}"
+
+# ---- 数据转换选项 ----
+# strip_tags：去 <think> 标签、保留推理正文。与 enable_thinking=False 的评测路径一致，
+# 换成 keep 会让 Math 分数假阴性（见文件头）。
+THINK_HANDLING="${THINK_HANDLING:-strip_tags}"
+# eval_aligned：训练 prompt 直接用 math500.py 的措辞，训练/评测同口径。
+INSTRUCTION_STYLE="${INSTRUCTION_STYLE:-eval_aligned}"
+# 1 会丢掉答案里没有 \boxed{} 的行（打分器只认这个跨度）。默认 0，先看比例再决定。
+REQUIRE_BOXED="${REQUIRE_BOXED:-0}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+
+# ---- 训练超参（Math 线专用）----
+# seqlen 是 IF 线的 4 倍，BATCH 相应降到 1/4；ACCUM 仍是 64 行/更新，与 IF 线可比。
+EPOCHS="${EPOCHS:-2}"
+LR="${LR:-2e-5}"
+# BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
+# 64 行"不成立。取 1 的理由见文件头「显存」与「饱和点」两节：8192 长序列下单卡
+# 一次只放一条，靠 ACCUM=64 把有效 batch 补回来。
+BATCH="${BATCH:-1}"
+ACCUM="${ACCUM:-64}"
+# 实测（全量 45792 行，Qwen3 tokenizer + chat template）：全序列 P50=3900 P90=6957
+# P99=8004 max=9004。4096 会截断 46.6%、其中 20326 行连题目都不剩，绝不能用。
+MAXLEN="${MAXLEN:-8192}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+# 长序列的 val 也贵，取小一点；跨 run 比较时必须保持同一个值。
+MAXVAL="${MAXVAL:-200}"
+# 全量微调时 --target_modules 只决定正则覆盖哪些层，不决定哪些参数训练（全都训）。
+# 本线没有正则，传什么都不影响结果；与 44 号保持一致便于对照。
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+
+# ---- LR 搜索 / 冒烟 ----
+LR_GRID="${LR_GRID:-5e-6 1e-5 2e-5 5e-5}"
+# 长序列每步慢，步数给少一点也够比出趋势
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-150}"
+SMOKE_STEPS="${SMOKE_STEPS:-20}"
+
+# ---- 评测（只测 Math 能力）----
+GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math_eval/gsm8k_test.jsonl}"
+MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math_eval/math500_test.jsonl}"
+# 训练答案实测 P50=3767。低于这个数会把正确推理在 \boxed{} 之前掐断，读成不会做。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+EVAL_BATCH="${EVAL_BATCH:-16}"
+# 3072 token 的 KV cache 很占地方，math 的解码 batch 单独给小值
+MATH_BATCH="${MATH_BATCH:-8}"
+
+RUN="part1_math_lr${LR}_seed${SEED}"
+CKPT="${CKPT_DIR}/${RUN}"
+RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
+
+mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
+  "${DATASET_CACHE}" "${RESULTS_ROOT}/map_cache"
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+
+echo "========================================================================"
+echo "Part 1 / Math 线: Base --OpenR1--> Model-Math   (full finetune, vanilla)"
+echo "  MODE           : ${MODE}"
+echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
+echo "  results root   : ${RESULTS_ROOT}"
+echo "  数据池         : ${MATH_DATASET}"
+echo "  think / prompt : ${THINK_HANDLING} / ${INSTRUCTION_STYLE}"
+echo "                   (评测侧 enable_thinking=False，strip_tags 才对得上)"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  评测           : gsm8k, math500   (对照 base, max_new_tokens=${MATH_MAX_NEW_TOKENS})"
+echo "  checkpoint     : ${CKPT}"
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置，不跑。"
+  exit 0
+fi
+
+# =============================================================================
+# 共用训练封装：vanilla 全量微调
+#   --full_finetune 1
+#   --replay_lambda 0 --measure_replay_when_lambda_zero 0   -> 不加载任何 penalty
+# =============================================================================
+train_one () {
+  local run="$1" epochs="$2" lr="$3" save_path="$4" max_steps="${5:-0}" do_save="${6:-1}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${MATH_DATASET}" \
+    --epochs "${epochs}" --lr "${lr}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${BATCH}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --max_steps "${max_steps}" \
+    --save "${do_save}" --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl"
+}
+
+# =============================================================================
+# MODE=data：OpenR1 (verl 的 RL schema) -> {instruction, input, output} 的 save_to_disk
+#
+# 源 schema 是 prompt=[system,user] / target=[assistant] / reward_model.ground_truth，
+# 不是 SFT 的三列，所以要摊平。转换脚本会打印 think 标签命中率、\boxed 覆盖率，以及
+# 每个候选 MAXLEN 的截断率 / "question gone" / "tok per epoch"。
+# **先读长度报告再定 MAXLEN**：截断是保尾丢头的，错了不报错，只会悄悄毁掉数据。
+# =============================================================================
+if [[ "${MODE}" == "data" ]]; then
+  [[ -f "${OPENR1_PARQUET}" ]] || { echo "缺 OpenR1 parquet: ${OPENR1_PARQUET}"; exit 1; }
+
+  echo "==== data: OpenR1-Math -> ${MATH_DATASET} ===="
+  python -m onereplay.scripts.prepare_openr1_math \
+    --openr1_path "${OPENR1_PARQUET}" \
+    --out_dir "${MATH_DATASET}" \
+    --think_handling "${THINK_HANDLING}" \
+    --instruction_style "${INSTRUCTION_STYLE}" \
+    --require_boxed "${REQUIRE_BOXED}" \
+    --max_len "${MAXLEN}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+
+  echo "数据准备完成。**先看长度报告**：确认 question gone ≈ 0，并用 tok/epoch 反推"
+  echo "训练时长，再决定 MAXLEN / EPOCHS，然后 MODE=smoke 冒烟。"
+  exit 0
+fi
+
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -d "${MATH_DATASET}" ]] || { echo "缺 Math 池: ${MATH_DATASET}（先跑 MODE=data）"; exit 1; }
+fi
+
+# =============================================================================
+# MODE=smoke：跑几十步、不保存。这条线的冒烟重点是**显存**：
+# 4096 x batch 2 是否真的装得下，峰值离 80GB 还有多少余量。
+# 另外确认 trainable params ≈ 1.72e9、loss 在动。
+# =============================================================================
+if [[ "${MODE}" == "smoke" ]]; then
+  train_one "smoke_math" 1 "${LR}" "${CKPT_DIR}/smoke_math" "${SMOKE_STEPS}" 0
+  echo "冒烟完成。峰值显存见日志的 peak memory 字段。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=lr_sweep：全量的 LR 必须用数据选，且不能沿用 IF 线的结果（见文件头）。
+# 每个 LR 只跑 SWEEP_MAX_STEPS 步、不保存权重，比同一步数下的 val loss。
+# =============================================================================
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  for lr in ${LR_GRID}; do
+    train_one "sweep_math_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_math_lr${lr}" \
+      "${SWEEP_MAX_STEPS}" 0
+  done
+  echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
+  for lr in ${LR_GRID}; do
+    f="${METRICS_DIR}/sweep_math_lr${lr}.jsonl"
+    if [[ -f "${f}" ]]; then
+      echo "lr=${lr}: $(python - "${f}" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+values = [r.get("val_loss") for r in rows if r.get("val_loss") is not None]
+print(values[-1] if values else "n/a")
+PY
+)"
+    fi
+  done
+  echo "挑 val loss 最低且没有发散的那个，作为 LR 传给 MODE=train。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=train：正式训练 Model-Math
+# =============================================================================
+if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
+  if [[ -d "${CKPT}" ]]; then
+    echo "跳过训练：${CKPT} 已存在（删掉可重跑）"
+  else
+    train_one "${RUN}" "${EPOCHS}" "${LR}" "${CKPT}" 0 1
+  fi
+  echo "训练完成。checkpoint 是完整权重目录，可直接作为 Part 2 下一阶段的起点："
+  echo "  --model_dir ${CKPT_DIR} --model_name ${RUN}"
+fi
+
+# =============================================================================
+# MODE=eval：base 与 Model-Math 各测 GSM8K + MATH-500
+#
+# 一次 evaluate 调用只加载模型一次，两个指标共用。
+# 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
+# is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
+# =============================================================================
+if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
+  METRICS=""
+  if [[ -f "${GSM8K_DATA}" ]]; then
+    METRICS="${METRICS},gsm8k"
+  else
+    echo "跳过 GSM8K：未找到 ${GSM8K_DATA}（prepare_math_data.py 产出）"
+  fi
+  if [[ -f "${MATH500_DATA}" ]]; then
+    METRICS="${METRICS},math500"
+  else
+    echo "跳过 MATH-500：未找到 ${MATH500_DATA}"
+  fi
+  METRICS="${METRICS#,}"
+  [[ -n "${METRICS}" ]] || { echo "没有可用指标，评测退出"; exit 1; }
+
+  run_eval () {
+    local name="$1" ckpt="$2"
+    local -a ckpt_arg=()
+    if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
+
+    if [[ -f "${RESULTS_ROOT}/math500/${name}/summary.json" && "${FORCE_EVAL}" != "1" ]]; then
+      echo "跳过评测 ${name}：已有 math500 summary（FORCE_EVAL=1 强制重评）"
+      return 0
+    fi
+    echo "==== eval ${name} (${METRICS}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      "${ckpt_arg[@]}" --run_name "${name}" \
+      --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --limit "${EVAL_LIMIT}" \
+      --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
+      --gsm8k_data_path "${GSM8K_DATA}" \
+      --math500_data_path "${MATH500_DATA}" \
+      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+  }
+
+  for which in ${RUNS_TO_EVAL}; do
+    case "${which}" in
+      base) run_eval "base" "" ;;
+      trained)
+        if [[ -d "${CKPT}" ]]; then
+          run_eval "${RUN}" "${CKPT}"
+        else
+          echo "跳过 ${RUN}：checkpoint 不存在"
+        fi
+        ;;
+      *) echo "未知 run: ${which}" ;;
+    esac
+  done
+fi
+
+echo "========================================================================"
+echo "产物:"
+echo "  Math 池      : ${MATH_DATASET}"
+echo "  checkpoint   : ${CKPT}"
+echo "  评测         : ${RESULTS_ROOT}/{gsm8k,math500}/<run>/summary.json"
+echo "  汇总 csv     : ${RESULTS_ROOT}/{gsm8k,math500}_summary.csv"
+echo ""
+echo "怎么读结论: Model-Math 的 GSM8K/MATH-500 明显高于 base => OpenR1 确实教会了"
+echo "            数学推理，这条线的 sanity check 通过。"
+echo "            MATH-500 是同分布上限（训练 prompt 与它一致），GSM8K 是跨格式泛化"
+echo "            （它要求 '####' 格式，训练时没见过），后者偏低是正常的。"
+echo "            如果都没涨，先查两件事再怀疑数据：(1) 池子是不是用了 strip_tags，"
+echo "            (2) MATH_MAX_NEW_TOKENS 是否够长（响应被掐断会读成不会做）。"
+echo "Job finished at: $(date)"

@@ -1,0 +1,584 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N p1_if
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/logs/onereplay/
+#
+# =============================================================================
+# Part 1 / IF 线: Qwen3-1.7B-Base --Conifer--> Model-IF，评 IFEval + IFBench
+#
+#     Base ---- Conifer (38906 单轮样本) ----> Model-IF
+#     评测: IFEval, IFBench          对照: base
+#
+# capability forgetting 实验的 sanity check 之一。只回答一个问题：
+#
+#     Conifer 能不能把 instruction-following 教起来？
+#
+# 必须先确认能，Part 2 里测到的 IF 下降才叫遗忘；否则那只是从来没学会。
+#
+# Math 线是 91_part1_math_openr1.pbs。两条线的 maxlen / batch / epochs 差好几倍，
+# 所以拆成两个脚本各管一套配置，不做交叉评测。
+#
+# -----------------------------------------------------------------------------
+# 【为什么是全量微调，而不是 LoRA】
+#
+# 工程：train.py 没有 --adapter_path / --resume_from，模型一律从
+#   --model_dir/--model_name 拼路径加载。而 trainers/base.py 的 save 分支是
+#   self.model.save_pretrained(save_path)，全量微调写的是**完整权重 + tokenizer**。
+#   于是 Part 2 的 Stage 2 只要把 --model_dir/--model_name 指到本脚本的输出目录就能
+#   接着训 Math，一行代码都不用改。LoRA 存的是 adapter，做不到，得先 merge。
+#
+# 科学：LoRA 的低秩约束本身就限制权重漂移、天然抗遗忘。用它研究遗忘会把「方法的
+#   效果」和「LoRA 的隐式正则」混在一起。全量是干净的对照底座。
+#
+# 代价：results_log/ 里的既有结论全是 LoRA 线，数值不能和这套并排读。
+#
+# -----------------------------------------------------------------------------
+# 【LR 不能照搬 LoRA 的 1e-4】
+#
+# 44 号脚本记录过：全量在 lr=1e-5 下 val loss ep3 = 0.07364，比 LoRA (lr=1e-4) 的
+# 0.04494 还差 64%。1.72e9 个可训练参数拟合得反而更差，参数量解释不了，只能是欠
+# 训练。所以起点定在 2e-5，但**正式跑之前先 MODE=lr_sweep 用数据选**。
+#
+# Conifer 是几百 token 的短答案，和 Math 那条几千 token 长推理的线每步有效监督
+# token 差一个量级，两条线的最优 LR 没有理由相同，各自 sweep。
+#
+# -----------------------------------------------------------------------------
+# 【Part 1 不需要采 C】
+#
+# build_regularizer 的加载条件是
+#     replay_lambda > 0  或  (measure_replay_when_lambda_zero==1 且 penalty 文件存在)
+# 所以 --replay_lambda 0 --measure_replay_when_lambda_zero 0 会返回 None，既不读 cov
+# 文件，也不会走 snapshot_reference_weights 存一份 W0。Part 1 是纯 vanilla，省掉一个
+# Stage 和 W0 那 3.4 GB。C 是 Part 2 才需要的东西。
+#
+# -----------------------------------------------------------------------------
+# 【MAXLEN 与左截断：这条线最容易被静默毁掉的地方】
+#
+# tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，**保尾丢头**。Conifer 超长
+# 的样本丢掉的是开头的 user turn —— 也就是约束本身 —— 留下的是答案。后果是模型学会
+# 「对没有约束的问题给出带格式的答案」，而这恰好是本阶段要建立的能力的反面。
+# loss 曲线看不出任何异常。
+#
+# 已在本地对**全部 38906 行**做过实测（Qwen3 tokenizer + 同一套 chat template），
+# 所以 MAXLEN 不用再猜：
+#
+#   全序列  P50=249  P90=505  P95=714  P99=964  max=1772
+#   答案    P50=181  P90=425  P95=658  P99=904  max=1720
+#   指令    P50= 43  P90= 87                    max= 253
+#
+#   max_len  截断行数   占比   指令全丢   tok/epoch
+#       512     3792   9.7%      3102      10.54M
+#       768     1486   3.8%      1085      11.20M
+#      1024      238   0.6%       146      11.38M
+#      1536        5   0.0%         4      11.41M   <- 默认值
+#      2048        0   0.0%         0      11.41M
+#
+# 选 1536 而不是 1024：把「指令全丢」的行从 146 压到 4，代价是 tok/epoch 只涨 0.3%
+# （11.38M -> 11.41M）。这 146 行恰好是答案最长的那些，而 IF 的约束都在指令开头，
+# 是左截断最先吃掉的部分，所以这一步很划算。
+#
+# 顺带说明为什么绝不能沿用 Commonsense170k 的 512：那会截断 9.7% 的行、其中 3102 行
+# 连指令都不剩，等于在 8% 的数据上训练"无约束却给带格式答案"——正是本阶段要建立的
+# 能力的反面。
+#
+# MODE=data 会在集群上重算这张表。换 tokenizer 或改 CONIFER_MODE/FORMAT_ONLY 后必须
+# 重看，不能沿用上面这组数。
+#
+# -----------------------------------------------------------------------------
+# 【数据池：Easy-to-Hard 全展开 + Process Feedback 取 messages[0]/[3]】
+#
+# prepare_conifer.py 的两条摊平规则，产出 38906 行：
+#
+#   Easy-to-Hard (10302 conv -> 35603 行)
+#     每一轮都在上一轮基础上多加一条约束，且每轮 user turn 都完整重述了问题、
+#     不依赖上文（已在真实数据上核对）。所以第 k 轮就是难度 k 的独立样本，全展开
+#     正好铺满 difficulty ladder。
+#
+#   Process Feedback (3304 conv -> 3303 行)
+#     4 条 message 的对话是 [问题, 首答, critique, 修正答]，取 messages[0] 和
+#     messages[3]：丢掉 critique 轮和被否决的首答，留下修正后的答案。2 条 message
+#     的本来就是单轮，取 messages[0]/[1]。2176 条 4-message 里有 1950 条的末答确实
+#     与首答不同，所以这个配对拿到的是改好的那个版本。
+#
+# turn_index / conifer_type 等元数据会写进 save_to_disk，但进不了模型：build_loader
+# 在 collate 前把除 input_ids/labels/attention_mask 之外的列全删掉。留着是给 Part 2
+# 的 difficulty-aware 采样用。
+#
+# -----------------------------------------------------------------------------
+# 【一个要提前知道的口径问题】
+#
+# IFEval / IFBench 测的是**可程序化验证**的约束（全小写、至少 N 个要点、不含逗号…）。
+# 而 Conifer 的约束里只有约 15.6% 属于这一类，其余 84.4% 是内容覆盖类要求
+# （"focus on Private Equity"、"address Managing Directors"）—— 同样是指令遵循，
+# 但自动打分器不测。
+#
+# 所以本线的 IFEval 涨幅可能不如直觉预期，主要贡献来自那 15.6%。这不影响 sanity
+# check 的结论（涨了就是教会了），但如果涨幅很小，先别急着怀疑数据，可以用
+# prepare_conifer.py 的 --format_constraints_only 1 单独训那 5544 行做对照。
+#
+# -----------------------------------------------------------------------------
+# 【base 那一行会明显慢】
+#
+# Qwen3-1.7B-Base 没经过 instruct tuning。它的 tokenizer 带完整 chat template（已核
+# 对），格式上没问题，但模型没学过这个格式，生成时很可能不会正常收尾，于是每个
+# prompt 都跑满 max_new_tokens。base 的评测因此比 Model-IF 慢不少，这是正常的，
+# 也正是要量出来的地板分数。想先看趋势就用 EVAL_LIMIT 截一下。
+#
+# -----------------------------------------------------------------------------
+# 【时间预算：这条线很便宜】
+#
+# 实测 tok/epoch = 11.41M（MAXLEN=1536 全量 38906 行）。按 5-9k token/s（全量微调
+# 无实测值，见下）估：1 epoch 约 21-38 min，3 epoch 约 1-2 h。训练和评测可以放在
+# 同一个作业里，不必像 Math 线那样拆开。
+#
+# 对比：Math 线是 190.0M tok/epoch，比这条线贵 17 倍。两条线的成本完全不对称。
+#
+# 吞吐没有全量微调的实测数：results_log 里那个 10181 token/s 是 LoRA + max_len 512。
+# 全量的优化器要更新 1.72e9 个参数，但 ACCUM=64 摊薄后这部分可忽略，所以量级应该接近。
+# MODE=smoke 会打印真实的 tokens_per_sec 和 peak memory，以它为准。
+#
+# -----------------------------------------------------------------------------
+# 【前置】计算节点无外网，以下都要先在有网节点备好
+#   1) 模型      ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
+#   2) Conifer   ${REPO_ROOT}/datasets/Conifer/data/train_sft-*.parquet (约 31MB，单分片)
+#                脚本也会退而去 Conifer_data/data/ 和 data_check/Conifer_data/data/ 找；
+#                都不在就提交时传 CONIFER_PARQUET=<绝对路径>。
+#   3) IFEval    随仓库自带 third_party/…（同步即有）；IFBench 来自 ifbench wheel，
+#                IFBENCH_INPUT 留空即用它内置的 IFBench_test.jsonl
+#   4) mkdir -p /scratch/weiliu87/logs/onereplay
+#
+# 【用法】
+#   # 0) 建池 + 看长度报告（CPU 即可，约 5 min）
+#   qsub -v MODE=data onereplay/pbs/90_part1_if_conifer.pbs
+#
+#   # 1) 冒烟：20 步。看两件事——loss 在动，以及日志里的 peak memory 和 tokens/s，
+#   #    后两个是 Math 线定 batch 的依据（本线便宜，先在这里量）。约 10 min。
+#   qsub -v MODE=smoke onereplay/pbs/90_part1_if_conifer.pbs
+#
+#   # 2) 选 LR（300 步 x 4 档，约 1-2 h）
+#   qsub -v MODE=lr_sweep onereplay/pbs/90_part1_if_conifer.pbs
+#
+#   # 3) 正式训练 + 评测（训练 1-2 h；本线够便宜，可以合在一个作业里）
+#   qsub -v MODE=train,LR=2e-5 onereplay/pbs/90_part1_if_conifer.pbs
+#
+#   # 4) 只评测（checkpoint 已在盘上）
+#   qsub -v MODE=eval,LR=2e-5 onereplay/pbs/90_part1_if_conifer.pbs
+#
+#   # 只看配置不跑
+#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/90_part1_if_conifer.pbs
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/90_part1_if_conifer.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_p1if_${JOBTAG}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_p1if_${JOBTAG}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_p1if_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    CONIFER_PARQUET IF_DATASET REPLAY_DATASET
+    MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
+    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES
+    CONIFER_MODE INCLUDE_PF FORMAT_ONLY BUILD_REPLAY_POOL
+    IFEVAL_INPUT IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS
+    EVAL_LIMIT EVAL_BATCH MAX_NEW_TOKENS RUNS_TO_EVAL
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# ---- 路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_if}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+# Conifer parquet 的位置。集群上是 ${REPO_ROOT}/datasets/Conifer/data/，本地曾放在
+# 仓库根、后来移到 data_check/ 下，所以按目录候选 + glob 找第一个命中的（数据集只有
+# 一个 train 分片，glob 不会有歧义）。想指定就提交时传 CONIFER_PARQUET=<绝对路径>。
+CONIFER_DIRS=(
+  "${REPO_ROOT}/datasets/Conifer/data"
+  "${REPO_ROOT}/Conifer_data/data"
+  "${REPO_ROOT}/data_check/Conifer_data/data"
+)
+if [[ -z "${CONIFER_PARQUET:-}" ]]; then
+  for _dir in "${CONIFER_DIRS[@]}"; do
+    for _hit in "${_dir}"/train_sft-*.parquet; do
+      if [[ -f "${_hit}" ]]; then
+        CONIFER_PARQUET="${_hit}"
+        break 2
+      fi
+    done
+  done
+  CONIFER_PARQUET="${CONIFER_PARQUET:-${CONIFER_DIRS[0]}/train_sft-00000-of-00001.parquet}"
+fi
+IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/conifer_if_full}"
+# Part 2 的 IF protection 池（本线用不到，顺手产出省一次排队）
+REPLAY_DATASET="${REPLAY_DATASET:-${RESULTS_ROOT}/datasets/conifer_if_replay}"
+BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-1}"
+
+# ---- 模式 ----
+MODE="${MODE:-data}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+SEED="${SEED:-1}"
+
+# ---- 数据池选项 ----
+# full：Easy-to-Hard 每一轮都算一条样本，铺满 difficulty ladder
+CONIFER_MODE="${CONIFER_MODE:-full}"
+INCLUDE_PF="${INCLUDE_PF:-1}"
+# 1 只留可程序化验证的约束（5544 行），与 IFEval 打分口径完全对齐。默认 0 用全量。
+FORMAT_ONLY="${FORMAT_ONLY:-0}"
+
+# ---- 训练超参（IF 线专用）----
+# BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
+# 64 行"不成立。ACCUM 是**行数**，micro-batch 数 = 64/4 = 16。Math 线也用 64，两条线
+# 的「一次更新」含义因此一致。
+#
+# BATCH=4 而不是 8：collator 按 batch 内最长动态补齐，所以激活上界是 BATCH x MAXLEN
+# = 4 x 1536 = 6144 token/micro-batch，与 Math 线的 1 x 8192 同量级。而且加大 batch
+# 换不到速度——results_log 的 batch 饱和测试（Job 2831163，同模型同卡）实测每步约
+# 908 token 时吞吐就已饱和，本线 BATCH=4 时每步约 1170 token（按 P50 算）已经超过它。
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-2e-5}"
+BATCH="${BATCH:-4}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-1536}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-500}"
+# 全量微调时 --target_modules 不再决定「哪些参数训练」（全都训），只决定正则覆盖
+# 哪些层。本线没有正则，传什么都不影响结果；保持与 44 号一致便于对照。
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+
+# ---- LR 搜索 / 冒烟 ----
+LR_GRID="${LR_GRID:-5e-6 1e-5 2e-5 5e-5}"
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-300}"
+SMOKE_STEPS="${SMOKE_STEPS:-20}"
+# 训练时子采样，0 = 用整池。改这个不需要重建数据池。
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+
+# ---- 评测（只测 IF 能力）----
+# 绝对路径，与仓库里其他 pbs（44/66/70/81）一致。这份 input_data.jsonl 随仓库自带
+# （onereplay/third_party/…，207KB，541 条 prompt），且没被 .rsync-exclude 排除，
+# 所以同步过去就有，不需要在集群上单独下载。
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+# 留空 = 用 ifbench wheel 自带的 IFBench_test.jsonl
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+EVAL_BATCH="${EVAL_BATCH:-32}"
+
+RUN="part1_if_lr${LR}_seed${SEED}"
+CKPT="${CKPT_DIR}/${RUN}"
+RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
+
+mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
+  "${DATASET_CACHE}" "${RESULTS_ROOT}/map_cache"
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+
+echo "========================================================================"
+echo "Part 1 / IF 线: Base --Conifer--> Model-IF   (full finetune, vanilla)"
+echo "  MODE           : ${MODE}"
+echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
+echo "  results root   : ${RESULTS_ROOT}"
+echo "  Conifer 源     : ${CONIFER_PARQUET}"
+echo "  数据池         : ${IF_DATASET}  (mode=${CONIFER_MODE} pf=${INCLUDE_PF} fmt_only=${FORMAT_ONLY})"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  评测           : ifeval, ifbench   (对照 base)"
+echo "  checkpoint     : ${CKPT}"
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置，不跑。"
+  exit 0
+fi
+
+# =============================================================================
+# 共用训练封装：vanilla 全量微调
+#   --full_finetune 1
+#   --replay_lambda 0 --measure_replay_when_lambda_zero 0   -> 不加载任何 penalty
+# =============================================================================
+train_one () {
+  local run="$1" epochs="$2" lr="$3" save_path="$4" max_steps="${5:-0}" do_save="${6:-1}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${IF_DATASET}" \
+    --epochs "${epochs}" --lr "${lr}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${BATCH}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --max_steps "${max_steps}" \
+    --save "${do_save}" --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl"
+}
+
+# =============================================================================
+# MODE=data：Conifer -> {instruction, input, output} 的 save_to_disk
+#
+# 长度报告会打印每个候选 MAXLEN 的截断率、平均丢多少 token，以及
+# "instruction gone"（答案已填满预算、指令一个 token 都不剩的行数）。
+# **先读这张表再定 MAXLEN**：截断是保尾丢头的，错了不报错，只会悄悄毁掉数据。
+# =============================================================================
+if [[ "${MODE}" == "data" ]]; then
+  if [[ ! -f "${CONIFER_PARQUET}" ]]; then
+    echo "缺 Conifer parquet。在这些目录里找过 train_sft-*.parquet："
+    for _dir in "${CONIFER_DIRS[@]}"; do
+      echo "  ${_dir}/"
+    done
+    echo "把 parquet 放到其中之一，或提交时传 CONIFER_PARQUET=<绝对路径>"
+    exit 1
+  fi
+  echo "Conifer parquet: ${CONIFER_PARQUET}"
+
+  echo "==== data: Conifer -> ${IF_DATASET} ===="
+  python -m onereplay.scripts.prepare_conifer \
+    --conifer_path "${CONIFER_PARQUET}" \
+    --out_dir "${IF_DATASET}" \
+    --mode "${CONIFER_MODE}" \
+    --include_process_feedback "${INCLUDE_PF}" \
+    --format_constraints_only "${FORMAT_ONLY}" \
+    --max_len "${MAXLEN}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+
+  if [[ "${BUILD_REPLAY_POOL}" == "1" ]]; then
+    echo "==== data: Conifer replay pool (sampled/hardest, 供 Part 2 用) ===="
+    python -m onereplay.scripts.prepare_conifer \
+      --conifer_path "${CONIFER_PARQUET}" \
+      --out_dir "${REPLAY_DATASET}" \
+      --mode sampled --sample_strategy hardest \
+      --include_process_feedback "${INCLUDE_PF}" \
+      --format_constraints_only "${FORMAT_ONLY}" \
+      --max_len "${MAXLEN}" \
+      --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+  fi
+
+  echo "数据准备完成。**先看上面的长度报告再定 MAXLEN**，然后 MODE=smoke 冒烟。"
+  exit 0
+fi
+
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -d "${IF_DATASET}" ]] || { echo "缺 IF 池: ${IF_DATASET}（先跑 MODE=data）"; exit 1; }
+fi
+
+# =============================================================================
+# MODE=smoke：跑几十步、不保存。只回答「链路通不通」。
+# 看三件事：trainable params ≈ 1.72e9、峰值显存有余量、loss 在动。
+# =============================================================================
+if [[ "${MODE}" == "smoke" ]]; then
+  train_one "smoke_if" 1 "${LR}" "${CKPT_DIR}/smoke_if" "${SMOKE_STEPS}" 0
+  echo "冒烟完成。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=lr_sweep：全量微调的 LR 必须用数据选，不能照搬 LoRA 的 1e-4（见文件头）。
+# 每个 LR 只跑 SWEEP_MAX_STEPS 步、不保存权重，比同一步数下的 val loss。
+# =============================================================================
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  for lr in ${LR_GRID}; do
+    train_one "sweep_if_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_if_lr${lr}" \
+      "${SWEEP_MAX_STEPS}" 0
+  done
+  echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
+  for lr in ${LR_GRID}; do
+    f="${METRICS_DIR}/sweep_if_lr${lr}.jsonl"
+    if [[ -f "${f}" ]]; then
+      echo "lr=${lr}: $(python - "${f}" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+values = [r.get("val_loss") for r in rows if r.get("val_loss") is not None]
+print(values[-1] if values else "n/a")
+PY
+)"
+    fi
+  done
+  echo "挑 val loss 最低且没有发散的那个，作为 LR 传给 MODE=train。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=train：正式训练 Model-IF
+# =============================================================================
+if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
+  if [[ -d "${CKPT}" ]]; then
+    echo "跳过训练：${CKPT} 已存在（删掉可重跑）"
+  else
+    train_one "${RUN}" "${EPOCHS}" "${LR}" "${CKPT}" 0 1
+  fi
+  echo "训练完成。checkpoint 是完整权重目录，可直接作为 Part 2 Stage 2 的起点："
+  echo "  --model_dir ${CKPT_DIR} --model_name ${RUN}"
+fi
+
+# =============================================================================
+# MODE=eval：base 与 Model-IF 各测 IFEval + IFBench
+#
+# 一次 evaluate 调用只加载模型一次，两个指标共用。
+# 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
+# is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载
+# （parent 作 model_dir、目录名作 model_name），命令与 LoRA 线完全一致。
+# =============================================================================
+if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
+  METRICS=""
+  if [[ -f "${IFEVAL_INPUT}" ]]; then
+    METRICS="${METRICS},ifeval"
+  else
+    echo "跳过 IFEval：未找到 ${IFEVAL_INPUT}"
+  fi
+  # ifbench 留空表示用 wheel 内置测试集，所以无条件加入；wheel 没装会在此报错退出。
+  METRICS="${METRICS},ifbench"
+  METRICS="${METRICS#,}"
+  [[ -n "${METRICS}" ]] || { echo "没有可用指标，评测退出"; exit 1; }
+
+  run_eval () {
+    local name="$1" ckpt="$2"
+    local -a ckpt_arg=()
+    if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
+
+    if [[ -f "${RESULTS_ROOT}/ifbench/${name}/summary.json" && "${FORCE_EVAL}" != "1" ]]; then
+      echo "跳过评测 ${name}：已有 ifbench summary（FORCE_EVAL=1 强制重评）"
+      return 0
+    fi
+    echo "==== eval ${name} (${METRICS}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      "${ckpt_arg[@]}" --run_name "${name}" \
+      --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --limit "${EVAL_LIMIT}" \
+      --max_new_tokens "${MAX_NEW_TOKENS}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --ifeval_input "${IFEVAL_INPUT}" \
+      --ifbench_input "${IFBENCH_INPUT}" \
+      --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+  }
+
+  for which in ${RUNS_TO_EVAL}; do
+    case "${which}" in
+      base) run_eval "base" "" ;;
+      trained)
+        if [[ -d "${CKPT}" ]]; then
+          run_eval "${RUN}" "${CKPT}"
+        else
+          echo "跳过 ${RUN}：checkpoint 不存在"
+        fi
+        ;;
+      *) echo "未知 run: ${which}" ;;
+    esac
+  done
+fi
+
+echo "========================================================================"
+echo "产物:"
+echo "  IF 池        : ${IF_DATASET}"
+echo "  replay 池    : ${REPLAY_DATASET}   (Part 2 用)"
+echo "  checkpoint   : ${CKPT}"
+echo "  评测         : ${RESULTS_ROOT}/{ifeval,ifbench}/<run>/summary.json"
+echo "  汇总 csv     : ${RESULTS_ROOT}/{ifeval,ifbench}_summary.csv"
+echo ""
+echo "怎么读结论: Model-IF 的 IFEval/IFBench 明显高于 base => Conifer 确实教会了 IF，"
+echo "            这条线的 sanity check 通过，可以进 Part 2 Stage 1。"
+echo "Job finished at: $(date)"
