@@ -327,7 +327,7 @@ DROP_UNPARSABLE="${DROP_UNPARSABLE:-1}"
 # ---- 训练超参（CS 线专用，理由见文件头）----
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-2e-5}"
-BATCH="${BATCH:-8}"
+BATCH="${BATCH:-16}"
 ACCUM="${ACCUM:-64}"
 # **占位值，等 MODE=data 的长度报告**。见文件头 MAXLEN 一节。
 MAXLEN="${MAXLEN:-512}"

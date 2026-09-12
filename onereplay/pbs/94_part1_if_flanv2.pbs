@@ -1,0 +1,823 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N p1_if_flan
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# Part 1 / IF 线第二点: Qwen3-1.7B-Base --FLAN-v2--> Model-IF-FLAN
+#                      评 IFEval + IFBench + FollowBench
+#
+#     Base ---- FLAN v2 / Flan 2021 (50000 单轮样本) ----> Model-IF-FLAN
+#     评测: IFEval, IFBench, FollowBench      对照: base
+#
+# 90 号是同一条线的 Conifer 点。两个脚本除了数据以外的超参都对齐（BATCH/ACCUM/
+# MAXLEN/LR grid 全同），因为这两点存在的意义就是在**只改数据**的前提下比较，
+# 唯一故意不同的是 EPOCHS（见下面 token 预算一节）。
+#
+# 这一点在 prepare_conifer.py 文件头描述的 alignment gradient 上处于最不对齐的
+# 一端：
+#     FLAN v2（通用指令）-> Conifer 全量（混合约束）-> Conifer fmt-only（可验证约束）
+#
+# -----------------------------------------------------------------------------
+# 【这条线最可能被误读的地方：FLAN v2 的答案极短】
+#
+# 实测（Qwen3 tokenizer，四个 remix 都一样）：targets 的 P50 只有 18-19 token，
+# 均值约 30。而 Conifer 的答案 P50 是 181。FLAN 的 targets 是分类标签、短答案、
+# 翻译句 —— 这本来就是 Flan 2021 的形态，不是数据坏了。
+#
+# 后果：在这套数据上全量微调**一定会把输出长度压下去**。而 IFEval / IFBench /
+# FollowBench 里相当一部分约束（"至少 400 词"、"3 个要点"、format 与 style 类）
+# 本质上在量长度。所以：
+#
+#     报这条线的任何 IF 分数，必须同时报 response_words_p50。
+#
+# 这是 IFBench 那次诊断留下的口径（results_log/2026-09-12 第 8c 节），92 号脚本
+# 的汇总表也是因此带这一列。如果本线的分数比 base 低、而 words 同时大幅缩短，
+# 那先怀疑的是长度漂移，不是「FLAN 教不会 IF」——两者要分开归因。
+#
+# 反过来说，这也正是这一点的科学价值：它给出 alignment gradient 最不对齐那一端
+# 的实际读数，包括「通用指令数据会不会反而把 IF 评测拖下去」这个问题的答案。
+#
+# -----------------------------------------------------------------------------
+# 【数据：为什么是 40/40/10/10 而不是官方的 25/25/25/25】
+#
+# 官方 flan2021_submix（run_example.py）把四种模板等权混合：
+#     flan_zsopt 1 : flan_fsopt 1 : flan_zsnoopt 1 : flan_fsnoopt 1
+# 按**行**等权是可辩护的默认，但这条线有两个理由偏离它：
+#
+#   1) few-shot 行比 zero-shot 长 2.5-3.3 倍（实测 token 均值 zs 210-227 /
+#      fs 488-615）。按行等权的话 few-shot 会吃掉约 72% 的 token 预算。
+#   2) IFEval / IFBench / FollowBench 全都是单轮零样本口径。few-shot 的示例
+#      训练的是一种评测从不呈现的格式。
+#
+# 40/40/10/10 让两种 few-shot 样式都在（它们是 Flan 2021 的一部分），但不让它们
+# 占住 token 预算。manifest 里会记下实际的 token 份额，所以这个选择是显式的。
+# 想复现官方口径就传 FLAN_WEIGHTS=25:25:25:25（冒号而不是逗号，因为 qsub -v 自己
+# 用逗号分隔变量；脚本里会转回逗号）。
+#
+# 另外两件必须知道的事：
+#
+#   * 只取 flan 来源，不含 t0 / niv2 / cot / dialog。download_flan_v2.py 只读
+#     SirNeural/flan_v2 的 flan_* 四个文件，所以这是数据源层面就定下的，不靠过滤。
+#   * 上游 dump 的 `task` 列是常量字符串 "flan"，没有任务粒度。所以 FLAN 自己的
+#     capped-proportional 任务平衡（old_knowledge.allocate_task_quota 对 v1 dump
+#     做的那件事）在这个 dump 上做不了，也没法报 per-task 表。好消息是这个 dump
+#     本身的翻译占比已经只有约 15%（换算后），接近 capped-proportional 的目标值
+#     （69 个任务里 5 个是 WMT），所以不需要救。manifest 里的 family 直方图是词法
+#     近似的混合指纹，不是任务分布，别当后者用。
+#
+# -----------------------------------------------------------------------------
+# 【token 预算：为什么 EPOCHS 默认 1，以及 1 epoch 并没有对齐 Conifer】
+#
+# 90 号是 38906 行 / MAXLEN 1536 / 11.41M tok/epoch / EPOCHS=3 = 总共 34.2M token。
+#
+# 本池 50000 行 / 40:40:10:10 / MAXLEN 1536 ≈ 14.3M tok/epoch。所以：
+#
+#     EPOCHS=1  ->  14.3M  = Conifer 预算的 42%
+#     EPOCHS=2  ->  28.5M  = 83%
+#     EPOCHS=2.4 -> 34.2M  = 对齐（非整数，实际取 2 或 3）
+#     EPOCHS=3  ->  42.8M  = 125%
+#
+# 默认 1 是因为 FLAN v2 实际是无限量的，1 epoch 不重复样本是它的标准配方，而且
+# 30 token 的答案重复三遍很容易变成背答案。但**这不是对齐 token**，报结果时要么
+# 说清是 42% 预算，要么把池子扩到约 12 万行再跑 1 epoch。MODE=data 的长度报告会
+# 把这三个数和「对齐需要几个 epoch」直接打出来，以它为准。
+#
+# 还有一个比总 token 更重要的口径差：**带 loss 的答案 token**。label 只在答案上，
+# 而 FLAN 的答案均值约 30 token、Conifer 约 218。即使总 token 对齐了，监督信号
+# 也差一个量级。长度报告单独打了这一行。
+#
+# -----------------------------------------------------------------------------
+# 【MAXLEN 1536：和 90 号同值，但截断的后果完全不同】
+#
+# tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，保尾丢头。
+#
+# 在 Conifer 上这是个静默灾难：约束在 user turn 开头，丢头就等于训练「对没有约束
+# 的问题给出带格式的答案」。在 FLAN 上恰好相反：few-shot prompt 的结构是
+# 「示例1 示例2 … 真正的问题」，问题在最后。所以被截的行只是退化成更少 shot 的
+# 同一道题，题干和指令都在。这是良性的。
+#
+# 实测截断率（40/40/10/10，MAXLEN=1536）：zs 约 0.3-0.6%，fs 约 1.4-1.9%。
+# 1024 下 fs_opt 升到 4.6%。1536 沿用 90 号既够用又保持可比，不用为 FLAN 单独调。
+#
+# -----------------------------------------------------------------------------
+# 【评测比 90 号贵三倍：FollowBench 是新加的】
+#
+# IFEval 541 行 @1024 + IFBench 300 行 @2048 + FollowBench 820 行 @2048。
+# 按 92 号的估计，FollowBench 约是 IFBench 的 3 倍时间，所以一次 eval 的总量大约
+# 是 90 号的 3-4 倍。base 那一行还会更慢（Qwen3-1.7B-Base 没经过 instruct tuning，
+# 不会正常收尾，每个 prompt 都跑满 max_new_tokens）。
+#
+# 所以本脚本允许把评测拆开跑，用三个独立开关：
+#     MODE=eval,DO_FOLLOWBENCH=0          先把便宜的两个跑掉
+#     MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0  再单独跑 FollowBench
+# 三个指标都开时放在同一次 evaluate 调用里、只加载模型一次，这是默认；拆开是为了
+# 卡 walltime。
+#
+# 用三个开关而不是一个 EVAL_METRICS=ifeval,ifbench 列表，是因为 **qsub -v 自己就用
+# 逗号分隔变量**，带逗号的值会被 PBS 切开成两个变量名。同理下面 FLAN_WEIGHTS 在
+# -v 里要写成冒号形式。
+#
+# FollowBench 不读全局 --limit（metric 只认 group_limit，已核对代码），所以
+# EVAL_LIMIT 截不了它，冒烟要用 FB_GROUP_LIMIT。
+#
+# FollowBench 只出 rule 那一半（350/820 行、70/164 组），judge 那 470 行落到
+# judge_inputs.jsonl，要在有网的地方过 scripts/judge_followbench.py。详见 92 号
+# 文件头，那里记了读这张表的三条纪律。
+#
+# -----------------------------------------------------------------------------
+# 【前置】计算节点无外网，第 2 条必须先在登录节点做完
+#   1) 模型   ${MODEL_DIR}/${MODEL_NAME}   (Qwen3-1.7B-Base)
+#   2) FLAN v2 取样（**登录节点，约 10 min，600MB 网络，原始 gz 不落盘**）：
+#        python -m onereplay.scripts.download_flan_v2 \
+#          --out_dir ${REPO_ROOT}/datasets/flan_v2
+#      它从 SirNeural/flan_v2 的 flan_* 四个文件各流式读一个 400MB 解压窗口，
+#      蓄水池抽样出 60k/60k/15k/15k 行写成 jsonl。127 GiB 的原始 dump 一个字节
+#      都不会写到盘上，所以不占你那 150GB 冗余。
+#      日志里会打一张平稳性表（TVD(block, window)），实测四路都在 0.010-0.012，
+#      这是「只能从 gz 流头部读」不引入偏置的依据。
+#      默认取样量对本脚本是够的：40/40/10/10 建 50k 训练池 + 2k heldout 需要
+#      20800/20800/5200/5200 行；就算切 disjoint replay 也只要 28800/28800/
+#      7200/7200，都在 60k/60k/15k/15k 之内。
+#      改大 FLAN_TARGET_ROWS 之后要回去看 MODE=data 的输出：配额没凑满时
+#      prepare 会打一行 "!! 配额没满足" 并说明该调哪个 --rows。注意那只是
+#      **警告不是报错**，退出码仍是 0，所以别只看作业成功就往下走。
+#   3) IFEval 随仓库自带；IFBench 来自 ifbench wheel；FollowBench 完全 vendored
+#      在 onereplay/third_party/followbench/（零外部依赖，不需要 pip 也不需要 NLTK）
+#   4) mkdir -p ${REPO_ROOT}/logs
+#
+# 【用法】
+#   # 0) 建池 + 看长度报告和 token 预算（CPU 即可，约 5 min）
+#   qsub -v MODE=data onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # 1) 冒烟：20 步，看 loss 在动、peak memory 和 tokens/s
+#   qsub -v MODE=smoke onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # 2) 选 LR（数据换了，不能照搬 90 号选出来的值）
+#   qsub -v MODE=lr_sweep onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # 3) 正式训练（1 epoch 约 25-45 min）+ 评测
+#   qsub -v MODE=train,LR=2e-5 onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # 4) 只评测，且拆开跑以免卡 walltime
+#   qsub -v MODE=eval,LR=2e-5,DO_FOLLOWBENCH=0          onereplay/pbs/94_part1_if_flanv2.pbs
+#   qsub -v MODE=eval,LR=2e-5,DO_IFEVAL=0,DO_IFBENCH=0  onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # FollowBench 冒烟：每类前 2 组阶梯 = 60 行（按组截，不能按行）
+#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0,FB_GROUP_LIMIT=2 onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # 复现官方等权混合。冒号是为了绕开 qsub -v 的逗号分隔，脚本里会转回逗号。
+#   qsub -v MODE=data,FLAN_WEIGHTS=25:25:25:25 onereplay/pbs/94_part1_if_flanv2.pbs
+#
+#   # 只看配置不跑
+#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/94_part1_if_flanv2.pbs
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/94_part1_if_flanv2.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+# 用 ${JOB_TMPDIR:-...} 而不是像 90 号那样无条件赋值：外层把 JOB_TMPDIR 转发进
+# 容器后内层会再算一遍，而 JOBTAG 在 PBS_JOBID 缺失时退化成 local$$，内外层的 $$
+# 并不相同。集群上 PBS_JOBID 总是有的，所以 90 号没被咬到；这里尊重转发值。
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_p1flan_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_p1flan_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_p1flan_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME LINE_ROOT RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    FLAN_SAMPLE_DIR IF_DATASET REPLAY_POOL HELDOUT_POOL
+    MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
+    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
+    FLAN_WEIGHTS FLAN_TARGET_ROWS FLAN_REPLAY_ROWS FLAN_HELDOUT_ROWS
+    FLAN_REPLAY_MODE FLAN_DEDUP_ACROSS_REMIXES BUILD_REPLAY_POOL
+    IFEVAL_INPUT IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS
+    FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
+    DO_IFEVAL DO_IFBENCH DO_FOLLOWBENCH
+    EVAL_LIMIT EVAL_BATCH MAX_NEW_TOKENS RUNS_TO_EVAL
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# ---- 路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+# 与 90 号的 results_part1_if 分开：同一条线的两个点，结果树不能混在一起，
+# 否则 evaluate 的 <metric>_summary.csv 会把两份数据的分数追加进同一个文件。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+# download_flan_v2.py 在登录节点写下的四份 jsonl 所在目录。
+FLAN_SAMPLE_DIR="${FLAN_SAMPLE_DIR:-${REPO_ROOT}/datasets/flan_v2}"
+IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/flan_v2_if_50k}"
+# prepare_flan_v2 的默认命名就是 <out_dir>_replay.jsonl / <out_dir>_heldout.jsonl，
+# 这里显式写出来只是为了能在产物清单里报路径。
+REPLAY_POOL="${REPLAY_POOL:-${IF_DATASET}_replay.jsonl}"
+HELDOUT_POOL="${HELDOUT_POOL:-${IF_DATASET}_heldout.jsonl}"
+BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-1}"
+
+# ---- 模式 ----
+MODE="${MODE:-data}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+SEED="${SEED:-1}"
+
+# ---- 数据池选项 ----
+# 行权重，顺序固定为 zs_opt,zs_noopt,fs_opt,fs_noopt。理由见文件头。
+# 接受冒号或逗号：qsub -v 自己就用逗号分隔变量，所以 -v 里必须写 40:40:10:10，
+# 这里统一转成 prepare_flan_v2 要的逗号形式。
+FLAN_WEIGHTS="${FLAN_WEIGHTS:-40,40,10,10}"
+FLAN_WEIGHTS="${FLAN_WEIGHTS//:/,}"
+FLAN_TARGET_ROWS="${FLAN_TARGET_ROWS:-50000}"
+# Part 2 的 IF protection 池 + C 的语料。replay.py 和 collect_cov 读同一个文件，
+# 这是 71/83 号已经在强制的约束（两边必须同池，否则 OneReplay vs EWC 被"谁拿到
+# 哪批数据"混淆）。
+FLAN_REPLAY_ROWS="${FLAN_REPLAY_ROWS:-20000}"
+# nested = replay 池是训练池打乱后的前缀，也就是通常定义的 Experience Replay：
+# 复习 Stage 1 训过的行。disjoint 会让 replay 臂在 Stage 2 拿从没见过的 IF 样本
+# **继续学**，而 OneReplay 只拿到一个惩罚矩阵、没有任何新梯度信号，等于悄悄给
+# replay 基线一个对方结构上不可能有的优势。所以默认 nested。
+FLAN_REPLAY_MODE="${FLAN_REPLAY_MODE:-nested}"
+# probe.py 的 flan_heldout 曲线用的行，**永远**与训练池和 replay 池互斥。
+# 要互斥的是测量，不是复习 —— flan_inpool 与 flan_heldout 的间隙才能区分
+# "能力还在" 和 "只是背下了那些行"。
+FLAN_HELDOUT_ROWS="${FLAN_HELDOUT_ROWS:-2000}"
+# 0（默认）保留跨 remix 重复的 (inputs, targets)。opt/noopt 对无答案选项的任务
+# 渲染完全相同，等权混合四种模板本身就是在给这些任务加权，这是 flan2021_submix
+# 的固有行为；而且所有碰撞都判给 zs_noopt，去重会把那一路剩成纯多选题池。
+# 实测重复率约 0.24%，prepare 会把数量报出来。
+FLAN_DEDUP_ACROSS_REMIXES="${FLAN_DEDUP_ACROSS_REMIXES:-0}"
+
+# ---- 训练超参 ----
+# 除 EPOCHS 外全部与 90 号对齐：这两点的比较前提是「只改数据」。
+#
+# BATCH=4 / ACCUM=64：一次更新 64 行，激活上界 4 x 1536 = 6144 token/micro-batch，
+# 和 90 号完全一致。注意本池 80% 是很短的 zero-shot 行（P50 约 70-76 token），
+# 动态补齐之后多数 micro-batch 会远低于 results_log 那个 908 token/step 的吞吐
+# 饱和点，所以 BATCH=8 很可能是免费的 —— 但那会让激活上界翻倍、与 90 号不再同
+# 配置。先用 MODE=smoke 看实测 tokens_per_sec 和 peak memory 再决定要不要动。
+#
+# EPOCHS=1：见文件头 token 预算一节。这**不是**对齐 Conifer 的 34.2M token，
+# 只有 42%。要对齐就传 EPOCHS=2（83%）或 3（125%），或者把池子扩到约 12 万行。
+EPOCHS="${EPOCHS:-1}"
+LR="${LR:-2e-5}"
+BATCH="${BATCH:-4}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-1536}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-500}"
+# 全量微调时只决定正则覆盖哪些层；本线没有正则，保持与 90 号一致便于对照。
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+
+# ---- LR 搜索 / 冒烟 ----
+# 数据换了，90 号选出来的 LR 不能照搬：Conifer 是几百 token 的长答案，本池是
+# 30 token 的短答案，每步有效监督 token 差一个量级。
+LR_GRID="${LR_GRID:-2e-5 5e-5 1e-4 2e-4}"
+# **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)
+# = SWEEP_MAX_STEPS / 16。忘了这个换算就会严重高估 sweep 的说服力。
+SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-1600}"
+SMOKE_STEPS="${SMOKE_STEPS:-20}"
+LOG_EVERY="${LOG_EVERY:-500}"
+SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-50}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+
+# ---- 评测 ----
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
+# FollowBench：820 行，全 vendored，零外部依赖。空 FB_DATA = 用 vendored 的
+# third_party/followbench/data，空 FB_CATEGORIES = 六类全跑。
+FB_DATA="${FB_DATA:-}"
+FB_CATEGORIES="${FB_CATEGORIES:-}"
+FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-2048}"
+# 不回落到 EVAL_BATCH：example 类把 few-shot 示例内联在 instruction 里，
+# prompt P90=2516 / max=5019 token，远长于 IFEval/IFBench，同一个 batch 值需要的
+# KV 不是一个量级。OOM 就降到 8，或者 FB_CATEGORIES=example 单独跑。
+FB_BATCH="${FB_BATCH:-16}"
+# 冒烟用。按**组**取（每类前 N 个 example_id），绝不按行 —— CSL 和 rule 侧的分母
+# 都假设一组完整的 level 1..5。注意全局 --limit 对 followbench 不生效（metric 只
+# 读 followbench_group_limit，已核对代码），所以截它只能用这个。
+FB_GROUP_LIMIT="${FB_GROUP_LIMIT:-0}"
+# 三个独立开关而不是一个逗号列表：qsub -v 用逗号分隔变量（见文件头）。
+# 全开时三个指标共用一次模型加载；关掉一部分是为了把 walltime 拆开。
+DO_IFEVAL="${DO_IFEVAL:-1}"
+DO_IFBENCH="${DO_IFBENCH:-1}"
+DO_FOLLOWBENCH="${DO_FOLLOWBENCH:-1}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+EVAL_BATCH="${EVAL_BATCH:-32}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+
+RUN="part1_if_flanv2_lr${LR}_seed${SEED}"
+CKPT="${CKPT_DIR}/${RUN}"
+RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
+
+mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
+  "${DATASET_CACHE}" "${RESULTS_ROOT}/map_cache"
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+
+echo "========================================================================"
+echo "Part 1 / IF 线第二点: Base --FLAN-v2--> Model-IF-FLAN   (full finetune, vanilla)"
+echo "  MODE           : ${MODE}"
+echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
+echo "  results root   : ${RESULTS_ROOT}"
+echo "  FLAN 取样目录  : ${FLAN_SAMPLE_DIR}"
+echo "  数据池         : ${IF_DATASET}"
+echo "                   ${FLAN_TARGET_ROWS} 行, weights=${FLAN_WEIGHTS} (zs_opt,zs_noopt,fs_opt,fs_noopt)"
+echo "  replay/C 池    : ${REPLAY_POOL}  (${FLAN_REPLAY_ROWS} 行, ${FLAN_REPLAY_MODE})"
+echo "  heldout 池     : ${HELDOUT_POOL}  (${FLAN_HELDOUT_ROWS} 行, 与上两者互斥)"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
+fi
+echo "  评测           : ifeval=${DO_IFEVAL} ifbench=${DO_IFBENCH} followbench=${DO_FOLLOWBENCH}   (对照 base)"
+echo "  checkpoint     : ${CKPT}"
+echo "  对照线         : 90_part1_if_conifer.pbs  (11.41M tok/epoch x 3 = 34.2M)"
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置，不跑。"
+  exit 0
+fi
+
+# =============================================================================
+# 共用训练封装：vanilla 全量微调，与 90 号逐字对齐
+#   --full_finetune 1
+#   --replay_lambda 0 --measure_replay_when_lambda_zero 0   -> 不加载任何 penalty
+# =============================================================================
+train_one () {
+  local run="$1" epochs="$2" lr="$3" save_path="$4" max_steps="${5:-0}" do_save="${6:-1}"
+  local log_every="${7:-${LOG_EVERY}}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${IF_DATASET}" \
+    --epochs "${epochs}" --lr "${lr}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${BATCH}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --max_steps "${max_steps}" --log_every "${log_every}" \
+    --save "${do_save}" --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl"
+}
+
+# =============================================================================
+# MODE=data：取样好的 jsonl -> {instruction, input, output} 的 save_to_disk
+#            顺带切出 replay/C 池和 heldout 探针池
+#
+# 下载不在这里：计算节点无外网，download_flan_v2.py 必须在登录节点先跑完。
+#
+# 长度报告会打印每个候选 MAXLEN 的截断率、per-remix 的长度分布、以及
+# **答案 token**（唯一带 loss 的那部分）和「对齐 Conifer 总 token 需要几个 epoch」。
+# 先读这张表再定 EPOCHS，不要直接信文件头里那几个估算值。
+# =============================================================================
+if [[ "${MODE}" == "data" ]]; then
+  MISSING=0
+  for _label in zs_opt zs_noopt fs_opt fs_noopt; do
+    if [[ ! -f "${FLAN_SAMPLE_DIR}/flan_v2_${_label}.jsonl" ]]; then
+      echo "缺 ${FLAN_SAMPLE_DIR}/flan_v2_${_label}.jsonl"
+      MISSING=1
+    fi
+  done
+  if [[ "${MISSING}" == "1" ]]; then
+    echo ""
+    echo "取样文件不全。计算节点无外网，要先在**登录节点**跑（约 10 min，600MB 网络）:"
+    echo "  python -m onereplay.scripts.download_flan_v2 \\"
+    echo "    --out_dir ${FLAN_SAMPLE_DIR}"
+    echo ""
+    echo "它流式读 SirNeural/flan_v2 的 flan_* 四个文件，原始 gz 不落盘。"
+    exit 1
+  fi
+
+  echo "==== data: FLAN v2 取样 -> ${IF_DATASET} ===="
+  REPLAY_ROWS_ARG="${FLAN_REPLAY_ROWS}"
+  if [[ "${BUILD_REPLAY_POOL}" != "1" ]]; then
+    echo "BUILD_REPLAY_POOL=0：不切 replay 池"
+    REPLAY_ROWS_ARG=0
+  fi
+  python -m onereplay.scripts.prepare_flan_v2 \
+    --sample_dir "${FLAN_SAMPLE_DIR}" \
+    --out_dir "${IF_DATASET}" \
+    --target_rows "${FLAN_TARGET_ROWS}" \
+    --weights "${FLAN_WEIGHTS}" \
+    --replay_rows "${REPLAY_ROWS_ARG}" \
+    --replay_mode "${FLAN_REPLAY_MODE}" \
+    --replay_out "${REPLAY_POOL}" \
+    --heldout_rows "${FLAN_HELDOUT_ROWS}" \
+    --heldout_out "${HELDOUT_POOL}" \
+    --dedup_across_remixes "${FLAN_DEDUP_ACROSS_REMIXES}" \
+    --seed "${SEED}" \
+    --max_len "${MAXLEN}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+
+  echo ""
+  echo "数据准备完成。**先看上面的输出再往下走**（prepare 的退出码是 0，不代表配额满了）："
+  echo "  1) 有没有 \"!! 配额没满足\" —— 有就说明某一路取样不够，池子比 ${FLAN_TARGET_ROWS} 小"
+  echo "  2) 截断率决定 MAXLEN 还能不能用 ${MAXLEN}"
+  echo "  3) 「对齐总 token 需要几个 epoch」决定 EPOCHS（当前默认 ${EPOCHS}）"
+  echo "  4) 答案 token 那一行说明按总 token 对齐并不等于按监督 token 对齐"
+  echo "然后 MODE=smoke 冒烟。"
+  exit 0
+fi
+
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -d "${IF_DATASET}" ]] || { echo "缺 IF 池: ${IF_DATASET}（先跑 MODE=data）"; exit 1; }
+fi
+
+# =============================================================================
+# MODE=smoke：跑几十步、不保存。只回答「链路通不通」。
+# 看三件事：trainable params ≈ 1.72e9、峰值显存有余量、loss 在动。
+# 另外记下 tokens_per_sec —— 这是判断 BATCH 能不能从 4 提到 8 的唯一依据。
+# =============================================================================
+if [[ "${MODE}" == "smoke" ]]; then
+  train_one "smoke_if_flanv2" 1 "${LR}" "${CKPT_DIR}/smoke_if_flanv2" "${SMOKE_STEPS}" 0
+  echo "冒烟完成。记下 peak memory 和 tokens_per_sec。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=lr_sweep：数据换了就要重选 LR（见上面 LR_GRID 的注释）。
+#
+# 【怎么读结果】末值最低 != 该选它。两件事要一起看：
+#   1) val loss 的**边际收益**。LR 翻倍只换来千分之几时已经到膝点。
+#   2) 训练 loss 的**轨迹**（stdout 里 SWEEP_LOG_EVERY 一行的 task_loss）。发散
+#      表现为中途抬头、剧烈抖动或 nan，末值单看不出来。
+#
+# 本线还有一个 90 号没有的陷阱：FLAN 的答案只有约 30 token，val loss 的绝对值
+# 因此和 Conifer 线**完全不可比**（分母不同）。只在本线内部横向比 LR。
+# =============================================================================
+if [[ "${MODE}" == "lr_sweep" ]]; then
+  echo "grid=${LR_GRID}"
+  echo "每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次优化器更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
+  for lr in ${LR_GRID}; do
+    train_one "sweep_if_flanv2_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_if_flanv2_lr${lr}" \
+      "${SWEEP_MAX_STEPS}" 0 "${SWEEP_LOG_EVERY}"
+  done
+  echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
+  for lr in ${LR_GRID}; do
+    f="${METRICS_DIR}/sweep_if_flanv2_lr${lr}.jsonl"
+    if [[ -f "${f}" ]]; then
+      echo "lr=${lr}: $(python - "${f}" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+values = [r.get("val_loss") for r in rows if r.get("val_loss") is not None]
+print(values[-1] if values else "n/a")
+PY
+)"
+    fi
+  done
+  echo
+  echo "别只看这张表：回到上面每档的 task_loss 轨迹，确认没有中途抬头/抖动/nan。"
+  echo "这些绝对值不能和 90 号的比 —— FLAN 的答案短得多，loss 的分母不是一个东西。"
+  exit 0
+fi
+
+# =============================================================================
+# MODE=train：正式训练 Model-IF-FLAN
+# =============================================================================
+if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
+  if [[ -d "${CKPT}" ]]; then
+    echo "跳过训练：${CKPT} 已存在（删掉可重跑）"
+  else
+    train_one "${RUN}" "${EPOCHS}" "${LR}" "${CKPT}" 0 1
+  fi
+  echo "训练完成。checkpoint 是完整权重目录，可直接作为 Part 2 Stage 2 的起点："
+  echo "  --model_dir ${CKPT_DIR} --model_name ${RUN}"
+fi
+
+# =============================================================================
+# MODE=eval：base 与 Model-IF-FLAN 各测 IFEval + IFBench + FollowBench
+#
+# 一次 evaluate 调用只加载模型一次，三个指标共用。DO_IFEVAL / DO_IFBENCH /
+# DO_FOLLOWBENCH 可以把它们拆到不同作业里，因为三个加起来大约是 90 号的 3-4 倍
+# 时间（FollowBench 820 行占大头）。跳过检查按**请求的那几个**指标算，所以拆开
+# 跑时第二批不会被第一批的产物挡掉。
+#
+# 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
+# is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
+# =============================================================================
+if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
+  # 组装指标列表。IFEval 的输入随仓库自带，缺了就跳过它而不是整个作业退出；
+  # IFBench 留空 input 表示用 wheel 内置测试集，FollowBench 的数据和判分器完全
+  # vendored —— 这两个没有可检查的前置文件，装缺了会在 evaluate 里报错退出。
+  METRICS=""
+  if [[ "${DO_IFEVAL}" == "1" ]]; then
+    if [[ -f "${IFEVAL_INPUT}" ]]; then
+      METRICS="${METRICS},ifeval"
+    else
+      echo "跳过 IFEval：未找到 ${IFEVAL_INPUT}"
+    fi
+  fi
+  if [[ "${DO_IFBENCH}" == "1" ]]; then
+    METRICS="${METRICS},ifbench"
+  fi
+  if [[ "${DO_FOLLOWBENCH}" == "1" ]]; then
+    METRICS="${METRICS},followbench"
+  fi
+  METRICS="${METRICS#,}"
+  [[ -n "${METRICS}" ]] || { echo "没有可用指标（三个 DO_* 开关都关了？），评测退出"; exit 1; }
+
+  if [[ "${FB_GROUP_LIMIT}" != "0" ]]; then
+    echo "!! FB_GROUP_LIMIT=${FB_GROUP_LIMIT}：FollowBench 冒烟模式，产出的 summary.json"
+    echo "   只覆盖每类前 ${FB_GROUP_LIMIT} 组，不是正式结果。"
+  fi
+  if [[ "${EVAL_LIMIT}" != "0" && "${METRICS}" == *followbench* ]]; then
+    echo "!! EVAL_LIMIT=${EVAL_LIMIT} 截的是 ifeval/ifbench；FollowBench 不读全局 --limit，"
+    echo "   要截它请用 FB_GROUP_LIMIT（按阶梯组，不能按行）。"
+  fi
+
+  run_eval () {
+    local name="$1" ckpt="$2"
+    local -a ckpt_arg=()
+    if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
+
+    # 只有请求的指标**全部**已有结果才跳过，否则拆开跑时第二批会被第一批的
+    # 产物挡掉。
+    local pending=0 m
+    for m in ${METRICS//,/ }; do
+      if [[ ! -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
+        pending=1
+      fi
+    done
+    if [[ "${pending}" == "0" && "${FORCE_EVAL}" != "1" ]]; then
+      echo "跳过评测 ${name}：${METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
+      return 0
+    fi
+
+    # 空值不传 flag，让 metric 用自己的默认（vendored 数据 / 六类全跑）。
+    local -a fb_data_arg=() fb_cats_arg=()
+    if [[ -n "${FB_DATA}" ]]; then fb_data_arg=(--followbench_data "${FB_DATA}"); fi
+    if [[ -n "${FB_CATEGORIES}" ]]; then fb_cats_arg=(--followbench_categories "${FB_CATEGORIES}"); fi
+
+    echo "==== eval ${name} (${METRICS}) ===="
+    python -m onereplay.scripts.evaluate \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      "${ckpt_arg[@]}" --run_name "${name}" \
+      --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --limit "${EVAL_LIMIT}" \
+      --max_new_tokens "${MAX_NEW_TOKENS}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --ifeval_input "${IFEVAL_INPUT}" \
+      --ifbench_input "${IFBENCH_INPUT}" \
+      --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
+      --followbench_max_new_tokens "${FB_MAX_NEW_TOKENS}" \
+      --followbench_batch_size "${FB_BATCH}" \
+      --followbench_group_limit "${FB_GROUP_LIMIT}" \
+      "${fb_data_arg[@]}" "${fb_cats_arg[@]}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+  }
+
+  for which in ${RUNS_TO_EVAL}; do
+    case "${which}" in
+      base) run_eval "base" "" ;;
+      trained)
+        if [[ -d "${CKPT}" ]]; then
+          run_eval "${RUN}" "${CKPT}"
+        else
+          echo "跳过 ${RUN}：checkpoint 不存在"
+        fi
+        ;;
+      *) echo "未知 run: ${which}" ;;
+    esac
+  done
+
+  # -------------------------------------------------------------------------
+  # 汇总：三个指标一张表，**每个分数右边紧跟它自己的响应词数中位数**。
+  #
+  # 这一段不是锦上添花。本线训练数据的答案 P50 只有 18 token，输出长度一定会塌，
+  # 而三个 benchmark 里都有相当比例的约束其实在量长度。分数和 words 分开看就会
+  # 把长度漂移读成能力变化。words 用 len(response.split()) 从各自的
+  # responses.jsonl 现算，与 followbench.response_shape 同一个定义，所以 fb 那列
+  # 和它 summary.json 里的 response_words_p50 严格一致。
+  # -------------------------------------------------------------------------
+  python - "${RESULTS_ROOT}" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+METRICS = ("ifeval", "ifbench", "followbench")
+
+# RUNS_TO_EVAL 里是别名（base/trained），实际目录名是 base / part1_if_flanv2_*，
+# 而且拆开跑时同一个 run 会分几次作业落盘。扫目录比推算名字稳。
+names: set[str] = set()
+for metric in METRICS:
+    directory = root / metric
+    if directory.is_dir():
+        names.update(path.name for path in directory.iterdir() if path.is_dir())
+if not names:
+    print("\n没有可汇总的 summary.json")
+    raise SystemExit(0)
+order = sorted(names, key=lambda name: (name != "base", name))
+
+
+def load(metric: str, name: str):
+    path = root / metric / name / "summary.json"
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def words_p50(metric: str, name: str):
+    path = root / metric / name / "responses.jsonl"
+    if not path.is_file():
+        return None
+    counts = []
+    with path.open(encoding="utf-8") as file:
+        for line in file:
+            if line.strip():
+                counts.append(len(str(json.loads(line).get("response", "")).split()))
+    if not counts:
+        return None
+    counts.sort()
+    return counts[len(counts) // 2]
+
+
+def pct(payload, key, width):
+    if payload is None or payload.get(key) is None:
+        return "-".rjust(width)
+    return f"{payload[key] * 100:.1f}".rjust(width)
+
+
+def num(value, width, fmt="{:.0f}"):
+    if value is None:
+        return "-".rjust(width)
+    return fmt.format(value).rjust(width)
+
+
+print()
+print("=" * 100)
+print("Part 1 / FLAN-v2 线   prompt-level strict accuracy (%)，words = 响应词数中位数")
+print("=" * 100)
+print(f"{'run':<32}{'IFEval':>8}{'words':>8}{'IFBench':>9}{'words':>8}{'FB HSR':>9}{'words':>8}")
+for name in order:
+    ifeval = load("ifeval", name)
+    ifbench = load("ifbench", name)
+    fb = load("followbench", name)
+    # FB HSR 取 level 1..5 的均值，是这张概览表的单值代理；分级曲线在下一张表。
+    levels = (
+        [fb.get(f"rule_hsr_level_{level}") for level in range(1, 6)] if fb else []
+    )
+    levels = [value for value in levels if value is not None]
+    fb_mean = f"{sum(levels) / len(levels) * 100:.1f}".rjust(9) if levels else "-".rjust(9)
+    print(
+        f"{name:<32}"
+        + pct(ifeval, "strict_prompt_accuracy", 8)
+        + num(words_p50("ifeval", name), 8)
+        + pct(ifbench, "strict_prompt_accuracy", 9)
+        + num(words_p50("ifbench", name), 8)
+        + fb_mean
+        + num(words_p50("followbench", name), 8)
+    )
+print()
+print("**分数和它右边的 words 必须一起读**：本线训练数据的答案 P50 只有 18 token，")
+print("输出长度必然被压缩，而三个 benchmark 里的 format / style / 长度类约束有相当")
+print("一部分其实在量长度（见 results_log/2026-09-12 第 8c 节）。分数变了先看 words，")
+print("再谈「FLAN 教不教得会 IF」。")
+
+# FollowBench 的价值在分级曲线而不是单值：它报的是模型在第几级开始塌。
+fb_rows = [(name, load("followbench", name)) for name in order]
+fb_rows = [(name, payload) for name, payload in fb_rows if payload]
+if fb_rows:
+    print()
+    print("=" * 100)
+    print("FollowBench rule 侧分级曲线（HSR %，覆盖 70/164 组；CSL 是 0-5 的级数）")
+    print("=" * 100)
+    print(f"{'run':<32}{'L1':>7}{'L2':>7}{'L3':>7}{'L4':>7}{'L5':>7}{'CSL':>8}{'empty':>7}")
+    for name, payload in fb_rows:
+        cells = "".join(
+            pct(payload, f"rule_hsr_level_{level}", 7) for level in range(1, 6)
+        )
+        print(
+            f"{name:<32}{cells}"
+            + num(payload.get("rule_csl"), 8, "{:.2f}")
+            + num(payload.get("response_empty"), 7)
+        )
+    print()
+    print("这三列**不是 FollowBench 全量分数**：style 类 rule 覆盖为 0，format 类只")
+    print("覆盖 2/30，example 类还有 2 组是退化的（ladder 4 恒 0 / ladder 21 恒满分）。")
+    print("judge 那 470 行要在有网的地方过 judge_followbench.py 才能补齐 164 组。")
+PY
+fi
+
+echo "========================================================================"
+echo "产物:"
+echo "  IF 池        : ${IF_DATASET}"
+echo "                 manifest -> ${RESULTS_ROOT}/datasets/$(basename "${IF_DATASET}")_manifest.json"
+echo "  replay/C 池  : ${REPLAY_POOL}   (Part 2 用；replay.py 与 collect_cov 读同一份)"
+echo "  heldout 池   : ${HELDOUT_POOL}   (probe.py 的 flan_heldout)"
+echo "  checkpoint   : ${CKPT}"
+echo "  评测         : ${RESULTS_ROOT}/{ifeval,ifbench,followbench}/<run>/summary.json"
+echo "  汇总 csv     : ${RESULTS_ROOT}/{ifeval,ifbench,followbench}_summary.csv"
+echo ""
+echo "FollowBench 的 judge 那半边（470 行，要在有网的地方跑）:"
+echo "  python -m onereplay.scripts.judge_followbench \\"
+echo "    --input ${RESULTS_ROOT}/followbench/${RUN}/judge_inputs.jsonl \\"
+echo "    --output ${RESULTS_ROOT}/followbench/${RUN}/judge_outputs.jsonl --api_key ..."
+echo "然后 score_followbench.py 合并两半，出完整的 164 组 HSR/SSR/CSL。"
+echo ""
+echo "怎么读结论:"
+echo "  * 与 90 号（Conifer）并排读，就得到 alignment gradient 最不对齐那一端的读数。"
+echo "  * 分数升降都要先对照 FB words / 响应长度，再谈能力 —— 本线必然压缩输出长度。"
+echo "  * 两条线的 val loss 绝对值不可比（答案长度差一个量级），只能比评测分数。"
+echo "Job finished at: $(date)"
