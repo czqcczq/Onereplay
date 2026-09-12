@@ -392,7 +392,7 @@ MAXVAL="${MAXVAL:-200}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
 # ---- LR 搜索 / 冒烟 ----
-LR_GRID="${LR_GRID:2e-5 5e-5 1e-4}"
+LR_GRID="${LR_GRID:-2e-5 5e-5 1e-4}"
 # **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)，
 # 而本线 BATCH=1 所以分母是 **64** —— 每次更新要烧掉 64 个 micro-batch。
 #
