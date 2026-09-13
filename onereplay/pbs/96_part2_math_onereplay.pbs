@@ -347,7 +347,7 @@ MAXLEN="${MAXLEN:-8192}"
 # Model-IF-Math 和 Part 1 的 Model-Math 是同样的新任务预算，数学分可以并排读。
 EPOCHS="${EPOCHS:-2}"
 # **两条臂必须同 LR**，这是比较的前提。LR 写进 run 名，train 和 eval 要传同一个值。
-LR="${LR:-2e-5}"
+LR="${LR:-5e-5}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-200}"
 # 全量微调下 --target_modules 不决定哪些参数训练（全都训），只在 LoRA 路径有用。
