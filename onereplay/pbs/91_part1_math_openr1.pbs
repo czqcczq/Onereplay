@@ -174,22 +174,38 @@
 # instruction_style 或 think_handling，必须重看，不能沿用上面这组数。
 #
 # -----------------------------------------------------------------------------
-# 【评测预算必须大于训练答案长度】
+# 【评测预算必须大于训练答案长度】4096 已实测不够，默认改成 8192
 #
-# 训练答案实测 P50=3767 / P75=5416 / P90=6819 token，而 evaluate.py 的默认
-# max_new_tokens 只有 1024——那会把绝大多数正确推理在写到 \boxed{} 之前掐断，打分器
-# 找不到 boxed 跨度，直接读成"不会做"。
+# 训练答案实测 P50=3767 / P75=5416 / P90=6819 / P95=7524 / P99=8004 token。评测预算
+# 只要低于这个分布的中位数，就会把正确推理在写到 \boxed{} 之前掐断，而 math500.py 的
+# extract_answer 抽不到 boxed 跨度就返回 None，is_equiv(None, gold) 直接判错——分数
+# 读成"不会做"。
 #
-# MATH_MAX_NEW_TOKENS 默认给 4096，刚好覆盖过半（P50=3767）并留出余量。上半部分仍会
-# 被截断，这是和评测耗时的折中：解码时间正比于这个预算，而它已经是本线最慢的一步。
+# 曾经的默认 4096 正好卡在训练答案中位数下面，代价实测如下（lr=5e-5 seed=1，batch=128）：
 #
-# 判读规则：如果 MATH-500 低得可疑，**先去 ${RESULTS_ROOT}/math500/<run>/responses.jsonl
-# 数一下有多少条响应结尾没有 \boxed{}**。如果占比高，是预算不够而不是能力不行，
-# 把 MATH_MAX_NEW_TOKENS 提到 6144（覆盖到 P90 附近）重评。
+#                报告 acc   无答案    其中撞上限    响应 token P50/P90/P99/max
+#   base           0.528    14.6%      58.9%         468 / 1978 / 4147 / 4194
+#   Model-Math     0.388    55.0%      99.6%        4096 / 4096 / 4096 / 4096
 #
-# 实测（GSM8K 1319 题，MATH_MAX_NEW_TOKENS=4096）：161 条没有 \boxed{}，占 12.2%。
-# 这个数同时是"不吐 EOS 的行"的占比下界，而它决定评测耗时——见下面 MATH_BATCH 的
-# 注释：generate 整批等最慢的一行，12.2% 下 batch=32 有 98% 的批次跑满上限。
+# Model-Math 的长度分布**在中位数上就被右删失**（P50 == cap），无答案的 275 行里 274
+# 行是撞上限，自然收尾却不写 boxed 的只有 1 行。所以 0.388 < 0.528 是纯测量假象：
+#   两边都抽出答案的 200 题交集   0.870 vs 0.805
+#   各自能抽出答案的行           0.862 vs 0.618
+#   base 在 Model-Math 被截断的那 275 行上只有 0.375（它自己也有 48 行无答案）
+# GSM8K 同病但症状轻，因为它的打分器兜底取"整篇最后一个数字"：未截断子集 0.861 vs
+# base 0.368，而报告值是 0.719 vs 0.320。四个报告数字全都偏低。
+#
+# 8192 的依据：数据集本身按 8192 筛过，训练答案 P99=8004 / max=7993，且每条训练目标
+# 末尾都补了 EOS（onereplay/data/chat.py 的 apply_train_template），所以模型学到的回答
+# 长度分布基本被 8000 封住，8192 能覆盖 95%+。代价是解码时间，见下面 MATH_BATCH。
+#
+# 判读规则：eval 跑完会自动打 length/truncation diagnostic（本文件 eval 段末尾）。
+# hit-cap 接近 0 且 P99 明显低于 cap 才算预算够用；hit-cap 还高就继续往 12288 提。
+#
+# 【这件事对 Part 2 / Part 3 的杀伤力更大】删失是长度相关的：任何让输出变短的干预
+# （replay 混 IF 数据、EWC 把权重拉回 base）都会让更多行在预算内收尾，MATH-500 分数
+# 因此上升，会被误读成"该方法保住了数学能力"。所以 96/98/99 号必须用同一个预算，且
+# 每个 arm 都要同时报 accuracy / no-answer / hit-cap，否则遗忘结论和输出长度分不开。
 #
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先在有网节点备好
@@ -217,8 +233,11 @@
 #   #    建议先只跑 1 个 epoch，确认分数起来了再考虑加第二个。
 #   qsub -v MODE=train,LR=2e-5,EPOCHS=1,DO_EVAL=0 onereplay/pbs/91_part1_math_openr1.pbs
 #
-#   # 4) 评测另开一个作业（约 4-8 h，4096 token 预算下解码很慢）
-#   qsub -v MODE=eval,LR=2e-5 onereplay/pbs/91_part1_math_openr1.pbs
+#   # 4) 评测另开一个作业。4096 已实测不够（见文件头），默认 cap=8192 / batch=64，
+#   #    两个 run 合计约 6 h。产物写到 ${RESULTS_ROOT}/eval_cap8192/，不覆盖 4096
+#   #    那次。这次 checkpoint 是 lr=5e-5，**必须带 LR=5e-5**，否则会去找不存在的
+#   #    part1_math_lr2e-5_seed1。
+#   qsub -v MODE=eval,LR=5e-5 onereplay/pbs/91_part1_math_openr1.pbs
 #
 #   # 想先便宜地把整条链路跑通，用子集（约 1-2 h）
 #   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_part1_math_openr1.pbs
@@ -287,8 +306,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED
     REPLAY_ROWS REPLAY_POOL REPLAY_SAMPLE_SEED
-    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS
-    EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL
+    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
+    EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL DIAG_LEN
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -440,8 +459,10 @@ SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-64}"
 # ---- 评测（只测 Math 能力）----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 训练答案实测 P50=3767。低于这个数会把正确推理在 \boxed{} 之前掐断，读成不会做。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+# 训练答案实测 P50=3767 / P99=8004。cap=4096 实测让 Model-Math 56.2% 的响应撞上限、
+# 55% 抽不出答案，accuracy 直接失去意义（见文件头那张表）。改这个值必须整张结果表
+# 一起重评，不能和旧数字混用。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-8192}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
 # math 的解码 batch 刻意给大值，理由不是显存而是 generate 的退出条件。
@@ -456,14 +477,24 @@ EVAL_BATCH="${EVAL_BATCH:-32}"
 # MATH-500 500）从 58 批降到 15 批，实测 3h 掉到 45min 量级。
 #
 # KV cache 账（Qwen3-1.7B：28 层 / 8 个 KV head / head_dim 128 / bf16）：
-#   每 token 28x2x8x128x2 = 112 KiB -> 4096 token 一条序列 458 MiB
-#   batch 128 -> 59 GiB，加 3.4GB 权重在 80GB 卡上放得下。
-# 显存不够就传 MATH_BATCH=64（约 29 GiB，批数 29，约 1.5h）。
+#   每 token 28x2x8x128x2 = 112 KiB
+#   -> 一条序列 4096 token 458 MiB、8192 token 917 MiB
+#
+# **cap 提到 8192 的同时 batch 必须减半**：8192 下 batch 128 要 114 GiB，80GB 卡直接
+# OOM；batch 64 是 57 GiB，加 3.4GB 权重刚好放得下（expandable_segments 已开）。
+# 墙钟按"批数 x cap"估（几乎每批都跑满上限）：1819 题 / 64 = 29 批 x 8192 ≈ 3h 一个
+# run，base + trained 约 6h，walltime 24h 够。
+# 还 OOM 就降到 48（43 GiB，38 批，约 3.9h）或 32（29 GiB，57 批，约 5.8h）。
 #
 # 换 batch 会换 left padding 的宽度和 kernel 选择，贪心输出可能有微小漂移，所以
 # **同一张结果表里的所有 run 必须用同一个 MATH_BATCH 重评**——generation.py 开头
 # 那段"a mix of old and new numbers is not comparable"就是在说这件事。
-MATH_BATCH="${MATH_BATCH:-128}"
+MATH_BATCH="${MATH_BATCH:-64}"
+# 评测产物和 4096 那次拆开：旧数字留在 ${RESULTS_ROOT}/{gsm8k,math500}/ 作对照，
+# 这次写到 eval_cap${MATH_MAX_NEW_TOKENS}/。checkpoint 仍从 ${CKPT_DIR} 读，不受影响。
+# 想覆盖原目录就提交时传 EVAL_OUT_DIR=${RESULTS_ROOT} FORCE_EVAL=1。
+EVAL_OUT_DIR="${EVAL_OUT_DIR:-${RESULTS_ROOT}/eval_cap${MATH_MAX_NEW_TOKENS}}"
+DIAG_LEN="${DIAG_LEN:-1}"
 
 RUN="part1_math_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
@@ -484,7 +515,8 @@ echo "  数据池         : ${MATH_DATASET}"
 echo "  think / prompt : ${THINK_HANDLING} / ${INSTRUCTION_STYLE}"
 echo "                   (评测侧 enable_thinking=False，strip_tags 才对得上)"
 echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
-echo "  评测           : gsm8k, math500   (对照 base, max_new_tokens=${MATH_MAX_NEW_TOKENS})"
+echo "  评测           : gsm8k, math500   (对照 base, max_new_tokens=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH})"
+echo "  eval out       : ${EVAL_OUT_DIR}   (FORCE_EVAL=${FORCE_EVAL})"
 echo "  checkpoint     : ${CKPT}"
 echo "========================================================================"
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -657,15 +689,15 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
     local -a ckpt_arg=()
     if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
 
-    if [[ -f "${RESULTS_ROOT}/math500/${name}/summary.json" && "${FORCE_EVAL}" != "1" ]]; then
-      echo "跳过评测 ${name}：已有 math500 summary（FORCE_EVAL=1 强制重评）"
+    if [[ -f "${EVAL_OUT_DIR}/math500/${name}/summary.json" && "${FORCE_EVAL}" != "1" ]]; then
+      echo "跳过评测 ${name}：已有 ${EVAL_OUT_DIR}/math500/${name}/summary.json（FORCE_EVAL=1 强制重评）"
       return 0
     fi
-    echo "==== eval ${name} (${METRICS}) ===="
+    echo "==== eval ${name} (${METRICS}) cap=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} -> ${EVAL_OUT_DIR} ===="
     python -m onereplay.scripts.evaluate \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
-      --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --metrics "${METRICS}" --out_dir "${EVAL_OUT_DIR}" --seed "${SEED}" \
       --limit "${EVAL_LIMIT}" \
       --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
       --gsm8k_data_path "${GSM8K_DATA}" \
@@ -681,25 +713,83 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
         if [[ -d "${CKPT}" ]]; then
           run_eval "${RUN}" "${CKPT}"
         else
-          echo "跳过 ${RUN}：checkpoint 不存在"
+          echo "跳过 ${RUN}：checkpoint 不存在（${CKPT}）"
+          echo "这次训练用的是 lr=5e-5，MODE=eval 必须带 LR=5e-5，默认 LR=2e-5 会对不上。"
         fi
         ;;
       *) echo "未知 run: ${which}" ;;
     esac
   done
+
+  # 长度/截断诊断：hit-cap 接近 0 且 P99 明显低于 cap 才算预算够用。
+  if [[ "${DIAG_LEN}" == "1" ]]; then
+    DIAG_FILES=()
+    for which in ${RUNS_TO_EVAL}; do
+      case "${which}" in
+        base) name="base" ;;
+        trained) name="${RUN}" ;;
+        *) continue ;;
+      esac
+      for metric in gsm8k math500; do
+        f="${EVAL_OUT_DIR}/${metric}/${name}/responses.jsonl"
+        [[ -f "${f}" ]] && DIAG_FILES+=("${f}")
+      done
+    done
+    if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
+      python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "${DIAG_FILES[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, cap = sys.argv[1], int(sys.argv[2])
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+print(f"==== response length / truncation diagnostic (cap={cap}) ====")
+for path in sys.argv[3:]:
+    file = Path(path)
+    if not file.is_file():
+        continue
+    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+    if not rows:
+        continue
+    lengths = sorted(
+        len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+        for row in rows
+    )
+    missing = sum(row.get("prediction") in (None, "") for row in rows)
+    hit_cap = sum(length >= cap - 8 for length in lengths)
+    label = f"{file.parent.parent.name}/{file.parent.name}"
+    print(
+        f"{label:>40}: n={len(rows)} "
+        f"no-answer={missing} ({missing / len(rows):.1%}) "
+        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
+    )
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则把 MATH_MAX_NEW_TOKENS 提到 12288 再重评。")
+PY
+    fi
+  fi
 fi
 
 echo "========================================================================"
 echo "产物:"
 echo "  Math 池      : ${MATH_DATASET}"
 echo "  checkpoint   : ${CKPT}"
-echo "  评测         : ${RESULTS_ROOT}/{gsm8k,math500}/<run>/summary.json"
-echo "  汇总 csv     : ${RESULTS_ROOT}/{gsm8k,math500}_summary.csv"
+echo "  评测         : ${EVAL_OUT_DIR}/{gsm8k,math500}/<run>/summary.json"
+echo "  汇总 csv     : ${EVAL_OUT_DIR}/{gsm8k,math500}_summary.csv"
+echo "  4096 旧结果  : ${RESULTS_ROOT}/{gsm8k,math500}/  （未覆盖）"
 echo ""
 echo "怎么读结论: Model-Math 的 GSM8K/MATH-500 明显高于 base => OpenR1 确实教会了"
 echo "            数学推理，这条线的 sanity check 通过。"
 echo "            MATH-500 是同分布上限（训练 prompt 与它一致），GSM8K 是跨格式泛化"
 echo "            （它要求 '####' 格式，训练时没见过），后者偏低是正常的。"
-echo "            如果都没涨，先查两件事再怀疑数据：(1) 池子是不是用了 strip_tags，"
-echo "            (2) MATH_MAX_NEW_TOKENS 是否够长（响应被掐断会读成不会做）。"
+echo "            先看作业末尾的 length diagnostic：hit-cap 还高就不是能力不行，是预算"
+echo "            仍不够。四个数字必须和 4096 那次分开读，不能混进同一张表。"
 echo "Job finished at: $(date)"
