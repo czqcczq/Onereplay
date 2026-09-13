@@ -187,6 +187,10 @@
 # 数一下有多少条响应结尾没有 \boxed{}**。如果占比高，是预算不够而不是能力不行，
 # 把 MATH_MAX_NEW_TOKENS 提到 6144（覆盖到 P90 附近）重评。
 #
+# 实测（GSM8K 1319 题，MATH_MAX_NEW_TOKENS=4096）：161 条没有 \boxed{}，占 12.2%。
+# 这个数同时是"不吐 EOS 的行"的占比下界，而它决定评测耗时——见下面 MATH_BATCH 的
+# 注释：generate 整批等最慢的一行，12.2% 下 batch=32 有 98% 的批次跑满上限。
+#
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先在有网节点备好
 #   1) 模型      ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
@@ -218,6 +222,12 @@
 #
 #   # 想先便宜地把整条链路跑通，用子集（约 1-2 h）
 #   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 5) 反向线（Math -> IF）要用的 20k 旧知识池。训练池逐字不变，已有 checkpoint
+#   #    不受影响，所以在 Model-Math 训完之后补跑是安全的（约 10-15 min，纯 CPU）。
+#   qsub -v MODE=data,REPLAY_ROWS=20000 onereplay/pbs/91_part1_math_openr1.pbs
+#      也可以不重跑本脚本，直接用 99 号的 MODE=pool 从已存的训练池上切（几分钟，
+#      两条路径调的是同一个 carve_replay_pool，产物逐字相同）。
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
@@ -276,6 +286,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED
+    REPLAY_ROWS REPLAY_POOL REPLAY_SAMPLE_SEED
     GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS
     EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL
   )
@@ -355,6 +366,21 @@ if [[ -z "${OPENR1_PARQUET:-}" ]]; then
 fi
 MATH_DATASET="${MATH_DATASET:-${RESULTS_ROOT}/datasets/openr1_math}"
 
+# ---- 反向线（Math -> IF）的旧知识池 ----
+# 本线自己不需要它。它是 99/100/101 号的输入：Math 变成"被保护的能力"时，C_math /
+# F_math / replay 三者必须读同一批旧知识行，那批行就是这个文件。
+#
+# nested 随机子集：训练池**一行都不删**，这只是它的另一个视图。所以在 Model-Math 已经
+# 训完之后补跑 MODE=data 是安全的——prepare_openr1_math 在同样的 --seed 下写出逐字
+# 相同的训练池（rows 的构造是确定的，--max_train_samples 0 下连 shuffle 都不发生），
+# 已有 checkpoint 不会失效。
+#
+# 默认 0 = 不写，保持这条线原来的行为不变。要产池就 REPLAY_ROWS=20000。
+REPLAY_ROWS="${REPLAY_ROWS:-0}"
+REPLAY_POOL="${REPLAY_POOL:-${MATH_DATASET}_replay.jsonl}"
+# 与 --seed 分开：重抽旧知识池不该牵动训练池。
+REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
+
 # ---- 模式 ----
 MODE="${MODE:-data}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -418,8 +444,26 @@ MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
-# 3072 token 的 KV cache 很占地方，math 的解码 batch 单独给小值
-MATH_BATCH="${MATH_BATCH:-32}"
+# math 的解码 batch 刻意给大值，理由不是显存而是 generate 的退出条件。
+#
+# GSM8K 上实测 12.2% 的响应不吐 EOS（数学题上就是陷入重复循环），而 model.generate
+# 只在**批内所有行都结束**时才退出。batch=32 时一批撞上限的概率是
+# 1-(1-0.122)^32 = 98.4%，也就是几乎每批都要跑满 MATH_MAX_NEW_TOKENS 步。所以墙钟
+# 正比于**批数**，跟平均响应长度无关。
+#
+# decode 阶段是权重带宽瓶颈：每一步都要把 3.4GB 的 bf16 权重读一遍，不管批内是 32
+# 行还是 128 行，单步耗时几乎不变。批数却少 4 倍——1819 道题（GSM8K 1319 +
+# MATH-500 500）从 58 批降到 15 批，实测 3h 掉到 45min 量级。
+#
+# KV cache 账（Qwen3-1.7B：28 层 / 8 个 KV head / head_dim 128 / bf16）：
+#   每 token 28x2x8x128x2 = 112 KiB -> 4096 token 一条序列 458 MiB
+#   batch 128 -> 59 GiB，加 3.4GB 权重在 80GB 卡上放得下。
+# 显存不够就传 MATH_BATCH=64（约 29 GiB，批数 29，约 1.5h）。
+#
+# 换 batch 会换 left padding 的宽度和 kernel 选择，贪心输出可能有微小漂移，所以
+# **同一张结果表里的所有 run 必须用同一个 MATH_BATCH 重评**——generation.py 开头
+# 那段"a mix of old and new numbers is not comparable"就是在说这件事。
+MATH_BATCH="${MATH_BATCH:-128}"
 
 RUN="part1_math_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
@@ -503,10 +547,19 @@ if [[ "${MODE}" == "data" ]]; then
     --instruction_style "${INSTRUCTION_STYLE}" \
     --require_boxed "${REQUIRE_BOXED}" \
     --max_len "${MAXLEN}" \
+    --replay_rows "${REPLAY_ROWS}" \
+    --replay_out "${REPLAY_POOL}" \
+    --replay_sample_seed "${REPLAY_SAMPLE_SEED}" \
     --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
 
   echo "数据准备完成。**先看长度报告**：确认 question gone ≈ 0，并用 tok/epoch 反推"
   echo "训练时长，再决定 MAXLEN / EPOCHS，然后 MODE=smoke 冒烟。"
+  if (( REPLAY_ROWS > 0 )); then
+    echo ""
+    echo "另外写了反向线（Math -> IF）的旧知识池: ${REPLAY_POOL}"
+    echo "它是训练池的 nested 随机子集，训练池本身逐字不变，所以已有的 Model-Math"
+    echo "checkpoint 依然有效。99 号采 C_math 读的就是这个文件。"
+  fi
   exit 0
 fi
 

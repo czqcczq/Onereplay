@@ -1,0 +1,922 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N p2_math_rp
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# Part 2 replay 臂: Model-IF-FLAN --OpenR1-Math--> Model-IF-Math，用重放保护 IF
+#
+#     数据级混合：训练集 =  行 Ope45334nR1 + 19947 行 FLAN(20k 池)，逐行打散
+#     BATCH=1 与 vanilla / onereplay 完全一致，只有 ACCUM 从 64 抬到 92
+#
+# 这是 onereplay 的另一条主要对照。三条臂的差别只在「旧知识怎么用」：
+#   onereplay  把 20k 行压成 C = E[x xᵀ]，训练时只算 tr(ΔW C ΔWᵀ)，语料不再碰
+#   ewc        把 20k 行压成对角 Fisher，同理
+#   replay     **保留语料**，训练时真的再训一遍其中的行
+# 三者吃的是同一批 20k 行（同一个 jsonl、同一个池指纹），所以比较的是"怎么用"，
+# 不是"用了多少"。
+#
+# =============================================================================
+# 【本脚本第一版用的是 batch 级混合（BATCH=2, 1new+1replay），那是错的。留档】
+#
+# 错在哪：SFTTrainer.compute_task_loss 返回的是 HF 的 outputs.loss，也就是**整个
+# micro-batch 的监督 token 池化平均**：
+#     loss = (Σ_新任务token CE + Σ_replaytoken CE) / (n_新 + n_replay)
+# 所以一行 replay 对梯度的权重是它的 **token 占比**，不是行占比。而两边的答案长度
+# 差两个数量级（OpenR1 答案 P50 = 3767 token，FLAN targets P50 = 18 token），于是
+#     1 new + 1 replay 的"行数 1:1"  ->  replay 只占约 27/(3800+27) = **0.7% 的损失**
+# 那样的 replay 臂等于没开，跑完只能得到「重放无效」这个假结论。
+#
+# batch_mix.py 自己把这件事写在注释里了（_mean_supervised_tokens 的 docstring）：
+#     "A row's share of the batch is not its share of the loss: the model averages
+#      cross-entropy over supervised tokens, so a batch that is half replay *rows*
+#      is half replay *loss* only when both sides have similar answer lengths."
+# 83 号没踩到，是因为它的新任务是 Commonsense@512，答案长度和 FLAN 同一个量级。
+# 本线新任务是 8192 的长 CoT，这个前提不成立了。
+#
+# -----------------------------------------------------------------------------
+# 【数据级混合为什么能修好它：BATCH=1 下 损失占比 == 行占比】
+#
+# 数据级（--replay_ratio）把 replay 行**作为独立的行**拼进训练集，于是 BATCH=1 时
+# 每个 micro-batch 只有一行，它的 loss 就是这一行自己的 token 平均；累加时
+#     loss = task_loss / accumulation_steps
+# 每个 micro-batch 都除同一个数。**所以一行 25 token 的 FLAN 和一行 3767 token 的
+# OpenR1 对累加梯度的贡献完全相等**，都是 1/ACCUM。
+#     行占比 30.6%  ->  损失占比 30.6%   （batch 级是 0.7%，差 44 倍）
+#
+# 这不是取巧，这是"一行算一个样本"的标准 SFT 语义；batch 级那条路才是被
+# token 池化悄悄改掉了权重。
+#
+# -----------------------------------------------------------------------------
+# 【顺带解决了 BATCH 不可比的问题：三条臂全是 BATCH=1】
+#
+# 数据级不需要动 BATCH，所以 vanilla / onereplay / replay 的 micro-batch 都是 1 行、
+# 每步开销直接可比，**96 号那两个已经在跑的作业不用重跑**。
+#
+# 唯一要动的是 ACCUM，因为混合后每个 micro-batch 只有 69.4% 的概率是新任务行：
+#     期望新任务行数/更新 = ACCUM / (1 + ratio) = 92 / 1.44 = 63.9 ≈ 64   ok
+# ACCUM 保持 64 的话每次更新只有 44.4 行新任务，这条臂就"少学了新任务"，而
+# 「保住了旧能力」和「少学了新任务」在结果表上长得一模一样。Step 0 会算这个数并断言。
+#
+# 代价：数据级是按概率抽的，每次更新的新任务行数是 64±4（二项波动），不像 batch 级
+# 那样精确。batch_mix.py 的模块 docstring 就是为了消掉这个波动才写的。但 ±4 行是
+# 二阶效应（等价于 batch size 轻微起伏，SGD 完全能容忍），而 0.7% 的损失占比是
+# 一阶错误 —— 用一阶错误换二阶精确性是不划算的。
+#
+# -----------------------------------------------------------------------------
+# 【ratio 的上限是 0.441，到不了 0.5，这是池子大小决定的】
+#
+# 数据级是**追加**：num_replay = ratio x |train|，而 build_replay_dataset 拒绝
+# 「要的比池子里有的多」（它不肯静默少训）：
+#     requested N replay samples but the pool only holds 20000 usable rows
+# 所以上限 = 20000 / 45334 = **0.4412**，即 30.6% old / 69.4% new。
+# 默认 REPLAY_RATIO=0.44（19947 行，留一点余量）。
+#
+# 到不了严格的 0.5/0.5，但这是"用完整个 C 的池子"能达到的最大值，而且它换来的是
+# 真实的 30.6% 损失占比。要更高只能扩大池子，那会破坏「replay 子集嵌套在 C 的池里」
+# —— 那时 replay 就是从更多旧知识里保护，比较也就不成立了。
+#
+# -----------------------------------------------------------------------------
+# 【开销：数据级还便宜得多，因为短行不再被补齐到 8192】
+#
+# BATCH=1 时每个 micro-batch 只有一行，补齐长度就是它自己的长度。一行 266 token 的
+# FLAN 只花 266 token 的计算，而不是像 batch 级那样陪着 8192 的邻居补零到 8192。
+#     新任务  45334 步 x 200ms（96 号实测）           = 9067 s
+#     replay  19947 步 x 约 20ms（266/4149 的长度比）  = 约 400 s
+#     ------------------------------------------------------------
+#     约 2.63 h/epoch，比 vanilla 的 2.52 h 只贵 **约 5%**
+# batch 级那条路是 2 倍（约 10h/2epoch），而且多出来的几乎全是补零。
+# 所以这一版既更正确、又便宜一个数量级。
+#
+# -----------------------------------------------------------------------------
+# 【replay_max_len 必须等于 C 的 max_len，不是等于新任务的 max_len】
+#
+# 1536。理由和 83 号第 78-85 行一样：C 是在 max_len 1536 下采的，replay 若只给 512，
+# 它保护的旧知识就**严格少于**罚项编码的旧知识，两条臂比的就不只是"怎么用"了。
+# Step 0 会读 C 文件的 metadata.max_len 并硬比对。
+# 顺带：截断保留的是**最后** max_len 个 token，所以超长行会丢掉问题、留下答案，
+# 把"问答复习"变成"裸续写"。FLAN 在 1536 下 P100 都进得去，这里不是问题。
+#
+# -----------------------------------------------------------------------------
+# 【为什么单独一个文件，而不是给 96 号加 ARM=replay】
+#
+# 96 号的 vanilla / onereplay 两条臂共用逐字相同的 BATCH/ACCUM，那是"只改一个变量"的
+# 结构保证。replay 臂虽然 BATCH 相同，但 ACCUM 必须从 64 抬到 92（否则每次更新只有
+# 44.4 行新任务），塞进去就破坏了那个保证，也会让 96 号里"两条臂逐字相同"的注释失真。
+# 81(onereplay)/82(ewc)/83(replay) 当年分文件也是同一个理由。
+#
+# -----------------------------------------------------------------------------
+# 【前置】计算节点无外网
+#   1) Model-IF-FLAN checkpoint   94 号 MODE=train 的产物
+#   2) OpenR1 数据池              91 号 MODE=data 的产物
+#   3) 20k 旧知识池               94 号的 flan_v2_if_50k_replay.jsonl（本臂直接读它）
+#   4) C_if                       95 号的产物（只用来对 max_len / 池指纹，不参与训练）
+#   5) 数学评测集 + IFEval 输入
+#
+# 【用法】
+#   # 先看计划和前置检查，不碰 GPU
+#   qsub -v DRY_RUN=1 onereplay/pbs/98_part2_math_replay.pbs
+#
+#   # 冒烟：70 步，看峰值显存（应与 96 号的 63 GiB 同量级）+ 混合行数那一行
+#   qsub -v MODE=smoke onereplay/pbs/98_part2_math_replay.pbs
+#
+#   # 正式训练（约 5.3h，与 96 号同量级；评测仍建议另开）
+#   qsub -v MODE=train,DO_EVAL=0 onereplay/pbs/98_part2_math_replay.pbs
+#
+#   # 评测（拆两半，加起来装不进一个 24h）
+#   qsub -v MODE=eval,DO_IF=0 onereplay/pbs/98_part2_math_replay.pbs
+#   qsub -v MODE=eval,DO_MATH=0 onereplay/pbs/98_part2_math_replay.pbs
+#
+#   # 便宜地把链路跑通
+#   qsub -v MODE=train,MAX_TRAIN_SAMPLES=2000,EPOCHS=1,DO_EVAL=0 \
+#     onereplay/pbs/98_part2_math_replay.pbs
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/98_part2_math_replay.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_p2rp_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_p2rp_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_p2rp_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME IF_LINE_ROOT IF_CKPT_DIR IF_LR IF_RUN IF_CKPT
+    MATH_LINE_ROOT MATH_DATASET RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    POOL_FILE POOL_ROWS_EXPECT COV_PATH COV_SCOPE REQUIRE_COV
+    MODE DRY_RUN DO_TRAIN DO_EVAL DO_MATH DO_IF SEED FORCE_TRAIN FORCE_EVAL
+    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    REPLAY_RATIO REPLAY_PER_BATCH REPLAY_MAXLEN REPLAY_POOL_SIZE REPLAY_SAMPLE_SEED
+    REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN
+    SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY
+    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS MATH_BATCH
+    IFEVAL_INPUT MAX_NEW_TOKENS EVAL_BATCH
+    FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
+    EVAL_LIMIT
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+# ---- Stage 1 / IF 线（94 号）的产物：基座和旧知识池都在这里 ----
+IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
+IF_CKPT_DIR="${IF_CKPT_DIR:-${IF_LINE_ROOT}/checkpoints}"
+# 与 95 号采 C、97 号采 F 读的是同一个文件。这是三条臂"吃同一批旧知识"的物理保证。
+POOL_FILE="${POOL_FILE:-${IF_LINE_ROOT}/datasets/flan_v2_if_50k_replay.jsonl}"
+POOL_ROWS_EXPECT="${POOL_ROWS_EXPECT:-20000}"
+
+# ---- Math 线（91 号）的产物：新任务池，只读不重建 ----
+MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_math}"
+MATH_DATASET="${MATH_DATASET:-${MATH_LINE_ROOT}/datasets/openr1_math}"
+
+# ---- Part 2 的结果树，与 96/97 号同一棵 ----
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part2_if2math}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+# ---- C_if：本臂**不用**它训练，只用它的 metadata 对 max_len 和池指纹 ----
+COV_SCOPE="${COV_SCOPE:-full}"
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_if_flanv2_20k_${COV_SCOPE}.pt}"
+REQUIRE_COV="${REQUIRE_COV:-1}"
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+
+MODE="${MODE:-train}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+DO_MATH="${DO_MATH:-1}"
+DO_IF="${DO_IF:-1}"
+SEED="${SEED:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+
+# ---- 训练超参 ----
+# BATCH=1，与 96 号的 vanilla / onereplay **逐字相同**。这是数据级混合带来的：
+# 每个 micro-batch 只有一行，所以每步开销三条臂直接可比，也不用重跑 96 号那两个作业。
+# 同时 BATCH=1 让"损失占比 == 行占比"成立（见文件头），这是这一版的核心。
+BATCH="${BATCH:-1}"
+# 92 而不是 96 号的 64：混合后每个 micro-batch 只有 1/(1+ratio) 的概率是新任务行，
+# 要让期望的新任务行数/更新仍是 64 就得把窗口放大同样的倍数。Step 0 会算并断言。
+ACCUM="${ACCUM:-92}"
+MAXLEN="${MAXLEN:-8192}"
+EPOCHS="${EPOCHS:-2}"
+# 必须与 96 号两条臂用同一个值
+LR="${LR:-2e-5}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-200}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+LOG_EVERY="${LOG_EVERY:-500}"
+SMOKE_STEPS="${SMOKE_STEPS:-70}"
+
+# ---- replay ----
+# 数据级混合的比例：num_replay = ratio x |train|，追加进训练集后逐行打散。
+# 上限是 pool_rows/train_rows = 20000/45334 = 0.4412（超了 build_replay_dataset 会抛错，
+# 它不肯静默少训）。0.44 = 19947 行，留一点余量。Step 0 会实算并断言。
+REPLAY_RATIO="${REPLAY_RATIO:-0.44}"
+# 0 = 关掉 batch 级混合。**不要把它打开**：BATCH>1 时一个 micro-batch 里的 loss 是
+# 所有监督 token 池化平均的，短的 FLAN 行会被长的 OpenR1 行按 token 数压到约 0.7%
+# 的权重（详见文件头的留档）。
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-0}"
+# 1536 = C 的 max_len，不是新任务的 8192。Step 0 会和 C 文件硬比对。
+REPLAY_MAXLEN="${REPLAY_MAXLEN:-1536}"
+# 与 95 号 collect_cov 的 --max_samples 对齐，保证 replay 子集嵌套在 C 的池里。
+# 池文件本身正好 20000 行，所以这里等于"取全部"。
+REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-20000}"
+REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
+# gold targets，与 C / F 看到的答案是同一批（本线不做自蒸馏）
+REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN:-inputs}"
+REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-targets}"
+
+# ---- 评测：与 96 号同预算 ----
+GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
+MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+# 128 而不是 32：GSM8K 有 12.2% 的响应不吐 EOS，而 generate 整批等最慢的一行，所以
+# batch=32 下 98% 的批次都跑满 4096 步，墙钟正比于批数。decode 是权重带宽瓶颈，批大
+# 4 倍单步几乎不变贵，批数少 4 倍。KV cache 约 59 GiB（458 MiB/条 x 128）。
+# 完整算术见 91 号同名变量。显存不够传 MATH_BATCH=64。
+# 换 batch 会让贪心输出微小漂移，所以本线所有臂必须同值重评。
+MATH_BATCH="${MATH_BATCH:-128}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+EVAL_BATCH="${EVAL_BATCH:-32}"
+FB_DATA="${FB_DATA:-}"
+FB_CATEGORIES="${FB_CATEGORIES:-}"
+FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-2048}"
+FB_BATCH="${FB_BATCH:-16}"
+FB_GROUP_LIMIT="${FB_GROUP_LIMIT:-0}"
+EVAL_LIMIT="${EVAL_LIMIT:-0}"
+
+mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${DATASET_CACHE}" "${RESULTS_ROOT}/map_cache"
+
+# ===========================================================================
+# Step 0: 前置检查
+# ===========================================================================
+echo "==== Step 0: 前置检查 ===="
+
+# ---- 混合方式与更新预算的硬断言 ----
+if (( REPLAY_PER_BATCH != 0 )); then
+  echo "REPLAY_PER_BATCH=${REPLAY_PER_BATCH}：本脚本要求它是 0（走数据级混合）。"
+  echo "batch 级混合下一个 micro-batch 的 loss 是所有监督 token 池化平均的，"
+  echo "短的 FLAN 行会被长的 OpenR1 行按 token 数压到约 0.7% 的权重 —— 那样的"
+  echo "replay 臂等于没开。详见文件头的留档。"
+  exit 1
+fi
+if (( BATCH != 1 )); then
+  echo "BATCH=${BATCH}：本脚本要求 1。"
+  echo "理由有两个，都在文件头：(1) 只有 BATCH=1 时'损失占比 == 行占比'才成立，"
+  echo "BATCH>1 会让短的 replay 行被 token 池化压低权重；(2) BATCH=1 与 96 号的"
+  echo "vanilla / onereplay 逐字相同，每步开销才可比。"
+  exit 1
+fi
+
+# 期望的新任务行数/更新 = ACCUM / (1 + ratio)。混合后每个 micro-batch 是新任务行的
+# 概率是 1/(1+ratio)，所以窗口要放大同样的倍数才能维持 96 号的 64 行/更新。
+WANT_NEW_PER_UPDATE="${WANT_NEW_PER_UPDATE:-64}"
+read -r ROW_SHARE EXPECT_NEW_PER_UPDATE WANT_ACCUM <<EOF
+$(python - "${REPLAY_RATIO}" "${ACCUM}" "${WANT_NEW_PER_UPDATE}" <<'PY'
+import sys
+
+ratio, accum, want = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+row_share = ratio / (1.0 + ratio)
+expect = accum / (1.0 + ratio)
+print(f"{row_share:.4f} {expect:.1f} {round(want * (1.0 + ratio))}")
+PY
+)
+EOF
+echo "混合方式           : 数据级（--replay_ratio ${REPLAY_RATIO}，逐行打散进训练集）"
+echo "  replay 行占比    : ${ROW_SHARE}"
+echo "  replay 损失占比  : ${ROW_SHARE}  (BATCH=1 下两者相等，这是本方案的关键)"
+echo "  新任务行数/更新  : ${EXPECT_NEW_PER_UPDATE} 期望值 (96 号两条臂是 ${WANT_NEW_PER_UPDATE})"
+if [[ "${ACCUM}" != "${WANT_ACCUM}" ]]; then
+  echo ""
+  echo "!! ACCUM=${ACCUM} 与 ratio=${REPLAY_RATIO} 不配平。"
+  echo "   期望新任务行数/更新 = ACCUM/(1+ratio) = ${EXPECT_NEW_PER_UPDATE}，"
+  echo "   而 96 号的 vanilla / onereplay 是 ${WANT_NEW_PER_UPDATE}。"
+  echo "   把 ACCUM 调到 ${WANT_ACCUM}（= ${WANT_NEW_PER_UPDATE} x (1+${REPLAY_RATIO})）。"
+  echo "   不配平的话这条臂就是'少学了新任务'，而它和'保住了旧能力'在结果表上一样。"
+  exit 1
+fi
+
+# ---- 解析 Stage 1 checkpoint（与 95/96/97 号同一套逻辑）----
+if [[ -z "${IF_CKPT:-}" ]]; then
+  if [[ -n "${IF_LR:-}" ]]; then
+    IF_RUN="${IF_RUN:-part1_if_flanv2_lr${IF_LR}_seed${SEED}}"
+    IF_CKPT="${IF_CKPT_DIR}/${IF_RUN}"
+  else
+    mapfile -t _CANDS < <(
+      find "${IF_CKPT_DIR}" -maxdepth 1 -mindepth 1 -type d \
+        -name "part1_if_flanv2_lr*_seed${SEED}" 2>/dev/null | sort
+    )
+    if (( ${#_CANDS[@]} == 0 )); then
+      echo "在 ${IF_CKPT_DIR} 下找不到 part1_if_flanv2_lr*_seed${SEED}"
+      echo "先跑 94 号 MODE=train，或传 IF_CKPT=/abs/path"
+      exit 1
+    fi
+    if (( ${#_CANDS[@]} > 1 )); then
+      echo "命中多个 Stage 1 checkpoint，必须显式选一个（要与 96 号用的同一个）:"
+      for _c in "${_CANDS[@]}"; do echo "  ${_c}"; done
+      exit 1
+    fi
+    IF_CKPT="${_CANDS[0]}"
+    IF_RUN="$(basename "${IF_CKPT}")"
+  fi
+fi
+IF_RUN="${IF_RUN:-$(basename "${IF_CKPT}")}"
+[[ -d "${IF_CKPT}" ]] || { echo "缺 Stage 1 checkpoint（基座）: ${IF_CKPT}"; exit 1; }
+[[ -f "${IF_CKPT}/config.json" ]] || { echo "${IF_CKPT} 不是可加载的模型目录"; exit 1; }
+
+RUN="part2_math_replay_lr${LR}_r${REPLAY_RATIO}_seed${SEED}"
+CKPT="${CKPT_DIR}/${RUN}"
+
+# ---- 新任务池 ----
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -d "${MATH_DATASET}" ]] || {
+    echo "缺 OpenR1 池: ${MATH_DATASET}（91 号 MODE=data 的产物，本线不重建）"
+    exit 1
+  }
+fi
+
+# ---- ratio 是否超出池子容量 ----
+# build_replay_dataset 在 num_replay > 池行数时抛错，但那发生在**新任务已经 tokenize
+# 完**之后（几十分钟）。这里提前算出来，几秒钟就能挡掉。
+if [[ "${MODE}" != "eval" ]]; then
+  python - "${MATH_DATASET}" "${REPLAY_RATIO}" "${VAL_FRAC}" "${POOL_ROWS_EXPECT}" <<'PY'
+import sys
+
+from datasets import load_from_disk
+
+path, ratio, val_frac, pool_rows = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+dataset = load_from_disk(path)
+if hasattr(dataset, "keys"):
+    dataset = dataset["train"] if "train" in dataset else dataset[list(dataset.keys())[0]]
+total = len(dataset)
+# train.py 先切 validation 再混 replay，所以分母是切完之后的行数。
+val_rows = round(total * val_frac)
+train_rows = total - val_rows
+num_replay = round(ratio * train_rows)
+cap = pool_rows / train_rows
+
+print(f"新任务池           : {total} 行 -> val {val_rows} / train {train_rows}")
+print(f"  ratio={ratio} -> num_replay = {num_replay} 行（池子 {pool_rows} 行）")
+print(f"  ratio 上限       : {cap:.4f} = {pool_rows}/{train_rows}")
+if num_replay > pool_rows:
+    raise SystemExit(
+        f"\n!! ratio={ratio} 要 {num_replay} 行 replay，池子只有 {pool_rows} 行。\n"
+        "build_replay_dataset 会抛错（它不肯静默少训），而那发生在新任务 tokenize 完之后。\n"
+        f"把 REPLAY_RATIO 降到 <= {cap:.4f}，并同步把 ACCUM 调成 round(64 x (1+ratio))。\n"
+        "不要靠扩大 --replay_pool_size 绕过：那会破坏「replay 子集嵌套在 C 的池里」，\n"
+        "replay 就变成从更多旧知识里保护，和 onereplay 的比较不再成立。"
+    )
+print(f"  容量检查         : ok（用掉池子的 {num_replay / pool_rows:.1%}）")
+PY
+fi
+
+# ---- 旧知识池 ----
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -f "${POOL_FILE}" ]] || {
+    echo "缺 20k 旧知识池: ${POOL_FILE}（94 号 MODE=data 的产物）"
+    exit 1
+  }
+  POOL_ROWS_ACTUAL="$(wc -l < "${POOL_FILE}")"
+  echo "旧知识池           : ${POOL_FILE}"
+  echo "  行数             : ${POOL_ROWS_ACTUAL} (期望 ${POOL_ROWS_EXPECT})"
+  if [[ "${POOL_ROWS_ACTUAL}" != "${POOL_ROWS_EXPECT}" ]]; then
+    echo "行数与期望不符 —— 这会让 replay 和 C/F 不同池，三条臂的对照直接失效。"
+    echo "确认这就是 95/97 号用过的那个池的话，传 POOL_ROWS_EXPECT=${POOL_ROWS_ACTUAL}。"
+    exit 1
+  fi
+
+  # 池指纹：与 95/97 号同参重算，用来和 C 文件里记的对比。
+  POOL_FP="$(python -m onereplay.scripts.check_old_knowledge_pool \
+    --data_files "${POOL_FILE}" --dataset_split train \
+    --cache_dir "${DATASET_CACHE}" --streaming 0 \
+    --input_column "${REPLAY_INPUT_COLUMN}" --target_column "${REPLAY_TARGET_COLUMN}" \
+    --require_target 1 \
+    --max_samples 0 --sample_shuffle 0 --sample_seed "${REPLAY_SAMPLE_SEED}" \
+    --label if_flanv2_20k | tail -n 1)"
+  echo "${POOL_FP}"
+  POOL_HASH="${POOL_FP##*fingerprint=}"
+
+  # ---- 与 C 的一致性：max_len 和池指纹 ----
+  # 本臂不用 C 训练，但两条臂必须"从同样多的旧知识里保护"。C 在 1536 下采的，
+  # replay 若给 512 就是保护了严格更少的旧知识（83 号第 78-85 行同一个道理）。
+  if [[ -f "${COV_PATH}" ]]; then
+    python - "${COV_PATH}" "${IF_RUN}" "${POOL_HASH}" "${REPLAY_MAXLEN}" <<'PY'
+import sys
+
+import torch
+
+cov_path, want_model, want_fp, want_replay_max_len = sys.argv[1:5]
+want_replay_max_len = int(want_replay_max_len)
+
+meta = torch.load(cov_path, map_location="cpu").get("metadata", {})
+print(f"C_if 的口径: {cov_path}")
+bad = []
+for label, got, want in (
+    ("model_name", str(meta.get("model_name", "")), want_model),
+    ("pool_fingerprint", str(meta.get("pool_fingerprint", "")), want_fp),
+    ("max_len vs replay_max_len", int(meta.get("max_len", -1)), want_replay_max_len),
+):
+    flag = "ok" if got == want else "!! 不一致"
+    print(f"  {label:<26} C={got}")
+    print(f"  {'':<26} replay={want}   {flag}")
+    if got != want:
+        bad.append(label)
+
+if bad:
+    raise SystemExit(
+        f"\n!! 与 C 不一致的项: {', '.join(bad)}\n"
+        "replay 与 onereplay 的对照要求两者从**同一批、同样长度预算**的旧知识里保护。\n"
+        "  model_name 不一致  -> 两条臂的起点权重不是同一个模型\n"
+        "  指纹不一致         -> 吃的不是同一批 20k 行\n"
+        "  max_len 不一致     -> replay 看到的旧知识严格少于/多于罚项编码的\n"
+        "改本作业的参数，或重采 C。"
+    )
+print("与 C 的口径一致（同模型、同池、同 max_len）：ok")
+PY
+  elif [[ "${REQUIRE_COV}" == "1" ]]; then
+    echo "缺 C_if: ${COV_PATH}"
+    echo "本臂不用 C 训练，但默认要求它存在以对齐 max_len 和池指纹。"
+    echo "只想单独跑 replay 基线的话传 REQUIRE_COV=0。"
+    exit 1
+  else
+    echo "!! REQUIRE_COV=0：跳过与 C 的一致性检查。池指纹 = ${POOL_HASH}"
+  fi
+fi
+
+echo ""
+echo "========================================================================"
+echo "Part 2 replay 臂: Model-IF-FLAN --OpenR1-Math--> Model-IF-Math"
+echo "  基座           : ${IF_CKPT}"
+echo "  新任务池       : ${MATH_DATASET}"
+echo "  旧知识池       : ${POOL_FILE:-(eval 模式不读)}"
+echo "                   ${REPLAY_TARGET_COLUMN} 列（gold），pool_size=${REPLAY_POOL_SIZE}"
+echo "  混合           : 数据级 --replay_ratio ${REPLAY_RATIO}（逐行打散进训练集）"
+echo "                   行占比 = 损失占比 = ${ROW_SHARE}（BATCH=1 下两者相等）"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM}"
+echo "                   maxlen=${MAXLEN} replay_max_len=${REPLAY_MAXLEN}"
+echo "                   新任务行数/更新 ≈ ${EXPECT_NEW_PER_UPDATE}（与 96 号的 ${WANT_NEW_PER_UPDATE} 一致）"
+echo "  预计训练时长   : 约 2.63 h/epoch，比 vanilla 的 2.52 h 贵约 5%"
+echo "  run 名         : ${RUN}"
+echo "========================================================================"
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查，不训练不评测。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+# =============================================================================
+# 训练封装
+#
+# 与 96 号的 train_one 相比只多了 replay 那一段，且**没有任何正则参数** ——
+# 本臂靠真的再训旧数据来保护，不靠罚项。--replay_lambda 0
+# --measure_replay_when_lambda_zero 0 明确关掉 penalty 路径（否则默认 measure=1
+# 会加载 C 并每步求值，这条臂的时间和显存就不是 replay 的了）。
+#
+#   $1 run  $2 epochs  $3 save_path  $4 max_steps  $5 save  $6 log_every
+# =============================================================================
+train_one () {
+  local run="$1" epochs="$2" save_path="$3"
+  local max_steps="${4:-0}" do_save="${5:-1}" log_every="${6:-${LOG_EVERY}}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo "==== train ${run} (ratio=${REPLAY_RATIO} lr=${LR} max_steps=${max_steps}) ===="
+  # --eval_batch_size 与 BATCH 同为 1，和 96 号两条臂一致。validation 是纯新任务的
+  # （train.py 在混 replay 之前就切好了 val），所以 val_loss 与 96 号逐字可比 ——
+  # calibrate_lambda 的 matched plasticity 要用到这一点。
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${IF_CKPT_DIR}" --model_name "${IF_RUN}" --seed "${SEED}" \
+    --dataset_path "${MATH_DATASET}" \
+    --epochs "${epochs}" --lr "${LR}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size 1 \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_ratio "${REPLAY_RATIO}" \
+    --replay_per_batch 0 \
+    --replay_data_files "${POOL_FILE}" \
+    --replay_input_column "${REPLAY_INPUT_COLUMN}" \
+    --replay_target_column "${REPLAY_TARGET_COLUMN}" \
+    --replay_pool_size "${REPLAY_POOL_SIZE}" \
+    --replay_sample_seed "${REPLAY_SAMPLE_SEED}" \
+    --replay_max_len "${REPLAY_MAXLEN}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --max_steps "${max_steps}" --log_every "${log_every}" \
+    --save "${do_save}" --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl" 2>&1 | tee "${TMPDIR}/${run}.log"
+
+  # ---- 从日志里断言 replay 真的混进去了 ----
+  # mix_replay_into_train 打的是它真正拼出来的行数，而不是我们传了什么。传参与实际
+  # 不一致（比如 ratio 舍成 0、或池子被过滤空）不会报错，只会静默变成 vanilla。
+  if ! grep -qE "replay: [0-9]+ new-task \+ [0-9]+ replay = [0-9]+ rows" "${TMPDIR}/${run}.log"; then
+    echo "!! 日志里找不到数据级混合那一行（'... new-task + ... replay = ... rows'）。"
+    echo "   replay 可能根本没混进去 —— 这条臂就退化成 vanilla 了。"
+    grep -iF "replay" "${TMPDIR}/${run}.log" | head -n 20 || true
+    return 1
+  fi
+  local want_rlen="replay pool: tokenizing at max_len=${REPLAY_MAXLEN} (new task stays at ${MAXLEN})"
+  if ! grep -qF "${want_rlen}" "${TMPDIR}/${run}.log"; then
+    echo "!! 日志里找不到 replay 的 max_len 那一行:"
+    echo "   ${want_rlen}"
+    grep -F "replay pool" "${TMPDIR}/${run}.log" || true
+    return 1
+  fi
+  # 实际 ratio 与传入的偏差。mix_replay_into_train 会打 actual=...，它等于
+  # len(replay)/len(train)，因为 num_replay 是四舍五入的，应当与 ratio 差 <1e-4。
+  if grep -qF "batch-level replay" "${TMPDIR}/${run}.log"; then
+    echo "!! 日志里出现了 batch-level replay —— --replay_per_batch 没关掉。"
+    echo "   那条路径下 replay 的损失占比会掉到约 0.7%（见文件头留档）。"
+    return 1
+  fi
+  echo "数据级混合与 replay_max_len 与传参一致：ok"
+  echo "---- 实际混进去的行数 ----"
+  grep -E "replay: [0-9]+ new-task" "${TMPDIR}/${run}.log" || true
+  grep -F "replay pool" "${TMPDIR}/${run}.log" || true
+  grep -F "replay targets:" "${TMPDIR}/${run}.log" || true
+}
+
+# =============================================================================
+# MODE=smoke：70 步、不保存。这条臂的冒烟要盯三件事：
+#
+#   1) **峰值显存**。BATCH=1，所以应当与 96 号 onereplay 的 63.03 GiB 同量级，甚至
+#      更低（没有 C 的 6.58 GiB 和 W0 的 3.20 GiB，但也没有它们）—— 预期约 53 GiB，
+#      即 91 号 vanilla 的 50.77 GiB 上下。明显更高就是哪里配错了。
+#   2) **每步时间**。混合后 70 步里约 30.6% 是短的 replay 行，所以平均 ms/step 会
+#      **低于** 96 号的 200ms（短行更快）。这正是数据级比 batch 级便宜的原因。
+#   3) **混合行数那一行**真的出现了（train_one 里已经断言）。
+# =============================================================================
+if [[ "${MODE}" == "smoke" ]]; then
+  train_one "smoke_p2_replay" 1 "${CKPT_DIR}/smoke_p2_replay" "${SMOKE_STEPS}" 0 10
+
+  echo ""
+  echo "==== 冒烟自检 ===="
+  python - "${METRICS_DIR}/smoke_p2_replay.jsonl" "${REPLAY_MAXLEN}" <<'PY'
+import json
+import sys
+
+path, want_rlen = sys.argv[1], int(sys.argv[2])
+rows = [
+    json.loads(line)
+    for line in open(path, encoding="utf-8").read().splitlines()
+    if line.strip()
+]
+epochs = [row for row in rows if row.get("record_type") == "epoch"]
+if not epochs:
+    raise SystemExit("缺 epoch 记录，冒烟没跑完")
+last = epochs[-1]
+
+for key, label, fmt in (
+    ("train_task_loss", "task_loss", "{:.6f}"),
+    ("tokens_per_sec", "tokens/s", "{:.0f}"),
+    ("sec_per_step", "sec/step", "{:.3f}"),
+    ("covariance_memory_gb", "C 常驻 GiB", "{:.2f}"),
+    ("reference_memory_gb", "W0 常驻 GiB", "{:.2f}"),
+):
+    value = last.get(key)
+    print(f"  {label:<16}{fmt.format(value) if isinstance(value, (int, float)) else '-'}")
+for key in sorted(k for k in last if "peak" in k and "memory" in k):
+    print(f"  {key:<16}{last[key]}")
+
+problems = []
+if last.get("covariance_memory_gb"):
+    problems.append(
+        f"这条臂常驻了 {last['covariance_memory_gb']:.2f} GiB 的 C —— "
+        "--measure_replay_when_lambda_zero 0 没生效。replay 臂不该加载任何 penalty 矩阵。"
+    )
+if last.get("replay_per_batch"):
+    problems.append(
+        f"metrics 里 replay_per_batch={last['replay_per_batch']}，应当是 0。"
+        "batch 级混合会把 replay 的损失占比压到约 0.7%。"
+    )
+if last.get("replay_max_len") is not None and int(last["replay_max_len"]) != want_rlen:
+    problems.append(f"metrics 里 replay_max_len={last['replay_max_len']} != {want_rlen}")
+
+print()
+if problems:
+    for item in problems:
+        print(f"!! {item}")
+    raise SystemExit("冒烟自检未通过")
+print("冒烟自检通过。")
+print("接下来人工对两个数:")
+print("  peak memory  应在 50-55 GiB（BATCH=1 且不加载任何 penalty 矩阵）。")
+print("               明显更高就先查是不是误开了 batch 级混合或 C 被加载了。")
+print("  sec/step     应**低于** 96 号的 0.200s —— 因为约 30.6% 的步是短的 replay 行。")
+print("               高于 0.200s 说明 replay 行没有按自己的长度补齐，要查 BATCH。")
+PY
+  exit 0
+fi
+
+# =============================================================================
+# MODE=train
+# =============================================================================
+if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
+  if [[ -d "${CKPT}" && "${FORCE_TRAIN}" != "1" ]]; then
+    echo "跳过训练：${CKPT} 已存在（FORCE_TRAIN=1 可强制重训）"
+  else
+    train_one "${RUN}" "${EPOCHS}" "${CKPT}" 0 1 "${LOG_EVERY}"
+
+    echo ""
+    echo "==== 训练自检: ${RUN} ===="
+    python - "${METRICS_DIR}/${RUN}.jsonl" "${EXPECT_NEW_PER_UPDATE}" <<'PY'
+import json
+import sys
+
+path, want_new_per_update = sys.argv[1], float(sys.argv[2])
+rows = [
+    json.loads(line)
+    for line in open(path, encoding="utf-8").read().splitlines()
+    if line.strip()
+]
+epochs = [row for row in rows if row.get("record_type") == "epoch"]
+if not epochs:
+    raise SystemExit(f"{path} 里没有 epoch 记录，训练没跑完")
+
+print(f"{'epoch':>6}{'task_loss':>13}{'val_loss':>12}{'tok/s':>10}{'sec/step':>10}")
+for row in epochs:
+    print(
+        f"{row['epoch']:>6}{row['train_task_loss']:>13.6f}"
+        + (f"{row['val_loss']:>12.6f}" if row.get("val_loss") is not None else f"{'-':>12}")
+        + f"{row.get('tokens_per_sec', 0):>10.0f}{row.get('sec_per_step', 0):>10.3f}"
+    )
+
+problems = []
+last = epochs[-1]
+if last.get("covariance_memory_gb"):
+    problems.append("replay 臂常驻了 C，penalty 路径没关干净")
+print()
+print("注意 val_loss 是**纯新任务**的（train.py 在混 replay 之前就切好了 val），")
+print("所以它和 96 号两条臂逐字可比 —— calibrate_lambda 的 matched plasticity 用得上它。")
+print(f"每次更新的新任务行数期望是 {want_new_per_update:.1f}，与 96 号的 64 一致（Step 0 已断言）。")
+print("数据级混合是按概率抽的，所以实际值有 ±4 行左右的二项波动，这是这条路径的代价。")
+if problems:
+    for item in problems:
+        print(f"!! {item}")
+    raise SystemExit("训练自检未通过")
+print("训练自检通过。")
+PY
+  fi
+  echo ""
+  echo "checkpoint 是完整权重目录: --model_dir ${CKPT_DIR} --model_name ${RUN}"
+fi
+# =============================================================================
+# MODE=eval：与 96 号同一套预算、同一个结果树，所以汇总表能把四行放在一起读
+#   if_anchor / vanilla / onereplay / replay
+# =============================================================================
+if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
+  METRICS=""
+  if [[ "${DO_MATH}" == "1" ]]; then
+    if [[ -f "${GSM8K_DATA}" ]]; then METRICS="${METRICS},gsm8k"; else echo "跳过 GSM8K：缺 ${GSM8K_DATA}"; fi
+    if [[ -f "${MATH500_DATA}" ]]; then METRICS="${METRICS},math500"; else echo "跳过 MATH-500：缺 ${MATH500_DATA}"; fi
+  fi
+  if [[ "${DO_IF}" == "1" ]]; then
+    if [[ -f "${IFEVAL_INPUT}" ]]; then METRICS="${METRICS},ifeval"; else echo "跳过 IFEval：缺 ${IFEVAL_INPUT}"; fi
+    METRICS="${METRICS},followbench"
+  fi
+  METRICS="${METRICS#,}"
+  [[ -n "${METRICS}" ]] || { echo "没有可用指标（DO_MATH/DO_IF 都关了？）"; exit 1; }
+
+  if [[ ! -d "${CKPT}" ]]; then
+    echo "跳过评测：checkpoint 不存在 ${CKPT}（先跑 MODE=train）"
+  else
+    pending=0
+    for m in ${METRICS//,/ }; do
+      [[ -f "${RESULTS_ROOT}/${m}/${RUN}/summary.json" ]] || pending=1
+    done
+    if [[ "${pending}" == "0" && "${FORCE_EVAL}" != "1" ]]; then
+      echo "跳过评测 ${RUN}：${METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
+    else
+      fb_data_arg=(); fb_cats_arg=()
+      [[ -n "${FB_DATA}" ]] && fb_data_arg=(--followbench_data "${FB_DATA}")
+      [[ -n "${FB_CATEGORIES}" ]] && fb_cats_arg=(--followbench_categories "${FB_CATEGORIES}")
+
+      echo "==== eval ${RUN} (${METRICS}) ===="
+      python -m onereplay.scripts.evaluate \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${CKPT}" --run_name "${RUN}" \
+        --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+        --limit "${EVAL_LIMIT}" \
+        --max_new_tokens "${MAX_NEW_TOKENS}" \
+        --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
+        --gsm8k_data_path "${GSM8K_DATA}" \
+        --math500_data_path "${MATH500_DATA}" \
+        --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+        --ifeval_input "${IFEVAL_INPUT}" \
+        --followbench_max_new_tokens "${FB_MAX_NEW_TOKENS}" \
+        --followbench_batch_size "${FB_BATCH}" \
+        --followbench_group_limit "${FB_GROUP_LIMIT}" \
+        "${fb_data_arg[@]}" "${fb_cats_arg[@]}" \
+        --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # 汇总：与 96 号同一段代码、同一棵结果树，所以四条臂自动排在一张表里。
+  # 每个分数右边紧跟它自己的响应词数中位数（理由见 96 号）。
+  # -------------------------------------------------------------------------
+  python - "${RESULTS_ROOT}" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+METRICS = ("gsm8k", "math500", "ifeval", "followbench")
+
+names: set[str] = set()
+for metric in METRICS:
+    directory = root / metric
+    if directory.is_dir():
+        names.update(path.name for path in directory.iterdir() if path.is_dir())
+if not names:
+    print("\n没有可汇总的 summary.json")
+    raise SystemExit(0)
+
+
+def sort_key(name: str):
+    if name == "if_anchor":
+        rank = 0
+    elif "vanilla" in name:
+        rank = 1
+    elif "onereplay" in name:
+        rank = 2
+    elif "replay" in name:
+        rank = 3
+    else:
+        rank = 4
+    return (rank, name)
+
+
+def load(metric: str, name: str):
+    path = root / metric / name / "summary.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def words_p50(metric: str, name: str):
+    path = root / metric / name / "responses.jsonl"
+    if not path.is_file():
+        return None
+    counts = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                counts.append(len(str(json.loads(line).get("response", "")).split()))
+    if not counts:
+        return None
+    counts.sort()
+    return counts[len(counts) // 2]
+
+
+def pct(payload, key, width):
+    if payload is None or payload.get(key) is None:
+        return "-".rjust(width)
+    return f"{payload[key] * 100:.1f}".rjust(width)
+
+
+def num(value, width, fmt="{:.0f}"):
+    return ("-" if value is None else fmt.format(value)).rjust(width)
+
+
+print()
+print("=" * 108)
+print("Part 2: Model-IF-FLAN --OpenR1--> Model-IF-Math   四条臂")
+print("  左半 = 新任务学到多少   右半 = 旧能力保留多少   words = 该指标自己的响应词数中位数")
+print("=" * 108)
+print(f"{'run':<44}{'GSM8K':>8}{'MATH500':>9}{'IFEval':>8}{'words':>7}{'FB HSR':>8}{'words':>7}")
+for name in sorted(names, key=sort_key):
+    fb = load("followbench", name)
+    levels = [fb.get(f"rule_hsr_level_{level}") for level in range(1, 6)] if fb else []
+    levels = [value for value in levels if value is not None]
+    fb_mean = f"{sum(levels) / len(levels) * 100:.1f}".rjust(8) if levels else "-".rjust(8)
+    print(
+        f"{name:<44}"
+        + pct(load("gsm8k", name), "accuracy", 8)
+        + pct(load("math500", name), "accuracy", 9)
+        + pct(load("ifeval", name), "strict_prompt_accuracy", 8)
+        + num(words_p50("ifeval", name), 7)
+        + fb_mean
+        + num(words_p50("followbench", name), 7)
+    )
+
+print()
+print("读 replay 这一行时要同时给出三个附加数字:")
+print("  1) **行占比 = 损失占比 = 30.6%**（BATCH=1 数据级混合下两者相等）。")
+print("     不是 50%：上限由池子决定（20000/45334=0.441），而池子不能扩 —— 扩了")
+print("     replay 就是从比 C 更多的旧知识里保护，比较不再成立。")
+print("  2) **墙钟约 +5%**（约 2.63 vs 2.52 h/epoch）。三条臂都是 BATCH=1，每步开销")
+print("     直接可比。onereplay 的正则只占约 0.13% 计算，replay 多的是 19947 个短步。")
+print("  3) **常驻显存**：replay 为 0（不存任何矩阵），onereplay 为 C 6.58 GiB +")
+print("     W0 3.20 GiB。但 replay 要留着 20k 行语料。这个 trade-off 是两条方法的")
+print("     核心区别，和分数一样重要。")
+print()
+print("**IF 分数升降先看 words 再谈能力**（见 96 号 / results_log 2026-09-12 第 8c 节）。")
+print("**FB HSR 只有 rule 那一半**（350/820 行、70/164 组），不要写成 FollowBench 全量分。")
+PY
+fi
+
+echo ""
+echo "========================================================================"
+echo "产物:"
+echo "  checkpoint : ${CKPT}"
+echo "  metrics    : ${METRICS_DIR}/${RUN}.jsonl"
+echo "  评测       : ${RESULTS_ROOT}/{gsm8k,math500,ifeval,followbench}/${RUN}/summary.json"
+echo ""
+echo "Part 2 现在的四条臂（全部共用同一批 20k FLAN 旧知识）:"
+echo "  if_anchor                                       Stage 2 的起点（before）"
+echo "  part2_math_vanilla_lr${LR}_seed${SEED}                    无保护（遗忘的标尺）"
+echo "  part2_math_onereplay_lr${LR}_lam<λ>_seed${SEED}       C_if 罚项"
+echo "  ${RUN}   真的重放旧数据"
+echo "  (EWC 臂用 97 号采的 F，训练脚本还没写)"
+echo "Job finished at: $(date)"

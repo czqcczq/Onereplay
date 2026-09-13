@@ -720,7 +720,7 @@ cat <<EOF
 下一步:
   1) 采 F_if（EWC 对照臂用）。必须打印出与上面**完全相同**的池指纹:
        ${POOL_HASH}
-     qsub onereplay/pbs/96_part2_fisher_if_flanv2.pbs
+     qsub onereplay/pbs/97_part2_fisher_if_flanv2.pbs
      （F 是 d_out x d_in，all-linear 下约 6.9 GB；batch 写死 1，是三个采集里最慢的）
 
   2) Stage 2 训练 + 评测（96 号）。四条臂共用这三份旧知识:

@@ -77,11 +77,34 @@ re-deriving it from the parquet later is avoidable work.
 Read the length report before choosing --max_len. These CoTs are long and
 truncation keeps the END of the sequence, so an over-long row loses the
 question and keeps the tail of the reasoning.
+
+--------------------------------------------------------------------------
+--replay_rows: the old-knowledge pool for the reverse direction
+--------------------------------------------------------------------------
+The Math -> IF direction needs Math to be the protected capability, so it needs
+what prepare_flan_v2.py's --replay_out gives the forward direction: one file of
+old-knowledge rows that C_math, F_math and replay all read, so the three arms
+differ in how they use the old data and not in which old data they got.
+
+--replay_rows N writes {inputs, targets, data_source, source_index} jsonl -- the
+column names collect_cov / collect_fisher / replay.py already default to. The
+draw is a random subset of the training rows (nested, not disjoint) and the
+training pool is untouched, so adding --replay_rows to an invocation that
+already ran leaves the Stage 1 checkpoint valid. Default 0 keeps the old
+behaviour.
+
+Note the asymmetry with the FLAN line: 94's pool also carves a 2000-row heldout
+slice that training never sees, which is what makes probe.py's in-pool vs
+heldout gap measurable. There is no OpenR1 equivalent because 91 trains on all
+45792 rows -- no unused tail exists. The math counterpart of that gap is
+build_math_probe.py, which uses GSM8K / MATH-500 items (never trained on) as
+the out-of-pool side against a slice of this replay pool.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 from pathlib import Path
 from typing import Any
@@ -184,6 +207,29 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Where the manifest goes. Defaults to out_dir's parent.",
+    )
+    parser.add_argument(
+        "--replay_rows",
+        type=int,
+        default=0,
+        help="Rows written to --replay_out as the old-knowledge pool for a "
+        "reverse-direction Stage 2 (C_math / F_math / replay all read it). "
+        "0 skips the file, which is the behaviour every earlier run had.",
+    )
+    parser.add_argument(
+        "--replay_out",
+        type=str,
+        default="",
+        help="jsonl path for the replay/C pool. Empty defaults to "
+        "<out_dir>_replay.jsonl next to out_dir.",
+    )
+    parser.add_argument(
+        "--replay_sample_seed",
+        type=int,
+        default=1,
+        help="Seed for the random subset drawn into --replay_out. Kept separate "
+        "from --seed so the replay pool can be redrawn without touching the "
+        "training pool that --seed governs.",
     )
     return parser.parse_args()
 
@@ -446,6 +492,72 @@ def length_report(rows: list[dict[str, Any]], args: argparse.Namespace) -> dict[
     return report
 
 
+REPLAY_COLUMNS = ("inputs", "targets", "data_source", "source_index")
+
+
+def replay_row_order(num_rows: int, replay_rows: int, sample_seed: int) -> list[int]:
+    """The exact row indices --replay_rows draws, in the order it writes them.
+
+    Split out so a caller holding the already-saved training pool can reproduce
+    the same subset without re-converting the parquet: 99's MODE=pool goes
+    through load_from_disk and this function, and lands on a byte-identical
+    file. Keeping the permutation in one place is what makes that claim safe to
+    make -- two copies of "shuffle then take a prefix" would drift.
+    """
+
+    import random
+
+    if replay_rows > num_rows:
+        raise SystemExit(
+            f"--replay_rows {replay_rows} exceeds the {num_rows} converted rows; "
+            "the pool has to be a subset of what Stage 1 trained on."
+        )
+    order = list(range(num_rows))
+    random.Random(sample_seed).shuffle(order)
+    return order[:replay_rows]
+
+
+def to_replay_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Rename one training row into the pool's {inputs, targets} schema.
+
+    inputs/targets are the column names collect_cov, collect_fisher and
+    replay.py all default to, so a pool written this way is a drop-in for the
+    FLAN one the forward direction used. `input` is always empty here (the
+    question lives in `instruction`), so dropping it loses nothing.
+    """
+
+    return {
+        "inputs": row["instruction"],
+        "targets": row["output"],
+        "data_source": row["data_source"],
+        "source_index": row["source_index"],
+    }
+
+
+def carve_replay_pool(
+    rows: list[dict[str, Any]], args: argparse.Namespace
+) -> list[dict[str, Any]]:
+    """Draw the old-knowledge pool as a random subset of the training rows.
+
+    Nested rather than disjoint: C_math, F_math and replay all have to describe
+    knowledge the Stage 1 model actually acquired, so the pool has to be drawn
+    from the rows it trained on. Nothing is removed from the training pool --
+    this is an extra view of it, which is why adding --replay_rows to an
+    invocation that already ran reproduces the same training pool byte for byte
+    and leaves the Stage 1 checkpoint valid.
+
+    The subset is random rather than a prefix because --max_train_samples 0
+    (the default, and what the Part 1 line used) leaves `rows` in OpenR1's own
+    order, which is grouped by data_source: a prefix would be one or two
+    sources instead of a sample of the corpus. The drawn order is kept as-is
+    rather than re-sorted, so a consumer that cycles the file front-to-back
+    (replay.py does) still sees a mixture from the first row on.
+    """
+
+    order = replay_row_order(len(rows), args.replay_rows, args.replay_sample_seed)
+    return [to_replay_row(rows[index]) for index in order]
+
+
 def main() -> None:
     """Write the converted pool as save_to_disk plus a manifest."""
 
@@ -507,6 +619,28 @@ def main() -> None:
     DatasetDict({"train": Dataset.from_list(rows)}).save_to_disk(str(out_dir))
     print(f"wrote pool to {out_dir}")
 
+    replay_out = (
+        Path(args.replay_out)
+        if args.replay_out
+        else out_dir.parent / f"{out_dir.name}_replay.jsonl"
+    )
+    replay_rows: list[dict[str, Any]] = []
+    if args.replay_rows > 0:
+        replay_rows = carve_replay_pool(rows, args)
+        replay_out.parent.mkdir(parents=True, exist_ok=True)
+        with replay_out.open("w", encoding="utf-8") as file:
+            for row in replay_rows:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        sources = collections.Counter(row["data_source"] for row in replay_rows)
+        print(
+            f"wrote replay/C pool to {replay_out}  {len(replay_rows)} rows "
+            f"(nested subset, replay_sample_seed={args.replay_sample_seed})"
+        )
+        print(
+            "  data_source mix: "
+            + ", ".join(f"{name or '<empty>'}={count}" for name, count in sources.most_common())
+        )
+
     manifest: dict[str, Any] = {
         "source": args.openr1_path or args.openr1_repo,
         "think_handling": args.think_handling,
@@ -519,6 +653,13 @@ def main() -> None:
         "seed": args.seed,
         "train": {"path": str(out_dir), "num_rows": len(rows)},
         "counts": stats,
+        "replay": {
+            "path": str(replay_out) if replay_rows else "",
+            "num_rows": len(replay_rows),
+            "mode": "nested",
+            "sample_seed": args.replay_sample_seed,
+            "columns": list(REPLAY_COLUMNS),
+        },
         "boxed_answer_rows": boxed,
         "note": "train.py splits validation out of this pool with --val_fraction. "
         "gold_answer / data_source / source_index are metadata; build_loader "

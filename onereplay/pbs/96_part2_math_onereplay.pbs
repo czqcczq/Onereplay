@@ -382,7 +382,12 @@ GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
 # 训练答案实测 P50=3767，低于这个数会把正确推理在 \boxed{} 之前掐断、读成不会做。
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
-MATH_BATCH="${MATH_BATCH:-32}"
+# 128 而不是 32：GSM8K 有 12.2% 的响应不吐 EOS，而 generate 整批等最慢的一行，所以
+# batch=32 下 98% 的批次都跑满 4096 步，墙钟正比于批数。decode 是权重带宽瓶颈，批大
+# 4 倍单步几乎不变贵，批数少 4 倍。KV cache 约 59 GiB（458 MiB/条 x 128）。
+# 完整算术见 91 号同名变量。显存不够传 MATH_BATCH=64。
+# 换 batch 会让贪心输出微小漂移，所以本线所有臂必须同值重评。
+MATH_BATCH="${MATH_BATCH:-128}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
