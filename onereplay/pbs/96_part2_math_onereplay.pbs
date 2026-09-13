@@ -260,7 +260,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     LAMBDA_GRID_ONEREPLAY EWC_GRID_MULTIPLIERS
     PROBE_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY PROBE_LOG_EVERY
     PROBE_VANILLA PROBE_ARM
-    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS MATH_BATCH
+    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS MATH_BATCH DIAG_LEN
     IFEVAL_INPUT MAX_NEW_TOKENS EVAL_BATCH
     FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
     EVAL_LIMIT RUNS_TO_EVAL
@@ -411,14 +411,34 @@ SMOKE_STEPS="${SMOKE_STEPS:-70}"
 # ---- 评测：数学侧与 91 号同预算，IF 侧与 94 号同预算 ----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 训练答案实测 P50=3767，低于这个数会把正确推理在 \boxed{} 之前掐断、读成不会做。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
-# 128 而不是 32：GSM8K 有 12.2% 的响应不吐 EOS，而 generate 整批等最慢的一行，所以
-# batch=32 下 98% 的批次都跑满 4096 步，墙钟正比于批数。decode 是权重带宽瓶颈，批大
-# 4 倍单步几乎不变贵，批数少 4 倍。KV cache 约 59 GiB（458 MiB/条 x 128）。
-# 完整算术见 91 号同名变量。显存不够传 MATH_BATCH=64。
+# 训练答案实测 P50=3767 / P99=8004，低于这个数会把正确推理在 \boxed{} 之前掐断、
+# 读成不会做。**4096 已在 91 号上实测不够**：Model-Math 有 56.2% 的响应撞上限、55%
+# 抽不出答案，MATH-500 读出 0.388 而 base 是 0.528 —— 纯测量假象（能抽出答案的行上
+# 是 0.862 vs 0.618，base 在被截断的那 275 行上只有 0.375）。跟 91 号一起提到 8192。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-8192}"
+# batch 给大值的理由不是显存而是 generate 的退出条件：GSM8K 有 12.2% 的响应不吐 EOS，
+# 而 generate 整批等最慢的一行，所以几乎每批都跑满 cap，墙钟正比于**批数**。decode
+# 是权重带宽瓶颈，批大 4 倍单步几乎不变贵，批数却少 4 倍。
+#
+# **cap 提到 8192 就不能再用 128**：KV cache 112 KiB/token（28 层 / 8 个 KV head /
+# head_dim 128 / bf16），prompt+8192 约 8700 token 一条序列 0.93 GiB。批数不是
+# 1819/B，两个指标各自分桶，= ceil(1319/B) + ceil(500/B)：
+#
+#   B=64  -> 29 批 / 峰值 66.8 GiB (140GiB 的 48%) / 3.0 h
+#   B=96  -> 20 批 / 峰值 97.6 GiB (70%)          / 2.1 h   <- 默认
+#   B=112 -> 17 批 / 峰值 113 GiB  (81%)          / 1.8 h
+#   B=128 -> 15 批 / 峰值 128 GiB  (92%)          / 1.6 h
+#
+# 取 96 而不是 128：再往上只省 31 min，占用却推到 92%，而**所有臂必须同值重评**，
+# 一条臂在两小时后 OOM 的代价远大于那 31 min。80GB 卡上传 64。
+# evaluate 每个指标跑完会打一行 peak GPU memory，按实测值再决定要不要上 112。
+# 完整算术见 91 号同名变量。
 # 换 batch 会让贪心输出微小漂移，所以本线所有臂必须同值重评。
-MATH_BATCH="${MATH_BATCH:-128}"
+MATH_BATCH="${MATH_BATCH:-96}"
+# 评测末尾打长度/截断诊断。这条线**必须**看它：删失是长度相关的，任何让输出变短的
+# 干预（C_if 把权重拉回 Stage 1、EWC 同理）都会让更多行在预算内收尾、数学分因此上升，
+# 会被误读成"该方法保住了数学能力"。见 91 号文件头最后一节。
+DIAG_LEN="${DIAG_LEN:-1}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
@@ -1101,8 +1121,8 @@ fi
 # MODE=eval：新任务 (GSM8K + MATH-500) 与旧能力 (IFEval + FollowBench)
 #
 # 一次 evaluate 调用只加载模型一次，请求的指标共用。DO_MATH / DO_IF 把两半拆到不同
-# 作业，因为加起来装不进一个 24h walltime（数学侧 4096 token 预算解码 4-8h，IF 侧
-# 三个数据集 3-4h，再加 5h 训练）。
+# 作业，因为加起来装不进一个 24h walltime（数学侧 8192 预算 / batch 96 约 2.1h，IF
+# 侧三个数据集 3-4h，再加 5h 训练）。
 #
 # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
 # is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
@@ -1198,6 +1218,61 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       fi
       ;;
   esac
+
+  # -------------------------------------------------------------------------
+  # 长度/截断诊断：数学分数只有配着 hit-cap 才能读。
+  # hit-cap 接近 0 且 P99 明显低于 cap => 预算够用，accuracy 是能力；hit-cap 还高
+  # => 分数被右删失，而删失率随输出长度变、各臂的输出长度又不同，于是臂间不可比。
+  # -------------------------------------------------------------------------
+  if [[ "${DIAG_LEN}" == "1" && "${DO_MATH}" == "1" ]]; then
+    if [[ "${ARM}" == "anchor" ]]; then DIAG_NAME="if_anchor"; else DIAG_NAME="${RUN}"; fi
+    DIAG_FILES=()
+    for diag_metric in gsm8k math500; do
+      diag_file="${RESULTS_ROOT}/${diag_metric}/${DIAG_NAME}/responses.jsonl"
+      [[ -f "${diag_file}" ]] && DIAG_FILES+=("${diag_file}")
+    done
+    if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
+      python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "${DIAG_FILES[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, cap = sys.argv[1], int(sys.argv[2])
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+print(f"==== response length / truncation diagnostic (cap={cap}) ====")
+for path in sys.argv[3:]:
+    file = Path(path)
+    if not file.is_file():
+        continue
+    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+    if not rows:
+        continue
+    lengths = sorted(
+        len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+        for row in rows
+    )
+    missing = sum(row.get("prediction") in (None, "") for row in rows)
+    hit_cap = sum(length >= cap - 8 for length in lengths)
+    label = f"{file.parent.parent.name}/{file.parent.name}"
+    print(
+        f"{label:>48}: n={len(rows)} "
+        f"no-answer={missing} ({missing / len(rows):.1%}) "
+        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
+    )
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则把 MATH_MAX_NEW_TOKENS 提到")
+print("12288（MATH_BATCH 降到 64）后**所有臂一起重评**，不能只重评一条。")
+PY
+    fi
+  fi
 
   # -------------------------------------------------------------------------
   # 汇总：一张表，**每个分数右边紧跟它自己的响应词数中位数**。
@@ -1297,6 +1372,11 @@ print("  遗忘量  = if_anchor 的 IF 分数 − 该臂的 IF 分数")
 print("  保护效果 = onereplay 的 IF 分数 − vanilla 的 IF 分数")
 print("  代价    = vanilla 的数学分 − onereplay 的数学分（保护换来的可塑性损失）")
 print("  三个数要一起看：只报第二个而不报第三个，等于用「少学新任务」冒充「保住旧能力」。")
+print()
+print("**数学分数必须配着上面那张 length diagnostic 的 hit-cap 读。** 4096 下 Model-Math")
+print("有 56.2% 的响应撞上限、MATH-500 被读成 0.388（真实值在 0.86 量级），而删失率随")
+print("输出长度变 —— 任何让输出变短的干预都会靠「逃出截断」把数学分推上去。hit-cap 不")
+print("接近 0 时，各臂的数学分之间没有可比性。")
 print()
 print("**IF 分数升降先看 words 再谈能力。** Stage 1 把输出压到 P50 约 18 token，")
 print("Stage 2 的 OpenR1 答案 P50 是 3767 token，长度会被往反方向推两个数量级，而")

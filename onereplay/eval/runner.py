@@ -119,9 +119,24 @@ def run_evaluation(
         metric_out.mkdir(parents=True, exist_ok=True)
         local_cfg = dict(cfg)
         local_cfg["output_dir"] = str(metric_out)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         result = metric.run(model, tokenizer, device, local_cfg)
         summary["metrics"][metric_name] = result
         print(json.dumps({"metric": metric_name, **result}, ensure_ascii=False, indent=2))
+        # Peak memory is per metric because the KV cache a metric needs is
+        # batch x (prompt + max_new_tokens), and both factors differ by an order
+        # of magnitude between families. Printed rather than folded into result:
+        # the metric summaries feed an appended CSV whose header comes from
+        # their own keys, so adding one would break every existing file.
+        if device.type == "cuda":
+            print(
+                f"[{metric_name}] peak GPU memory: "
+                f"{torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB allocated / "
+                f"{torch.cuda.max_memory_reserved(device) / 2**30:.2f} GiB reserved "
+                f"(card total {torch.cuda.get_device_properties(device).total_memory / 2**30:.1f} GiB)",
+                flush=True,
+            )
 
     summary_path = output_root / f"{name}_summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
