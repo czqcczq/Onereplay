@@ -3,7 +3,7 @@
 #PBS -N p2_math_or
 #PBS -j oe
 #PBS -k oed
-#PBS -q autox
+#PBS -q auto
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
