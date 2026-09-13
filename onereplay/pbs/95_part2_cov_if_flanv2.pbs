@@ -1,0 +1,739 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N p2_cov_if
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=6:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# Part 2 / Stage 1 采集: 在 Model-IF-FLAN 上采 C_if
+#
+#     Model-IF-FLAN  --(FLAN v2 replay 池 20k 行, gold targets)-->  C_if
+#
+# Part 2 要验证的是 onereplay 在**持续后训练**里保不保得住能力：
+#
+#     Base --FLANv2--> Model-IF-FLAN --OpenR1-Math + C_if--> Model-IF-Math
+#                      ^^^^^^^^^^^^^                ^^^^
+#                      本脚本的模型                  本脚本的产物
+#
+# 三个采集件（C / Fisher / replay）全部来自**同一个 20k 行文件**，这是三条臂可比的
+# 前提。本脚本只采 C；Fisher 是 96 号；replay 不需要采集，训练时直接读同一个 jsonl。
+#
+# -----------------------------------------------------------------------------
+# 【最关键的一条：C 必须在 Model-IF-FLAN 上采，不是在 Base 上采】
+#
+# 罚项是 λ · tr(ΔW C ΔWᵀ)，其中 ΔW = W − W0，而 W0 是 train.py 在**训练开始时**
+# 从加载进来的模型快照的（scripts/train.py 里 build_regularizer 之后紧跟
+# snapshot_reference_weights）。Part 2 的训练起点是 Model-IF-FLAN，所以：
+#
+#     W0 = Model-IF-FLAN 的权重  ->  C 也必须是 Model-IF-FLAN 的 E[x xᵀ]
+#
+# C 描述的是「在 W0 这一点上，旧知识的输入激活往哪些方向张」。拿 Base 的 C 配
+# Model-IF-FLAN 的 W0 是两个不同点的量拼在一起：隐状态分布在 Stage 1 已经被改过
+# 一遍了，Base 的协方差方向不再是当前模型看到的方向。这个错误**不报错、loss 也正常**，
+# 只会让保护作用变弱且无法解释。
+#
+# 这也是 Part 2 与之前所有实验（01/31/41/62/68 号）的结构差别：那些脚本都是
+# Base --新任务--> 单阶段，采 C 的模型和训练起点天然是同一个 Base；这里是两阶段，
+# 采 C 的模型是上一阶段的产物。
+#
+# -----------------------------------------------------------------------------
+# 【为什么池子就是 94 号切出来的那 20k 行，而且必须是它】
+#
+# 94 号 MODE=data 已经在 50k 训练池里按 nested 模式切了一份 20k 的
+# flan_v2_if_50k_replay.jsonl（schema 是 {inputs, targets, task}）。三个用途读的是
+# 同一个文件：
+#
+#     C          collect_cov  --data_files <该文件>      （本脚本）
+#     Fisher     collect_fisher --data_files <该文件>    （96 号）
+#     replay     train.py     --replay_data_files <该文件>
+#
+# 这不是省事，是 71/83 号已经在强制的约束：三条臂如果拿到的旧知识不是同一批行，
+# 「OneReplay vs EWC vs replay」就被「谁看到了哪些数据」混淆，比较本身失效。
+#
+# nested（replay 池 ⊂ Stage 1 训练池）也是有意的：Stage 1 真的在这 20k 行上训过，
+# 所以 gold targets 的 replay 在这里是**标准 experience replay**（复习训过的数据）。
+#
+#   顺带纠正一处会误导人的旧注释：onereplay/data/replay.py 的文件头说 gold FLAN
+#   targets「对 instruction-tuned base 来说是新任务而不是复习，loss 从 3.0 起步」。
+#   那句话是为**单阶段**场景写的（Base 没在 FLAN 上训过，Commonsense 才是新任务）。
+#   Part 2 里 Model-IF-FLAN 刚在这些行上训完，gold replay 的起始 loss 接近它自己的
+#   训练 loss，那条警告在这条线上不成立。所以本线**不需要自蒸馏**
+#   （generate_replay_targets.py 这一步整个跳过），C 和 replay 都读 gold。
+#
+# -----------------------------------------------------------------------------
+# 【scope: 为什么默认 all-linear 而不是 q_proj,v_proj】
+#
+# Stage 2 是**全量微调**（用户已定，不做 LoRA）。全量微调下每一个线性层都在动，而
+# 罚项只覆盖有 C 的层（snapshot_reference_weights 的注释把这点说得很直白：
+# 「Only layers with a C are snapshotted, which makes this dictionary the
+# definition of the penalty's coverage」）。只采 q/v 就等于放开 MLP 自由漂移，而
+# gate/up/down 占了 1.7B 参数里的绝大多数，保护会结构性地偏弱。
+#
+# 所以默认 COV_SCOPE=full，与 44 号（唯一一条已跑通的全量正则线）一致：
+#     q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head  = 197 个模块
+#     （28 层 x 7 个投影 + lm_head）
+#
+# C 是 d_in x d_in（**不是** d_out x d_in，Fisher 才是后者），所以 k/v 的小 d_out
+# 不省空间，而 down_proj 的 d_in=6144 是唯一的大头：
+#
+#     每层  6 x 2048² + 6144² = 25.17M + 37.75M = 62.91M 个 fp32
+#     全部  62.91M x 28 + 2048²(lm_head) = 1.766G 个 fp32 = 约 7.1 GB (6.6 GiB)
+#
+# 对照 COV_SCOPE=qv 只有 28 x 2 x 2048² = 235M 个 = 940 MB。7 GB 落盘和常驻显存都
+# 不是问题（H200 约 140 GB），但要知道这个数：训练时 C 全程常驻 GPU
+# （move_covariances_to_device 一次性搬上去），再叠 W0 快照约 3.4 GB。
+#
+# 想跑 qv 对照（例如复现 3e-2 那套 λ 的量级）传 COV_SCOPE=qv，产物文件名会带 _qv，
+# 不会覆盖 full 版。
+#
+# -----------------------------------------------------------------------------
+# 【max_len=1536 / truncation_side left：必须和三处对齐】
+#
+#   1) Stage 1 训练时 94 号用的 MAXLEN=1536（截断率 zs 0.3-0.6% / fs 1.4-1.9%）
+#   2) 本脚本采 C
+#   3) Stage 2 训练时 replay 行的 --replay_max_len 1536
+#
+# 第 3 条是 replay.py 里 replay_max_len() 那段注释在说的事：新任务 OpenR1 的
+# --max_len 是 8192，但 replay 行不能跟着用 8192（没必要）也不能用 512（会截断），
+# 必须显式给 1536，否则「replay 复习的旧知识」比「C 编码的旧知识」少一截，两条臂
+# 不再是同一份旧知识。
+#
+# truncation_side left 与训练一致（tokenizer_to_ids 是 full_input_ids[-max_length:]，
+# 保尾丢头）。FLAN 上左截断是良性的：few-shot 的结构是「示例1 示例2 … 真问题」，
+# 丢头只是退化成更少 shot 的同一道题（94 号文件头有这一段）。但**必须显式传**，
+# collect_cov 的默认是空串 = 跟 tokenizer 默认（right，先切答案）。
+#
+# -----------------------------------------------------------------------------
+# 【采样：max_samples=0 + sample_shuffle=0，不是 20000 + shuffle】
+#
+# 这个文件本身**就是**那 20k 行，所以取全量、不打乱，行集合与 replay 的完全相同。
+# 走 --max_samples 20000 --sample_shuffle 1 也能得到同一批行（因为总数正好是 20000），
+# 但那样行集合就依赖 --sample_seed 与 replay 的 --replay_sample_seed 是否一致，
+# 平白多一个能出错的地方。Step 0 会断言行数正好是 POOL_ROWS_EXPECT。
+#
+# 顺带说明 replay 侧：build_replay_dataset 在 gold 路径上会 shuffle(replay_sample_seed)
+# 再按 --replay_pool_size 裁剪。传 --replay_pool_size 0（不裁剪）后，无论 seed 是
+# 多少，**行集合**都等于整个文件 = C 的行集合。只有顺序不同，而 batch/数据级混合都
+# 不在意顺序。
+#
+# --require_target 1 是为了和 replay 的过滤口径一致：to_sft_schema 会丢掉
+# instruction 或 output 为空的行。这个池子本来就没有空行（prepare_flan_v2 写之前
+# strip 过并要求非空），传上只是让两边逐字同口径，行数不会变。
+#
+# -----------------------------------------------------------------------------
+# 【COV_BATCH=8 与 cov_accum_device=device：这里刻意偏离 01 号的 batch=2 / cpu】
+#
+# 协方差 hook 按 attention_mask 过滤了 padding，batch 只改变浮点累加顺序，**不改变
+# C 的数学定义**，所以开大在数值上是安全的（62 号文件头同一段结论）。这次没有任何
+# 历史 run 要逐字对齐——C 是全新的（新模型、新池子、新 scope），唯一要对齐的是
+# 96 号的 Fisher 与本脚本看到同一批行，而那由池指纹保证，与 batch 无关。
+#
+# cov_accum_device 必须改成 device。默认 cpu 每个 batch 每层都把 XᵀX 拷回主机，
+# 代价随 **C 的大小**而不是 batch 大小走（covariance.py 里那段注释算过 8B 全 scope
+# 是 33.75 GiB/batch）。本线是 7 GB/batch，2500 个 batch 就是 17 TB 的 PCIe 流量，
+# 会完全盖住前向。device 把累加器留在 GPU 上（7 GB 常驻），传输归零。
+#
+# -----------------------------------------------------------------------------
+# 【前置】计算节点无外网，以下都要先就位
+#   1) Stage 1 的 checkpoint（94 号 MODE=train 的产物，完整权重目录）
+#        ${IF_CKPT_DIR}/part1_if_flanv2_lr<LR>_seed<SEED>/
+#      不传 IF_LR 时脚本会自己去 glob，命中不唯一会报错并列出候选。
+#   2) 20k replay/C 池（94 号 MODE=data 的产物）
+#        ${IF_LINE_ROOT}/datasets/flan_v2_if_50k_replay.jsonl
+#   3) mkdir -p ${REPO_ROOT}/logs
+#
+# 【用法】
+#   # 0) 先跑这个：只做 Step 0 的前置检查 + 池指纹，不碰 GPU（几分钟）
+#   qsub -v DRY_RUN=1 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#
+#   # 1) 正式采集（Step 0 -> 1 -> 2），约 20-40 min
+#   qsub onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#
+#   # 指定 Stage 1 的 LR（glob 命中多个时必须传）
+#   qsub -v IF_LR=5e-5 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#
+#   # 只重看诊断，不重采
+#   qsub -v DO_COV=0 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#
+#   # qv 对照（940 MB，λ 量级与历史 3e-2 那套可比）
+#   qsub -v COV_SCOPE=qv onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#
+#   # 产物已存在也重采
+#   qsub -v FORCE=1 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#
+# 下一步: 96 号采 F_if（必须打印出与本脚本相同的池指纹），然后 97 号 Stage 2 训练
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/95_part2_cov_if_flanv2.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_p2cov_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_p2cov_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_p2cov_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME IF_LINE_ROOT IF_CKPT_DIR IF_LR IF_RUN IF_CKPT
+    RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT
+    DRY_RUN FORCE DO_COV
+    SEED SAMPLE_SEED MAXLEN COV_SCOPE TARGET_MODULES COV_BATCH COV_ACCUM_DEVICE
+    COV_PATH COV_TAG REF_COV DEBUG_EXAMPLES USE_BF16
+    REF_LAMBDA_FULL REF_LAMBDA_QV
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+cd "${REPO_ROOT}"
+# ---- Stage 1（IF 线 / FLAN v2）的产物，本脚本只读 ----
+# 94 号的结果树。C 的模型和池子都来自这里。
+IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
+IF_CKPT_DIR="${IF_CKPT_DIR:-${IF_LINE_ROOT}/checkpoints}"
+# prepare_flan_v2 的默认命名：<训练池目录>_replay.jsonl，schema {inputs, targets, task}
+POOL_FILE="${POOL_FILE:-${IF_LINE_ROOT}/datasets/flan_v2_if_50k_replay.jsonl}"
+# 94 号的 FLAN_REPLAY_ROWS 默认值。Step 0 会断言实际行数等于它。
+POOL_ROWS_EXPECT="${POOL_ROWS_EXPECT:-20000}"
+
+# ---- Part 2 自己的结果树。与 results_part1_* 分开，免得 summary csv 混在一起 ----
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part2_if2math}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采 C）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+
+# ---- 阶段开关 ----
+# DRY_RUN 默认 0：Step 0 本身很快（纯 CPU，几分钟），正式作业也会先跑它。
+# 想只做检查就显式传 DRY_RUN=1。
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
+DO_COV="${DO_COV:-1}"
+
+# ---- 采集参数 ----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+# 必须等于 94 号训练时的 MAXLEN，也必须等于 Stage 2 的 --replay_max_len（见文件头）
+MAXLEN="${MAXLEN:-1536}"
+# full = 与 44 号一致的 all-linear，197 个模块、约 7.1 GB。理由见文件头 scope 一节。
+COV_SCOPE="${COV_SCOPE:-full}"
+case "${COV_SCOPE}" in
+  qv)
+    TARGET_MODULES="${TARGET_MODULES:-q_proj,v_proj}"
+    COV_TAG="${COV_TAG:-qv}"
+    ;;
+  full)
+    TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+    COV_TAG="${COV_TAG:-full}"
+    ;;
+  *)
+    echo "未知 COV_SCOPE=${COV_SCOPE}，可选 qv / full"; exit 1
+    ;;
+esac
+# batch 只改浮点累加顺序，不改 C 的定义（hook 按 attention_mask 过滤了 padding）。
+COV_BATCH="${COV_BATCH:-8}"
+# device：把 7 GB 累加器留在 GPU 上，省掉每 batch 每层的回传。见文件头。
+COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
+# C 由前向激活累加、hook 里已经 .float() 加宽，所以模型走 bf16 没有精度问题
+# （Fisher 那边不同，96 号要用 fp32，理由见 collect_fisher 的 docstring）。
+USE_BF16="${USE_BF16:-1}"
+# 打两条渲染后的文本。这一步是确认 checkpoint 的 chat template 和 94 号训练时同构，
+# 以及 assistant turn 里放的确实是 FLAN 的 gold target。
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
+
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_if_flanv2_20k_${COV_TAG}.pt}"
+# 历史上单阶段线的 C_if（01 号，Base 模型 / FLAN v1 dump / max_len 512）。存在就在
+# Step 2 里打一个 trace 比值，用来把 λ 的起点从历史值折算过来。缺了不影响采集。
+REF_COV="${REF_COV:-${REPO_ROOT}/results/cov/cov_flan_chat_20k_${COV_TAG}.pt}"
+# 历史 λ：44 号全量 all-linear 用 7.5e-3，32/63 号 LoRA qv 用 3e-2。
+REF_LAMBDA_FULL="${REF_LAMBDA_FULL:-7.5e-3}"
+REF_LAMBDA_QV="${REF_LAMBDA_QV:-3e-2}"
+if [[ "${COV_TAG}" == "qv" ]]; then
+  REF_LAMBDA="${REF_LAMBDA_QV}"
+else
+  REF_LAMBDA="${REF_LAMBDA_FULL}"
+fi
+
+mkdir -p "$(dirname "${COV_PATH}")" "${DATASET_CACHE}"
+
+# ===========================================================================
+# Step 0: 前置检查（纯 CPU，几分钟）
+#
+# 五件事，每一件对应一个「不报错但会毁掉结果」的失败模式：
+#   1) Stage 1 checkpoint 存在、唯一、且是**完整权重**而不是 LoRA adapter
+#   2) 池文件存在
+#   3) 池行数正好等于 POOL_ROWS_EXPECT（不等就说明 94 号的配额没满足，见其 MODE=data
+#      的输出——prepare 配额不满时只打警告、退出码仍是 0）
+#   4) 池指纹落盘打印出来：96 号采 F 时必须打印同一个值
+#   5) 池 schema 里有 inputs / targets 两列
+# ===========================================================================
+echo "==== Step 0: 前置检查 ===="
+
+# ---- 1) 解析 Stage 1 checkpoint ----
+# 允许三种指定方式，从具体到宽松：IF_CKPT（绝对路径）> IF_LR（拼 run 名）> glob 自动发现。
+if [[ -z "${IF_CKPT:-}" ]]; then
+  if [[ -n "${IF_LR:-}" ]]; then
+    IF_RUN="${IF_RUN:-part1_if_flanv2_lr${IF_LR}_seed${SEED}}"
+    IF_CKPT="${IF_CKPT_DIR}/${IF_RUN}"
+  else
+    # 自动发现：sweep_* / smoke_* 是 94 号的临时目录（save=0，本不该存在，但保险起见排除）
+    mapfile -t _CANDS < <(
+      find "${IF_CKPT_DIR}" -maxdepth 1 -mindepth 1 -type d \
+        -name "part1_if_flanv2_lr*_seed${SEED}" 2>/dev/null | sort
+    )
+    if (( ${#_CANDS[@]} == 0 )); then
+      echo "在 ${IF_CKPT_DIR} 下找不到 part1_if_flanv2_lr*_seed${SEED}"
+      echo "先跑: qsub -v MODE=train,LR=<lr> onereplay/pbs/94_part1_if_flanv2.pbs"
+      echo "或显式指定: qsub -v IF_CKPT=/abs/path onereplay/pbs/95_part2_cov_if_flanv2.pbs"
+      exit 1
+    fi
+    if (( ${#_CANDS[@]} > 1 )); then
+      echo "命中多个 Stage 1 checkpoint，必须显式选一个（C 采在哪个模型上决定了 W0）:"
+      for _c in "${_CANDS[@]}"; do echo "  ${_c}"; done
+      echo "传 IF_LR=<lr> 或 IF_CKPT=<绝对路径>"
+      exit 1
+    fi
+    IF_CKPT="${_CANDS[0]}"
+    IF_RUN="$(basename "${IF_CKPT}")"
+  fi
+fi
+IF_RUN="${IF_RUN:-$(basename "${IF_CKPT}")}"
+
+[[ -d "${IF_CKPT}" ]] || { echo "缺 Stage 1 checkpoint: ${IF_CKPT}"; exit 1; }
+[[ -f "${IF_CKPT}/config.json" ]] || {
+  echo "${IF_CKPT} 里没有 config.json，不是一个可加载的模型目录"; exit 1
+}
+if [[ -f "${IF_CKPT}/adapter_config.json" ]]; then
+  echo "${IF_CKPT} 是 LoRA adapter 目录（有 adapter_config.json）。"
+  echo "本线要求全量 checkpoint：C 采在 W0 上，而 W0 必须是 Stage 2 真正的起点权重。"
+  echo "LoRA 的话要先 merge 出完整权重再来。"
+  exit 1
+fi
+# tokenizer 必须随 checkpoint 落盘：chat template 决定了 C 看到的文本长什么样，
+# 拿 Base 的 tokenizer 去渲染 Stage 1 的模型是另一个静默不一致。
+[[ -f "${IF_CKPT}/tokenizer_config.json" ]] || {
+  echo "${IF_CKPT} 里没有 tokenizer_config.json。trainers/base.py 的 save 分支应当同时"
+  echo "写模型和 tokenizer；缺了说明这个目录不是 save_pretrained 的完整产物。"
+  exit 1
+}
+# 目录存在 + 有 config.json 还不够：save 被 walltime 打断过的话目录会在、权重却没写完。
+IF_WEIGHT_COUNT="$(find "${IF_CKPT}" -maxdepth 1 -type f \
+  \( -name '*.safetensors' -o -name '*.bin' \) | wc -l)"
+if (( IF_WEIGHT_COUNT == 0 )); then
+  echo "${IF_CKPT} 里没有 *.safetensors / *.bin —— 目录在但权重没落盘。"
+  echo "多半是 94 号那次 save 被打断了。删掉这个目录重训，或指向别的 checkpoint。"
+  exit 1
+fi
+echo "Stage 1 checkpoint : ${IF_CKPT}"
+echo "  run 名           : ${IF_RUN}"
+echo "  权重文件         : ${IF_WEIGHT_COUNT} 个"
+
+# ---- 2/3/5) 池文件、行数、schema ----
+[[ -f "${POOL_FILE}" ]] || {
+  echo "缺 20k replay/C 池: ${POOL_FILE}"
+  echo "它是 94 号 MODE=data 的产物（--replay_rows 20000 --replay_mode nested）。"
+  exit 1
+}
+POOL_ROWS_ACTUAL="$(wc -l < "${POOL_FILE}")"
+echo "池文件             : ${POOL_FILE}"
+echo "  行数             : ${POOL_ROWS_ACTUAL} (期望 ${POOL_ROWS_EXPECT})"
+if [[ "${POOL_ROWS_ACTUAL}" != "${POOL_ROWS_EXPECT}" ]]; then
+  echo ""
+  echo "行数不等于期望值。这通常意味着 94 号 MODE=data 的取样配额没满足 ——"
+  echo "prepare_flan_v2 在配额不满时只打一行 '!! 配额没满足'，**退出码仍是 0**，"
+  echo "所以作业成功不代表池子是满的。回去看那次作业的日志。"
+  echo "确认这就是想要的池大小的话，传 POOL_ROWS_EXPECT=${POOL_ROWS_ACTUAL} 放行。"
+  exit 1
+fi
+
+python - "${POOL_FILE}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    first = json.loads(handle.readline())
+missing = [column for column in ("inputs", "targets") if column not in first]
+if missing:
+    raise SystemExit(
+        f"池文件缺列 {missing}，实际有 {sorted(first)}。\n"
+        "collect_cov / collect_fisher / replay 三边都按 inputs/targets 读，"
+        "改列名会让三者读到不同的东西。"
+    )
+print(f"  schema           : {sorted(first)}  (inputs/targets 就位)")
+print(f"  第一行 inputs    : {str(first['inputs'])[:100]!r}")
+print(f"  第一行 targets   : {str(first['targets'])[:100]!r}")
+PY
+
+# ---- 4) 池指纹 ----
+# 与 Step 1 的 collect_cov 逐字同参（max_samples/sample_shuffle/require_target），
+# 所以这里打印的指纹就是 C 会看到的那批行的指纹。96 号必须打印同一个值。
+POOL_FP="$(python -m onereplay.scripts.check_old_knowledge_pool \
+  --data_files "${POOL_FILE}" --dataset_split train \
+  --cache_dir "${DATASET_CACHE}" --streaming 0 \
+  --input_column inputs --target_column targets \
+  --require_target 1 \
+  --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+  --label if_flanv2_20k | tail -n 1)"
+echo "${POOL_FP}"
+POOL_HASH="${POOL_FP##*fingerprint=}"
+POOL_FP_ROWS="${POOL_FP##*rows=}"; POOL_FP_ROWS="${POOL_FP_ROWS%% *}"
+if [[ "${POOL_FP_ROWS}" != "${POOL_ROWS_EXPECT}" ]]; then
+  echo "require_target 过滤后只剩 ${POOL_FP_ROWS} 行（原始 ${POOL_ROWS_EXPECT}）。"
+  echo "说明池里有空的 inputs/targets —— replay 的 to_sft_schema 也会丢掉这些行，"
+  echo "所以 C 和 replay 仍然同池，但先回去确认 94 号为什么写出了空行。"
+  exit 1
+fi
+
+echo ""
+echo "========================================================================"
+echo "Part 2 / Stage 1 采集: C_if  (在 Model-IF-FLAN 上，不是在 Base 上)"
+echo "  采 C 的模型   : ${IF_CKPT}"
+echo "                  ^ 这就是 Stage 2 的 W0；换成 Base 会让 C 与 W0 不同点"
+echo "  对照(未使用)  : ${MODEL_DIR}/${MODEL_NAME}"
+echo "  旧知识池      : ${POOL_FILE}"
+echo "                  ${POOL_ROWS_EXPECT} 行, gold targets, nested ⊂ Stage 1 训练池"
+echo "  池指纹        : ${POOL_HASH}"
+echo "                  ^ 96 号采 F 时必须打印同一个值"
+echo "  scope         : ${COV_SCOPE}  (${TARGET_MODULES})"
+echo "  采集口径      : max_len=${MAXLEN} truncation=left batch=${COV_BATCH}"
+echo "                  accum_device=${COV_ACCUM_DEVICE} bf16=${USE_BF16}"
+echo "                  max_samples=0 (全量) sample_shuffle=0 require_target=1"
+echo "  产物          : ${COV_PATH}"
+echo "  历史对照 C    : ${REF_COV} $( [[ -f "${REF_COV}" ]] && echo '(存在, Step 2 会比)' || echo '(不存在, 跳过比值)' )"
+echo "========================================================================"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只做前置检查。确认上面的 checkpoint / 行数 / 指纹无误后，"
+  echo "去掉 DRY_RUN 再投一次即可（Step 0 会重跑一遍，很快）。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+# ===========================================================================
+# Step 1: 采 C_if
+#
+# --model_dir/--model_name 拼出的是 Stage 1 的 checkpoint 目录，这是本脚本与
+# 01/31/41/62/68 号所有采集脚本唯一的结构性区别（它们指向 Base）。
+#
+# 逐条对上文件头的理由：
+#   --include_target_in_chat 1   assistant turn 放 FLAN 的 gold target，与 replay
+#                                读同一列，也与 Stage 1 训练时的监督对象一致
+#   --enable_thinking 0          本线没有自蒸馏、没有 <think>，与 concat 一起保持 0
+#   --concat_prompt_target 0
+#   --truncation_side left       与训练一致；默认空串会走 tokenizer 默认(right, 先切答案)
+#   --max_samples 0 --sample_shuffle 0   文件本身就是那 20k 行，取全量不打乱
+#   --require_target 1           与 replay 的 to_sft_schema 同口径
+# ===========================================================================
+if [[ "${DO_COV}" == "1" ]]; then
+  if [[ "${FORCE}" != "1" && -f "${COV_PATH}" ]]; then
+    echo "跳过采 C：${COV_PATH} 已存在（FORCE=1 可强制重采）"
+  else
+    echo "==== Step 1: collect C_if -> ${COV_PATH} ===="
+    python -m onereplay.scripts.collect_cov \
+      --model_dir "${IF_CKPT_DIR}" --model_name "${IF_RUN}" \
+      --seed "${SEED}" --use_bf16 "${USE_BF16}" \
+      --data_files "${POOL_FILE}" --dataset_split train \
+      --cache_dir "${DATASET_CACHE}" --streaming 0 \
+      --input_column inputs --target_column targets \
+      --require_target 1 \
+      --use_chat_template 1 --include_target_in_chat 1 \
+      --enable_thinking 0 --concat_prompt_target 0 \
+      --debug_print_examples "${DEBUG_EXAMPLES}" \
+      --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+      --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
+      --truncation_side left \
+      --target_modules "${TARGET_MODULES}" \
+      --cov_normalization none \
+      --cov_accum_device "${COV_ACCUM_DEVICE}" \
+      --output_path "${COV_PATH}"
+  fi
+else
+  echo "DO_COV=0：使用已有 ${COV_PATH}"
+fi
+[[ -f "${COV_PATH}" ]] || { echo "缺 C_if: ${COV_PATH}"; exit 1; }
+
+# ===========================================================================
+# Step 2: 诊断
+#
+# 四组数，各自能挡掉一类错误：
+#   A) metadata 自检 —— 池指纹 / max_len / truncation / scope 有没有真的传上去。
+#      这些错了 C 仍然会写出一个合法文件，只有 metadata 能证明它是对的。
+#   B) 层覆盖 —— 模块数、每个投影家族齐不齐。scope=full 应当是 197 个。
+#      少了就说明 --target_modules 里某个名字在这个模型上没命中。
+#   C) 数值健康 —— NaN/Inf、对角非负（C=E[x xᵀ] 必然半正定，对角是 E[x_i²]）、
+#      trace 按家族分布。down_proj 的 trace 会比别人大一个量级，这是正常的：
+#      它的输入是 SwiGLU 之后的 6144 维激活。
+#   D) λ 的起点 —— 约束强度 ∝ λ · trace(C)，所以历史 λ 要按 trace 反比折算。
+#      **这只是起点，不是结论**：新任务换了（Commonsense512 -> OpenR1@8192），
+#      task_loss 的尺度也不一样，λ 必须在 97 号里用 PROBE 短跑实测罚项/任务损失
+#      的比例再定。
+# ===========================================================================
+echo "==== Step 2: 诊断 C_if ===="
+python - "${COV_PATH}" "${POOL_HASH}" "${MAXLEN}" "${TARGET_MODULES}" \
+         "${REF_COV}" "${REF_LAMBDA}" "${IF_CKPT}" <<'PY'
+import json
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import torch
+
+cov_path, want_fp, want_max_len, want_modules, ref_path, ref_lambda, ckpt = sys.argv[1:8]
+want_max_len = int(want_max_len)
+want_modules = [item for item in want_modules.split(",") if item]
+ref_lambda = float(ref_lambda)
+
+# 预期模块数从 config.json 的层数算，不写死。lm_head 全模型只有一个，其余每层一个
+# —— 与 68/70 号的 expect 公式同一套。写死 197 的话，改 TARGET_MODULES（比如按 8B
+# 线的约定去掉 lm_head）就会误报成"层没命中"。
+num_layers = int(json.loads((Path(ckpt) / "config.json").read_text())["num_hidden_layers"])
+expected = sum(1 if item == "lm_head" else num_layers for item in want_modules)
+
+payload = torch.load(cov_path, map_location="cpu")
+covariances = payload["covariances"]
+meta = payload.get("metadata", {})
+counts = payload.get("counts", {})
+
+# ---- A) metadata 自检 ----
+print("A) 采集口径（metadata，证明参数真的传上去了）")
+problems = []
+checks = [
+    ("pool_fingerprint", want_fp, "池指纹与 Step 0 不一致：C 看到的行不是那 20k 行"),
+    ("max_len", want_max_len, "max_len 不是 1536：与 Stage 1 训练和 replay_max_len 不对齐"),
+    ("truncation_side", "left", "truncation_side 不是 left：切掉的是答案而不是 few-shot 示例"),
+    ("require_target", 1, "require_target 不是 1：与 replay 的过滤口径不一致"),
+    ("sample_shuffle", 0, "sample_shuffle 不是 0"),
+    ("max_samples", 0, "max_samples 不是 0（应当取全量）"),
+    ("cov_normalization", "none", "cov_normalization 不是 none"),
+]
+for key, want, message in checks:
+    got = meta.get(key)
+    ok = str(got) == str(want)
+    print(f"   {key:<20} = {got!s:<40} {'ok' if ok else '!! ' + message}")
+    if not ok:
+        problems.append(message)
+
+got_modules = list(meta.get("target_modules", []))
+if sorted(got_modules) != sorted(want_modules):
+    problems.append(f"target_modules 不一致: {got_modules} vs {want_modules}")
+print(f"   {'target_modules':<20} = {','.join(got_modules)}")
+print(f"   {'model_name':<20} = {meta.get('model_name')}")
+print(f"   {'pool_rows':<20} = {meta.get('pool_rows')}")
+
+# ---- B) 层覆盖 ----
+by_family: dict[str, list[str]] = defaultdict(list)
+for name in covariances:
+    by_family[name.rsplit(".", 1)[-1]].append(name)
+
+total_elements = sum(matrix.numel() for matrix in covariances.values())
+print()
+print(f"B) 层覆盖: {len(covariances)} 个模块, {total_elements / 1e9:.3f}G 个 fp32 "
+      f"= {total_elements * 4 / 1024 ** 3:.2f} GiB")
+print(f"   预期 {expected} 个 = {num_layers} 层 x "
+      f"{len([m for m in want_modules if m != 'lm_head'])} 类"
+      + (" + lm_head" if "lm_head" in want_modules else " (不含 lm_head)"))
+if len(covariances) != expected:
+    problems.append(
+        f"模块数 {len(covariances)} != 预期 {expected}。"
+        "少了就说明某个 target_modules 名字在这个模型上没命中。"
+    )
+if "lm_head" in covariances or any(name.endswith("lm_head") for name in covariances):
+    # tie_word_embeddings 下 lm_head.weight 就是 embed_tokens.weight。罚项只从
+    # lm_head 这一侧看（用最终隐状态的协方差），embedding 查表那一侧完全没有约束
+    # ——embed_tokens 是 nn.Embedding，find_target_linear_module_names 永远不会命中它。
+    # 不会重复计数（snapshot_reference_weights 按 storage 去重），但覆盖是"半边"的。
+    print("   note: lm_head 在覆盖内。该权重与 embed_tokens 共享存储（Qwen3-1.7B 是")
+    print("         tie_word_embeddings=true），罚项只约束 lm_head 这一侧的输入协方差。")
+
+# ---- C) 数值健康 + trace ----
+print()
+print(f"C) 数值健康与 trace（按家族）")
+print(f"   {'family':<12}{'层数':>6}{'d_in':>7}{'trace p50':>14}{'trace min':>14}{'trace max':>14}")
+all_traces = []
+for family in sorted(by_family):
+    names = sorted(by_family[family])
+    traces = []
+    for name in names:
+        matrix = covariances[name].float()
+        if not torch.isfinite(matrix).all():
+            problems.append(f"{name} 含 NaN/Inf")
+        diagonal = torch.diagonal(matrix)
+        if (diagonal < 0).any():
+            # C = E[x xᵀ] 半正定，对角是 E[x_i²]，负值只能来自数值损坏
+            problems.append(f"{name} 对角有负值 (min={diagonal.min().item():.3e})")
+        traces.append(diagonal.sum().item())
+    all_traces.extend(traces)
+    tensor = torch.tensor(traces)
+    dim = covariances[names[0]].shape[-1]
+    print(
+        f"   {family:<12}{len(names):>6}{dim:>7}"
+        f"{tensor.median().item():>14.4e}{tensor.min().item():>14.4e}{tensor.max().item():>14.4e}"
+    )
+token_counts = sorted(set(counts.values()))
+print(f"   累加的非 padding token 数: {token_counts[0]:,}"
+      + ("" if len(token_counts) == 1 else f" .. {token_counts[-1]:,} (各层不同?!)"))
+if len(token_counts) > 1:
+    problems.append("各层的 token 计数不同，同一批前向不该出现这种情况")
+
+# ---- D) λ 起点 ----
+print()
+print("D) λ 的起点")
+mean_trace = torch.tensor(all_traces).mean().item()
+print(f"   mean trace(C_if) over {len(all_traces)} layers = {mean_trace:.4e}")
+if Path(ref_path).is_file():
+    reference = torch.load(ref_path, map_location="cpu")
+    reference = reference["covariances"] if "covariances" in reference else reference
+    shared = sorted(set(covariances) & set(reference))
+    if shared:
+        ratios = torch.tensor([
+            torch.diagonal(covariances[name].float()).sum().item()
+            / max(torch.diagonal(reference[name].float()).sum().item(), 1e-30)
+            for name in shared
+        ])
+        r = ratios.mean().item()
+        print(f"   trace(C_new)/trace(C_hist) over {len(shared)} shared layers: "
+              f"mean={r:.3f} min={ratios.min().item():.3f} max={ratios.max().item():.3f}")
+        print(f"   历史 λ={ref_lambda:g} 按 trace 反比折算 -> λ ≈ {ref_lambda / r:.3e}")
+        print("   注意历史 C 与本次差了三件事（模型 Base vs Model-IF-FLAN、FLAN dump 版本、")
+        print("   max_len 512 vs 1536），所以这个比值只是量级参考，不是等强度换算。")
+    else:
+        print(f"   历史 C 的层集合与本次无交集（scope 不同?），跳过比值")
+else:
+    print(f"   找不到历史对照 {ref_path}，只能用绝对值")
+    print(f"   历史 λ 参考: 全量 all-linear 7.5e-3 (44 号) / LoRA qv 3e-2 (32/63 号)")
+print()
+print("   **λ 不要在这里定死。** 约束强度 ∝ λ·trace(C)，但罚项要和**任务损失**比较才有")
+print("   意义，而 Part 2 的新任务是 OpenR1@8192（长 CoT，task_loss 的尺度和")
+print("   Commonsense@512 完全不同）。97 号有 MODE=lambda_probe：短跑几十次更新，打印")
+print("   reg_loss / task_loss 的实际比例，据此选 λ。上面这个数只是 grid 的中心。")
+
+print()
+if problems:
+    print("!! 诊断发现问题:")
+    for item in problems:
+        print(f"   - {item}")
+    raise SystemExit("C_if 不可用，先修上面的问题（重采要传 FORCE=1）")
+print("诊断通过：C_if 可用。")
+PY
+
+# ===========================================================================
+# 产物与下一步
+# ===========================================================================
+echo ""
+echo "========================================================================"
+COV_SIZE="$(du -h "${COV_PATH}" | cut -f1)"
+cat <<EOF
+产物:
+  C_if = ${COV_PATH}   (${COV_SIZE})
+    采在  : ${IF_CKPT}
+    池子  : ${POOL_FILE}  (${POOL_ROWS_EXPECT} 行)
+    指纹  : ${POOL_HASH}
+    scope : ${COV_SCOPE}  (${TARGET_MODULES})
+
+本线**不需要混合**：只保护一个域（IF），所以 C_if 直接就是训练用的 C。
+62/68 号那种 mix_covariances 步骤在这里没有对应物。
+
+下一步:
+  1) 采 F_if（EWC 对照臂用）。必须打印出与上面**完全相同**的池指纹:
+       ${POOL_HASH}
+     qsub onereplay/pbs/96_part2_fisher_if_flanv2.pbs
+     （F 是 d_out x d_in，all-linear 下约 6.9 GB；batch 写死 1，是三个采集里最慢的）
+
+  2) Stage 2 训练 + 评测（97 号）。四条臂共用这三份旧知识:
+       vanilla    不加载任何 penalty
+       onereplay  --cov_path ${COV_PATH}  --replay_lambda <λ>
+       ewc        --regularizer ewc --fisher_path <F_if>
+       replay     --replay_data_files ${POOL_FILE} --replay_max_len ${MAXLEN}
+     IF 保留用 ifeval + followbench（不用 ifbench），新任务用 gsm8k + math500。
+
+  3) 可选诊断：C 的谱结构（能看出罚项主要在压哪些方向）。7 GB 的 C 跑全量很慢，
+     先只看 attention 那几层:
+       python -m onereplay.scripts.inspect_cov_layers \\
+         --cov_path ${COV_PATH} \\
+         --base_model_dir ${IF_CKPT} --top 20
+EOF
+echo "Job finished at: $(date)"
