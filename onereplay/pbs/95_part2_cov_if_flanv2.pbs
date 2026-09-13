@@ -20,7 +20,7 @@
 #                      本脚本的模型                  本脚本的产物
 #
 # 三个采集件（C / Fisher / replay）全部来自**同一个 20k 行文件**，这是三条臂可比的
-# 前提。本脚本只采 C；Fisher 是 96 号；replay 不需要采集，训练时直接读同一个 jsonl。
+# 前提。本脚本只采 C；Fisher 是 97 号；replay 不需要采集，训练时直接读同一个 jsonl。
 #
 # -----------------------------------------------------------------------------
 # 【最关键的一条：C 必须在 Model-IF-FLAN 上采，不是在 Base 上采】
@@ -48,7 +48,7 @@
 # 同一个文件：
 #
 #     C          collect_cov  --data_files <该文件>      （本脚本）
-#     Fisher     collect_fisher --data_files <该文件>    （96 号）
+#     Fisher     collect_fisher --data_files <该文件>    （97 号）
 #     replay     train.py     --replay_data_files <该文件>
 #
 # 这不是省事，是 71/83 号已经在强制的约束：三条臂如果拿到的旧知识不是同一批行，
@@ -130,7 +130,7 @@
 # 协方差 hook 按 attention_mask 过滤了 padding，batch 只改变浮点累加顺序，**不改变
 # C 的数学定义**，所以开大在数值上是安全的（62 号文件头同一段结论）。这次没有任何
 # 历史 run 要逐字对齐——C 是全新的（新模型、新池子、新 scope），唯一要对齐的是
-# 96 号的 Fisher 与本脚本看到同一批行，而那由池指纹保证，与 batch 无关。
+# 97 号的 Fisher 与本脚本看到同一批行，而那由池指纹保证，与 batch 无关。
 #
 # cov_accum_device 必须改成 device。默认 cpu 每个 batch 每层都把 XᵀX 拷回主机，
 # 代价随 **C 的大小**而不是 batch 大小走（covariance.py 里那段注释算过 8B 全 scope
@@ -165,7 +165,7 @@
 #   # 产物已存在也重采
 #   qsub -v FORCE=1 onereplay/pbs/95_part2_cov_if_flanv2.pbs
 #
-# 下一步: 96 号采 F_if（必须打印出与本脚本相同的池指纹），然后 97 号 Stage 2 训练
+# 下一步: 97 号采 F_if（必须打印出与本脚本相同的池指纹），然后 96 号 Stage 2 训练
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
 
@@ -319,7 +319,7 @@ COV_BATCH="${COV_BATCH:-8}"
 # device：把 7 GB 累加器留在 GPU 上，省掉每 batch 每层的回传。见文件头。
 COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
 # C 由前向激活累加、hook 里已经 .float() 加宽，所以模型走 bf16 没有精度问题
-# （Fisher 那边不同，96 号要用 fp32，理由见 collect_fisher 的 docstring）。
+# （Fisher 那边不同，97 号要用 fp32，理由见 collect_fisher 的 docstring）。
 USE_BF16="${USE_BF16:-1}"
 # 打两条渲染后的文本。这一步是确认 checkpoint 的 chat template 和 94 号训练时同构，
 # 以及 assistant turn 里放的确实是 FLAN 的 gold target。
@@ -348,7 +348,7 @@ mkdir -p "$(dirname "${COV_PATH}")" "${DATASET_CACHE}"
 #   2) 池文件存在
 #   3) 池行数正好等于 POOL_ROWS_EXPECT（不等就说明 94 号的配额没满足，见其 MODE=data
 #      的输出——prepare 配额不满时只打警告、退出码仍是 0）
-#   4) 池指纹落盘打印出来：96 号采 F 时必须打印同一个值
+#   4) 池指纹落盘打印出来：97 号采 F 时必须打印同一个值
 #   5) 池 schema 里有 inputs / targets 两列
 # ===========================================================================
 echo "==== Step 0: 前置检查 ===="
@@ -451,7 +451,7 @@ PY
 
 # ---- 4) 池指纹 ----
 # 与 Step 1 的 collect_cov 逐字同参（max_samples/sample_shuffle/require_target），
-# 所以这里打印的指纹就是 C 会看到的那批行的指纹。96 号必须打印同一个值。
+# 所以这里打印的指纹就是 C 会看到的那批行的指纹。97 号必须打印同一个值。
 POOL_FP="$(python -m onereplay.scripts.check_old_knowledge_pool \
   --data_files "${POOL_FILE}" --dataset_split train \
   --cache_dir "${DATASET_CACHE}" --streaming 0 \
@@ -478,7 +478,7 @@ echo "  对照(未使用)  : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  旧知识池      : ${POOL_FILE}"
 echo "                  ${POOL_ROWS_EXPECT} 行, gold targets, nested ⊂ Stage 1 训练池"
 echo "  池指纹        : ${POOL_HASH}"
-echo "                  ^ 96 号采 F 时必须打印同一个值"
+echo "                  ^ 97 号采 F 时必须打印同一个值"
 echo "  scope         : ${COV_SCOPE}  (${TARGET_MODULES})"
 echo "  采集口径      : max_len=${MAXLEN} truncation=left batch=${COV_BATCH}"
 echo "                  accum_device=${COV_ACCUM_DEVICE} bf16=${USE_BF16}"
@@ -549,7 +549,7 @@ fi
 #      它的输入是 SwiGLU 之后的 6144 维激活。
 #   D) λ 的起点 —— 约束强度 ∝ λ · trace(C)，所以历史 λ 要按 trace 反比折算。
 #      **这只是起点，不是结论**：新任务换了（Commonsense512 -> OpenR1@8192），
-#      task_loss 的尺度也不一样，λ 必须在 97 号里用 PROBE 短跑实测罚项/任务损失
+#      task_loss 的尺度也不一样，λ 必须在 96 号里用 PROBE 短跑实测罚项/任务损失
 #      的比例再定。
 # ===========================================================================
 echo "==== Step 2: 诊断 C_if ===="
@@ -688,7 +688,7 @@ else:
 print()
 print("   **λ 不要在这里定死。** 约束强度 ∝ λ·trace(C)，但罚项要和**任务损失**比较才有")
 print("   意义，而 Part 2 的新任务是 OpenR1@8192（长 CoT，task_loss 的尺度和")
-print("   Commonsense@512 完全不同）。97 号有 MODE=lambda_probe：短跑几十次更新，打印")
+print("   Commonsense@512 完全不同）。96 号有 MODE=lambda_probe：短跑几十次更新，打印")
 print("   reg_loss / task_loss 的实际比例，据此选 λ。上面这个数只是 grid 的中心。")
 
 print()
@@ -723,7 +723,7 @@ cat <<EOF
      qsub onereplay/pbs/96_part2_fisher_if_flanv2.pbs
      （F 是 d_out x d_in，all-linear 下约 6.9 GB；batch 写死 1，是三个采集里最慢的）
 
-  2) Stage 2 训练 + 评测（97 号）。四条臂共用这三份旧知识:
+  2) Stage 2 训练 + 评测（96 号）。四条臂共用这三份旧知识:
        vanilla    不加载任何 penalty
        onereplay  --cov_path ${COV_PATH}  --replay_lambda <λ>
        ewc        --regularizer ewc --fisher_path <F_if>

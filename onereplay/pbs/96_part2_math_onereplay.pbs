@@ -164,6 +164,11 @@
 #
 #   # 2) 选 λ（短跑几档，只看 λ·R / task_loss 的比值）
 #   qsub -v MODE=lambda_probe onereplay/pbs/96_part2_math_onereplay.pbs
+#   # 已经单独交了完整 vanilla 的话，probe 里那档 λ=0 可以省掉
+#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0 onereplay/pbs/96_part2_math_onereplay.pbs
+#   # 只验一个 λ（最快，约 20 次更新）
+#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0,LAMBDA_GRID=7.5e-3 \
+#     onereplay/pbs/96_part2_math_onereplay.pbs
 #
 #   # 3) vanilla 臂（必须跑，是遗忘的标尺）。训练+数学评测同作业，IF 评测另开。
 #   qsub -v MODE=train,ARM=vanilla,DO_IF=0 onereplay/pbs/96_part2_math_onereplay.pbs
@@ -238,6 +243,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LAMBDA LAMBDA_GRID REG_IMPL REG_ONCE REG_ALLOW_TF32 NORMALIZE_BY_LAYERS
     PROBE_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY PROBE_LOG_EVERY
+    PROBE_VANILLA
     GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS MATH_BATCH
     IFEVAL_INPUT MAX_NEW_TOKENS EVAL_BATCH
     FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
@@ -364,6 +370,11 @@ NORMALIZE_BY_LAYERS="${NORMALIZE_BY_LAYERS:-1}"
 # （R 在前几次更新里就从 0 长到稳定量级）；它不是 LR sweep，不需要比末值。
 PROBE_MAX_STEPS="${PROBE_MAX_STEPS:-1280}"
 PROBE_LOG_EVERY="${PROBE_LOG_EVERY:-64}"
+# probe 里那条 λ=0 的短跑。它**不是** calibrate_lambda 要的地板（那个必须是完整
+# EPOCHS 的 vanilla run），只是让你在同样 20 次更新下看到「罚项把 task_loss 推高了
+# 多少」。选 λ 靠的 λ·R/task_loss 比值只用到 onereplay 臂自己的两个数，所以已经
+# 单独交了完整 vanilla 的话，这条可以关掉，省 1/4 的 probe 时间。
+PROBE_VANILLA="${PROBE_VANILLA:-1}"
 SMOKE_STEPS="${SMOKE_STEPS:-70}"
 
 # ---- 评测：数学侧与 91 号同预算，IF 侧与 94 号同预算 ----
@@ -679,9 +690,15 @@ fi
 if [[ "${MODE}" == "lambda_probe" ]]; then
   echo "grid=${LAMBDA_GRID}"
   echo "每档 ${PROBE_MAX_STEPS} micro-batch = $(( PROBE_MAX_STEPS / (ACCUM / BATCH) )) 次优化器更新 = $(( PROBE_MAX_STEPS * BATCH )) 行"
-  echo "先跑一档 vanilla 当 λ=0 的地板"
-  train_one "probe_p2_vanilla" vanilla 1 0 "${CKPT_DIR}/probe_p2_vanilla" \
-    "${PROBE_MAX_STEPS}" 0 "${PROBE_LOG_EVERY}"
+  if [[ "${PROBE_VANILLA}" == "1" ]]; then
+    echo "先跑一档 vanilla 当同步长下的 λ=0 参照"
+    train_one "probe_p2_vanilla" vanilla 1 0 "${CKPT_DIR}/probe_p2_vanilla" \
+      "${PROBE_MAX_STEPS}" 0 "${PROBE_LOG_EVERY}"
+  else
+    echo "PROBE_VANILLA=0：跳过 probe 里的 λ=0 那一档。"
+    echo "选 λ 的 λ·R/task_loss 比值只用 onereplay 臂自己的数，不需要它。"
+    echo "但 calibrate_lambda 的 floor 必须是**完整 EPOCHS** 的 vanilla run，别拿这条顶替。"
+  fi
   for lam in ${LAMBDA_GRID}; do
     train_one "probe_p2_onereplay_lam${lam}" onereplay 1 "${lam}" \
       "${CKPT_DIR}/probe_p2_onereplay_lam${lam}" "${PROBE_MAX_STEPS}" 0 "${PROBE_LOG_EVERY}"
