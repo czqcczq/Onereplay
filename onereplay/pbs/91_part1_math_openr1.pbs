@@ -429,7 +429,10 @@ LR="${LR:-5e-5}"
 # BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
 # 64 行"不成立。取 1 的理由见文件头「显存」与「饱和点」两节：8192 长序列下单卡
 # 一次只放一条，靠 ACCUM=64 把有效 batch 补回来。
-BATCH="${BATCH:-8}"
+# NuminaMath 实测：BATCH=8 在 MAXLEN=4096 下 OOM（8 x 4096 = 32768 token/micro-batch，
+# 是 OpenR1 时代 1 x 8192 的四倍激活）。4 跑得动，且 4 x 4096 = 16384 token/step 已经
+# 远在吞吐饱和点之上，所以这不是速度上的妥协。
+BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-64}"
 # 实测（全量 45792 行，Qwen3 tokenizer + chat template）：全序列 P50=3900 P90=6957
 # P99=8004 max=9004。4096 会截断 46.6%、其中 20326 行连题目都不剩，绝不能用。

@@ -9,9 +9,9 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 2: Model-IF-FLAN --OpenR1-Math--> Model-IF-Math，用 C_if 保护 IF 能力
+# Part 2: Model-IF-FLAN --NuminaMath-CoT--> Model-IF-Math，用 C_if 保护 IF 能力
 #
-#     Model-IF-FLAN ---- Openr1-Math-46k-8192 ----> Model-IF-Math
+#     Model-IF-FLAN ---- NuminaMath-CoT 50k @ 4096 ----> Model-IF-Math
 #                   \                          /
 #                    \---- λ·tr(ΔW C_if ΔWᵀ) -/
 #
@@ -72,7 +72,8 @@
 # -----------------------------------------------------------------------------
 # 【显存预算：从 91 号的实测值往上加，加数都是可算的】
 #
-#   91 号实测 (BATCH=1, MAXLEN=8192, 全量 vanilla)   50.77 GiB allocated / 53.79 reserved
+#   91 号 Numina 实测 (BATCH=4, MAXLEN=4096)         BATCH=8 会 OOM，所以 vanilla 那边
+#                                                     已经贴得比 OpenR1 那轮近
 #   + C_if 常驻 (fp32, 197 层, all-linear)            + 6.58 GiB
 #       6 x 2048² + 6144² = 62.91M/层 x 28 + lm_head 2048² = 1.766G 个 fp32
 #       move_covariances_to_device 一次性搬上去，全程不动
@@ -80,9 +81,10 @@
 #       regularizer.py 的注释记的就是这个数
 #   + analytic 的单层临时量 (最大是 lm_head 的 fp32)   + 约 1.2 GiB
 #   ------------------------------------------------  --------------
-#   预计 onereplay 臂                                 约 62 GiB / 140 GiB (H200)
+#   本臂比 91 号的 vanilla 多约 11 GiB
 #
-# 余量充足，但**必须先跑 MODE=smoke 看实测**：上面是加法估计，不是测量。
+# **必须先跑 MODE=smoke 看实测**：91 号在 BATCH=8 上已经 OOM 过一次，本臂在同样的
+# BATCH 下还要再加这 11 GiB，所以 BATCH=4 不要往上试。上面是加法估计，不是测量。
 # smoke 还要确认日志里出现这一行（trainers/base.py 在第 1 步打印）：
 #     regularizer covers 197 layers; no penalty matrix for 0 layers
 # missing 非 0 就说明 C 的层名和模型对不上，罚项在偷偷少覆盖几层。
@@ -105,8 +107,9 @@
 #
 # 不要直接照搬历史值。历史上 44 号全量 all-linear 用 7.5e-3、32/63 号 LoRA qv 用
 # 3e-2，但那些是在**另一个新任务**（Commonsense170k @ max_len 512）上定的。约束强度
-# 要和**任务损失**比才有意义，而本线的新任务是 OpenR1 @ 8192 的长 CoT，task_loss 的
-# 绝对尺度完全不是一回事。
+# 要和**任务损失**比才有意义，而本线的新任务是 NuminaMath @ 4096，task_loss 的
+# 绝对尺度完全不是一回事。换掉 OpenR1 之后连 Part 2 自己早先那轮 λ 也不能直接照抄：
+# 新任务变了，probe 要重跑。
 #
 # 三步走，都在本脚本里：
 #
@@ -136,8 +139,8 @@
 # 【读结果的两条纪律，都是 Part 1 留下来的】
 #
 # 1) **报任何 IF 分数必须同时报响应长度中位数。** 这是第 8c 节的口径。本线尤其危险：
-#    Stage 1 的 FLAN targets P50 只有 18-19 token（94 号文件头），Stage 2 的 OpenR1
-#    答案 P50 是 3767 token —— 输出长度会被往反方向猛推两个数量级。IFEval /
+#    Stage 1 的 FLAN targets P50 只有 18-19 token（94 号文件头），Stage 2 的 Numina
+#    答案 P50 是 351 token —— 输出长度会被往反方向推一个数量级。IFEval /
 #    FollowBench 里相当一部分约束本质在量长度，分数升降先看 words 再谈能力。
 #    本脚本的汇总表默认每个分数右边紧跟它自己的 words 中位数。
 #
@@ -149,7 +152,7 @@
 # 【前置】计算节点无外网
 #   1) Model-IF-FLAN checkpoint     94 号 MODE=train 的产物（不传 IF_LR 时自动 glob）
 #   2) C_if                         95 号的产物
-#   3) OpenR1 数据池                91 号 MODE=data 的产物 results_part1_math/datasets/openr1_math
+#   3) NuminaMath 数据池            prepare_numina_math.py 的产物 ${REPO_ROOT}/datasets/numina_math_50k
 #   4) 数学评测集                   ${REPO_ROOT}/datasets/math/{gsm8k,math500}_test.jsonl
 #   5) IFEval 输入随仓库自带；FollowBench 完全 vendored（零外部依赖）
 #   6) mkdir -p ${REPO_ROOT}/logs
@@ -252,8 +255,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME IF_LINE_ROOT IF_CKPT_DIR IF_LR IF_RUN IF_CKPT
-    MATH_LINE_ROOT MATH_DATASET RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
-    COV_PATH COV_SCOPE FISHER_PATH
+    MATH_DATASET RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    CF_ROOT COV_PATH COV_SCOPE FISHER_PATH
     MODE ARM DRY_RUN DO_TRAIN DO_EVAL DO_MATH DO_IF SEED FORCE_TRAIN FORCE_EVAL
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LAMBDA LAMBDA_GRID REG_IMPL REG_ONCE REG_ALLOW_TF32 NORMALIZE_BY_LAYERS
@@ -313,25 +316,36 @@ cd "${REPO_ROOT}"
 IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
 IF_CKPT_DIR="${IF_CKPT_DIR:-${IF_LINE_ROOT}/checkpoints}"
 
-# ---- Math 线（91 号）的产物：数据池就在这里，本脚本只读不重建 ----
-# 91 号 MODE=data 已经把 OpenR1 摊平成 {instruction,input,output} 的 save_to_disk，
-# 并且用 strip_tags + eval_aligned 处理过 <think>。本线**不重新建池**：换一遍就等于
-# 换了数据，Part 1 的 Model-Math 分数也不再可比。
-MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_math}"
-MATH_DATASET="${MATH_DATASET:-${MATH_LINE_ROOT}/datasets/openr1_math}"
+# ---- 新任务数据池：NuminaMath-CoT 50k，prepare_numina_math.py 的产物，只读不重建 ----
+# 它不在 results_part1_* 下，而是 ${REPO_ROOT}/datasets/ —— 91 号也读同一个目录，
+# 两条线因此吃的是逐字相同的池子，Model-Math 和 Model-IF-Math 的数学分可以并排读。
+#
+# 换掉 OpenR1 的原因：R1 traces 的答案中位 3767 token，1.7B 学到文体却收敛不了，
+# MATH500 上过半响应一路循环到预算耗尽、因为没走到 \boxed 而记 0 分。Numina 是同一批
+# 题目（OpenR1-Math-220k 就是拿 R1 去解 NuminaMath 1.5 得到的）配短解答：答案 P50=351
+# P90=778 max=2666，自我复核标记词中位 0 个。--think_handling 在这里是空操作，
+# 池里没有 <think> 标签。
+MATH_DATASET="${MATH_DATASET:-${REPO_ROOT}/datasets/numina_math_50k}"
 
 # ---- Part 2 自己的结果树 ----
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part2_if2math}"
+# 与 OpenR1 那轮分开：evaluate 会把分数追加进 ${RESULTS_ROOT}/<metric>_summary.csv，
+# 共用一棵树会把两种训练数据的结果混进同一个文件，而它们不可比。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part2_if2numina}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
+# ---- C_if / F_if 所在的采集树，与上面的结果树分开 ----
+# 95/97 号采的是**旧知识 IF 侧**（Model-IF-FLAN + FLAN v2 的 20k 池），和新任务换不换
+# 数学数据集完全无关，所以它们仍然写在 results_part2_if2math 下，不跟着改名。
+CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_part2_if2math}"
+
 # ---- C_if：95 号的产物 ----
 COV_SCOPE="${COV_SCOPE:-full}"
-COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_if_flanv2_20k_${COV_SCOPE}.pt}"
+COV_PATH="${COV_PATH:-${CF_ROOT}/cov/cov_if_flanv2_20k_${COV_SCOPE}.pt}"
 # ---- F_if：97 号的产物（ewc 臂用）。scope 跟 C 同一个变量，两者必须同 scope ----
-FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_if_flanv2_20k_${COV_SCOPE}.pt}"
+FISHER_PATH="${FISHER_PATH:-${CF_ROOT}/fisher/fisher_if_flanv2_20k_${COV_SCOPE}.pt}"
 
 # ---- 原始 Base：evaluate.py 在 --adapter_path 为空时会加载它，本线只有它当占位 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
@@ -356,15 +370,17 @@ FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 
 # ---- 训练超参：与 91 号逐字对齐，改任何一个都会让 Part 1 的对照失效 ----
-# BATCH=1 是 91 号实测出来的：BATCH=2 同样 400 行从 80.2s 涨到 160.8s（attention 的
-# T² 项 + 重尾长度分布下动态补齐把每条序列的 T 都推高）。不是妥协，是最快的配置。
-BATCH="${BATCH:-1}"
+# BATCH=4 是 Numina 上实测的上限：8 在 MAXLEN=4096 下 OOM。本臂还要再叠 C_if 常驻
+# 6.58 GiB + W0 快照 3.20 GiB + analytic 单层临时量约 1.2 GiB，余量比 91 号更窄，
+# 所以这里不要往上试。
+BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-64}"
-# 8192：91 号对全部 45792 行实测过，4096 会截断 46.6% 且其中 20326 行连题目都不剩。
-MAXLEN="${MAXLEN:-8192}"
-# 2 epoch = 190.0M tok/epoch x 2 ÷ 21154 tok/s ≈ 5.0 h。与 91 号默认一致，这样
-# Model-IF-Math 和 Part 1 的 Model-Math 是同样的新任务预算，数学分可以并排读。
-EPOCHS="${EPOCHS:-2}"
+# 4096：Numina 全序列 P50=479 P90=942 P99=1507 max=2810，4096 下截断**0 行**。
+# 8192 只是白付 attention 的 T² 成本。
+MAXLEN="${MAXLEN:-4096}"
+# 3 epoch = 27.1M tok/epoch x 3 = 81.3M token。与 91 号默认一致，这样 Model-IF-Math
+# 和 Part 1 的 Model-Math 是同样的新任务预算，数学分可以并排读。
+EPOCHS="${EPOCHS:-3}"
 # **两条臂必须同 LR**，这是比较的前提。LR 写进 run 名，train 和 eval 要传同一个值。
 LR="${LR:-5e-5}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
@@ -511,8 +527,9 @@ CKPT="${CKPT_DIR}/${RUN}"
 # ---- 数据池 / 评测集 / C ----
 if [[ "${ARM}" != "anchor" && "${MODE}" != "eval" ]]; then
   [[ -d "${MATH_DATASET}" ]] || {
-    echo "缺 OpenR1 池: ${MATH_DATASET}"
-    echo "它是 91 号 MODE=data 的产物。本线不重建池（换池就换了数据）。"
+    echo "缺 NuminaMath 池: ${MATH_DATASET}"
+    echo "它是 prepare_numina_math.py 的产物（91 号读的也是同一个目录）。"
+    echo "本线不重建池：换池就换了数据，Part 1 的 Model-Math 分数不再可比。"
     exit 1
   }
 fi
@@ -564,7 +581,7 @@ print(f"  target_modules   = {','.join(meta.get('target_modules', []))}")
 print(f"  层数             = {len(covariances)}")
 # 这两个 max_len **本来就不该相等**，写出来免得后面有人当 bug 修。
 # C 是旧知识（FLAN，P50 约 18 token）的隐状态二阶矩，用的是旧任务的预算；
-# 新任务（OpenR1 长 CoT）在 8192 下训练。罚项只经过 ΔW 与 C 相乘，两边的序列长度
+# 新任务（NuminaMath CoT）在 4096 下训练。罚项只经过 ΔW 与 C 相乘，两边的序列长度
 # 不需要一致，需要一致的是**模型**（上面那条检查）。
 print(f"  max_len          = {cov_max_len}  (采 C 时旧知识池的预算)")
 print(f"  新任务 max_len   = {new_task_max_len}  (本作业训练的预算；两者不必相等)")
@@ -675,7 +692,7 @@ fi
 
 echo ""
 echo "========================================================================"
-echo "Part 2: Model-IF-FLAN --OpenR1-Math--> Model-IF-Math   (full finetune)"
+echo "Part 2: Model-IF-FLAN --NuminaMath-CoT--> Model-IF-Math   (full finetune)"
 echo "  MODE / ARM     : ${MODE} / ${ARM}"
 if [[ "${MODE}" == "lambda_probe" ]]; then
 # probe 不看 ARM，它扫的是 PROBE_ARM。这一行免得下面的"保护"栏被读成本次扫的对象。
@@ -889,7 +906,7 @@ fi
 # 那要跑完整训练看 IF 分数和 val_loss。
 #
 # 为什么不能照搬历史 λ：约束强度 ∝ λ·trace(C)，但罚项要和任务损失比才有意义，而
-# 本线的新任务是 OpenR1 @ 8192 的长 CoT。44 号那个 7.5e-3 是在 Commonsense @ 512
+# 本线的新任务是 NuminaMath @ 4096。44 号那个 7.5e-3 是在 Commonsense @ 512
 # 上定的，task_loss 的绝对尺度完全不同。
 #
 # PROBE_MAX_STEPS 数的是 micro-batch，更新次数要除以 ACCUM/BATCH=64。默认 1280 步
@@ -1277,8 +1294,8 @@ PY
   # -------------------------------------------------------------------------
   # 汇总：一张表，**每个分数右边紧跟它自己的响应词数中位数**。
   #
-  # 这不是锦上添花。Stage 1 的 FLAN targets P50 只有 18-19 token，Stage 2 的 OpenR1
-  # 答案 P50 是 3767 token —— 输出长度会被往反方向推两个数量级，而 IFEval/FollowBench
+  # 这不是锦上添花。Stage 1 的 FLAN targets P50 只有 18-19 token，Stage 2 的 Numina
+  # 答案 P50 是 351 token —— 输出长度会被往反方向推一个数量级，而 IFEval/FollowBench
   # 里相当一部分约束本质在量长度（Part 1 第 8c 节）。分数和 words 分开看就会把长度
   # 漂移读成能力变化。
   #
@@ -1344,7 +1361,7 @@ def num(value, width, fmt="{:.0f}"):
 
 print()
 print("=" * 108)
-print("Part 2: Model-IF-FLAN --OpenR1--> Model-IF-Math")
+print("Part 2: Model-IF-FLAN --NuminaMath-CoT--> Model-IF-Math")
 print("  左半 = 新任务学到多少   右半 = 旧能力保留多少   words = 该指标自己的响应词数中位数")
 print("=" * 108)
 print(f"{'run':<40}{'GSM8K':>8}{'MATH500':>9}{'IFEval':>8}{'words':>7}{'FB HSR':>8}{'words':>7}")
@@ -1373,13 +1390,14 @@ print("  保护效果 = onereplay 的 IF 分数 − vanilla 的 IF 分数")
 print("  代价    = vanilla 的数学分 − onereplay 的数学分（保护换来的可塑性损失）")
 print("  三个数要一起看：只报第二个而不报第三个，等于用「少学新任务」冒充「保住旧能力」。")
 print()
-print("**数学分数必须配着上面那张 length diagnostic 的 hit-cap 读。** 4096 下 Model-Math")
-print("有 56.2% 的响应撞上限、MATH-500 被读成 0.388（真实值在 0.86 量级），而删失率随")
-print("输出长度变 —— 任何让输出变短的干预都会靠「逃出截断」把数学分推上去。hit-cap 不")
-print("接近 0 时，各臂的数学分之间没有可比性。")
+print("**数学分数必须配着上面那张 length diagnostic 的 hit-cap 读。** OpenR1 那轮的教训：")
+print("8192 预算下 Model-Math 仍有 56.2% 的响应撞上限、MATH-500 被读成 0.388（能抽出答案")
+print("的行上是 0.862），而删失率随输出长度变 —— 任何让输出变短的干预都会靠「逃出截断」")
+print("把数学分推上去。换成 Numina（答案 P50=351）就是为了让 hit-cap 回到 0 附近；它如果")
+print("还不接近 0，各臂的数学分之间依然没有可比性。")
 print()
 print("**IF 分数升降先看 words 再谈能力。** Stage 1 把输出压到 P50 约 18 token，")
-print("Stage 2 的 OpenR1 答案 P50 是 3767 token，长度会被往反方向推两个数量级，而")
+print("Stage 2 的 Numina 答案 P50 是 351 token，长度会被往反方向推一个数量级，而")
 print("IFEval/FollowBench 里不少约束本质在量长度（见 results_log/2026-09-12 第 8c 节）。")
 print()
 print("**FB HSR 不是 FollowBench 全量分数**：只有 rule 那一半（350/820 行、70/164 组），")

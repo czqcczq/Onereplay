@@ -11,13 +11,13 @@
 # =============================================================================
 # Part 3 / Stage 1 采集: 在 Model-Math 上一次采完 C_math 和 F_math
 #
-#     Model-Math  --(OpenR1 20k 行, gold targets)-->  C_math + F_math
+#     Model-Math  --(NuminaMath 20k 行, gold targets)-->  C_math + F_math
 #
 # Part 3 是 Part 2 的**反方向**。Part 2 是「先学 IF，再学 Math，保 IF」，这条线把两个
 # 域调换：
 #
-#     Part 2   Base --FLANv2--> Model-IF-FLAN --OpenR1 + C_if  --> 保 IF
-#     Part 3   Base --OpenR1--> Model-Math    --FLANv2  + C_math--> 保 Math
+#     Part 2   Base --FLANv2--> Model-IF-FLAN --Numina + C_if  --> 保 IF
+#     Part 3   Base --Numina--> Model-Math    --FLANv2 + C_math--> 保 Math
 #                               ^^^^^^^^^^^^             ^^^^^^
 #                               本脚本的模型              本脚本的产物
 #
@@ -39,11 +39,11 @@
 #     W0 = Model-Math 的权重  ->  C 也必须是 Model-Math 的 E[x xᵀ]
 #
 # 拿 Base 的 C 配 Model-Math 的 W0 是把两个不同点的量拼在一起：隐状态分布在 Stage 1
-# 已经被 OpenR1 改过一遍了。这个错误**不报错、loss 也正常**，只会让保护变弱且无法解释。
+# 已经被 Numina 改过一遍了。这个错误**不报错、loss 也正常**，只会让保护变弱且无法解释。
 # EWC 那边同理：F 是在 W0 处的曲率，采在 Base 上就不是这个 W0 的曲率。
 #
 # -----------------------------------------------------------------------------
-# 【池子：OpenR1 训练池里 nested 随机抽的 20k 行】
+# 【池子：NuminaMath 50k 训练池里 nested 随机抽的 20k 行】
 #
 # 三个用途读同一个文件，这是三条臂可比的前提（71/83 号已经在强制这个约束）：
 #
@@ -65,21 +65,22 @@
 # 路径调的是同一个排列函数，产物逐字相同。
 #
 # -----------------------------------------------------------------------------
-# 【max_len=8192：这是与 IF 线最大的量的差别，几乎所有开销都由它决定】
+# 【max_len=4096：换成 NuminaMath 之后这条线便宜了将近一个数量级】
 #
 # 必须和三处对齐：
-#   1) Stage 1 训练时 91 号用的 MAXLEN=8192
+#   1) Stage 1 训练时 91 号用的 MAXLEN=4096
 #   2) 本脚本采 C 和 F
-#   3) Stage 2（101 号）训练时 replay 行的 --replay_max_len 8192
+#   3) Stage 2（101 号）训练时 replay 行的 --replay_max_len 4096
 #
 # 第 3 条是 replay.py 里 replay_max_len() 那段注释的镜像：Part 3 的新任务是 FLANv2，
-# --max_len 是 1536，但 replay 行是 math，**不能**跟着用 1536（那会把 4000 token 的
-# CoT 砍掉四分之三，「replay 复习的旧知识」比「C 编码的旧知识」少一大截，两条臂不再是
-# 同一份旧知识）。Part 2 那边是反过来的（新任务 8192，replay 池 1536），两边都得显式传。
+# --max_len 是 1536，但 replay 行是 math，**不能**跟着用 1536（Numina 的全序列 P90 就
+# 有 942 token，1536 会开始切，「replay 复习的旧知识」比「C 编码的旧知识」少一截，两条
+# 臂不再是同一份旧知识）。两边都得显式传。
 #
-# 91 号实测（全量 45792 行，Qwen3 tokenizer + chat template）：
-#     全序列 P50=3900  P90=6957  P99=8004  max=9004
-# 所以 8192 下截断率不到 1%。
+# prepare_numina_math 的 length report（50k 行，Qwen3 tokenizer + chat template）：
+#     全序列 P50=479  P90=942  P95=1118  P99=1507  max=2810
+# 所以 4096 下截断 **0 行**。OpenR1 那版需要 8192（P99=8004）是因为 R1 traces 的
+# 答案中位就有 3767 token；换数据集的动机正是那个长度本身。
 #
 # -----------------------------------------------------------------------------
 # 【truncation_side left：在 math 上比在 FLAN 上危险得多，但仍然必须是 left】
@@ -89,9 +90,9 @@
 #
 # 但要知道它在这条线上意味着什么：FLAN 上左截断是良性的（few-shot 结构是「示例1 示例2
 # … 真问题」，丢头只退化成更少 shot 的同一道题）。math 上丢头丢的是**题目本身**，剩下
-# 一段没有问题的推理。91 号文件头算过：4096 下会有 20326 行「连题目都不剩」，这就是它
-# 选 8192 的原因。8192 下 P99=8004，受影响的不到 1%，可以接受——但这是「够长所以罕见」，
-# 不是「左截断在 math 上无害」。
+# 一段没有问题的推理。OpenR1 那版在 4096 下会有 20326 行「连题目都不剩」，所以它必须用
+# 8192。Numina 在 4096 下一行都不截，风险归零——但这是「够短所以碰不到」，不是「左截断
+# 在 math 上无害」。改小 MAXLEN 会立刻把这个风险请回来。
 #
 # collect_cov / collect_fisher 的默认都是空串 = 跟 tokenizer 默认（right，先切答案），
 # 所以 left 必须显式传。对 F 更要紧：右截断把答案切干净之后这一行的 supervised token
@@ -99,24 +100,23 @@
 # **静默稀释 F**。
 #
 # -----------------------------------------------------------------------------
-# 【COV_BATCH=2 而不是 95 号的 8：8192 下显存账由 logits 主导】
+# 【COV_BATCH=4：4096 下显存账仍由 logits 主导，但每行便宜了一半】
 #
 # 协方差 hook 按 attention_mask 过滤了 padding，batch 只改变浮点累加顺序，**不改变 C
-# 的数学定义**，所以取多少纯粹是性能选择。8192 下的账：
+# 的数学定义**，所以取多少纯粹是性能选择。4096 下的账：
 #
-#   logits (bf16)   B x 8192 x 151936 x 2B = B x 2.49 GiB    <- 最大的一项
+#   logits (bf16)   B x 4096 x 151936 x 2B = B x 1.16 GiB    <- 最大的一项
 #   C 累加器        6.58 GiB（常驻 device，与 B 无关）
 #   权重 (bf16)     3.2 GiB
-#   down_proj hook  B x 8192 x 6144 x 4B = B x 0.19 GiB（.float() 转换的瞬时量）
+#   down_proj hook  B x 4096 x 6144 x 4B = B x 0.09 GiB（.float() 转换的瞬时量）
 #
-# logits 那 2.49 GiB/行 **躲不掉**：transformers 有 logits_to_keep 可以只算最后若干个
+# logits 那 1.16 GiB/行 **躲不掉**：transformers 有 logits_to_keep 可以只算最后若干个
 # 位置，但那会在 lm_head 之前就把 hidden_states 切掉，于是 lm_head 的 hook 只看到最后
 # 一个位置，lm_head 的 C 就废了。lm_head 在 scope 里，所以必须让它看到全部位置。
 #
-# 另一个理由是 padding 浪费：池子是随机序（MODE=pool 打乱后写的），一个 batch 里 8 行
-# 会被 pad 到这 8 行的最大值（8 次抽样的 max 大约落在 7000-8000），而均值只有 4000 上下
-# ——batch=8 有近 1.8 倍的算力花在 padding 上。8192 一行本身已经能把 GPU 喂饱，所以取
-# 小 batch 是双赢。显存宽松想换速度可以传 COV_BATCH=4。
+# padding 浪费在 Numina 上也小得多：长度分布窄（P50=479 P90=942），一个 batch 的 max
+# 不会像 OpenR1 那样把均值拉高近一倍。OpenR1 那时取 2 是因为 8192 一行就能喂饱 GPU 且
+# 补齐浪费大，两条理由在这里都弱了，所以取 4。显存还很宽松，想再快可以试 8。
 #
 # -----------------------------------------------------------------------------
 # 【F 侧被 collect_fisher 强制的三件事，都不是可调项】
@@ -129,20 +129,23 @@
 #
 # FISHER_DEVICE=cuda：放 CPU 每条样本要把 197 个梯度平方搬过 PCIe（约 6.88 GB/条），
 # 20000 条按 20 GB/s 算是 +1.9h 下限，而且是 197 次小传输 x 20000 的同步开销。1.7B 上
-# cuda 总占用（fp32 权重 6.9 + fp32 梯度 6.9 + F 累加器 6.9 + 8192 的激活）约 30-40 GiB，
+# cuda 总占用（fp32 权重 6.9 + fp32 梯度 6.9 + F 累加器 6.9 + 4096 的激活）约 25-30 GiB，
 # H200 余量很大。显存紧的卡再传 FISHER_DEVICE=cpu。
 #
 # -----------------------------------------------------------------------------
-# 【运行时长：F 是大头，很可能需要分两次投】
+# 【运行时长：换成 Numina 之后一个作业就装得下，不必再分两次投】
 #
 # 关键的量是**池子的 token 总数**。IF 线那 20k 行 FLAN 累出 5,318,546 个非 padding
-# token；这条线 20k 行 math 按 P50=3900 估是约 8000 万，**16 倍**。
+# token；这条线 20k 行 Numina 按全序列均值约 542 估是约 1100 万，只有 2 倍。
+# （OpenR1 那版按 P50=3900 估是约 8000 万，是这里的 7 倍多，那才是当初 24h walltime
+#   和「分两次投」这条建议的由来。）
 #
-#   Step 1  采 C    IF 线约 12 min  ->  这条线约 2-3 h
-#   Step 3  采 F    IF 线 0.5-2 h   ->  这条线约 6-10 h（fp32、逐样本 backward）
+#   Step 1  采 C    IF 线约 12 min  ->  这条线约 20-40 min
+#   Step 3  采 F    IF 线 0.5-2 h   ->  这条线约 1-2 h（fp32、逐样本 backward）
 #
-# 合起来贴着 24h 的 walltime。**建议分两次投**：
-#   qsub -v DO_FISHER=0 ...   先只采 C（2-3h），拿到 C 就能去 101 号跑 lambda_probe
+# 合起来两三个小时，24h 的 walltime 余量很大，直接一次投完即可。仍然想分开的话
+# （比如先拿 C 去 101 号跑 lambda_probe）：
+#   qsub -v DO_FISHER=0 ...   先只采 C
 #   qsub -v DO_COV=0 ...      再采 F（Step 0 会用 C 文件交叉校验池指纹）
 #
 # collect_cov 每 50 个 batch 打一次进度，collect_fisher 每 ${LOG_EVERY} 条打一次
@@ -152,7 +155,7 @@
 # 【λ 不要在这里定死】
 #
 # 约束强度 ∝ λ·trace(C)，但罚项要和**任务损失**比较才有意义。Part 3 的新任务是
-# FLANv2@1536（短答案，task_loss 的尺度和 Part 2 的 OpenR1@8192 完全不同），所以
+# FLANv2@1536（短答案，task_loss 的尺度和 Part 2 的 Numina@4096 完全不同），所以
 # Part 2 那套 λ 在这里没有可比性，Step 2 折算出来的数只是 grid 的中心。101 号有
 # MODE=lambda_probe：短跑几十次更新、打印 reg_loss / task_loss 的实际比例，据此选 λ。
 #
@@ -165,8 +168,8 @@
 #   1) Stage 1 的 checkpoint（91 号 MODE=train 的产物，完整权重目录）
 #        ${MATH_CKPT_DIR}/part1_math_lr<LR>_seed<SEED>/
 #      不传 MATH_LR 时脚本会自己去 glob，命中不唯一会报错并列出候选。
-#   2) Stage 1 的训练池（91 号 MODE=data 的产物，save_to_disk 目录）
-#        ${MATH_LINE_ROOT}/datasets/openr1_math/
+#   2) Stage 1 的训练池（prepare_numina_math.py 的产物，save_to_disk 目录）
+#        ${REPO_ROOT}/datasets/numina_math_50k/
 #   3) mkdir -p ${REPO_ROOT}/logs
 #
 # 【用法】务必按顺序
@@ -303,12 +306,18 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 
 cd "${REPO_ROOT}"
 
-# ---- Stage 1（Math 线 / OpenR1）的产物，本脚本只读 ----
-MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_math}"
+# ---- Stage 1（Math 线 / NuminaMath-CoT）的产物，本脚本只读 ----
+# Model-Math 现在是 91 号用 NuminaMath 50k 训出来的那一个，不是 OpenR1 那一版。
+# 它就是 Stage 2 的 W0，所以 C/F 必须采在它身上。
+MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_numina_math}"
 MATH_CKPT_DIR="${MATH_CKPT_DIR:-${MATH_LINE_ROOT}/checkpoints}"
-# 91 号的 MATH_DATASET 默认值。MODE=pool 从它上面切池子（只读）。
-TRAIN_POOL="${TRAIN_POOL:-${MATH_LINE_ROOT}/datasets/openr1_math}"
-# prepare_openr1_math 的默认命名：<训练池目录>_replay.jsonl，schema {inputs, targets, ...}
+# 91 号的 MATH_DATASET 默认值。注意它在 ${REPO_ROOT}/datasets/ 下而不是结果树里
+# （prepare_numina_math.py 直接写在那），MODE=pool 从它上面切池子（只读）。
+TRAIN_POOL="${TRAIN_POOL:-${REPO_ROOT}/datasets/numina_math_50k}"
+# <训练池目录>_replay.jsonl，schema {inputs, targets, data_source, source_index}。
+# MODE=pool 走 prepare_openr1_math 的 replay_row_order + to_replay_row —— Numina 池的
+# 列名（instruction/output/data_source/source_index）与 OpenR1 池相同，所以那对函数
+# 直接适用，不需要为新数据集另写一份。
 POOL_FILE="${POOL_FILE:-${TRAIN_POOL}_replay.jsonl}"
 POOL_ROWS_EXPECT="${POOL_ROWS_EXPECT:-20000}"
 # 与训练池的 --seed 分开：重抽旧知识池不该牵动训练池。必须与 91 号的
@@ -335,8 +344,10 @@ DO_FISHER="${DO_FISHER:-1}"
 # ---- 共用的采集口径 ----
 SEED="${SEED:-1}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
-# 必须等于 91 号训练时的 MAXLEN，也必须等于 Stage 2 的 --replay_max_len（见文件头）
-MAXLEN="${MAXLEN:-8192}"
+# 必须等于 91 号训练时的 MAXLEN，也必须等于 Stage 2 的 --replay_max_len（见文件头）。
+# Numina 全序列 P50=479 P90=942 P99=1507 max=2810，4096 下截断 0 行，所以 8192 只是
+# 白付 attention 的 T² 成本和显存。
+MAXLEN="${MAXLEN:-4096}"
 # scope 对 C 和 F 必须相同，否则 EWC 和 onereplay 约束的层集合不同，对照失效。
 SCOPE="${SCOPE:-full}"
 case "${SCOPE}" in
@@ -354,27 +365,30 @@ case "${SCOPE}" in
 esac
 
 # ---- C 侧 ----
-# 2 而不是 95 号的 8：8192 下 logits 是 2.49 GiB/行，且 padding 浪费随 batch 涨。见文件头。
-COV_BATCH="${COV_BATCH:-2}"
+# 4：MAXLEN 从 8192 降到 4096 之后 logits 减半到 1.16 GiB/行，而 Numina 的长度分布
+# 也窄得多（P50=479 对 P90=942），动态补齐的浪费远小于 OpenR1 那时。文件头里
+# COV_BATCH=2 的那段算术是按 8192 写的，不再适用。
+COV_BATCH="${COV_BATCH:-4}"
 # device：把 6.58 GiB 累加器留在 GPU 上，省掉每 batch 每层的回传。
 COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
 # C 由前向激活累加、hook 里已经 .float() 加宽，所以模型走 bf16 没有精度问题。
 COV_USE_BF16="${COV_USE_BF16:-1}"
-COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_math_openr1_20k_${TAG}.pt}"
+# 文件名带 numina：OpenR1 那版 C/F 如果还在同一棵树下，不能被覆盖，也不能被误用。
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_math_numina_20k_${TAG}.pt}"
 
 # ---- F 侧 ----
 # cuda：放 CPU 每条要过 PCIe 搬 6.88 GB。见文件头。
 FISHER_DEVICE="${FISHER_DEVICE:-cuda}"
 # 0 = 模型跑 fp32。梯度在 backward 里就被舍入了，事后加宽救不回来。
 FISHER_USE_BF16="${FISHER_USE_BF16:-0}"
-FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_math_openr1_20k_${TAG}.pt}"
+FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_math_numina_20k_${TAG}.pt}"
 # 0 = 全量。只在冒烟时改；改了 Step 4 会拒绝（N != 池行数）。
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
 LOG_EVERY="${LOG_EVERY:-500}"
 
 # ---- 诊断辅助 ----
 # 打两条渲染后的文本。确认 checkpoint 的 chat template 和 91 号训练时同构，
-# 以及 assistant turn 里放的确实是 OpenR1 的 gold CoT（strip_tags 之后没有 <think>）。
+# 以及 assistant turn 里放的确实是 Numina 的 gold CoT（原始数据就没有 <think>）。
 DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
 # 历史上单阶段线的 C_math（31/46 号，Base 模型 / MetaMath 30k 池 / qv scope）。存在就在
 # Step 2 里打一个 trace 比值。full scope 的 1.7B 版本不存在，会自动跳过。
@@ -580,9 +594,13 @@ print(f"  第一行 inputs    : {str(first['inputs'])[:100]!r}")
 print(f"  第一行 targets   : {str(first['targets'])[:100]!r}")
 if "<think>" in str(first["targets"]):
     raise SystemExit(
-        "!! targets 里有 <think> 标签。91 号用的是 --think_handling strip_tags，"
-        "评测路径 enable_thinking=False，带标签说明训练池的口径变过了。"
+        "!! targets 里有 <think> 标签。NuminaMath 的解答本来就不带标签，评测路径又是"
+        "enable_thinking=False，出现标签说明这个池子不是从 numina_math_50k 切的。"
     )
+if "\\boxed" not in str(first["targets"]) and "\\fbox" not in str(first["targets"]):
+    # 只看第一行，所以这是提示不是断言：prepare_numina_math 的 --require_boxed 1
+    # 让整池 100% 带 boxed，缺了多半是池子来源不对。
+    print("  !! 第一行 targets 里没有 \\boxed —— 确认这个池子确实来自 numina_math_50k")
 PY
 
 # ---- 3) 池指纹 ----
@@ -594,7 +612,7 @@ POOL_FP="$(python -m onereplay.scripts.check_old_knowledge_pool \
   --input_column inputs --target_column targets \
   --require_target 1 \
   --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
-  --label math_openr1_20k | tail -n 1)"
+  --label math_numina_20k | tail -n 1)"
 echo "${POOL_FP}"
 POOL_HASH="${POOL_FP##*fingerprint=}"
 POOL_FP_ROWS="${POOL_FP##*rows=}"; POOL_FP_ROWS="${POOL_FP_ROWS%% *}"
@@ -650,9 +668,9 @@ fi
 # 01/31/41/62/68 号所有采集脚本的结构性区别（它们指向 Base）。
 #
 # 逐条对上文件头的理由：
-#   --include_target_in_chat 1   assistant turn 放 OpenR1 的 gold CoT，与 replay 读同
+#   --include_target_in_chat 1   assistant turn 放 Numina 的 gold CoT，与 replay 读同
 #                                一列，也与 Stage 1 训练时的监督对象一致
-#   --enable_thinking 0          91 号用 strip_tags，池里没有 <think>；与 concat 一起保持 0
+#   --enable_thinking 0          Numina 的解答本来就不带 <think>；与 concat 一起保持 0
 #   --concat_prompt_target 0
 #   --truncation_side left       与训练一致；默认空串会走 tokenizer 默认(right, 先切答案)
 #   --max_samples 0 --sample_shuffle 0   文件本身就是那 20k 行，取全量不打乱
@@ -663,7 +681,7 @@ if [[ "${DO_COV}" == "1" ]]; then
     echo "跳过采 C：${COV_PATH} 已存在（FORCE=1 可强制重采）"
   else
     echo "==== Step 1: collect C_math -> ${COV_PATH} ===="
-    echo "8192 上下文、约 8000 万 token，预计 2-3h。每 50 个 batch 打一次进度。"
+    echo "4096 上下文、约 1100 万 token，预计 20-40 min。每 50 个 batch 打一次进度。"
     python -m onereplay.scripts.collect_cov \
       --model_dir "${MATH_CKPT_DIR}" --model_name "${MATH_RUN}" \
       --seed "${SEED}" --use_bf16 "${COV_USE_BF16}" \
@@ -797,8 +815,9 @@ for family in sorted(by_family):
 token_counts = sorted(set(counts.values()))
 print(f"   累加的非 padding token 数: {token_counts[0]:,}"
       + ("" if len(token_counts) == 1 else f" .. {token_counts[-1]:,} (各层不同?!)"))
-print("     参考：IF 线那 20k 行 FLAN 是 5,318,546 个。这条线应当在 8 千万量级——")
-print("     明显偏小就说明 max_len 或 truncation 把 CoT 截掉了。")
+print("     参考：IF 线那 20k 行 FLAN 是 5,318,546 个。Numina 20k 行按均值约 542 估")
+print("     应当在 1100 万上下——明显偏小就说明 max_len 或 truncation 把解答截掉了。")
+print("     （OpenR1 那版的参考值是 8 千万，不要拿它来对这条线。）")
 if len(token_counts) > 1:
     problems.append("各层的 token 计数不同，同一批前向不该出现这种情况")
 
@@ -821,8 +840,8 @@ if Path(ref_path).is_file():
         print(f"   trace(C_new)/trace(C_hist) over {len(shared)} shared layers: "
               f"mean={r:.3f} min={ratios.min().item():.3f} max={ratios.max().item():.3f}")
         print(f"   历史 λ={ref_lambda:g} 按 trace 反比折算 -> λ ≈ {ref_lambda / r:.3e}")
-        print("   历史 C 与本次差了模型（Base vs Model-Math）、池子（MetaMath vs OpenR1）、")
-        print("   max_len（512 vs 8192）三件事，所以这只是量级参考，不是等强度换算。")
+        print("   历史 C 与本次差了模型（Base vs Model-Math）、池子（MetaMath vs Numina）、")
+        print("   max_len（512 vs 4096）三件事，所以这只是量级参考，不是等强度换算。")
     else:
         print("   历史 C 的层集合与本次无交集（scope 不同?），跳过比值")
 else:
@@ -831,7 +850,7 @@ else:
 print()
 print("   **λ 不要在这里定死。** 约束强度 ∝ λ·trace(C)，但罚项要和**任务损失**比较才有")
 print("   意义，而 Part 3 的新任务是 FLANv2@1536（短答案），task_loss 的尺度和 Part 2 的")
-print("   OpenR1@8192 完全不同。101 号有 MODE=lambda_probe：短跑几十次更新，打印")
+print("   Numina@4096 完全不同。101 号有 MODE=lambda_probe：短跑几十次更新，打印")
 print("   reg_loss / task_loss 的实际比例，据此选 λ。上面这个数只是 grid 的中心。")
 
 print()
@@ -861,7 +880,7 @@ if [[ "${DO_FISHER}" == "1" ]]; then
   else
     echo ""
     echo "==== Step 3: collect F_math -> ${FISHER_PATH} ===="
-    echo "${POOL_FP_ROWS} 次逐样本 backward，fp32、8192 上下文，预计 6-10h。"
+    echo "${POOL_FP_ROWS} 次逐样本 backward，fp32、4096 上下文，预计 1-2h。"
     echo "**拿日志里的 ms/example x ${POOL_FP_ROWS} 才是真实时长**，区间只够判断有没有卡住。"
     python -m onereplay.scripts.collect_fisher \
       --model_dir "${MATH_CKPT_DIR}" --model_name "${MATH_RUN}" \
@@ -1046,8 +1065,9 @@ for family in sorted(family_mean):
 
 # ------------------------------------------------------- D) 估计量健康
 print("\n[D] 估计量健康")
-print("  这条线要特别看这一组：math 答案 P50=3900 / max=9004，长度跨度比 FLAN 大得多，")
-print("  而 ||g_n||² 随监督 token 数增长，所以 ESS 被少数长 CoT 压低的风险高。")
+print("  Numina 的长度跨度（答案 P50=351 / P90=778 / max=2666）比 OpenR1 那版窄得多，")
+print("  ESS 被少数长 CoT 压低的风险因此低不少，但 ||g_n||² 仍随监督 token 数增长，")
+print("  所以这一组还是要看。")
 report = meta.get("length_weighting", {})
 if report:
     print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -1067,7 +1087,8 @@ if report:
         )
     print(f"  zero_supervision_rows = {zero_rows:.0f}")
     print("    这些行没有任何被监督的 token，贡献 0 但仍计入 N（add_empty）。")
-    print("    左截断 + 8192 下应当接近 0；不为 0 说明有行被截得连答案都不剩。")
+    print("    左截断 + 4096 下应当**正好是 0**（Numina 全序列 max=2810，根本截不到）；")
+    print("    不为 0 说明池里有空 targets，或者 MAXLEN 被调小过。")
     if zero_rows > 0.01 * max(examples, 1.0):
         problems.append(
             f"zero_supervision_rows={zero_rows:.0f} 超过 1% 的行没有监督 token，"
@@ -1134,9 +1155,15 @@ cat <<EOF
   replay     --replay_data_files ${POOL_FILE} --replay_max_len ${MAXLEN}
 
   注意 --replay_max_len ${MAXLEN}：新任务 FLANv2 的 --max_len 是 1536，但 replay 行是
-  math，跟着用 1536 会把 4000 token 的 CoT 砍掉四分之三。这是 Part 2 那条注释的镜像。
+  math，Numina 全序列 P99=1507、max=2810，跟着用 1536 会开始切尾。这是 Part 2 那条
+  注释的镜像。
 
-  评测：Math 保留用 gsm8k + math500（记得 MATH_BATCH=128，见 91 号那段注释），
-  新任务 IF 用 ifeval + followbench。
+  101 号的默认值还指着 OpenR1 那一版，所以投的时候要显式覆盖这三项：
+    COV_PATH=${COV_PATH}
+    FISHER_PATH=${FISHER_PATH}
+    POOL_FILE=${POOL_FILE}
+  基座也要换成 numina 训出来的 Model-Math（MATH_LINE_ROOT=${MATH_LINE_ROOT}）。
+
+  评测：Math 保留用 gsm8k + math500，新任务 IF 用 ifeval + followbench。
 EOF
 echo "Job finished at: $(date)"
