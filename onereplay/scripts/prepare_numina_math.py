@@ -45,6 +45,11 @@ There is no length filter and no need for one: nothing in this corpus reaches
 before setting the training budget anyway, and note the eval budget can come
 down with it -- targets this short give the model no reason to generate 8192.
 
+The official 100-row test split is written next to the pool as JSONL, not into
+--out_dir. train.py only reads the train split and carves --val_fraction from
+it, so that 200-row holdout stays the in-run val loss. The JSONL is a
+seed-independent CE probe for when the 50k draw itself changes.
+
 Example:
 
     python onereplay/scripts/prepare_numina_math.py \\
@@ -160,6 +165,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay_rows", type=int, default=0)
     parser.add_argument("--replay_sample_seed", type=int, default=1)
     parser.add_argument("--replay_out", type=str, default="")
+    parser.add_argument(
+        "--save_test",
+        type=int,
+        default=1,
+        help="1 writes the official NuminaMath test split (100 rows) as JSONL. "
+        "Kept out of --out_dir: train.py only reads the train split and carves "
+        "val_fraction from it. This file is a seed-independent CE probe, not "
+        "the training val set. 0 skips it.",
+    )
+    parser.add_argument(
+        "--test_out",
+        type=str,
+        default="",
+        help="JSONL path for the official test split. Empty writes "
+        "{jsonl_dir}/{out_dir.name}_test.jsonl.",
+    )
     return parser.parse_args()
 
 
@@ -174,7 +195,14 @@ def iter_shards(args: argparse.Namespace):
     if path and path.is_dir() and list(path.glob("*.parquet")):
         import pyarrow.parquet as pq
 
-        for shard in sorted(path.glob("train-*.parquet")) or sorted(path.glob("*.parquet")):
+        # The HF snapshot puts test-00000-of-00001.parquet in the same data/
+        # directory as the five train shards, so the fallback has to exclude it
+        # by name. Sweeping the whole directory would fold the held-out split
+        # into the training pool, and nothing downstream would report it.
+        shards = sorted(path.glob("train-*.parquet")) or [
+            shard for shard in sorted(path.glob("*.parquet")) if not shard.name.startswith("test-")
+        ]
+        for shard in shards:
             table = pq.read_table(shard, columns=list(NUMINA_COLUMNS))
             yield (
                 shard.name,
@@ -201,6 +229,105 @@ def iter_shards(args: argparse.Namespace):
         dataset["problem"],
         dataset["solution"],
     )
+
+
+def make_sft_row(
+    problem: str,
+    solution: str,
+    source: str,
+    source_index: int,
+    style: str,
+) -> dict[str, Any]:
+    """One training-schema row. gold_answer is filled later by fill_gold_answers."""
+
+    return {
+        "instruction": build_instruction(problem, "", style),
+        "input": "",
+        "output": solution.strip(),
+        "gold_answer": "",
+        "data_source": source or "?",
+        "source_index": int(source_index),
+    }
+
+
+def fill_gold_answers(rows: list[dict[str, Any]]) -> None:
+    """Set gold_answer to the same \\boxed span the MATH500 grader reads."""
+
+    from onereplay.eval.metrics.math500 import extract_answer
+
+    for row in rows:
+        row["gold_answer"] = extract_answer(row["output"]) or ""
+
+
+def load_official_test(args: argparse.Namespace) -> list[tuple[str, str, str]]:
+    """Return (source, problem, solution) triples from the official test split.
+
+    The HF snapshot keeps test-*.parquet next to the train shards. This loader
+    never feeds those rows into the training draw; it only exists so --save_test
+    can write a fixed probe that does not move when --seed or --sample_rows
+    change.
+    """
+
+    path = Path(args.numina_path) if args.numina_path else None
+    if path and path.is_dir():
+        shards = sorted(path.glob("test-*.parquet"))
+        if not shards and (path / "data").is_dir():
+            shards = sorted((path / "data").glob("test-*.parquet"))
+        if shards:
+            import pyarrow.parquet as pq
+
+            triples: list[tuple[str, str, str]] = []
+            for shard in shards:
+                table = pq.read_table(shard, columns=list(NUMINA_COLUMNS))
+                triples.extend(
+                    zip(
+                        table.column("source").to_pylist(),
+                        table.column("problem").to_pylist(),
+                        table.column("solution").to_pylist(),
+                    )
+                )
+            return triples
+
+    from datasets import load_dataset, load_from_disk
+
+    if path and path.is_dir():
+        if not (path / "dataset_dict.json").exists():
+            return []
+        dataset = load_from_disk(str(path))
+    else:
+        dataset = load_dataset(args.numina_repo)
+    if not hasattr(dataset, "keys") or "test" not in dataset:
+        return []
+    split = dataset["test"]
+    missing = [c for c in NUMINA_COLUMNS if c not in split.column_names]
+    if missing:
+        raise SystemExit(f"NuminaMath test columns {missing} not found; got {split.column_names}")
+    return list(zip(split["source"], split["problem"], split["solution"]))
+
+
+def convert_official_test(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Map the official test split onto the training schema, unfiltered.
+
+    require_boxed / --sources / --sample_rows stay off: filtering would make
+    this a different set every time those flags change, which is the opposite
+    of a fixed probe. Empty problem/solution rows are dropped because a CE
+    probe with no supervised tokens is a NaN waiting to happen.
+    """
+
+    triples = load_official_test(args)
+    rows: list[dict[str, Any]] = []
+    dropped = 0
+    for index, (source, problem, solution) in enumerate(triples):
+        if not (problem or "").strip() or not (solution or "").strip():
+            dropped += 1
+            continue
+        rows.append(
+            make_sft_row(problem, solution, source or "?", index, args.instruction_style)
+        )
+    fill_gold_answers(rows)
+    if dropped:
+        print(f"official test: dropped {dropped} empty rows of {len(triples)}", flush=True)
+    return rows
 
 
 def usable(source: str, problem: str, solution: str, allow: set[str], args) -> bool:
@@ -303,14 +430,7 @@ def draw_sample(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[st
                 if len(tokenizer(solution, add_special_tokens=False)["input_ids"]) > max_sol:
                     continue
             seen[source] += 1
-            row = {
-                "instruction": build_instruction(problem, "", args.instruction_style),
-                "input": "",
-                "output": solution.strip(),
-                "gold_answer": "",
-                "data_source": source,
-                "source_index": index,
-            }
+            row = make_sft_row(problem, solution, source, index, args.instruction_style)
             pool = reservoir[source]
             if len(pool) < quota[source]:
                 pool.append(row)
@@ -321,17 +441,10 @@ def draw_sample(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[st
         offset += len(sources)
         print(f"  {name}", flush=True)
 
-    # gold_answer is metadata, not a training target, but it has to be the same
-    # span the grader reads or a later accuracy probe measures a different
-    # thing. Imported here rather than at module scope so this script does not
-    # pull in torch for callers that only want the pool.
-    from onereplay.eval.metrics.math500 import extract_answer
-
     rows: list[dict[str, Any]] = []
     for source in sorted(reservoir):
-        for row in reservoir[source]:
-            row["gold_answer"] = extract_answer(row["output"]) or ""
-            rows.append(row)
+        rows.extend(reservoir[source])
+    fill_gold_answers(rows)
 
     # The pool is grouped by source up to here, and train.py carves validation
     # off by row position, so an unshuffled pool would hand it one or two
@@ -408,6 +521,8 @@ def main() -> None:
 
     out_dir = Path(args.out_dir)
     out_dir.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_dir = Path(args.jsonl_dir) if args.jsonl_dir else out_dir.parent
+    jsonl_dir.mkdir(parents=True, exist_ok=True)
     DatasetDict({"train": Dataset.from_list(rows)}).save_to_disk(str(out_dir))
     print(f"wrote pool to {out_dir}")
 
@@ -433,6 +548,34 @@ def main() -> None:
             + ", ".join(f"{name or '<empty>'}={count}" for name, count in mix.most_common())
         )
 
+    test_rows: list[dict[str, Any]] = []
+    test_out = (
+        Path(args.test_out) if args.test_out else jsonl_dir / f"{out_dir.name}_test.jsonl"
+    )
+    if args.save_test == 1:
+        test_rows = convert_official_test(args)
+        if not test_rows:
+            raise SystemExit(
+                "official NuminaMath test split not found next to the train shards. "
+                "Pass --save_test 0 to skip, or point --numina_path at the directory "
+                "that holds test-*.parquet (or a DatasetDict with a test split)."
+            )
+        test_out.parent.mkdir(parents=True, exist_ok=True)
+        with test_out.open("w", encoding="utf-8") as file:
+            for row in test_rows:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        mix = collections.Counter(row["data_source"] for row in test_rows)
+        boxed_test = sum(1 for row in test_rows if has_boxed(row["output"]))
+        print(
+            f"wrote official test split to {test_out}  {len(test_rows)} rows "
+            f"(not used as val; train.py still carves val_fraction from the pool)"
+        )
+        print(
+            "  data_source mix: "
+            + ", ".join(f"{name or '<empty>'}={count}" for name, count in mix.most_common())
+        )
+        print(f"  答案带 \\boxed 的行：{boxed_test}/{len(test_rows)}")
+
     manifest: dict[str, Any] = {
         "source": args.numina_path or args.numina_repo,
         "dataset": "NuminaMath-CoT",
@@ -448,6 +591,13 @@ def main() -> None:
         "per-source reservoir draw under seed:{source}",
         "seed": args.seed,
         "train": {"path": str(out_dir), "num_rows": len(rows)},
+        "official_test": {
+            "path": str(test_out) if test_rows else "",
+            "num_rows": len(test_rows),
+            "source_index": "row index in the official test split, not the train corpus",
+            "note": "Not the training val set. train.py carves --val_fraction from "
+            "the train pool; this JSONL is a seed-independent CE probe.",
+        },
         "counts": stats,
         "replay": {
             "path": str(replay_out) if replay_rows else "",
@@ -458,8 +608,10 @@ def main() -> None:
         },
         "boxed_answer_rows": boxed,
         "note": "Drop-in for the OpenR1 pool: same columns, same instruction "
-        "wording, same manifest shape. train.py splits validation out with "
-        "--val_fraction; gold_answer / data_source / source_index are metadata.",
+        "wording, same manifest shape. train.py splits validation out of the "
+        "train pool with --val_fraction. The official 100-row test split is "
+        "written beside the pool and is not read at train time. gold_answer / "
+        "data_source / source_index are metadata.",
     }
     if args.tokenizer_path:
         # The length report is a convenience; the manifest is the pool's only
@@ -474,8 +626,6 @@ def main() -> None:
     else:
         print("skipping length report: no --tokenizer_path")
 
-    jsonl_dir = Path(args.jsonl_dir) if args.jsonl_dir else out_dir.parent
-    jsonl_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = jsonl_dir / f"{out_dir.name}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote manifest to {manifest_path}")

@@ -420,12 +420,12 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
 # ---- 训练超参（Math 线专用）----
 # seqlen 是 IF 线的 4 倍，BATCH 相应降到 1/4；ACCUM 仍是 64 行/更新，与 IF 线可比。
-EPOCHS="${EPOCHS:-2}"
-LR="${LR:-2e-5}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-5e-5}"
 # BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
 # 64 行"不成立。取 1 的理由见文件头「显存」与「饱和点」两节：8192 长序列下单卡
 # 一次只放一条，靠 ACCUM=64 把有效 batch 补回来。
-BATCH="${BATCH:-1}"
+BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
 # 实测（全量 45792 行，Qwen3 tokenizer + chat template）：全序列 P50=3900 P90=6957
 # P99=8004 max=9004。4096 会截断 46.6%、其中 20326 行连题目都不剩，绝不能用。
