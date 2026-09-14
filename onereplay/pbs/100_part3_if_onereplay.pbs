@@ -385,7 +385,7 @@ MAXLEN="${MAXLEN:-1536}"
 # 94 号改了而这里不改的话，「Stage 2 学到多少 IF」就混进了预算差异。
 EPOCHS="${EPOCHS:-3}"
 # **各臂必须同 LR**，这是比较的前提。LR 写进 run 名，train 和 eval 要传同一个值。
-LR="${LR:-2e-5}"
+LR="${LR:-5e-5}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-500}"
 # 全量微调下 --target_modules 不决定哪些参数训练（全都训），只在 LoRA 路径有用。
