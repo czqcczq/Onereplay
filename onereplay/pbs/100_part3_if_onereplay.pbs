@@ -251,7 +251,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME MATH_LINE_ROOT MATH_CKPT_DIR MATH_LR MATH_RUN MATH_CKPT
-    IF_LINE_ROOT IF_DATASET RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    IF_LINE_ROOT IF_DATASET RESULTS_ROOT CF_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
     COV_PATH COV_SCOPE FISHER_PATH
     MODE ARM DRY_RUN DO_TRAIN DO_EVAL DO_MATH DO_IF SEED FORCE_TRAIN FORCE_EVAL
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
@@ -323,19 +323,29 @@ IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
 IF_DATASET="${IF_DATASET:-${IF_LINE_ROOT}/datasets/flan_v2_if_50k}"
 
 # ---- Part 3 自己的结果树 ----
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part3_math2if}"
+# 与 OpenR1 那轮分开（那轮在 results_part3_math2if）。**不能共用**：本线的 W0 换成了
+# Numina 版 Model-Math，checkpoint 目录名却完全相同（run 名里没有数据集），共用会让
+# MODE=train 看到旧 checkpoint 就"跳过训练"，或者 FORCE_TRAIN=1 就地覆盖掉旧产物；
+# 评测分数还会追加进同一个 <metric>_summary.csv，两轮混在一张表里且不报错。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part3_numina2if}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
+# ---- C_math / F_math 所在的采集树：99 号写在哪里，这里就读哪里 ----
+# 99 号的 RESULTS_ROOT 仍是 results_part3_math2if，它采的是**旧知识 math 侧**
+# （Model-Math + Numina 20k 池），和 Stage 2 的新任务无关，所以不跟着改名。
+# 99 号如果改了输出位置，这里传 CF_ROOT= 覆盖即可。
+CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_part3_math2if}"
+
 # ---- C_math：99 号的产物（在 Model-Math 上采的 NuminaMath 20k 二阶矩）----
-# 文件名带 numina：OpenR1 那版 C/F 如果还在同一棵树下，指到它就是拿另一个模型的
+# 文件名带 numina：OpenR1 那版 C/F 就在同一棵树下，指到它就是拿另一个模型的
 # 二阶矩配本线的 W0，不报错但无法解释。
 COV_SCOPE="${COV_SCOPE:-full}"
-COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_math_numina_20k_${COV_SCOPE}.pt}"
+COV_PATH="${COV_PATH:-${CF_ROOT}/cov/cov_math_numina_20k_${COV_SCOPE}.pt}"
 # ---- F_math：99 号的产物（ewc 臂用）。scope 跟 C 同一个变量，两者必须同 scope ----
-FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_math_numina_20k_${COV_SCOPE}.pt}"
+FISHER_PATH="${FISHER_PATH:-${CF_ROOT}/fisher/fisher_math_numina_20k_${COV_SCOPE}.pt}"
 
 # ---- 原始 Base：evaluate.py 在 --adapter_path 为空时会加载它，本线只有它当占位 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
