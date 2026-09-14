@@ -453,7 +453,7 @@ ACCUM="${ACCUM:-64}"
 MAXLEN="${MAXLEN:-1536}"
 # 1 epoch：与 94 号默认一致。这样 Model-CS-IF 和 Part 1 的 Model-IF-FLAN 是同样的
 # 新任务预算（约 14.3M tok，只有 Conifer 的 42%，见 94 号文件头），IF 分可以并排读。
-EPOCHS="${EPOCHS:-1}"
+EPOCHS="${EPOCHS:-3}"
 # **各臂必须同 LR**，这是比较的前提。LR 写进 run 名，train 和 eval 要传同一个值。
 LR="${LR:-2e-5}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
