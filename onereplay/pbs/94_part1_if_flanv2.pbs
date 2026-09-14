@@ -353,8 +353,8 @@ FLAN_DEDUP_ACROSS_REMIXES="${FLAN_DEDUP_ACROSS_REMIXES:-0}"
 #
 # EPOCHS=1：见文件头 token 预算一节。这**不是**对齐 Conifer 的 34.2M token，
 # 只有 42%。要对齐就传 EPOCHS=2（83%）或 3（125%），或者把池子扩到约 12 万行。
-EPOCHS="${EPOCHS:-1}"
-LR="${LR:-2e-5}"
+EPOCHS="${EPOCHS:-3}"
+LR="${LR:-5e-5}"
 BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
 MAXLEN="${MAXLEN:-1536}"
