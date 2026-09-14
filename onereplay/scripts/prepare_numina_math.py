@@ -146,6 +146,15 @@ def parse_args() -> argparse.Namespace:
         help="Model dir for the length report. Empty skips it, which also skips "
         "the only check on the training budget.",
     )
+    parser.add_argument(
+        "--max_len",
+        type=int,
+        default=4096,
+        help="Training budget the truncation table is headlined against; does "
+        "not itself truncate. 4096 is provably lossless here -- the longest "
+        "solution in the corpus is 2832 tokens -- so the report should show 0 "
+        "rows truncated at this value.",
+    )
     parser.add_argument("--length_sample", type=int, default=3000)
     parser.add_argument("--jsonl_dir", type=str, default="")
     parser.add_argument("--replay_rows", type=int, default=0)
@@ -348,8 +357,33 @@ def draw_sample(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[st
     return rows, stats
 
 
+def check_out_dir(out_dir: Path) -> None:
+    """Refuse an --out_dir that is not empty and not a pool we wrote before.
+
+    save_to_disk lays dataset_dict.json and a split directory straight into the
+    path it is given, so pointing --out_dir at a directory that holds other
+    things -- a datasets/ root next to math500_test.jsonl, say -- mixes a pool
+    into it and the eval data quietly goes missing. Checked before the two-pass
+    draw rather than after, so the failure costs seconds instead of minutes.
+    """
+
+    if not out_dir.exists():
+        return
+    entries = sorted(path.name for path in out_dir.iterdir())
+    if not entries or "dataset_dict.json" in entries:
+        return
+    raise SystemExit(
+        f"--out_dir {out_dir} already holds {len(entries)} entries and none of "
+        f"them is dataset_dict.json, so this is not a pool directory:\n"
+        f"  {', '.join(entries[:8])}{' ...' if len(entries) > 8 else ''}\n"
+        f"save_to_disk would write into it. Point --out_dir at a new "
+        f"subdirectory, e.g. {out_dir / 'numina_math_50k'}."
+    )
+
+
 def main() -> None:
     args = parse_args()
+    check_out_dir(Path(args.out_dir))
     rows, stats = draw_sample(args)
 
     print(f"\n==== 采样结果（seed={args.seed}, require_boxed={args.require_boxed}）====")
@@ -428,7 +462,15 @@ def main() -> None:
         "--val_fraction; gold_answer / data_source / source_index are metadata.",
     }
     if args.tokenizer_path:
-        manifest["length"] = length_report(rows, args)
+        # The length report is a convenience; the manifest is the pool's only
+        # record of which rows came from where. Losing provenance because a
+        # percentile table raised is the wrong failure, so the report is allowed
+        # to fail loudly and the manifest still gets written.
+        try:
+            manifest["length"] = length_report(rows, args)
+        except Exception as error:  # noqa: BLE001
+            print(f"length report failed: {type(error).__name__}: {error}", flush=True)
+            manifest["length"] = {"error": f"{type(error).__name__}: {error}"}
     else:
         print("skipping length report: no --tokenizer_path")
 
