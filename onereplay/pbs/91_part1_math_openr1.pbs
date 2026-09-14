@@ -357,16 +357,16 @@ cd "${REPO_ROOT}"
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_math}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_numina_math}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
-# OpenR1 parquet 的位置。集群上是 huggingface-cli download 直接落的仓库名目录
+# OpenR1 parquet 的位置。只给 MODE=data 用：那一档会跑 prepare_openr1_math，把
+# 源 parquet 摊成 save_to_disk。Numina 池已经备好了，正式训练不要走 MODE=data。
+# 集群上是 huggingface-cli download 直接落的仓库名目录
 # ${REPO_ROOT}/datasets/Openr1-Math-46k-8192/openr1.parquet，本地放在 data_check/ 下。
-# 按目录候选 + glob 找第一个命中的（该仓库只有一个 parquet，glob 不会有歧义）。
-# 想指定就提交时传 OPENR1_PARQUET=<绝对路径>。
 OPENR1_DIRS=(
   "${REPO_ROOT}/datasets/Openr1-Math-46k-8192"
   "${REPO_ROOT}/datasets/openr1"
@@ -383,7 +383,11 @@ if [[ -z "${OPENR1_PARQUET:-}" ]]; then
   done
   OPENR1_PARQUET="${OPENR1_PARQUET:-${OPENR1_DIRS[0]}/openr1.parquet}"
 fi
-MATH_DATASET="${MATH_DATASET:-${RESULTS_ROOT}/datasets/openr1_math}"
+# train.py --dataset_path 要的是 save_to_disk 根目录（里面有 dataset_dict.json
+# 和 train/），不是 train/data-*.arrow，也不是旁边的 *_test.jsonl。
+# load_and_prepare_dataset 会读 dataset["train"]，再按 val_fraction 切 val。
+# 官方 100 行 test（numina_math_50k_test.jsonl）训练侧不读。
+MATH_DATASET="${MATH_DATASET:-${REPO_ROOT}/datasets/numina_math_50k}"
 
 # ---- 反向线（Math -> IF）的旧知识池 ----
 # 本线自己不需要它。它是 99/100/101 号的输入：Math 变成"被保护的能力"时，C_math /
@@ -429,7 +433,7 @@ BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
 # 实测（全量 45792 行，Qwen3 tokenizer + chat template）：全序列 P50=3900 P90=6957
 # P99=8004 max=9004。4096 会截断 46.6%、其中 20326 行连题目都不剩，绝不能用。
-MAXLEN="${MAXLEN:-8192}"
+MAXLEN="${MAXLEN:-4096}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 # 长序列的 val 也贵，取小一点；跨 run 比较时必须保持同一个值。
 MAXVAL="${MAXVAL:-200}"
@@ -518,14 +522,14 @@ mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
 
 echo "========================================================================"
-echo "Part 1 / Math 线: Base --OpenR1--> Model-Math   (full finetune, vanilla)"
+echo "Part 1 / Math 线: Base --NuminaMath-CoT 50k--> Model-Math   (full finetune, vanilla)"
 echo "  MODE           : ${MODE}"
 echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  results root   : ${RESULTS_ROOT}"
-echo "  OpenR1 源      : ${OPENR1_PARQUET}"
 echo "  数据池         : ${MATH_DATASET}"
+echo "                   (save_to_disk 根目录；val 从该池 val_fraction 切，不读 *_test.jsonl)"
 echo "  think / prompt : ${THINK_HANDLING} / ${INSTRUCTION_STYLE}"
-echo "                   (评测侧 enable_thinking=False，strip_tags 才对得上)"
+echo "                   (Numina 无 <think> 标签，strip_tags 是空操作；prompt 仍 eval_aligned)"
 echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
 echo "  评测           : gsm8k, math500   (对照 base, max_new_tokens=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH})"
 echo "  eval out       : ${EVAL_OUT_DIR}   (FORCE_EVAL=${FORCE_EVAL})"
@@ -573,6 +577,13 @@ train_one () {
 # **先读长度报告再定 MAXLEN**：截断是保尾丢头的，错了不报错，只会悄悄毁掉数据。
 # =============================================================================
 if [[ "${MODE}" == "data" ]]; then
+  if [[ -f "${MATH_DATASET}/dataset_dict.json" ]]; then
+    echo "拒绝 MODE=data：${MATH_DATASET} 已经是一个 save_to_disk 池"
+    echo "  （有 dataset_dict.json）。prepare_openr1_math 会把 --out_dir 整目录覆盖掉。"
+    echo "  Numina 50k 已经备好，直接 MODE=smoke / MODE=train。若真要重建 OpenR1 池，"
+    echo "  另指定 MATH_DATASET=<新目录>，不要指向 datasets/numina_math_50k。"
+    exit 1
+  fi
   if [[ ! -f "${OPENR1_PARQUET}" ]]; then
     echo "缺 OpenR1 parquet。在这些目录里找过 *.parquet 和 data/*.parquet："
     for _dir in "${OPENR1_DIRS[@]}"; do
