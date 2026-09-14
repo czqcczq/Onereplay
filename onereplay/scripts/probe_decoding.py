@@ -113,10 +113,11 @@ def parse_args() -> argparse.Namespace:
         "--select",
         type=str,
         default="capped",
-        choices=["capped", "noanswer", "first"],
-        help="capped keeps rows whose earlier response filled the budget, "
-        "noanswer keeps rows that produced no \\boxed span (a superset), "
-        "first ignores --prior_responses entirely.",
+        choices=["capped", "ok", "noanswer", "first"],
+        help="capped keeps rows whose earlier response filled the budget, ok "
+        "keeps its complement (the rows that already terminated, for checking "
+        "that a policy does not damage what already worked), noanswer keeps "
+        "rows that produced no \\boxed span, first ignores --prior_responses.",
     )
     parser.add_argument(
         "--prior_cap",
@@ -191,7 +192,8 @@ def select_examples(args, examples, tokenizer) -> list[dict[str, str]]:
                 hit = not row.get("prediction")
             else:
                 length = len(tokenizer(response, add_special_tokens=False)["input_ids"])
-                hit = length >= cap - 8
+                capped = length >= cap - 8
+                hit = (not capped) if args.select == "ok" else capped
             if hit:
                 broken.add(row.get("question", ""))
 

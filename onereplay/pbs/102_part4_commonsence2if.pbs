@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N p3_if_or
+#PBS -N p4_cs2if
 #PBS -j oe
 #PBS -k oed
 #PBS -q autox
@@ -9,57 +9,114 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 3: Model-Math --FLANv2--> Model-Math-IF，用 C_math 保护 math 能力
+# Part 4: Model-CS --FLANv2--> Model-CS-IF，用 C_cs 保护常识问答能力
 #
-#     Model-Math ---- FLAN v2 (50000 单轮样本) ----> Model-Math-IF
-#                \                              /
-#                 \---- λ·tr(ΔW C_math ΔWᵀ) --/
+#     Model-CS ---- FLAN v2 (50000 单轮样本) ----> Model-CS-IF
+#              \                              /
+#               \---- λ·tr(ΔW C_cs ΔWᵀ) ----/
 #
-#     评测  旧能力保留: GSM8K + MATH-500      新任务: IFEval + FollowBench
-#     四行  math_anchor (Stage 2 起点) / vanilla (无保护) / onereplay (C_math) / ewc (F_math)
+#     评测  旧能力保留: commonsense_qa 八个测试集   新任务: IFEval + FollowBench
+#     四行  cs_anchor (Stage 2 起点) / vanilla (无保护) / onereplay (C_cs) / ewc (F_cs)
 #
-# 这是 96 号的**反方向**。96 号是「先学 IF，再学 Math，保 IF」；本线把两个域调换：
+# 这是第三条「保旧能力」的线，把结论从两个点变成三个点：
 #
-#     96 号  Base --FLANv2--> Model-IF-FLAN --OpenR1 + C_if  --> 保 IF
-#     100号  Base --OpenR1--> Model-Math    --FLANv2 + C_math--> 保 Math
-#                             ^^^^^^^^^^^^             ^^^^^^^^
-#                             本脚本的基座              本脚本的保护矩阵
+#     Part 2  Base --FLANv2----------> Model-IF-FLAN --OpenR1 + C_if  --> 保 IF
+#     Part 3  Base --OpenR1----------> Model-Math    --FLANv2 + C_math--> 保 Math
+#     Part 4  Base --Commonsense170k-> Model-CS      --FLANv2 + C_cs  --> 保 CS
+#                   ^^^^^^^^^^^^^^^^^  ^^^^^^^^                ^^^^^
+#                   93 号的产物         本脚本的基座             101 号采的矩阵
 #
-# 两个方向都做才能说「onereplay 保的是能力，不是某个特定域碰巧好保」。反方向还检验一个
-# 更强的说法：math 是长 CoT 能力、比指令跟随更脆，如果 C 在这个方向也守住了，结论更硬。
+# 三个旧能力的形态刻意选得不一样：IF 是格式服从，Math 是长 CoT 推理，CS 是**固定模板下
+# 的闭集多选常识问答**（93 号文件头的原话，不要写成"通用能力"—— 这八个测试集是
+# Commonsense170k 那八个数据集的留出半边，是严格的 in-domain train/test）。三种都守住，
+# 「onereplay 保的是能力、不是某个域碰巧好保」才算有证据。
 #
-# 大部分逻辑照抄 94 号（新任务 FLAN 的数据池 / BATCH/ACCUM/MAXLEN/LR）与 96 号（正则、
-# EWC 对照、评测框架、λ 标定），下面只讲**不一样的地方**和**为什么**。
+# -----------------------------------------------------------------------------
+# 【与 Part 3（100 号）的关系：新任务完全相同，所以这条线有两个便宜】
+#
+# 100 号和本脚本的新任务是同一个：94 号那个 FLAN v2 50k 池、同样的 BATCH/ACCUM/MAXLEN/
+# LR/EPOCHS。**唯一变的是基座和保护矩阵。** 由此得到两件别的线之间没有的东西：
+#
+# 1) λ 可以从 Part 3 折算过来。约束强度 ∝ λ·trace(C)，而 λ·R 要和 task_loss 比才有
+#    意义 —— 两条线的 task_loss 尺度相同（同一个新任务），于是只剩 trace(C) 一个变量：
+#        λ_part4 ≈ λ_part3 · trace(C_math) / trace(C_cs)
+#    101 号 Step 2 会把这个比值和折算值直接打出来（传 REF_LAMBDA=<Part 3 选定的 λ>）。
+#    这是一个真正可用的起点，不只是量级参考。但仍要跑一次 MODE=lambda_probe 确认。
+#
+# 2) 「代价」那一列可以跨线读。各臂在 IFEval/FollowBench 上的分数和 Part 3 是同一个
+#    新任务、同一套预算，所以「保 Math 要付多少可塑性」和「保 CS 要付多少」可以并排。
+#
+# -----------------------------------------------------------------------------
+# 【本线的测量比 Part 3 干净得多，这是它最容易被低估的价值】
+#
+# Part 3 的保留分数（GSM8K/MATH-500）是**生成 + 抽 \boxed{}**，于是分数和输出长度纠缠：
+# 输出被 FLAN 压短就走不到 \boxed{}、读成不会做，撞上 8192 上限又被右删失，所以那条线
+# 的每个数学分都必须配着 hit-cap 一起读才有可比性。
+#
+# 本线的主口径 acc_logprob **没有这个问题**：它对每行的候选集逐个算
+# "the correct answer is <label>" 的 continuation logprob 再取 argmax（见
+# eval/metrics/commonsense_qa.py 文件头），是闭集排序，不解码、不正则匹配、永远不会
+# "抽不出答案"，因此**不受输出长度漂移影响**。遗忘量可以直接读。
+#
+# 代价是它只回答「模型还能不能在闭集里排对」，不回答「还会不会按训练格式作答」。后者由
+# acc_gen + parse_rate 回答，而那两个数在本线会被新任务明显推动（见下一节），所以：
+#
+#     acc_logprob  = 能力保留，主口径，直接读
+#     acc_gen      = 格式保留，只能和 parse_rate 一起读，单独引用是错的
+#
+# 两个都报，而且要说清哪个是主口径。
+#
+# -----------------------------------------------------------------------------
+# 【输出长度的漂移方向和 Part 3 相反，受害的是 acc_gen 而不是 acc_logprob】
+#
+# Stage 1 的 Model-CS 只会输出 7-8 个 token（"the correct answer is <label>" 就是它
+# 一辈子学过的全部答案形态）。Stage 2 的 FLAN targets P50 是 18-19 token（94 号文件头），
+# 而且形态五花八门。所以本线的输出长度是被往**变长、变杂**的方向推 —— 和 Part 3 那个
+# 「长 CoT 被压成短答案」正好相反。
+#
+# 后果只落在生成式打分那一路：模型开始在答案前后加解释、或者干脆不用那个模板，于是
+# extract_label 抽不到 label（parse_rate 掉），acc_gen 跟着掉，而它的下降**不是**常识
+# 能力的下降。这正是为什么主口径必须是 acc_logprob。诊断段会把 parse_rate、响应长度、
+# 以及 logprob_pred 与 gen_pred 的一致率一起打出来，用来分辨「忘了常识」和「忘了格式」。
+#
+# 另一件要看的事：**预测塌成单一 label**。八个任务的候选集都很小（2-5 个），一个塌成
+# 「永远答 true」的模型 acc 会停在 random_baseline 附近而不是 0。诊断段因此还打每个
+# task 里 logprob_pred 的众数占比 —— 接近 1 就说明模型不是在答题而是在猜同一个词。
 #
 # -----------------------------------------------------------------------------
 # 【与 94 号（正向 IF 训练）的四处结构性差别】
 #
-# 1) 基座不是 Qwen3-1.7B-Base，而是 91 号训出来的 Model-Math。
+# 1) 基座不是 Qwen3-1.7B-Base，而是 93 号训出来的 Model-CS。
 #    train.py 从 --model_dir/--model_name 拼路径加载，全量 checkpoint 是完整权重 +
-#    tokenizer，所以直接把 91 号的输出目录当基座传进去，一行代码都不用改。
+#    tokenizer，所以直接把 93 号的输出目录当基座传进去，一行代码都不用改。
 #
-# 2) 加了正则：--cov_path C_math --replay_lambda λ。94 号是 --replay_lambda 0
+# 2) 加了正则：--cov_path C_cs --replay_lambda λ。94 号是 --replay_lambda 0
 #    --measure_replay_when_lambda_zero 0（build_regularizer 返回 None，纯 vanilla）。
 #
 # 3) vanilla 臂是**必须**的，不是可选对照。
-#    「onereplay 保住了 math」这句话只有和「不保护会掉多少」并排才有内容。而且各臂
+#    「onereplay 保住了 CS」这句话只有和「不保护会掉多少」并排才有内容。而且各臂
 #    必须同 LR / 同 EPOCHS / 同 seed / 同数据池，否则差异里混进别的东西。
 #
-# 4) 评测多了数学保留那一半（GSM8K + MATH-500），这才是本作业的主指标；IFEval +
-#    FollowBench 这次是**新任务**侧。**不评 IFBench**（与 96 号一致）：Part 1 第 8c 节
-#    结论是 IFBench 三个家族测长篇散文的涌现统计量、对输出长度极度敏感，而 SFT 必然
-#    改变输出长度，那 161 条对遗忘研究是噪声源。
+# 4) 评测多了常识保留那一半（commonsense_qa 八个测试集），这才是本作业的主指标；
+#    IFEval + FollowBench 这次是**新任务**侧。**不评 IFBench**（与 96/100 号一致）：
+#    Part 1 第 8c 节结论是 IFBench 三个家族测长篇散文的涌现统计量、对输出长度极度敏感，
+#    而 SFT 必然改变输出长度，那 161 条对遗忘研究是噪声源。
 #
 # -----------------------------------------------------------------------------
-# 【C_math 从哪来，以及它为什么必须是 99 号采的那一份】
+# 【C_cs 从哪来，以及它为什么必须是 101 号采的那一份】
 #
 # 罚项是 λ·tr(ΔW C ΔWᵀ)，ΔW = W − W0，而 W0 是 train.py 在训练开始时从**加载进来的
 # 模型**快照的（build_regularizer 之后紧跟 snapshot_reference_weights）。本脚本的
-# 基座是 Model-Math，所以 W0 = Model-Math 的权重，C 也必须是在同一个模型上采的 ——
-# 这正是 99 号做的事（--model_name = MATH_RUN）。拿 Base 上采的 C 来配，是两个不同点上
-# 的量拼在一起，不报错、loss 曲线也正常，只会让保护变弱且无法解释。
+# 基座是 Model-CS，所以 W0 = Model-CS 的权重，C 也必须是在同一个模型上采的 ——
+# 这正是 101 号做的事（--model_name = CS_RUN）。拿 Base 上采的 C 来配，是两个不同点上
+# 的量拼在一起，不报错、loss 曲线也正常，只会让保护变弱且无法解释。这条线上这个错误
+# 尤其容易犯，因为 Stage 1 把隐状态分布改得很彻底：93 号那 170k 行只教一件事，读完题
+# 之后输出 "the correct answer is <label>"。
 #
 # Step 0 会读 C 文件的 metadata，把 model_name 和本作业的基座名对表，不一致就退出。
+# 还会打印两个 max_len 并说明它们**本来就不该相等**：C_cs 采在 512（旧知识池的预算，
+# 与 93 号训练一致），新任务在 1536 训练。罚项只经过 ΔW 与 C 相乘，序列长度不需要一致，
+# 需要一致的是模型。
 #
 # -----------------------------------------------------------------------------
 # 【--reg_impl analytic 不是调优选项，是这条线的必需项】
@@ -72,19 +129,20 @@
 #
 # 保留 analytic 一是省这 6.4 GiB，二是它天然一次更新只注入一次罚项梯度，与
 # --reg_once_per_update 1 一致（传 0 会直接报错，train.py 里有显式检查）。本线的显存
-# 其实比 96 号宽松（新任务 1536 而不是 8192），但没有理由退回 autograd。
+# 与 100 号完全同量级（同一个新任务、同一个架构、同一个 scope），没有理由退回 autograd。
 #
 # -----------------------------------------------------------------------------
-# 【显存预算：本线比 96 号宽松，但仍要 smoke 实测】
+# 【显存预算：与 100 号相同，但 vanilla 基线仍要 smoke 实测】
 #
 # 新任务是 FLAN@1536（不是 96 号的 OpenR1@8192），激活小得多，所以 vanilla 基线的峰值
-# 远低于 96 号那 50 GiB 量级。确定的加数与 96 号相同（同一个架构、同一个 full scope）：
-#   + C_math 常驻 (fp32, 197 层, all-linear)         + 6.58 GiB
+# 远低于 96 号那 50 GiB 量级。确定的加数与 96/100 号相同（同一个架构、同一个 full scope）：
+#   + C_cs 常驻 (fp32, 197 层, all-linear)           + 6.58 GiB
 #       6 x 2048² + 6144² = 62.91M/层 x 28 + lm_head 2048² = 1.766G 个 fp32
 #   + W0 快照 (bf16, 1.72G 参数)                      + 3.20 GiB
 #   + analytic 的单层临时量 (最大是 lm_head 的 fp32)   + 约 1.2 GiB
 # H200 140 GiB 余量充足，80GB 卡也够。但 vanilla 基线的 peak **必须先跑 MODE=smoke 实测**，
-# 94 号没有正式记这个数（它也让你跑 smoke）。
+# 94 号没有正式记这个数（它也让你跑 smoke）。C 的形状和 100 号逐字相同（矩阵是 d_in x d_in，
+# 与采集时的序列长度无关），所以 100 号的 smoke 实测值在这里可以当预期，但别当结论。
 # smoke 还要确认日志里出现这一行（trainers/base.py 在第 1 步打印）：
 #     regularizer covers 197 layers; no penalty matrix for 0 layers
 # missing 非 0 就说明 C 的层名和模型对不上，罚项在偷偷少覆盖几层。
@@ -97,14 +155,22 @@
 # 但训练计算随序列长度掉：一次更新 64 行 x 约 150 token x 6 x 1.72e9 ≈ 0.1 PFLOP（FLAN
 # 序列比 OpenR1 短约 25 倍），所以正则占比升到 **约 3%**。仍然小，且 ACCUM=64 把它摊到
 # 一次更新只算一遍。onereplay 臂和 vanilla 臂的墙钟应当接近；差很多先怀疑显存抖动。
+# 这一节和 100 号逐字相同 —— 新任务一样、C 的形状一样，开销自然一样。
 #
 # -----------------------------------------------------------------------------
 # 【λ 怎么定：这是本脚本唯一一个真正需要人做判断的旋钮】
 #
-# 不要直接照搬历史值。44 号全量 all-linear 用 7.5e-3（Commonsense@512）、96 号那套是在
-# OpenR1@8192 上定的。约束强度要和**任务损失**比才有意义，而本线的新任务是 FLANv2@1536
-# 的短答案，task_loss 的绝对尺度和它们都不同。C_math 也是新采的（math 隐状态二阶矩），
-# trace(C) 的量级和 C_if 不是一回事，更不能照搬。
+# 本线有一个别的线没有的起点：Part 3 的 λ 按 trace 折算过来（新任务相同，见上面「与
+# Part 3 的关系」）。101 号 Step 2 传 REF_LAMBDA=<Part 3 选定的 λ> 就会打印
+#     λ_part4 ≈ λ_part3 · trace(C_math) / trace(C_cs)
+# 把那个数当 grid 中心，比从历史值猜好得多。
+#
+# 但**不要跳过 probe**。折算只保证起点在正确的数量级附近，它没覆盖一件事：C_math 采在
+# Model-Math 上、C_cs 采在 Model-CS 上，两个不同的 W0，ΔW 在训练早期的增长速度不必相同。
+#
+# 也不要照搬别的历史值。44 号那个 7.5e-3 是**新任务**为 Commonsense@512 时定的（正好和
+# 本线的旧/新方向相反），96 号那套是在 OpenR1@8192 上定的。约束强度要和**任务损失**比
+# 才有意义，而这两个 task_loss 的绝对尺度都不是 FLANv2@1536。
 #
 # 三步走，都在本脚本里：
 #
@@ -113,16 +179,16 @@
 #      方向（太小等于没开），又不能盖住任务信号（太大等于不学新任务）。
 #      metrics jsonl 里的字段名是 train_lambda_reg（= λ·R）和 train_task_loss。
 #
-#   2) 各档跑完整训练，看 val_loss（新任务 IF 的可塑性）和数学分（旧能力保留）。
+#   2) 各档跑完整训练，看 val_loss（新任务 IF 的可塑性）和常识 AVERAGE（旧能力保留）。
 #
 #   3) **matched plasticity**：报结果时各臂应当在同一个新任务 val_loss 上比，
-#      否则「onereplay 保住了 math」可能只是因为它少学了新任务。仓库里有现成工具，
+#      否则「onereplay 保住了 CS」可能只是因为它少学了新任务。仓库里有现成工具，
 #      它把 val_loss(λ) = floor + a·λ^b 拟合出来再反解：
 #
 #        python -m onereplay.scripts.calibrate_lambda \
 #          --results_root ${RESULTS_ROOT} \
-#          --pattern 'part3_if_onereplay_lr*_lam*_seed1' \
-#          --floor_run part3_if_vanilla_lr<LR>_seed1 \
+#          --pattern 'part4_if_onereplay_lr*_lam*_seed1' \
+#          --floor_run part4_if_vanilla_lr<LR>_seed1 \
 #          --target <vanilla 的 val_loss>
 #
 #      floor 必须是同配置的 vanilla run —— λ→0 收敛到的就是它，没有 floor 这个拟合
