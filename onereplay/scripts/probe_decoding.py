@@ -68,10 +68,19 @@ CONFIGS: dict[str, dict] = {
     "greedy": {},
     "imend": {"stop_on_im_end": True},
     "ngram40": {"no_repeat_ngram_size": 40},
-    "ngram40+imend": {"no_repeat_ngram_size": 40, "stop_on_im_end": True},
     "reppen1.05": {"repetition_penalty": 1.05},
+    "reppen1.1": {"repetition_penalty": 1.1},
     "sample.6": {"do_sample": True, "temperature": 0.6, "top_p": 0.95},
+    "sample.8": {"do_sample": True, "temperature": 0.8, "top_p": 0.95},
 }
+
+# NoRepeatNGramLogitsProcessor rebuilds the whole n-gram table from scratch on
+# every step, in Python: step t over a batch of B costs O(B * t * n) tuple
+# construction, so a full run is O(B * T**2 * n). At B=64, T=8192, n=40 that is
+# ~10**11 operations and the job never finishes. Everything else here is
+# vectorized on the GPU and costs nothing measurable, so ngram configs stay
+# available but are not part of the default set.
+QUADRATIC_KEYS = ("no_repeat_ngram_size",)
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,7 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--configs",
         type=str,
-        default="greedy,ngram40,reppen1.05,sample.6",
+        default="greedy,reppen1.05,reppen1.1,sample.6",
         help=f"Comma-separated subset of: {','.join(CONFIGS)}",
     )
     parser.add_argument(
@@ -232,6 +241,17 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"unknown configs {unknown}; pick from {list(CONFIGS)}")
 
+    # See QUADRATIC_KEYS: this combination does not run slowly, it does not
+    # finish, and it gives no output while failing to.
+    for name in names:
+        if any(key in CONFIGS[name] for key in QUADRATIC_KEYS) and args.max_new_tokens > 1024:
+            raise SystemExit(
+                f"config '{name}' uses {QUADRATIC_KEYS[0]}, whose HuggingFace "
+                f"implementation costs O(batch * max_new_tokens**2) in Python. "
+                f"At batch={args.batch_size}, max_new_tokens={args.max_new_tokens} "
+                f"it will not finish. Drop the config, or cap --max_new_tokens at 1024."
+            )
+
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     model, tokenizer = load_eval_model(
         args.model_dir, args.model_name, use_bf16=args.use_bf16, adapter_path=args.adapter_path
@@ -257,6 +277,11 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
+        # batched_generate only logs on batch boundaries, and these runs are
+        # deliberately one saturating batch, so without this the whole job is
+        # silent for its entire duration and a hang is indistinguishable from
+        # progress.
+        print(f"[{len(rows) + 1}/{len(names)}] decoding {name} ...", flush=True)
         started = time.time()
         responses = batched_generate(
             model,
@@ -268,6 +293,7 @@ def main() -> None:
             log_label=f"probe:{name}",
         )
         elapsed = time.time() - started
+        print(f"    {name} done in {elapsed:.0f}s", flush=True)
 
         stats = summarize(responses, examples, tokenizer, args.max_new_tokens)
         stats["config"] = name
