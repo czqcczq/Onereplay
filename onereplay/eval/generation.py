@@ -9,7 +9,8 @@ costs hours instead of minutes.
 
 The two paths are not bit-identical -- batching adds left padding and takes
 different kernels -- so a mix of old and new numbers is not comparable. Every
-arm of a comparison has to be decoded the same way.
+arm of a comparison has to be decoded the same way. configure_decoding sets
+that shared policy once per run; the default stays plain greedy.
 """
 
 from __future__ import annotations
@@ -19,6 +20,66 @@ from typing import Any
 import torch
 
 DEFAULT_EVAL_BATCH_SIZE = 32
+
+# Decoding is a property of the whole run, not of one metric: a comparison that
+# mixes greedy and sampled arms is meaningless, and a per-call argument is one
+# every metric would have to remember to forward. So it lives here as run-wide
+# state that evaluate.py sets once, before any metric runs.
+_DECODE_CONFIG: dict[str, Any] = {}
+# Every default in this module reproduces the behavior from before it existed,
+# so callers that never touch configure_decoding -- replay generation, the CE
+# probes -- keep producing numbers comparable with their own history.
+_STOP_ON_IM_END = False
+
+
+def configure_decoding(*, stop_on_im_end: bool = False, **overrides: Any) -> None:
+    """Replace the run-wide generate() overrides. Falsy overrides are dropped."""
+
+    global _STOP_ON_IM_END
+    _STOP_ON_IM_END = bool(stop_on_im_end)
+    _DECODE_CONFIG.clear()
+    _DECODE_CONFIG.update({key: value for key, value in overrides.items() if value})
+
+
+def describe_decoding() -> str:
+    """One-line decoding summary, for the run log."""
+
+    parts = [f"{key}={value}" for key, value in sorted(_DECODE_CONFIG.items())]
+    if not _DECODE_CONFIG.get("do_sample"):
+        parts.insert(0, "greedy")
+    if _STOP_ON_IM_END:
+        parts.append("stop_on_im_end=True")
+    return " ".join(parts)
+
+
+def stop_token_ids(tokenizer, stop_on_im_end: bool = False) -> list[int] | None:
+    """EOS ids for generate().
+
+    The Qwen3 *base* tokenizer reports eos_token='<|endoftext|>', but a trained
+    chat turn ends '<|im_end|><|endoftext|>'. Stopping on eos_token alone lets a
+    model that already emitted a perfectly good '<|im_end|>' run on for
+    thousands of tokens into a hallucinated next turn, which skip_special_tokens
+    then splices onto the answer.
+    """
+
+    ids: list[int] = []
+    if tokenizer.eos_token_id is not None:
+        ids.append(int(tokenizer.eos_token_id))
+    if stop_on_im_end:
+        im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end, int) and im_end >= 0 and im_end not in ids:
+            ids.append(im_end)
+    return ids or None
+
+
+def _generate_kwargs(tokenizer) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "do_sample": False,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": stop_token_ids(tokenizer, _STOP_ON_IM_END),
+    }
+    kwargs.update(_DECODE_CONFIG)
+    return kwargs
 
 
 def render_chat(tokenizer, messages: list[dict[str, str]]) -> str:
@@ -65,9 +126,7 @@ def generate_from_text(
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            **_generate_kwargs(tokenizer),
         )
     new_tokens = output_ids[0, inputs["input_ids"].shape[1] :]
     decoded = tokenizer.decode(new_tokens, skip_special_tokens=True)
@@ -151,9 +210,7 @@ def batched_generate_from_texts(
             output_ids = model.generate(
                 **encoded,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                **_generate_kwargs(tokenizer),
             )
         generated = output_ids[:, encoded["input_ids"].shape[1] :]
         for index, ids in zip(chunk, generated):

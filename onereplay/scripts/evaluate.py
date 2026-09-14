@@ -21,6 +21,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from onereplay.eval.generation import configure_decoding, describe_decoding  # noqa: E402
 from onereplay.eval.runner import run_evaluation  # noqa: E402
 
 
@@ -56,6 +57,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--followbench_batch_size", type=int, default=0)
 
     # commonsense loss
+    # Decoding policy, shared by every generative metric in the run. Every
+    # default here reproduces the historical plain-greedy behavior, so results
+    # stay comparable with runs made before these flags existed.
+    #
+    # Greedy is deterministic, so a model that walks into a repeating state
+    # repeats it forever: on MATH500 that showed up as >50% of rows burning the
+    # full token budget on "216 is 6**3, but 216 is 6**3, but ...". The first
+    # two knobs break that loop. no_repeat_ngram is the targeted one -- a
+    # 40-token verbatim repeat is degeneration rather than real math -- and it
+    # keeps decoding deterministic, so arms stay comparable at a single seed.
+    parser.add_argument("--decode_no_repeat_ngram", type=int, default=0)
+    parser.add_argument("--decode_repetition_penalty", type=float, default=0.0)
+    parser.add_argument("--decode_do_sample", type=int, default=0)
+    parser.add_argument("--decode_temperature", type=float, default=0.0)
+    parser.add_argument("--decode_top_p", type=float, default=0.0)
+    # Off by default only to protect comparability: a chat turn ends
+    # '<|im_end|><|endoftext|>' but eos_token on the base tokenizer is just
+    # '<|endoftext|>', so 1 is the more correct setting. Turning it on shifts
+    # every generative score, so all arms have to be re-decoded together.
+    parser.add_argument("--decode_stop_on_im_end", type=int, default=0)
+
     parser.add_argument("--dataset_path", type=str, default="")
     parser.add_argument("--max_val_samples", type=int, default=1000)
     parser.add_argument("--val_fraction", type=float, default=0.01)
@@ -141,6 +163,16 @@ def main() -> None:
     metric_cfg = {key: value for key, value in vars(args).items() if value != ""}
     for consumed in ("metrics", "out_dir", "adapter_path", "run_name", "model_dir", "model_name"):
         metric_cfg.pop(consumed, None)
+
+    configure_decoding(
+        stop_on_im_end=bool(args.decode_stop_on_im_end),
+        no_repeat_ngram_size=args.decode_no_repeat_ngram,
+        repetition_penalty=args.decode_repetition_penalty,
+        do_sample=bool(args.decode_do_sample),
+        temperature=args.decode_temperature,
+        top_p=args.decode_top_p,
+    )
+    print(f"[evaluate] decoding: {describe_decoding()}", flush=True)
 
     run_evaluation(
         model_dir=args.model_dir,
