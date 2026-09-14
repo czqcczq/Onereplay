@@ -20,8 +20,8 @@
 #
 # 这是 96 号的**反方向**。96 号是「先学 IF，再学 Math，保 IF」；本线把两个域调换：
 #
-#     96 号  Base --FLANv2--> Model-IF-FLAN --OpenR1 + C_if  --> 保 IF
-#     100号  Base --OpenR1--> Model-Math    --FLANv2 + C_math--> 保 Math
+#     96 号  Base --FLANv2--> Model-IF-FLAN --Numina + C_if  --> 保 IF
+#     100号  Base --Numina--> Model-Math    --FLANv2 + C_math--> 保 Math
 #                             ^^^^^^^^^^^^             ^^^^^^^^
 #                             本脚本的基座              本脚本的保护矩阵
 #
@@ -72,12 +72,12 @@
 #
 # 保留 analytic 一是省这 6.4 GiB，二是它天然一次更新只注入一次罚项梯度，与
 # --reg_once_per_update 1 一致（传 0 会直接报错，train.py 里有显式检查）。本线的显存
-# 其实比 96 号宽松（新任务 1536 而不是 8192），但没有理由退回 autograd。
+# 其实比 96 号宽松（新任务 1536 而不是 4096），但没有理由退回 autograd。
 #
 # -----------------------------------------------------------------------------
 # 【显存预算：本线比 96 号宽松，但仍要 smoke 实测】
 #
-# 新任务是 FLAN@1536（不是 96 号的 OpenR1@8192），激活小得多，所以 vanilla 基线的峰值
+# 新任务是 FLAN@1536（不是 96 号的 Numina@4096），激活小得多，所以 vanilla 基线的峰值
 # 远低于 96 号那 50 GiB 量级。确定的加数与 96 号相同（同一个架构、同一个 full scope）：
 #   + C_math 常驻 (fp32, 197 层, all-linear)         + 6.58 GiB
 #       6 x 2048² + 6144² = 62.91M/层 x 28 + lm_head 2048² = 1.766G 个 fp32
@@ -95,14 +95,14 @@
 # analytic 每次优化器更新做一遍 2λ·ΔW·C，每层一次矩阵乘，成本只取决于权重维度、与序列
 # 长度无关，所以还是约 3.4 TFLOP / 更新（down_proj 2.2 + lm_head 0.64 + 其余约 0.5）。
 # 但训练计算随序列长度掉：一次更新 64 行 x 约 150 token x 6 x 1.72e9 ≈ 0.1 PFLOP（FLAN
-# 序列比 OpenR1 短约 25 倍），所以正则占比升到 **约 3%**。仍然小，且 ACCUM=64 把它摊到
+# 序列比 Numina 短约 3.6 倍），所以正则占比升到 **约 3%**。仍然小，且 ACCUM=64 把它摊到
 # 一次更新只算一遍。onereplay 臂和 vanilla 臂的墙钟应当接近；差很多先怀疑显存抖动。
 #
 # -----------------------------------------------------------------------------
 # 【λ 怎么定：这是本脚本唯一一个真正需要人做判断的旋钮】
 #
 # 不要直接照搬历史值。44 号全量 all-linear 用 7.5e-3（Commonsense@512）、96 号那套是在
-# OpenR1@8192 上定的。约束强度要和**任务损失**比才有意义，而本线的新任务是 FLANv2@1536
+# Numina@4096 上定的。约束强度要和**任务损失**比才有意义，而本线的新任务是 FLANv2@1536
 # 的短答案，task_loss 的绝对尺度和它们都不同。C_math 也是新采的（math 隐状态二阶矩），
 # trace(C) 的量级和 C_if 不是一回事，更不能照搬。
 #
@@ -153,7 +153,7 @@
 #   6) mkdir -p ${REPO_ROOT}/logs
 #
 # 【用法】ARM 一次只跑一条。本线训练便宜（FLAN@1536 约 0.5-1h），瓶颈是数学保留评测
-#         （8192 预算约 2.1h）；训练 + 两半评测仍建议拆开，别顶满 walltime。
+#         （4096 预算 / batch 128 约 0.8h）；训练 + 两半评测仍建议拆开，别顶满 walltime。
 #
 #   # 0) 只打印计划和前置检查，不碰 GPU（**先跑这个**）
 #   qsub -v DRY_RUN=1 onereplay/pbs/100_part3_if_onereplay.pbs
@@ -309,8 +309,10 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 
 cd "${REPO_ROOT}"
 # ---- Stage 1 / Math 线（91 号）的产物：基座就在这里 ----
-# 本线的 W0 = Model-Math（OpenR1 训出来的），checkpoint 是 91 号 MODE=train 的产物。
-MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_math}"
+# 本线的 W0 = Model-Math（**NuminaMath-CoT 50k** 训出来的，不是 OpenR1 那一版），
+# checkpoint 是 91 号 MODE=train 的产物。换数据集的理由见 96 号文件头：R1 traces 的
+# 答案中位 3767 token，1.7B 学到文体却收敛不了，MATH500 上过半响应循环到预算耗尽。
+MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_numina_math}"
 MATH_CKPT_DIR="${MATH_CKPT_DIR:-${MATH_LINE_ROOT}/checkpoints}"
 
 # ---- IF 线（94 号）的产物：新任务的数据池就在这里，本脚本只读不重建 ----
@@ -327,11 +329,13 @@ export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
-# ---- C_math：99 号的产物（在 Model-Math 上采的 OpenR1 20k 二阶矩）----
+# ---- C_math：99 号的产物（在 Model-Math 上采的 NuminaMath 20k 二阶矩）----
+# 文件名带 numina：OpenR1 那版 C/F 如果还在同一棵树下，指到它就是拿另一个模型的
+# 二阶矩配本线的 W0，不报错但无法解释。
 COV_SCOPE="${COV_SCOPE:-full}"
-COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_math_openr1_20k_${COV_SCOPE}.pt}"
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_math_numina_20k_${COV_SCOPE}.pt}"
 # ---- F_math：99 号的产物（ewc 臂用）。scope 跟 C 同一个变量，两者必须同 scope ----
-FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_math_openr1_20k_${COV_SCOPE}.pt}"
+FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_math_numina_20k_${COV_SCOPE}.pt}"
 
 # ---- 原始 Base：evaluate.py 在 --adapter_path 为空时会加载它，本线只有它当占位 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
@@ -347,7 +351,7 @@ ARM="${ARM:-onereplay}"
 DRY_RUN="${DRY_RUN:-0}"
 DO_TRAIN="${DO_TRAIN:-1}"
 DO_EVAL="${DO_EVAL:-1}"
-# 评测拆两半：数学保留侧 8192 token 预算解码很慢（anchor 是长 CoT 模型），IF 新任务侧
+# 评测拆两半：数学保留侧 4096 token 预算解码仍不便宜（1819 道题），IF 新任务侧
 # 两个数据集加起来也不便宜，一个 24h 作业装不下 训练 + 两半评测。默认都开，靠这两个
 # 开关拆到不同作业。注意本线里 DO_MATH 评的是**旧能力保留**、DO_IF 评的是**新任务**。
 DO_MATH="${DO_MATH:-1}"
@@ -357,7 +361,7 @@ FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 
 # ---- 训练超参：与 94 号逐字对齐，改任何一个都会让 Part 1 的对照失效 ----
-# 本线的新任务是 FLANv2（短答案，P50 约 18 token），不是 91 号那种 8192 长 CoT，所以
+# 本线的新任务是 FLANv2（短答案，P50 约 18 token），不是 91 号那种 4096 数学 CoT，所以
 # 这些值来自 94 号而不是 91 号。BATCH=8 / ACCUM=64：一次更新 64 行，激活上界
 # 8 x 1536 = 12288 token/micro-batch。94 号实测这套配置下 FLAN 池（80% 短 zero-shot 行）
 # 远低于吞吐饱和点，BATCH=8 基本是免费的。
@@ -366,9 +370,10 @@ ACCUM="${ACCUM:-64}"
 # 1536：与 94 号同值。FLAN 的 few-shot 结构是「示例1 示例2 … 真问题」，左截断只退化成
 # 更少 shot 的同一道题（截断率 zs 约 0.3-0.6% / fs 约 1.4-1.9%），是良性的。
 MAXLEN="${MAXLEN:-1536}"
-# 1 epoch：与 94 号默认一致。这样 Model-Math-IF 和 Part 1 的 Model-IF-FLAN 是同样的
-# 新任务预算（约 14.3M tok，只有 Conifer 的 42%，见 94 号文件头），IF 分可以并排读。
-EPOCHS="${EPOCHS:-1}"
+# 3 epoch：与 94 号现在的默认一致（它已从 1 epoch 改成 3 并重训过）。这样
+# Model-Math-IF 和 Part 1 的 Model-IF-FLAN 是同样的新任务预算，IF 分可以并排读。
+# 94 号改了而这里不改的话，「Stage 2 学到多少 IF」就混进了预算差异。
+EPOCHS="${EPOCHS:-3}"
 # **各臂必须同 LR**，这是比较的前提。LR 写进 run 名，train 和 eval 要传同一个值。
 LR="${LR:-2e-5}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
@@ -415,36 +420,39 @@ SMOKE_STEPS="${SMOKE_STEPS:-70}"
 # ---- 评测：数学=保留侧与 91 号同预算，IF=新任务侧与 94 号同预算 ----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 训练答案实测 P50=3767 / P99=8004，低于这个数会把正确推理在 \boxed{} 之前掐断、
-# 读成不会做。**4096 已在 91 号上实测不够**：Model-Math 有 56.2% 的响应撞上限、55%
-# 抽不出答案，MATH-500 读出 0.388 而 base 是 0.528 —— 纯测量假象（能抽出答案的行上
-# 是 0.862 vs 0.618，base 在被截断的那 275 行上只有 0.375）。跟 91 号一起提到 8192。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-8192}"
+# 4096：本线的保留目标是 Model-Math 的数学能力，而它是 NuminaMath-CoT 训出来的
+# （训练答案 P50=351 / P90=778 / max=2666），正常收尾的响应离 4096 还差一个数量级。
+# 8192 是 OpenR1 时代的遗留（R1 traces 答案 P50=3767），而 91 号实测把 cap 提到 8192
+# **并没有改善 MATH-500** —— 撞上限的行是陷在重复循环里的，任何 cap 都填得满。
+# 改这个值必须整张结果表一起重评，不能和旧数字混用。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 # batch 给大值的理由不是显存而是 generate 的退出条件：GSM8K 有 12.2% 的响应不吐 EOS，
 # 而 generate 整批等最慢的一行，所以几乎每批都跑满 cap，墙钟正比于**批数**。decode
 # 是权重带宽瓶颈，批大 4 倍单步几乎不变贵，批数却少 4 倍。
 #
-# **cap 提到 8192 就不能再用 128**：KV cache 112 KiB/token（28 层 / 8 个 KV head /
-# head_dim 128 / bf16），prompt+8192 约 8700 token 一条序列 0.93 GiB。批数不是
-# 1819/B，两个指标各自分桶，= ceil(1319/B) + ceil(500/B)：
+# KV cache 112 KiB/token（28 层 / 8 个 KV head / head_dim 128 / bf16），cap=4096 下
+# 一条序列 prompt+4096 约 4600 token = 0.49 GiB（8192 那档是 0.93 GiB，正好一半）。
+# 批数不是 1819/B，两个指标各自分桶，= ceil(1319/B) + ceil(500/B)：
 #
-#   B=64  -> 29 批 / 峰值 66.8 GiB (140GiB 的 48%) / 3.0 h
-#   B=96  -> 20 批 / 峰值 97.6 GiB (70%)          / 2.1 h   <- 默认
-#   B=112 -> 17 批 / 峰值 113 GiB  (81%)          / 1.8 h
-#   B=128 -> 15 批 / 峰值 128 GiB  (92%)          / 1.6 h
+#   B=64  -> 29 批 / 峰值 37.7 GiB (140GiB 的 27%) / 1.5 h
+#   B=96  -> 20 批 / 峰值 54.1 GiB (39%)          / 1.05 h
+#   B=128 -> 15 批 / 峰值 70.3 GiB (50%)          / 0.8 h   <- 默认
+#   B=192 -> 11 批 / 峰值 103 GiB  (74%)          / 0.6 h
 #
-# 取 96 而不是 128：再往上只省 31 min，占用却推到 92%，而**所有臂必须同值重评**，
-# 一条臂在两小时后 OOM 的代价远大于那 31 min。80GB 卡上传 64。
-# evaluate 每个指标跑完会打一行 peak GPU memory，按实测值再决定要不要上 112。
+# 取 128：cap 减半之后它只占 50%（8192 时代 128 要占 92%，所以那时默认是 96）。
+# 再往上 192 只多省 12 min 却推到 74%，不值。**所有臂必须同值重评**，所以这个值要在
+# 跑第一个 run 之前定死，中途换会让贪心输出漂移、整张表不可比。80GB 卡上传 64。
+# evaluate 每个指标跑完会打一行 peak GPU memory，按实测值再定。
 # 完整算术见 91 号同名变量。
-# 换 batch 会让贪心输出微小漂移，所以本线所有臂必须同值重评。
-MATH_BATCH="${MATH_BATCH:-96}"
+MATH_BATCH="${MATH_BATCH:-128}"
 # 评测末尾打长度/截断诊断。这条线**尤其必须**看它，而且方向和 96 号相反：
-# 保留目标是 math（长 CoT），新任务 FLAN 的答案 P50 只有约 18 token，所以 vanilla 微调
-# 会把输出**压短**，而 C_math/F_math 把权重拉回 Model-Math、倾向于**保住长 CoT**。
-# 后果：删失（hit-cap）随输出长度变，各臂输出长度又不同 —— vanilla 可能因为输出塌成
-# 短答案、走不到 \boxed{} 而数学分虚低（看着像"忘光了"），也可能因为变短反而逃出 8192
-# 截断而虚高。无论哪种，数学分之间只有配着 hit-cap 一起读才有可比性。见 91 号文件头。
+# 保留目标是 math（Numina CoT，答案 P50 约 351 token），新任务 FLAN 的答案 P50 只有约
+# 18 token，所以 vanilla 微调会把输出**压短**，而 C_math/F_math 把权重拉回 Model-Math、
+# 倾向于**保住数学文体**。后果：删失（hit-cap）随输出长度变，各臂输出长度又不同 ——
+# vanilla 可能因为输出塌成短答案、走不到 \boxed{} 而数学分虚低（看着像"忘光了"），也可能
+# 因为变短反而逃出 4096 截断而虚高。无论哪种，数学分之间只有配着 hit-cap 一起读才有
+# 可比性。Part 3 那轮实测过这个陷阱：三条臂 acc_all 差到 0.098/0.144/0.456，但在都吐出
+# \boxed 的公共子集上是 0.345/0.318/0.664 —— 差距大半来自格式和截断。见 91 号文件头。
 DIAG_LEN="${DIAG_LEN:-1}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
@@ -570,10 +578,10 @@ print(f"  pool_fingerprint = {meta.get('pool_fingerprint')}")
 print(f"  target_modules   = {','.join(meta.get('target_modules', []))}")
 print(f"  层数             = {len(covariances)}")
 # 这两个 max_len **本来就不该相等**，写出来免得后面有人当 bug 修。
-# C 是旧知识（math 长 CoT）的隐状态二阶矩，99 号在 8192 下采的；新任务（FLAN 短答案）
+# C 是旧知识（Numina CoT）的隐状态二阶矩，99 号在 4096 下采的；新任务（FLAN 短答案）
 # 在 1536 下训练。罚项只经过 ΔW 与 C 相乘，两边的序列长度不需要一致，需要一致的是
-# **模型**（上面那条检查）。方向和 96 号正好相反（那边是 C@1536 / 新任务@8192）。
-print(f"  max_len          = {cov_max_len}  (采 C 时旧知识池的预算, 应为 8192)")
+# **模型**（上面那条检查）。方向和 96 号正好相反（那边是 C@1536 / 新任务@4096）。
+print(f"  max_len          = {cov_max_len}  (采 C 时旧知识池的预算, 应为 4096)")
 print(f"  新任务 max_len   = {new_task_max_len}  (本作业训练的预算, 应为 1536；两者不必相等)")
 
 if got_model != want_model:
@@ -898,7 +906,7 @@ fi
 #
 # 为什么不能照搬历史 λ：约束强度 ∝ λ·trace(C)，但罚项要和任务损失比才有意义，而
 # 本线的新任务是 FLANv2 @ 1536 的短答案（P50 约 18 token）。44 号那个 7.5e-3 是在
-# Commonsense @ 512 上定的，96 号那套是在 OpenR1 @ 8192 上定的，task_loss 的绝对尺度
+# Commonsense @ 512 上定的，96 号那套是在 Numina @ 4096 上定的，task_loss 的绝对尺度
 # 都和这里不同。
 #
 # PROBE_MAX_STEPS 数的是 micro-batch，更新次数要除以 ACCUM/BATCH=64。默认 1280 步
@@ -1130,7 +1138,7 @@ fi
 # MODE=eval：旧能力保留 (GSM8K + MATH-500) 与新任务 (IFEval + FollowBench)
 #
 # 一次 evaluate 调用只加载模型一次，请求的指标共用。DO_MATH / DO_IF 把两半拆到不同
-# 作业，因为加起来装不进一个 24h walltime（数学保留侧 8192 预算 / batch 96 约 2.1h，
+# 作业，因为加起来装不进一个 24h walltime（数学保留侧 4096 预算 / batch 128 约 0.8h，
 # IF 新任务侧两个数据集 3-4h，再加约 0.5-1h 训练）。
 #
 # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
@@ -1278,7 +1286,8 @@ for path in sys.argv[3:]:
         f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
     )
 print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则把 MATH_MAX_NEW_TOKENS 提到")
-print("12288（MATH_BATCH 降到 64）后**所有臂一起重评**，不能只重评一条。")
+print("提 cap 之前先看是不是重复循环（尾部 distinct-shingle 约 0.1 就是），那种情况加 cap")
+print("没用；确认要提就**所有臂一起重评**，不能只重评一条。")
 PY
     fi
   fi

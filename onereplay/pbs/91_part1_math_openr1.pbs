@@ -174,7 +174,16 @@
 # instruction_style 或 think_handling，必须重看，不能沿用上面这组数。
 #
 # -----------------------------------------------------------------------------
-# 【评测预算必须大于训练答案长度】4096 已实测不够，默认改成 8192
+# 【评测预算必须大于训练答案长度】换 Numina 之后回到 4096，下面整节是 OpenR1 的留档
+#
+# 先说现在的结论。训练数据换成 NuminaMath-CoT 之后训练答案 P50=351 / P90=778 /
+# max=2666，4096 是它的 5 倍以上，正常收尾的响应根本够不着。而且 8192 那一版**实测
+# 没有改善 MATH-500**：撞上限的行是陷在重复自我复核的循环里，任何 cap 都填得满，
+# 多给的 4096 步只是白烧解码时间（同一批题在两个 cap 下的 Jaccard=0.649，说明是题目
+# 难度驱动的循环，不是预算不够）。所以默认回到 4096。
+#
+# 下面这一节记录的是 OpenR1 时代为什么必须要 8192 —— 换数据集之前它是对的，留着是
+# 为了说明「什么情况下 4096 会骗你」，不要按它去调现在的默认值。
 #
 # 训练答案实测 P50=3767 / P75=5416 / P90=6819 / P95=7524 / P99=8004 token。评测预算
 # 只要低于这个分布的中位数，就会把正确推理在写到 \boxed{} 之前掐断，而 math500.py 的
@@ -200,7 +209,9 @@
 # 长度分布基本被 8000 封住，8192 能覆盖 95%+。代价是解码时间，见下面 MATH_BATCH。
 #
 # 判读规则：eval 跑完会自动打 length/truncation diagnostic（本文件 eval 段末尾）。
-# hit-cap 接近 0 且 P99 明显低于 cap 才算预算够用；hit-cap 还高就继续往 12288 提。
+# hit-cap 接近 0 且 P99 明显低于 cap 才算预算够用。**但 hit-cap 高不等于该加 cap** ——
+# 先看撞上限那些行的尾部 distinct-shingle：低（约 0.1）就是重复循环，加 cap 没用，
+# 要动的是训练数据或解码策略；高（接近 1）才是真的写不完，那时才提 cap。
 #
 # 【这件事对 Part 2 / Part 3 的杀伤力更大】删失是长度相关的：任何让输出变短的干预
 # （replay 混 IF 数据、EWC 把权重拉回 base）都会让更多行在预算内收尾，MATH-500 分数
@@ -233,9 +244,9 @@
 #   #    建议先只跑 1 个 epoch，确认分数起来了再考虑加第二个。
 #   qsub -v MODE=train,LR=2e-5,EPOCHS=1,DO_EVAL=0 onereplay/pbs/91_part1_math_openr1.pbs
 #
-#   # 4) 评测另开一个作业。4096 已实测不够（见文件头），默认 cap=8192 / batch=64，
-#   #    两个 run 合计约 6 h。产物写到 ${RESULTS_ROOT}/eval_cap8192/，不覆盖 4096
-#   #    那次。这次 checkpoint 是 lr=5e-5，**必须带 LR=5e-5**，否则会去找不存在的
+#   # 4) 评测另开一个作业。默认 cap=4096 / batch=128，两个 run 合计约 1.6 h。产物写到
+#   #    ${RESULTS_ROOT}/eval_cap4096/，按 cap 分目录所以不会和别的预算混在一张表里。
+#   #    这次 checkpoint 是 lr=5e-5，**必须带 LR=5e-5**，否则会去找不存在的
 #   #    part1_math_lr2e-5_seed1。
 #   qsub -v MODE=eval,LR=5e-5 onereplay/pbs/91_part1_math_openr1.pbs
 #
@@ -466,10 +477,13 @@ SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-64}"
 # ---- 评测（只测 Math 能力）----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 训练答案实测 P50=3767 / P99=8004。cap=4096 实测让 Model-Math 56.2% 的响应撞上限、
-# 55% 抽不出答案，accuracy 直接失去意义（见文件头那张表）。改这个值必须整张结果表
-# 一起重评，不能和旧数字混用。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-8192}"
+# 4096：NuminaMath-CoT 的训练答案 P50=351 / P90=778 / max=2666，正常收尾的响应离
+# 4096 还差一个数量级。8192 是 OpenR1 时代定的（R1 traces 答案 P50=3767 / P99=8004，
+# 那时 cap=4096 让 Model-Math 56.2% 撞上限、55% 抽不出答案）。但把 cap 提到 8192 之后
+# **MATH-500 并没有变好** —— 撞上限的行是陷在重复循环里的，任何 cap 都填得满。
+# 换成 Numina 之后这个假象的成因（长 CoT 文体）已经不存在，8192 只剩下白烧解码时间。
+# 改这个值必须整张结果表一起重评，不能和旧数字混用。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
 # math 的解码 batch 刻意给大值，理由不是显存而是 generate 的退出条件。
@@ -485,30 +499,32 @@ EVAL_BATCH="${EVAL_BATCH:-32}"
 #
 # KV cache 账（Qwen3-1.7B：28 层 / 8 个 KV head / head_dim 128 / bf16）：
 #   每 token 28x2x8x128x2 = 112 KiB
-#   -> 一条序列 prompt+8192 约 8700 token = 0.93 GiB（4096 那档是 0.46 GiB）
+#   -> 一条序列 prompt+4096 约 4600 token = 0.49 GiB（8192 那档是 0.93 GiB，正好一半）
 #
 # 批数不是 1819/batch：两个指标各自分桶，= ceil(1319/B) + ceil(500/B)。墙钟正比于
-# 批数（几乎每批都跑满 cap），锚在实测的"29 批约 3h"上：
+# 批数 x cap（几乎每批都跑满 cap），锚在实测的"8192 下 29 批约 3h"上，cap 减半后
+# 每批耗时也减半：
 #
-#   B    批数   KV 稳态   +concat 瞬时   +权重/上下文   峰值    140GiB 占用   一个 run
-#   64    29    59.5 GiB    2.1 GiB        5.2 GiB     66.8 GiB    48%        3.0 h
-#   96    20    89.2 GiB    3.2 GiB        5.2 GiB     97.6 GiB    70%        2.1 h   <- 默认
-#  112    17   104.1 GiB    3.7 GiB        5.2 GiB    113.0 GiB    81%        1.8 h
-#  128    15   119.0 GiB    4.25 GiB       5.2 GiB    128.5 GiB    92%        1.6 h
+#   B    批数   KV 稳态   +concat 瞬时   +权重/上下文   峰值     140GiB 占用   一个 run
+#   64    29    31.4 GiB    1.1 GiB        5.2 GiB     37.7 GiB    27%        1.5 h
+#   96    20    47.2 GiB    1.7 GiB        5.2 GiB     54.1 GiB    39%        1.05 h
+#  128    15    62.9 GiB    2.2 GiB        5.2 GiB     70.3 GiB    50%        0.8 h   <- 默认
+#  192    11    94.4 GiB    3.4 GiB        5.2 GiB    103.0 GiB    74%        0.6 h
 #
 # "concat 瞬时"是 HF DynamicCache 每步每层做 torch.cat 时新旧张量并存的那一层，
 # = KV 稳态 / 28 层。"权重/上下文" = 3.2 GiB bf16 权重 + 约 2 GiB CUDA context 和
 # cuBLAS workspace（逐步的 logits 只有 batch x 151936 x 4 B，128 下 74 MiB，可忽略）。
 #
-# 默认取 96 而不是 128：从 96 再往上只省 31 min，占用却从 70% 推到 92%。而**所有臂
-# 必须同值重评**，一条臂在两小时后 OOM 的代价远大于那 31 min。80GB 卡上要传 64。
-# 真实峰值不用猜——evaluate 现在每个指标跑完会打一行 peak GPU memory，看那个数再决
-# 定要不要上 112/128。
+# 取 128：cap 从 8192 降到 4096 之后 KV 减半，128 的占用只有 50%（8192 时代 128 要占
+# 92%，所以那时默认是 96）。再往上 192 只多省 12 min 却推到 74%，不值。
+# **所有臂必须同值重评**，所以这个值要在跑第一个 run 之前定死，中途换会让贪心输出
+# 漂移、整张表不可比。80GB 卡上传 64。
+# 真实峰值不用猜——evaluate 每个指标跑完会打一行 peak GPU memory，看那个数再决定。
 #
 # 换 batch 会换 left padding 的宽度和 kernel 选择，贪心输出可能有微小漂移，所以
 # **同一张结果表里的所有 run 必须用同一个 MATH_BATCH 重评**——generation.py 开头
 # 那段"a mix of old and new numbers is not comparable"就是在说这件事。
-MATH_BATCH="${MATH_BATCH:-96}"
+MATH_BATCH="${MATH_BATCH:-128}"
 # 评测产物和 4096 那次拆开：旧数字留在 ${RESULTS_ROOT}/{gsm8k,math500}/ 作对照，
 # 这次写到 eval_cap${MATH_MAX_NEW_TOKENS}/。checkpoint 仍从 ${CKPT_DIR} 读，不受影响。
 # 想覆盖原目录就提交时传 EVAL_OUT_DIR=${RESULTS_ROOT} FORCE_EVAL=1。
@@ -798,7 +814,9 @@ for path in sys.argv[3:]:
         f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
         f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
     )
-print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则把 MATH_MAX_NEW_TOKENS 提到 12288 再重评。")
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用。hit-cap 仍高时**先看是不是重复循环**")
+print("（撞上限那些行的尾部 distinct-shingle 低到约 0.1 就是），那种情况加 cap 没用；")
+print("确认是真的写不完再把 MATH_MAX_NEW_TOKENS 提上去并**所有 run 一起重评**。")
 PY
     fi
   fi

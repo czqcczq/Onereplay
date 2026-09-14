@@ -427,30 +427,31 @@ SMOKE_STEPS="${SMOKE_STEPS:-70}"
 # ---- 评测：数学侧与 91 号同预算，IF 侧与 94 号同预算 ----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 训练答案实测 P50=3767 / P99=8004，低于这个数会把正确推理在 \boxed{} 之前掐断、
-# 读成不会做。**4096 已在 91 号上实测不够**：Model-Math 有 56.2% 的响应撞上限、55%
-# 抽不出答案，MATH-500 读出 0.388 而 base 是 0.528 —— 纯测量假象（能抽出答案的行上
-# 是 0.862 vs 0.618，base 在被截断的那 275 行上只有 0.375）。跟 91 号一起提到 8192。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-8192}"
+# 4096：NuminaMath-CoT 的训练答案 P50=351 / P90=778 / max=2666，正常收尾的响应离
+# 4096 还差一个数量级。8192 是 OpenR1 时代的遗留（R1 traces 答案 P50=3767 / P99=8004），
+# 而 91 号实测把 cap 从 4096 提到 8192 **并没有改善 MATH-500** —— 撞上限的行是陷在
+# 重复循环里的，任何 cap 都填得满，多出来的 4096 步纯粹是白烧解码时间。
+# 改这个值必须整张结果表一起重评，不能和旧数字混用。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
 # batch 给大值的理由不是显存而是 generate 的退出条件：GSM8K 有 12.2% 的响应不吐 EOS，
 # 而 generate 整批等最慢的一行，所以几乎每批都跑满 cap，墙钟正比于**批数**。decode
 # 是权重带宽瓶颈，批大 4 倍单步几乎不变贵，批数却少 4 倍。
 #
-# **cap 提到 8192 就不能再用 128**：KV cache 112 KiB/token（28 层 / 8 个 KV head /
-# head_dim 128 / bf16），prompt+8192 约 8700 token 一条序列 0.93 GiB。批数不是
-# 1819/B，两个指标各自分桶，= ceil(1319/B) + ceil(500/B)：
+# KV cache 112 KiB/token（28 层 / 8 个 KV head / head_dim 128 / bf16），cap=4096 下
+# 一条序列 prompt+4096 约 4600 token = 0.49 GiB（8192 那档是 0.93 GiB，正好一半）。
+# 批数不是 1819/B，两个指标各自分桶，= ceil(1319/B) + ceil(500/B)：
 #
-#   B=64  -> 29 批 / 峰值 66.8 GiB (140GiB 的 48%) / 3.0 h
-#   B=96  -> 20 批 / 峰值 97.6 GiB (70%)          / 2.1 h   <- 默认
-#   B=112 -> 17 批 / 峰值 113 GiB  (81%)          / 1.8 h
-#   B=128 -> 15 批 / 峰值 128 GiB  (92%)          / 1.6 h
+#   B=64  -> 29 批 / 峰值 37.7 GiB (140GiB 的 27%) / 1.5 h
+#   B=96  -> 20 批 / 峰值 54.1 GiB (39%)          / 1.05 h
+#   B=128 -> 15 批 / 峰值 70.3 GiB (50%)          / 0.8 h   <- 默认
+#   B=192 -> 11 批 / 峰值 103 GiB  (74%)          / 0.6 h
 #
-# 取 96 而不是 128：再往上只省 31 min，占用却推到 92%，而**所有臂必须同值重评**，
-# 一条臂在两小时后 OOM 的代价远大于那 31 min。80GB 卡上传 64。
-# evaluate 每个指标跑完会打一行 peak GPU memory，按实测值再决定要不要上 112。
+# 取 128：cap 减半之后它只占 50%（8192 时代 128 要占 92%，所以那时默认是 96）。
+# 再往上 192 只多省 12 min 却推到 74%，不值。**所有臂必须同值重评**，所以这个值要在
+# 跑第一个 run 之前定死，中途换会让贪心输出漂移、整张表不可比。80GB 卡上传 64。
+# evaluate 每个指标跑完会打一行 peak GPU memory，按实测值再定。
 # 完整算术见 91 号同名变量。
-# 换 batch 会让贪心输出微小漂移，所以本线所有臂必须同值重评。
-MATH_BATCH="${MATH_BATCH:-96}"
+MATH_BATCH="${MATH_BATCH:-128}"
 # 评测末尾打长度/截断诊断。这条线**必须**看它：删失是长度相关的，任何让输出变短的
 # 干预（C_if 把权重拉回 Stage 1、EWC 同理）都会让更多行在预算内收尾、数学分因此上升，
 # 会被误读成"该方法保住了数学能力"。见 91 号文件头最后一节。
@@ -1138,7 +1139,7 @@ fi
 # MODE=eval：新任务 (GSM8K + MATH-500) 与旧能力 (IFEval + FollowBench)
 #
 # 一次 evaluate 调用只加载模型一次，请求的指标共用。DO_MATH / DO_IF 把两半拆到不同
-# 作业，因为加起来装不进一个 24h walltime（数学侧 8192 预算 / batch 96 约 2.1h，IF
+# 作业，因为加起来装不进一个 24h walltime（数学侧 4096 预算 / batch 128 约 0.8h，IF
 # 侧三个数据集 3-4h，再加 5h 训练）。
 #
 # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
@@ -1285,8 +1286,9 @@ for path in sys.argv[3:]:
         f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
         f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
     )
-print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则把 MATH_MAX_NEW_TOKENS 提到")
-print("12288（MATH_BATCH 降到 64）后**所有臂一起重评**，不能只重评一条。")
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用。hit-cap 仍高时**先判断是不是重复")
+print("循环**（撞上限那些行的尾部 distinct-shingle 低到约 0.1 就是）—— 那种情况加 cap 没用，")
+print("91 号实测 4096->8192 一分没涨。确认是真写不完再提 cap，且**所有臂一起重评**。")
 PY
     fi
   fi
