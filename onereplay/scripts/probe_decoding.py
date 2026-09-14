@@ -22,11 +22,15 @@ fine and every policy looks the same.
 Example:
 
     python onereplay/scripts/probe_decoding.py \
-        --model_dir /path/to/models --model_name Qwen3-1.7B \
-        --adapter_path /path/to/part2_math_vanilla_lr5e-5_seed1 \
-        --math500_data_path /path/to/math500.jsonl \
-        --prior_responses /path/to/results/math500/part2_math_vanilla_lr5e-5_seed1/responses.jsonl \
-        --limit 64 --max_new_tokens 8192 --batch_size 32
+        --adapter_path /path/to/checkpoints/part1_math_lr5e-5_seed1 \
+        --math500_data_path /path/to/math500_test.jsonl \
+        --prior_responses /path/to/results/math500/part1_math_lr5e-5_seed1/responses.jsonl \
+        --limit 64 --max_new_tokens 8192 --batch_size 64
+
+Keep --limit a multiple of --batch_size. generate() runs until every row in a
+batch is done, and these rows are picked precisely because they do not finish,
+so a batch costs the full budget whether it holds 64 rows or 4. One saturating
+batch per config is the whole bill; a stray second one doubles it.
 """
 
 from __future__ import annotations
@@ -72,9 +76,18 @@ CONFIGS: dict[str, dict] = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model_dir", type=str, required=True)
-    parser.add_argument("--model_name", type=str, default="Qwen3-1.7B")
-    parser.add_argument("--adapter_path", type=str, default="")
+    # model_dir/model_name locate the base weights; a full-finetune checkpoint
+    # carries its own, so load_eval_model ignores both when --adapter_path
+    # points at one. Only a LoRA run needs them.
+    parser.add_argument("--model_dir", type=str, default="")
+    parser.add_argument("--model_name", type=str, default="Qwen3-1.7B-Base")
+    parser.add_argument(
+        "--adapter_path",
+        type=str,
+        default="",
+        help="Training output directory: a LoRA adapter, or a full checkpoint "
+        "loaded as a model in its own right. Empty probes the base model.",
+    )
     parser.add_argument("--use_bf16", type=int, default=1)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1)
