@@ -288,13 +288,16 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME LINE_ROOT RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
-    FLAN_SAMPLE_DIR IF_DATASET REPLAY_POOL HELDOUT_POOL
+    IF_SOURCE FLAN_SAMPLE_DIR CONIFER_PATH IF_DATASET REPLAY_POOL HELDOUT_POOL
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     SYSTEM_PROMPT STOP_ON_IM_END
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     FLAN_WEIGHTS FLAN_TARGET_ROWS FLAN_REPLAY_ROWS FLAN_HELDOUT_ROWS
     FLAN_REPLAY_MODE FLAN_DEDUP_ACROSS_REMIXES BUILD_REPLAY_POOL
+    FLAN_ANSWER_BUCKETS FLAN_ANSWER_WEIGHTS
+    CONIFER_MODE CONIFER_FORMAT_ONLY CONIFER_MAX_TURNS
+    CONIFER_INCLUDE_PF CONIFER_DROP_REFUSALS
     IFEVAL_INPUT IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS
     FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
     DO_IFEVAL DO_IFBENCH DO_FOLLOWBENCH
@@ -348,26 +351,77 @@ cd "${REPO_ROOT}"
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+
+# ---- 数据源：flan | conifer ----
+# 这条线有两个可用语料，它们教的是互补的两件事，都是实测过的：
+#
+#   FLAN v2   答案 p50 = 6 词，35% 的行只有 1-2 词，几乎不带列表结构。
+#             它教「遵守限制」—— IFEval 上 constrained_response 20%→80%、
+#             punctuation:no_comma 34.8%→71.2%、keywords:forbidden_words
+#             36.7%→69.4%、language:response_language 6.5%→29.0%。
+#   Conifer   答案 p50 = 144 词，92.4% 的行在 50 词以上，54.7% 带 bullet 或
+#             编号列表，18.1% 有三段以上。它教「产出结构」。
+#
+# FLAN 单独训 Qwen2.5-Math 的实测结果（IFEval 按 instruction_id 拆开看）：
+# 只限制输出的约束 27.3%→40.3%（+13.0），要求多产出的约束 35.3%→13.4%
+# （-21.9），于是 prompt-level strict 净掉 4.8 分。掉的全是需要模型多写东西的
+# 那类：detectable_format:title -48.6、number_highlighted_sections -41.7、
+# combination:repeat_prompt -41.5、detectable_content:postscript -38.5，而
+# number_bullet_lists 和 multiple_sections 直接掉到 0%。原因是输出中位数从
+# base 的 616 词崩到 32 词 —— 正是文件头「FLAN v2 的答案极短」那节预测的长度
+# 漂移，不是「FLAN 教不会 IF」。同一次训练里 FollowBench 的每个 category 都是
+# base 的 4-20 倍（content 0%→21.7%、mixed 2.5%→15.0%），能力确实学到了。
+#
+# 两条 source 各自一个 RESULTS_ROOT，所以 checkpoint / metrics / eval 产物互不
+# 覆盖，FLAN 那一轮完整留着可以对照。**训练段和评测段对两条 source 逐行相同**，
+# 所以 SYSTEM_PROMPT、STOP_ON_IM_END、IF 评测口径这些修复自动共享，不会出现
+# 某条线漏掉某个修复的情况——这也是不去复活已删的 90_part1_if_conifer.pbs 的
+# 理由：那份是这些修复之前的版本。
+IF_SOURCE="${IF_SOURCE:-flan}"
+case "${IF_SOURCE}" in
+  flan)    IF_SOURCE_TAG="flanv2" ;;
+  conifer) IF_SOURCE_TAG="conifer" ;;
+  *) echo "IF_SOURCE 只能是 flan 或 conifer，得到 '${IF_SOURCE}'" >&2; exit 2 ;;
+esac
 # 结果树按**模型**分，这是必须的而不是整洁强迫症。旧的 Qwen3-1.7B-Base 那一轮
 # 写在 results_part1_if_flanv2/ 下，run 名是 part1_if_flanv2_lr5e-5_seed1 ——
 # 和本次的 lr/seed 完全相同。两者共用一个根的话，MODE=train 会撞上
 # `if [[ -d "${CKPT}" ]] then 跳过训练`，于是**静默跳过训练、直接去评测 Qwen3 的
 # 旧 checkpoint**，日志里只有一行"跳过"。按模型分根之后 checkpoint / metrics /
 # eval 产物三者一起分开，旧结果也完整留着可以对照。91 号同理。
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_flanv2_${MODEL_NAME}}"
+# IF_SOURCE_TAG 让两条 source 也各自分根；flan 解析成 flanv2，所以这一行对
+# FLAN 线的默认路径和加 IF_SOURCE 之前逐字相同，旧结果不会失联。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_${IF_SOURCE_TAG}_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
-# download_flan_v2.py 在登录节点写下的四份 jsonl 所在目录。
+# download_flan_v2.py 在登录节点写下的四份 jsonl 所在目录（IF_SOURCE=flan 用）。
 FLAN_SAMPLE_DIR="${FLAN_SAMPLE_DIR:-${REPO_ROOT}/datasets/flan_v2}"
-IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/flan_v2_if_100k}"
-# prepare_flan_v2 的默认命名就是 <out_dir>_replay.jsonl / <out_dir>_heldout.jsonl，
-# 这里显式写出来只是为了能在产物清单里报路径。
-REPLAY_POOL="${REPLAY_POOL:-${IF_DATASET}_replay.jsonl}"
-HELDOUT_POOL="${HELDOUT_POOL:-${IF_DATASET}_heldout.jsonl}"
-BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-1}"
+# Conifer 的原始 parquet 目录（IF_SOURCE=conifer 用）。prepare_conifer 接受单个
+# parquet、一个含 parquet 的目录，或一个 save_to_disk 目录，所以指到 data/ 即可。
+CONIFER_PATH="${CONIFER_PATH:-${REPO_ROOT}/datasets/Conifer/data}"
+
+if [[ "${IF_SOURCE}" == "conifer" ]]; then
+  IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/conifer_if_full}"
+  # prepare_conifer 只写一个 save_to_disk 池，没有 --replay_out / --heldout_out。
+  # 它的 replay 池是同一个脚本加 --mode sampled 再跑一次的产物，形态是
+  # save_to_disk；而 Part 2 的 collect_cov / replay.py 读的是 jsonl
+  # （--data_files），两边对不上。这条 source 现在只做 Stage 1 的训练 + 评测，
+  # 所以默认不建 replay/heldout 池。接 Part 2 之前要先定：给 prepare_conifer 加
+  # jsonl 输出，还是让 collect_cov 也能读 save_to_disk。别默默跳过这个决定。
+  REPLAY_POOL="${REPLAY_POOL:-${RESULTS_ROOT}/datasets/conifer_if_replay}"
+  HELDOUT_POOL="${HELDOUT_POOL:-}"
+  BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-0}"
+else
+  IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/flan_v2_if_100k}"
+  # prepare_flan_v2 的默认命名就是 <out_dir>_replay.jsonl / <out_dir>_heldout.jsonl，
+  # 这里显式写出来只是为了能在产物清单里报路径。
+  REPLAY_POOL="${REPLAY_POOL:-${IF_DATASET}_replay.jsonl}"
+  HELDOUT_POOL="${HELDOUT_POOL:-${IF_DATASET}_heldout.jsonl}"
+  BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-1}"
+fi
 
 # ---- 模式 ----
 MODE="${MODE:-data}"
@@ -384,6 +438,21 @@ SEED="${SEED:-1}"
 FLAN_WEIGHTS="${FLAN_WEIGHTS:-40,40,10,10}"
 FLAN_WEIGHTS="${FLAN_WEIGHTS//:/,}"
 FLAN_TARGET_ROWS="${FLAN_TARGET_ROWS:-100000}"
+# 答案长度重平衡，默认空 = 关闭，池子和这个旋钮存在之前逐行一致。
+# 为什么会需要它：FLAN 的 targets 是分类标签和短答案，100k 池实测答案 p50 = 6 词、
+# 35% 的行只有 1-2 词。拿它训 1 个 epoch 会把生成长度压崩（Qwen2.5-Math-1.5B 上
+# 回答中位数从 base 的 616 词掉到 32 词），于是 IFEval 里所有"要求模型多产出"的
+# 约束成批判死（title -48.6、number_highlighted_sections -41.7、repeat_prompt
+# -41.5、postscript -38.5），而同一次训练里"只限制输出"的约束是大涨的
+# （constrained_response +60、no_comma +36.4、forbidden_words +32.7）——能力学到了，
+# 可花的输出预算没了。冒号写法同 FLAN_WEIGHTS，为了绕开 qsub -v 的逗号分隔：
+#   qsub -v MODE=data,FLAN_ANSWER_BUCKETS=2:15:50,FLAN_ANSWER_WEIGHTS=10:25:35:30 ...
+# 注意它只能重排，造不出 dump 里没有的行：50+ 词的桶只占约 8%，所以高占比只在
+# 前若干行成立，prepare 会打印每一路的"配比可维持行数"。
+FLAN_ANSWER_BUCKETS="${FLAN_ANSWER_BUCKETS:-}"
+FLAN_ANSWER_BUCKETS="${FLAN_ANSWER_BUCKETS//:/,}"
+FLAN_ANSWER_WEIGHTS="${FLAN_ANSWER_WEIGHTS:-}"
+FLAN_ANSWER_WEIGHTS="${FLAN_ANSWER_WEIGHTS//:/,}"
 # Part 2 的 IF protection 池 + C 的语料。replay.py 和 collect_cov 读同一个文件，
 # 这是 71/83 号已经在强制的约束（两边必须同池，否则 OneReplay vs EWC 被"谁拿到
 # 哪批数据"混淆）。
@@ -403,6 +472,26 @@ FLAN_HELDOUT_ROWS="${FLAN_HELDOUT_ROWS:-2000}"
 # 实测重复率约 0.24%，prepare 会把数量报出来。
 FLAN_DEDUP_ACROSS_REMIXES="${FLAN_DEDUP_ACROSS_REMIXES:-0}"
 
+# ---- Conifer 池选项（只在 IF_SOURCE=conifer 时读）----
+# full = 保留每个 Easy-to-Hard turn，这是 Stage 1 的获取池口径。实测扁平化后
+# 38907 行（Easy-to-Hard 35603 + Process Feedback 3304），也就是说 Conifer 全量
+# 就这么多，不像 FLAN 可以靠多下载变大 —— 目标行数不是这条线的可调项。
+# sampled 是 replay 池的口径，每个对话只留一个 turn。
+CONIFER_MODE="${CONIFER_MODE:-full}"
+# 1 只留指令带 IFEval/IFBench 可程序化验证约束（长度、大小写、标点、列表结构、
+# placeholder）的 turn，约 15.6%：拿 ~35.6k 行换 ~5.5k 行更贴评测口径的数据。
+# 这条 source 是来补「产出结构」的，5.5k 行跑 1 epoch 大概不够，所以默认 0。
+CONIFER_FORMAT_ONLY="${CONIFER_FORMAT_ONLY:-0}"
+# 每个 Easy-to-Hard 对话最多留几个 turn，0 = 不限。阶梯是同一个问题逐级加约束，
+# 不限就会让同一个种子问题的多个变体都进池；留的时候从最难那端开始。
+CONIFER_MAX_TURNS="${CONIFER_MAX_TURNS:-0}"
+# 1 把 Process Feedback 子集也加进来，每个对话一行，取被批评后修正过的那个答案。
+CONIFER_INCLUDE_PF="${CONIFER_INCLUDE_PF:-1}"
+# 1（默认）丢掉开头就拒答的行。它们教的正好是这个阶段要建立的能力的反面，而且
+# 不是均匀分布的：拒答集中在每个阶梯的最后一级（4.61% vs 别处 2.23%），因为阶梯
+# 会一直加码到生成器不肯配合。留着会让 sampled/hardest 选中拒答而不是难度。
+CONIFER_DROP_REFUSALS="${CONIFER_DROP_REFUSALS:-1}"
+
 # ---- 训练超参（三条 Stage 1 线统一，见文件头「训练配方」）----
 #
 # BATCH=8 / ACCUM=64：一次更新 64 行，accumulation_steps = ACCUM // BATCH = 8。
@@ -419,8 +508,22 @@ LR="${LR:-5e-5}"
 # 训练开头 train.py 打的那行 `lr schedule: ...` 要和文件头算的更新数对得上。
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
-BATCH="${BATCH:-8}"
+# BATCH 默认按 source 分。FLAN 池 80% 是很短的 zero-shot 行，动态补齐后多数
+# micro-batch 远低于 8x2048 的上界；Conifer 的答案 p50 就有 144 词、p90 315 词，
+# 批内最长更常顶到 MAXLEN，所以给 4。两条 source 的有效 batch 都是 ACCUM=64
+# 行/更新，所以这只影响显存和吞吐，不影响两者可比。
+if [[ "${IF_SOURCE}" == "conifer" ]]; then
+  BATCH="${BATCH:-4}"
+else
+  BATCH="${BATCH:-8}"
+fi
 ACCUM="${ACCUM:-64}"
+# 两条 source 用同一个 2048，训练预算才可比。但**截断的后果方向是相反的**，这
+# 一条必须知道：tokenizer_to_ids 保留序列**末尾**。FLAN 的问题在 prompt 末尾，
+# 截断只是退化成更少 shot 的版本，问题还在；Conifer 把约束写在 user turn 的
+# **开头**，截断会把约束本身切掉，训出来就是「对一个没有约束的问题给出看起来
+# 受约束的答案」，而且完全静默。所以 IF_SOURCE=conifer 跑完 MODE=data 一定要看
+# prepare_conifer 的截断表再回来定这个值。
 MAXLEN="${MAXLEN:-2048}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-500}"
@@ -488,10 +591,14 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 # 开关它会移动所有生成式分数，所以**一张表里的所有 arm 必须同值重评**。
 STOP_ON_IM_END="${STOP_ON_IM_END:-1}"
 
-# run 名保持 part1_if_flanv2_lr<LR>_seed<SEED> 这个形状：95 号解析 Stage 1
+# run 名保持 part1_if_<source>_lr<LR>_seed<SEED> 这个形状：95 号解析 Stage 1
 # checkpoint 时靠它拼名和 glob（part1_if_flanv2_lr*_seed${SEED}）。把 MODEL_NAME
 # 塞进 run 名会让那两条同时失效，所以模型的区分放在 RESULTS_ROOT 上。
-RUN="part1_if_flanv2_lr${LR}_seed${SEED}"
+# source 必须进 run 名而不是只靠 RESULTS_ROOT 分根：两条 source 的 RESULTS_ROOT
+# 已经不同，不会互相覆盖，但如果 Conifer 的 checkpoint 和评测目录也叫 flanv2，
+# 读结果时会把两条线认错。IF_SOURCE=flan 时 tag 就是 flanv2，所以 FLAN 线的 run
+# 名和加 IF_SOURCE 之前逐字相同，95 号的 glob 照旧能命中。
+RUN="part1_if_${IF_SOURCE_TAG}_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
 RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
 
@@ -505,11 +612,17 @@ echo "Stage 1 / IF 线: Base --FLAN-v2--> Model-IF   (full finetune, vanilla)"
 echo "  MODE           : ${MODE}"
 echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  results root   : ${RESULTS_ROOT}"
-echo "  FLAN 取样目录  : ${FLAN_SAMPLE_DIR}"
-echo "  数据池         : ${IF_DATASET}"
-echo "                   ${FLAN_TARGET_ROWS} 行, weights=${FLAN_WEIGHTS} (zs_opt,zs_noopt,fs_opt,fs_noopt)"
-echo "  replay/C 池    : ${REPLAY_POOL}  (${FLAN_REPLAY_ROWS} 行, ${FLAN_REPLAY_MODE})"
-echo "  heldout 池     : ${HELDOUT_POOL}  (${FLAN_HELDOUT_ROWS} 行, 与上两者互斥)"
+if [[ "${IF_SOURCE}" == "conifer" ]]; then
+  echo "  Conifer 原始   : ${CONIFER_PATH}"
+  echo "  数据池         : ${IF_DATASET}   (mode=${CONIFER_MODE}, 全量约 38.9k 行)"
+  echo "  replay 池      : ${REPLAY_POOL}   (BUILD_REPLAY_POOL=${BUILD_REPLAY_POOL})"
+else
+  echo "  FLAN 取样目录  : ${FLAN_SAMPLE_DIR}"
+  echo "  数据池         : ${IF_DATASET}"
+  echo "                   ${FLAN_TARGET_ROWS} 行, weights=${FLAN_WEIGHTS} (zs_opt,zs_noopt,fs_opt,fs_noopt)"
+  echo "  replay/C 池    : ${REPLAY_POOL}  (${FLAN_REPLAY_ROWS} 行, ${FLAN_REPLAY_MODE})"
+  echo "  heldout 池     : ${HELDOUT_POOL}  (${FLAN_HELDOUT_ROWS} 行, 与上两者互斥)"
+fi
 echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
 echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
 echo "  system 消息    : ${SYSTEM_PROMPT}"
@@ -568,6 +681,45 @@ train_one () {
 # 先读这张表再定 EPOCHS，不要直接信文件头里那几个估算值。
 # =============================================================================
 if [[ "${MODE}" == "data" ]]; then
+  if [[ "${IF_SOURCE}" == "conifer" ]]; then
+    [[ -e "${CONIFER_PATH}" ]] || { echo "缺 Conifer 数据: ${CONIFER_PATH}"; exit 1; }
+
+    echo "==== data: Conifer -> ${IF_DATASET} ===="
+    python -m onereplay.scripts.prepare_conifer \
+      --conifer_path "${CONIFER_PATH}" \
+      --out_dir "${IF_DATASET}" \
+      --mode "${CONIFER_MODE}" \
+      --format_constraints_only "${CONIFER_FORMAT_ONLY}" \
+      --max_turns_per_conv "${CONIFER_MAX_TURNS}" \
+      --include_process_feedback "${CONIFER_INCLUDE_PF}" \
+      --drop_refusals "${CONIFER_DROP_REFUSALS}" \
+      --seed "${SEED}" \
+      --max_len "${MAXLEN}" \
+      --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+
+    if [[ "${BUILD_REPLAY_POOL}" == "1" ]]; then
+      echo ""
+      echo "==== data: Conifer replay 池 (mode=sampled) -> ${REPLAY_POOL} ===="
+      python -m onereplay.scripts.prepare_conifer \
+        --conifer_path "${CONIFER_PATH}" \
+        --out_dir "${REPLAY_POOL}" \
+        --mode sampled \
+        --format_constraints_only "${CONIFER_FORMAT_ONLY}" \
+        --include_process_feedback "${CONIFER_INCLUDE_PF}" \
+        --drop_refusals "${CONIFER_DROP_REFUSALS}" \
+        --seed "${SEED}" \
+        --max_len "${MAXLEN}" \
+        --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+    fi
+
+    echo ""
+    echo "数据准备完成。**先看截断表**：Conifer 的约束写在 user turn 开头，而"
+    echo "tokenizer_to_ids 保留序列末尾，截断会静默切掉约束本身，训成「对没有约束"
+    echo "的问题给出看起来受约束的答案」。MAXLEN=${MAXLEN} 的截断率不可接受就调大"
+    echo "再重跑 data。然后 MODE=smoke。"
+    exit 0
+  fi
+
   MISSING=0
   for _label in zs_opt zs_noopt fs_opt fs_noopt; do
     if [[ ! -f "${FLAN_SAMPLE_DIR}/flan_v2_${_label}.jsonl" ]]; then
@@ -596,6 +748,8 @@ if [[ "${MODE}" == "data" ]]; then
     --out_dir "${IF_DATASET}" \
     --target_rows "${FLAN_TARGET_ROWS}" \
     --weights "${FLAN_WEIGHTS}" \
+    --answer_word_buckets "${FLAN_ANSWER_BUCKETS}" \
+    --answer_bucket_weights "${FLAN_ANSWER_WEIGHTS}" \
     --replay_rows "${REPLAY_ROWS_ARG}" \
     --replay_mode "${FLAN_REPLAY_MODE}" \
     --replay_out "${REPLAY_POOL}" \
@@ -626,7 +780,8 @@ fi
 # 另外记下 tokens_per_sec —— 这是判断 BATCH 能不能从 4 提到 8 的唯一依据。
 # =============================================================================
 if [[ "${MODE}" == "smoke" ]]; then
-  train_one "smoke_if_flanv2" 1 "${LR}" "${CKPT_DIR}/smoke_if_flanv2" "${SMOKE_STEPS}" 0
+  train_one "smoke_if_${IF_SOURCE_TAG}" 1 "${LR}" \
+    "${CKPT_DIR}/smoke_if_${IF_SOURCE_TAG}" "${SMOKE_STEPS}" 0
   echo "冒烟完成。记下 peak memory 和 tokens_per_sec。"
   exit 0
 fi
@@ -646,12 +801,13 @@ if [[ "${MODE}" == "lr_sweep" ]]; then
   echo "grid=${LR_GRID}"
   echo "每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次优化器更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
   for lr in ${LR_GRID}; do
-    train_one "sweep_if_flanv2_lr${lr}" 1 "${lr}" "${CKPT_DIR}/sweep_if_flanv2_lr${lr}" \
+    train_one "sweep_if_${IF_SOURCE_TAG}_lr${lr}" 1 "${lr}" \
+      "${CKPT_DIR}/sweep_if_${IF_SOURCE_TAG}_lr${lr}" \
       "${SWEEP_MAX_STEPS}" 0 "${SWEEP_LOG_EVERY}"
   done
   echo "==== LR sweep val loss（同步数下比较，${SWEEP_MAX_STEPS} 步）===="
   for lr in ${LR_GRID}; do
-    f="${METRICS_DIR}/sweep_if_flanv2_lr${lr}.jsonl"
+    f="${METRICS_DIR}/sweep_if_${IF_SOURCE_TAG}_lr${lr}.jsonl"
     if [[ -f "${f}" ]]; then
       echo "lr=${lr}: $(python - "${f}" <<'PY'
 import json, sys
@@ -902,8 +1058,12 @@ echo "========================================================================"
 echo "产物:"
 echo "  IF 池        : ${IF_DATASET}"
 echo "                 manifest -> ${RESULTS_ROOT}/datasets/$(basename "${IF_DATASET}")_manifest.json"
-echo "  replay/C 池  : ${REPLAY_POOL}   (Part 2 用；replay.py 与 collect_cov 读同一份)"
-echo "  heldout 池   : ${HELDOUT_POOL}   (probe.py 的 flan_heldout)"
+if [[ "${IF_SOURCE}" == "conifer" ]]; then
+  echo "  replay 池    : ${REPLAY_POOL}   (save_to_disk；Part 2 读 jsonl，还没对接)"
+else
+  echo "  replay/C 池  : ${REPLAY_POOL}   (Part 2 用；replay.py 与 collect_cov 读同一份)"
+  echo "  heldout 池   : ${HELDOUT_POOL}   (probe.py 的 flan_heldout)"
+fi
 echo "  checkpoint   : ${CKPT}"
 echo "  评测         : ${RESULTS_ROOT}/{ifeval,ifbench,followbench}/<run>/summary.json"
 echo "  汇总 csv     : ${RESULTS_ROOT}/{ifeval,ifbench,followbench}_summary.csv"

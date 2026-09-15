@@ -31,6 +31,28 @@ setting, but it is not what this line wants:
 2021 is -- without letting them own the token budget. The manifest records the
 resulting token shares so the choice stays visible rather than implicit.
 
+Answer length
+-------------
+Flan 2021 targets are classification labels and short spans. Measured on the
+100k pool: answer p50 is 6 words and 35% of rows are one or two words. Training
+100k of those for an epoch collapses generation length -- on Qwen2.5-Math-1.5B
+the response median fell from 616 words at base to 32 -- and IFEval reads that
+as a regression, because about half its constraint types need the model to
+*produce* something extra: a <<title>>, a P.S., N highlighted sections, N
+bullets, the prompt repeated back, two alternative answers. Constraints that
+only restrict the output rose sharply over the same run (punctuation:no_comma
++36 points, keywords:forbidden_words +33, constrained_response +60), so the
+instruction-following was learned; the output budget to spend it on was not.
+
+--answer_word_buckets / --answer_bucket_weights reorder each remix so every
+prefix approximates a target length mix. Reordering, not filtering, so the
+heldout and disjoint-replay slices keep the same distribution as train -- see
+rebalance_by_answer_length. It cannot manufacture rows the dump does not hold:
+the 50+ word bucket is ~8% of a 150k-row sample, so a 30% target holds for
+about 40k rows and then runs dry, and the run prints that ceiling per remix.
+Past it the only ways up are a bigger download (download_flan_v2.py --rows /
+--read_mb) or a second, longer-answered source mixed in.
+
 What this dump cannot do
 ------------------------
 SirNeural/flan_v2's `task` column is the constant string "flan" on every row, so
@@ -167,6 +189,22 @@ def parse_args() -> argparse.Namespace:
         help="Row split over zs_opt,zs_noopt,fs_opt,fs_noopt. '25,25,25,25' is "
         "the official flan2021_submix weighting; see the module docstring for "
         "why the default tilts away from few-shot.",
+    )
+    parser.add_argument(
+        "--answer_word_buckets",
+        type=str,
+        default="",
+        help="Ascending word counts that cut the answers into length buckets, e.g. "
+        "'2,15,50' gives [0,2) [2,15) [15,50) [50,inf). Empty turns the length "
+        "rebalance off, which is the default and reproduces every earlier pool.",
+    )
+    parser.add_argument(
+        "--answer_bucket_weights",
+        type=str,
+        default="",
+        help="Target share per bucket, one more number than --answer_word_buckets "
+        "has edges, e.g. '10,25,35,30'. A share above what the dump holds is "
+        "honoured for a prefix only; the run prints how long it lasts.",
     )
     parser.add_argument(
         "--replay_rows",
@@ -337,6 +375,129 @@ def shuffled_pool(
         seen.add(digest)
         deduped.append(row)
     return deduped
+
+
+def parse_bucket_spec(
+    edges_spec: str, weights_spec: str
+) -> tuple[tuple[int, ...], tuple[float, ...]] | None:
+    """Read the answer-length buckets, or None when the rebalance is off."""
+
+    edges_spec = edges_spec.strip()
+    weights_spec = weights_spec.strip()
+    if not edges_spec and not weights_spec:
+        return None
+    if not edges_spec or not weights_spec:
+        raise SystemExit(
+            "--answer_word_buckets 和 --answer_bucket_weights 必须一起给"
+        )
+    edges = tuple(int(piece) for piece in edges_spec.split(",") if piece.strip())
+    if not edges or list(edges) != sorted(set(edges)) or edges[0] <= 0:
+        raise SystemExit(
+            f"--answer_word_buckets 要是严格递增的正整数，得到 {edges_spec!r}"
+        )
+    values = [float(piece) for piece in weights_spec.split(",") if piece.strip()]
+    if len(values) != len(edges) + 1:
+        raise SystemExit(
+            f"{len(edges)} 个边界切出 {len(edges) + 1} 个桶，"
+            f"--answer_bucket_weights 给了 {len(values)} 个"
+        )
+    if min(values) < 0 or sum(values) <= 0:
+        raise SystemExit("--answer_bucket_weights 要非负，且至少一个为正")
+    total = sum(values)
+    return edges, tuple(value / total for value in values)
+
+
+def bucket_names(edges: tuple[int, ...]) -> list[str]:
+    return [f"{lo}-{hi}" for lo, hi in zip((0, *edges), edges)] + [f"{edges[-1]}+"]
+
+
+def bucket_of(row: dict[str, str], edges: tuple[int, ...]) -> int:
+    words = len(row["targets"].split())
+    for index, edge in enumerate(edges):
+        if words < edge:
+            return index
+    return len(edges)
+
+
+def rebalance_by_answer_length(
+    pool: list[dict[str, str]],
+    edges: tuple[int, ...],
+    shares: tuple[float, ...],
+    wanted: int,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Reorder one remix so that every prefix approximates the target length mix.
+
+    Reordering rather than filtering, because carve_all consumes each pool in
+    order and cuts heldout and disjoint-replay from further down the same list.
+    A filter would leave those slices holding a different length distribution
+    from the training pool, which is exactly what probe.py's flan_heldout curve
+    assumes away.
+
+    Flan 2021 answers are classification labels and short spans -- 35% of this
+    dump is one or two words -- so any target share for the long buckets is well
+    above what they hold and runs dry partway down. `sustainable_rows` is where
+    that happens; past it the surviving buckets carry on at their relative
+    shares, and no row is dropped.
+    """
+
+    buckets: list[list[dict[str, str]]] = [[] for _ in range(len(edges) + 1)]
+    for row in pool:
+        buckets[bucket_of(row, edges)].append(row)
+    capacity = [len(bucket) for bucket in buckets]
+
+    # The first weighted bucket to run dry caps how far the mix holds.
+    sustainable = min(
+        (
+            int(capacity[index] / shares[index])
+            for index in range(len(shares))
+            if shares[index] > 0
+        ),
+        default=0,
+    )
+
+    cursors = [0] * len(buckets)
+    taken = [0] * len(buckets)
+    ordered: list[dict[str, str]] = []
+    for step in range(len(pool)):
+        # Deficit round robin: draw from whichever live bucket is furthest
+        # behind its share of the prefix so far, which keeps any prefix within
+        # one row per bucket of the target mix while the buckets last.
+        best = -1
+        best_deficit = 0.0
+        for index in range(len(buckets)):
+            if shares[index] <= 0 or cursors[index] >= capacity[index]:
+                continue
+            deficit = shares[index] * (step + 1) - taken[index]
+            if best < 0 or deficit > best_deficit:
+                best, best_deficit = index, deficit
+        if best < 0:
+            # Every weighted bucket is spent. Append the rest -- zero-weight
+            # buckets included -- so the pool still holds every row it had and
+            # an over-large --target_rows degrades instead of failing.
+            for index in range(len(buckets)):
+                ordered.extend(buckets[index][cursors[index] :])
+                cursors[index] = capacity[index]
+            break
+        ordered.append(buckets[best][cursors[best]])
+        cursors[best] += 1
+        taken[best] += 1
+
+    names = bucket_names(edges)
+    head = ordered[: wanted if wanted > 0 else len(ordered)]
+    achieved = collections.Counter(bucket_of(row, edges) for row in head)
+    report = {
+        "capacity": {names[index]: capacity[index] for index in range(len(names))},
+        "target_share": {
+            names[index]: round(shares[index], 4) for index in range(len(names))
+        },
+        "achieved_share": {
+            names[index]: round(achieved[index] / len(head), 4) if head else 0.0
+            for index in range(len(names))
+        },
+        "rows_considered": len(head),
+        "sustainable_rows": sustainable,
+    }
+    return ordered, report
 
 
 def carve_all(
@@ -677,6 +838,7 @@ def length_report(
 def main() -> None:
     args = parse_args()
     weights = parse_weights(args.weights)
+    bucket_spec = parse_bucket_spec(args.answer_word_buckets, args.answer_bucket_weights)
 
     out_dir = Path(args.out_dir)
     replay_out = Path(args.replay_out) if args.replay_out else out_dir.parent / f"{out_dir.name}_replay.jsonl"
@@ -707,12 +869,62 @@ def main() -> None:
 
     stats: collections.Counter = collections.Counter()
     pools: dict[str, list[dict[str, str]]] = {}
+    length_mix: dict[str, Any] = {}
     for label in REMIX_ORDER:
         wanted = sum(budgets[name].get(label, 0) for name in ("train", "replay", "heldout"))
         if wanted == 0:
             continue
         raw = load_remix(Path(args.sample_dir), label)
         pools[label] = shuffled_pool(raw, label, args, stats)
+        if bucket_spec is not None:
+            # What the mix actually has to cover is the rows carve_all draws off
+            # this pool. A nested replay slice is a prefix of the training one,
+            # so it costs nothing extra; only a disjoint draw does.
+            consumed = budgets["train"].get(label, 0) + budgets["heldout"].get(label, 0)
+            if args.replay_mode == "disjoint":
+                consumed += budgets["replay"].get(label, 0)
+            pools[label], length_mix[label] = rebalance_by_answer_length(
+                pools[label], bucket_spec[0], bucket_spec[1], consumed
+            )
+
+    if length_mix:
+        edges, shares = bucket_spec
+        names = bucket_names(edges)
+        print("==== 答案长度重平衡（按答案词数分桶）====")
+        print(
+            "  目标配比 : "
+            + "  ".join(f"{names[i]}={shares[i]:.0%}" for i in range(len(names)))
+        )
+        starved = []
+        for label in REMIX_ORDER:
+            entry = length_mix.get(label)
+            if entry is None:
+                continue
+            need = entry["rows_considered"]
+            hold = entry["sustainable_rows"]
+            flag = "" if hold >= need else "   << 配比撑不到需求量"
+            print(
+                f"  {label:<9} 可用 {len(pools[label]):>7,} 行，"
+                f"需要 {need:>7,}，配比可维持 {hold:>7,}{flag}"
+            )
+            print(
+                "            桶容量   "
+                + "  ".join(f"{name}={entry['capacity'][name]:,}" for name in names)
+            )
+            print(
+                "            实际达成 "
+                + "  ".join(f"{name}={entry['achieved_share'][name]:.1%}" for name in names)
+            )
+            if hold < need:
+                starved.append(label)
+        if starved:
+            print(
+                f"\n  !! {', '.join(starved)} 的长桶在取满之前就空了，"
+                "所以实际达成那一行才是这个池真正的长度分布。"
+                "\n     想真正推高长回答占比，只有调大 download_flan_v2.py 的 "
+                "--rows / --read_mb 重拉，或者混入别的长回答数据源。"
+            )
+        print()
 
     slices = carve_all(pools, budgets, args, stats)
 
@@ -807,6 +1019,18 @@ def main() -> None:
         "dedup": args.dedup,
         "dedup_across_remixes": args.dedup_across_remixes,
         "replay_mode": args.replay_mode,
+        "answer_length_rebalance": {
+            "buckets": args.answer_word_buckets,
+            "weights": args.answer_bucket_weights,
+            "note": "empty means off, i.e. the pool keeps Flan 2021's own answer "
+            "length distribution (p50 = 6 words, 35% of rows at 1-2 words). "
+            "Training on that collapses generation length, which reads as an "
+            "IFEval drop on every constraint that needs the model to produce "
+            "extra content -- title, postscript, repeat_prompt, bullet lists.",
+            "per_remix": length_mix,
+        }
+        if bucket_spec is not None
+        else {"buckets": "", "weights": "", "per_remix": {}},
         "train": {
             "path": str(out_dir),
             "num_rows": len(train_rows),
