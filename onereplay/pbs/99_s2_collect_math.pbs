@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 #PBS -P CFP03-SF-101
 #PBS -N p3_cf_math
 #PBS -j oe
@@ -65,21 +65,22 @@
 # 路径调的是同一个排列函数，产物逐字相同。
 #
 # -----------------------------------------------------------------------------
-# 【max_len=4096：换成 NuminaMath 之后这条线便宜了将近一个数量级】
+# 【max_len=2048：换成 NuminaMath 之后这条线便宜了将近一个数量级】
 #
 # 必须和三处对齐：
-#   1) Stage 1 训练时 91 号用的 MAXLEN=4096
+#   1) Stage 1 训练时 91 号用的 MAXLEN=2048
 #   2) 本脚本采 C 和 F
-#   3) Stage 2（101 号）训练时 replay 行的 --replay_max_len 4096
+#   3) Stage 3 训练时 replay 行的 --replay_max_len 2048
 #
-# 第 3 条是 replay.py 里 replay_max_len() 那段注释的镜像：Part 3 的新任务是 FLANv2，
-# --max_len 是 1536，但 replay 行是 math，**不能**跟着用 1536（Numina 的全序列 P90 就
-# 有 942 token，1536 会开始切，「replay 复习的旧知识」比「C 编码的旧知识」少一截，两条
-# 臂不再是同一份旧知识）。两边都得显式传。
+# 第 3 条是 replay.py 里 replay_max_len() 那段注释的镜像：Stage 3 往 IF 方向续训时
+# 新任务的 --max_len 是 1536，但 replay 行是 math，**不能**跟着用 1536（Numina 的
+# 全序列 P90 就有 942 token，1536 会开始切，「replay 复习的旧知识」比「C 编码的旧知
+# 识」少一截，两条臂不再是同一份旧知识）。往 CS 方向的 512 更是差得远。两边都得显
+# 式传。
 #
-# prepare_numina_math 的 length report（50k 行，Qwen3 tokenizer + chat template）：
+# prepare_numina_math 的 length report（Qwen 系 tokenizer + chat template）：
 #     全序列 P50=479  P90=942  P95=1118  P99=1507  max=2810
-# 所以 4096 下截断 **0 行**。OpenR1 那版需要 8192（P99=8004）是因为 R1 traces 的
+# 所以 2048 下只有极少数行被切。OpenR1 那版需要 8192（P99=8004）是因为 R1 traces 的
 # 答案中位就有 3767 token；换数据集的动机正是那个长度本身。
 #
 # -----------------------------------------------------------------------------
@@ -209,7 +210,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/99_part3_cf_math_openr1.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/99_s2_collect_math.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -255,7 +256,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME MATH_LINE_ROOT MATH_CKPT_DIR MATH_LR MATH_RUN MATH_CKPT
     TRAIN_POOL RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT POOL_SAMPLE_SEED
     MODE DRY_RUN FORCE DO_COV DO_FISHER
-    SEED SAMPLE_SEED MAXLEN SCOPE TARGET_MODULES
+    SEED SAMPLE_SEED MAXLEN SCOPE TARGET_MODULES SYSTEM_PROMPT
     COV_BATCH COV_ACCUM_DEVICE COV_USE_BF16 COV_PATH
     FISHER_DEVICE FISHER_USE_BF16 FISHER_PATH MAX_SAMPLES LOG_EVERY
     TAG REF_COV REF_LAMBDA_FULL REF_LAMBDA_QV DEBUG_EXAMPLES
@@ -306,14 +307,21 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 
 cd "${REPO_ROOT}"
 
+# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+
 # ---- Stage 1（Math 线 / NuminaMath-CoT）的产物，本脚本只读 ----
-# Model-Math 现在是 91 号用 NuminaMath 50k 训出来的那一个，不是 OpenR1 那一版。
-# 它就是 Stage 2 的 W0，所以 C/F 必须采在它身上。
-MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_numina_math}"
+# Model-Math 是 91 号用 NuminaMath 100k 训出来的那一个，它就是 Stage 3 的 W0，
+# 所以 C/F 必须采在它身上。结果树按模型分根，与 91 号的 RESULTS_ROOT 同构：
+# **91 号换了 MODEL_NAME 就必须在这里一起换**，否则会静默采到另一个模型的
+# checkpoint 上（那个目录也存在，run 名还完全一样）。
+MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_numina_${MODEL_NAME}}"
 MATH_CKPT_DIR="${MATH_CKPT_DIR:-${MATH_LINE_ROOT}/checkpoints}"
 # 91 号的 MATH_DATASET 默认值。注意它在 ${REPO_ROOT}/datasets/ 下而不是结果树里
 # （prepare_numina_math.py 直接写在那），MODE=pool 从它上面切池子（只读）。
-TRAIN_POOL="${TRAIN_POOL:-${REPO_ROOT}/datasets/numina_math_50k}"
+# 训练池不按模型分——它只是数据，和权重无关。
+TRAIN_POOL="${TRAIN_POOL:-${REPO_ROOT}/datasets/numina_math_100k}"
 # <训练池目录>_replay.jsonl，schema {inputs, targets, data_source, source_index}。
 # MODE=pool 走 prepare_openr1_math 的 replay_row_order + to_replay_row —— Numina 池的
 # 列名（instruction/output/data_source/source_index）与 OpenR1 池相同，所以那对函数
@@ -324,14 +332,13 @@ POOL_ROWS_EXPECT="${POOL_ROWS_EXPECT:-20000}"
 # REPLAY_SAMPLE_SEED 一致，否则两条产池路径给出不同的 20k 行。
 POOL_SAMPLE_SEED="${POOL_SAMPLE_SEED:-1}"
 
-# ---- Part 3 自己的结果树。与 results_part1_* / results_part2_* 分开 ----
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part3_math2if}"
+# ---- Stage 2 自己的结果树。与 results_part1_* 分开 ----
+# 名字里不带目标域（原来叫 math2if）：C_math / F_math 只取决于 Stage 1 的模型和
+# 旧知识池，和 Stage 3 往哪个方向续训无关。同一份 C_math 给 math->if 和
+# math->cs 两条 Stage 3 线共用。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_stage2_math_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
-
-# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
-MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
 
 # ---- 模式与阶段开关 ----
 # MODE=pool 只切池子然后退出（纯 CPU）。默认 collect 走 Step 0 -> 1 -> 2 -> 3 -> 4。
@@ -344,10 +351,17 @@ DO_FISHER="${DO_FISHER:-1}"
 # ---- 共用的采集口径 ----
 SEED="${SEED:-1}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
-# 必须等于 91 号训练时的 MAXLEN，也必须等于 Stage 2 的 --replay_max_len（见文件头）。
-# Numina 全序列 P50=479 P90=942 P99=1507 max=2810，4096 下截断 0 行，所以 8192 只是
-# 白付 attention 的 T² 成本和显存。
-MAXLEN="${MAXLEN:-4096}"
+# 必须等于 91 号训练时的 MAXLEN，也必须等于 Stage 3 的 --replay_max_len（见文件头）。
+# Numina 全序列 P50=479 P90=942 P99=1507 max=2810，2048 下截断的行极少，而 91 号
+# 用的就是 2048 —— 对齐训练侧优先于多留余量。
+MAXLEN="${MAXLEN:-2048}"
+# ---- system 消息：math 线**刻意留空**，必须与 91 号训练时一致 ----
+# 空 = 不传 system turn = Qwen2.5-Math 的模板自动注入
+#     "Please reason step by step, and put your final answer within \boxed{}."
+# 91 号就是在这个渲染下训的（那是它要复现的配方），所以采集这边也必须留空，
+# C/F 才和模型在 Stage 3 起点上真实会看到的文本分布一致。
+# 95 号（IF）和 101 号（CS）相反，它们传一条中性 system 消息把注入顶掉。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 # scope 对 C 和 F 必须相同，否则 EWC 和 onereplay 约束的层集合不同，对照失效。
 SCOPE="${SCOPE:-full}"
 case "${SCOPE}" in
@@ -690,6 +704,7 @@ if [[ "${DO_COV}" == "1" ]]; then
       --input_column inputs --target_column targets \
       --require_target 1 \
       --use_chat_template 1 --include_target_in_chat 1 \
+      --system_prompt "${SYSTEM_PROMPT}" \
       --enable_thinking 0 --concat_prompt_target 0 \
       --debug_print_examples "${DEBUG_EXAMPLES}" \
       --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
@@ -890,6 +905,7 @@ if [[ "${DO_FISHER}" == "1" ]]; then
       --input_column inputs --target_column targets \
       --require_target 1 \
       --use_chat_template 1 --include_target_in_chat 1 \
+      --system_prompt "${SYSTEM_PROMPT}" \
       --max_samples "${MAX_SAMPLES}" --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
       --max_len "${MAXLEN}" \
       --truncation_side left \

@@ -21,6 +21,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from onereplay.core.chat_policy import configure_system_prompt  # noqa: E402
 from onereplay.eval.generation import configure_decoding, describe_decoding  # noqa: E402
 from onereplay.eval.runner import run_evaluation  # noqa: E402
 
@@ -77,6 +78,13 @@ def parse_args() -> argparse.Namespace:
     # '<|endoftext|>', so 1 is the more correct setting. Turning it on shifts
     # every generative score, so all arms have to be re-decoded together.
     parser.add_argument("--decode_stop_on_im_end", type=int, default=0)
+    # Qwen2.5-Math's template injects "put your final answer within \boxed{}"
+    # when no system turn is given. That is the recipe on the math line and a
+    # contaminant on the IF and commonsense lines, so those pass a neutral
+    # system message here. It must match the value train.py was given, or the
+    # model is evaluated under a prompt it was never trained on. Empty keeps
+    # the template default, which is what every pre-Qwen2.5-Math run used.
+    parser.add_argument("--system_prompt", type=str, default="")
 
     parser.add_argument("--dataset_path", type=str, default="")
     parser.add_argument("--max_val_samples", type=int, default=1000)
@@ -164,6 +172,7 @@ def main() -> None:
     for consumed in ("metrics", "out_dir", "adapter_path", "run_name", "model_dir", "model_name"):
         metric_cfg.pop(consumed, None)
 
+    configure_system_prompt(args.system_prompt)
     configure_decoding(
         stop_on_im_end=bool(args.decode_stop_on_im_end),
         no_repeat_ngram_size=args.decode_no_repeat_ngram,

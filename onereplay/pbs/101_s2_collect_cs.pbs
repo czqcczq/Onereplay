@@ -291,7 +291,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/101_part4_cf_comminsence.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/101_s2_collect_cs.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -337,6 +337,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME CS_LINE_ROOT CS_CKPT_DIR CS_LR CS_RUN CS_CKPT
     TRAIN_POOL REPLAY_POOL_DIR TRAIN_MANIFEST REPLAY_MANIFEST
     RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT POOL_SAMPLE_SEED POOL_STRATEGY
+    SYSTEM_PROMPT
     MODE DRY_RUN FORCE DO_COV DO_FISHER
     SEED SAMPLE_SEED MAXLEN SCOPE TARGET_MODULES
     COV_BATCH COV_ACCUM_DEVICE COV_USE_BF16 COV_PATH
@@ -389,11 +390,20 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 
 cd "${REPO_ROOT}"
 
+# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+
 # ---- Stage 1（CS 线 / Commonsense170k）的产物，本脚本只读 ----
-CS_LINE_ROOT="${CS_LINE_ROOT:-${REPO_ROOT}/results_part1_cs}"
+# 结果树按模型分根，与 93 号的 RESULTS_ROOT 同构：**93 号换了 MODEL_NAME 就必须
+# 在这里一起换**，否则会静默采到另一个模型的 checkpoint 上（那个目录也存在，
+# run 名还完全一样）。
+CS_LINE_ROOT="${CS_LINE_ROOT:-${REPO_ROOT}/results_part1_cs_${MODEL_NAME}}"
 CS_CKPT_DIR="${CS_CKPT_DIR:-${CS_LINE_ROOT}/checkpoints}"
 # 93 号的 CS_DATASET 默认值（Stage 1 真正训过的那个池）。MODE=pool 只读它。
-TRAIN_POOL="${TRAIN_POOL:-${CS_LINE_ROOT}/datasets/commonsense_full}"
+# 93 号现在默认采样 100k（CS_POOL_MODE=sampled），所以目录名是 commonsense_100k；
+# 用 CS_POOL_MODE=full 训的话这里要跟着改。
+TRAIN_POOL="${TRAIN_POOL:-${CS_LINE_ROOT}/datasets/commonsense_100k}"
 # 93 号 BUILD_REPLAY_POOL=1 顺手产出的 20k 平衡池（save_to_disk）。在的话 MODE=pool
 # 直接 dump 它，不在就从 TRAIN_POOL 上按同 seed/strategy 现切。
 REPLAY_POOL_DIR="${REPLAY_POOL_DIR:-${CS_LINE_ROOT}/datasets/commonsense_replay}"
@@ -415,14 +425,12 @@ POOL_SAMPLE_SEED="${POOL_SAMPLE_SEED:-1}"
 # 必须等于 93 号的 REPLAY_STRATEGY（默认 balanced）。理由见文件头「池子」一节。
 POOL_STRATEGY="${POOL_STRATEGY:-balanced}"
 
-# ---- Part 4 自己的结果树。与 results_part1_* / results_part2_* / results_part3_* 分开 ----
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part4_cs2if}"
+# ---- Stage 2 自己的结果树。与 results_part1_* 分开 ----
+# 名字里不带目标域（原来叫 cs2if）：C_cs / F_cs 只取决于 Stage 1 的模型和旧知识
+# 池，和 Stage 3 往哪个方向续训无关。同一份 C_cs 给 cs->if 和 cs->math 共用。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_stage2_cs_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
-
-# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
-MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
 
 # ---- 模式与阶段开关 ----
 # MODE=pool 只落池子然后退出（纯 CPU）。默认 collect 走 Step 0 -> 1 -> 2 -> 3 -> 4。
@@ -438,6 +446,16 @@ SAMPLE_SEED="${SAMPLE_SEED:-1}"
 # 必须等于 93 号 MODE=train **实际用的** MAXLEN，也必须等于 Stage 2 的 --replay_max_len。
 # 512 是 93 号的默认值，而它文件头说过那是个待验证的占位值 —— 改过就必须在这里显式传。
 MAXLEN="${MAXLEN:-512}"
+# ---- system 消息：必须与 93 号训练时逐字相同 ----
+# 换成 Qwen2.5-Math-1.5B 之后，没有 system turn 时 chat template 会自动注入
+# "Please reason step by step, and put your final answer within \boxed{}."。
+# 93 号因此给 CS 线固定传了一条中性 system 消息。collect_cov / collect_fisher 的
+# --system_prompt 默认是空串，不传的话：
+#     训练时模型看到的  = [system: 中性] + [user: 题目] + [assistant: the correct answer is x]
+#     C/F 看到的        = [system: 数学 \boxed 指令] + [user: 题目] + [assistant: ...]
+# 两者不是同一个文本分布，C 描述的就不是模型在 Stage 3 起点上真实会看到的方向。
+# 不报错、C 照样写得出来、训练照样跑。93 号改了这里必须跟着改。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
 # scope 对 C 和 F 必须相同，否则 EWC 和 onereplay 约束的层集合不同，对照失效。
 SCOPE="${SCOPE:-full}"
 case "${SCOPE}" in
@@ -1031,6 +1049,7 @@ if [[ "${DO_COV}" == "1" ]]; then
       --input_column inputs --target_column targets \
       --require_target 1 \
       --use_chat_template 1 --include_target_in_chat 1 \
+      --system_prompt "${SYSTEM_PROMPT}" \
       --enable_thinking 0 --concat_prompt_target 0 \
       --debug_print_examples "${DEBUG_EXAMPLES}" \
       --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
@@ -1270,6 +1289,7 @@ if [[ "${DO_FISHER}" == "1" ]]; then
       --input_column inputs --target_column targets \
       --require_target 1 \
       --use_chat_template 1 --include_target_in_chat 1 \
+      --system_prompt "${SYSTEM_PROMPT}" \
       --max_samples "${MAX_SAMPLES}" --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
       --max_len "${MAXLEN}" \
       --truncation_side left \

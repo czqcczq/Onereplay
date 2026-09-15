@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 #PBS -P CFP03-SF-101
 #PBS -N p1_if_flan
 #PBS -j oe
@@ -9,19 +9,47 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 1 / IF 线第二点: Qwen3-1.7B-Base --FLAN-v2--> Model-IF-FLAN
-#                      评 IFEval + IFBench + FollowBench
+# Stage 1 / IF 线: Qwen2.5-Math-1.5B --FLAN-v2--> Model-IF
+#                  评 IFEval + IFBench + FollowBench
 #
-#     Base ---- FLAN v2 / Flan 2021 (50000 单轮样本) ----> Model-IF-FLAN
+#     Base ---- FLAN v2 / Flan 2021 (100000 单轮样本) ----> Model-IF
 #     评测: IFEval, IFBench, FollowBench      对照: base
 #
-# 90 号是同一条线的 Conifer 点。两个脚本除了数据以外的超参都对齐（BATCH/ACCUM/
-# MAXLEN/LR grid 全同），因为这两点存在的意义就是在**只改数据**的前提下比较，
-# 唯一故意不同的是 EPOCHS（见下面 token 预算一节）。
+# 三条 Stage 1 线（91 号 math / 93 号 cs / 本脚本 if）现在共用同一个 base 和
+# 同一套训练配方：100k 行 / 1 epoch / lr 5e-5 / cosine + warmup 0.1。只有数据
+# 和评测不同。换成 Qwen2.5-Math-1.5B 的理由见 91 号文件头：Qwen3-1.7B-Base 上
+# 训练 math 前后没有差别，这个模型上有，而 Stage 2/3 的交叉实验要求三条线的
+# base 是同一个权重。
 #
-# 这一点在 prepare_conifer.py 文件头描述的 alignment gradient 上处于最不对齐的
-# 一端：
-#     FLAN v2（通用指令）-> Conifer 全量（混合约束）-> Conifer fmt-only（可验证约束）
+# 代价是 base 偏科：一个数学专用模型在 IFEval 上的起点会很低。本线读的是
+# base -> Model-IF 的**方向和幅度**，不是绝对值，所以这不影响结论。
+#
+# -----------------------------------------------------------------------------
+# 【Qwen2.5-Math 换模型带来的三个坑，三个都是静默的】
+#
+# 1) **chat template 会自动注入一条数学 system 指令**。没有 system 消息时，
+#    Qwen2.5-Math 的模板补上
+#        "Please reason step by step, and put your final answer within \boxed{}."
+#    而 data/chat.py 的 apply_train_template 和 eval/generation.py 的 render_chat
+#    都只传 user 角色。math 线上这正是论文的 "default chat template + CoT
+#    prompting"（91 号就靠它），在 IF 线上却是污染：每一条 FLAN 训练行和每一条
+#    IFEval/IFBench/FollowBench 评测 prompt 都会被要求输出 \boxed{}。IFEval 里
+#    大量约束是"不要用逗号"、"回答分三段"这类，和 \boxed{} 直接冲突。
+#    所以本线**必须**传 SYSTEM_PROMPT（默认已给一条中性的 Qwen2.5 助手消息），
+#    它同时传给 train.py 和 evaluate.py。两边不一致 = 模型在没训过的 prompt 下
+#    被评测，分数无意义。93 号（commonsense）同理，91 号（math）留空。
+#
+# 2) **eos_token 是 <|endoftext|>，但 chat template 用 <|im_end|> 收尾**。模型
+#    吐出 <|im_end|> 时 generate 不会停，会续写下一轮对话，skip_special_tokens
+#    再把那段拼到答案后面 —— IFEval 的约束检查和 FollowBench 的判分都会读到多
+#    出来的那段。evaluate.py 的 --decode_stop_on_im_end 默认是 0，本脚本固定传 1。
+#
+# 3) **上下文硬上限 4096**（config.json 的 max_position_embeddings；
+#    tokenizer_config 里的 model_max_length=131072 是假的）。这一条只咬评测：
+#    训练 MAXLEN=1536 远在窗口内，但 FollowBench 的 example 类把 few-shot 示例
+#    内联进 instruction，prompt P90=2516 / max=5019 token。prompt 本身就超窗口
+#    的那几行没救（要么 FB_CATEGORIES 排除 example，要么接受），但生成预算必须
+#    收住：三个 MAX_NEW_TOKENS 因此都从 2048 降到 1024（见下面「评测预算」一节）。
 #
 # -----------------------------------------------------------------------------
 # 【这条线最可能被误读的地方：FLAN v2 的答案极短】
@@ -72,25 +100,30 @@
 #     近似的混合指纹，不是任务分布，别当后者用。
 #
 # -----------------------------------------------------------------------------
-# 【token 预算：为什么 EPOCHS 默认 1，以及 1 epoch 并没有对齐 Conifer】
+# 【训练配方：100k 行 / 1 epoch / 5e-5 / cosine + warmup 0.1，三条线统一】
 #
-# 90 号是 38906 行 / MAXLEN 1536 / 11.41M tok/epoch / EPOCHS=3 = 总共 34.2M token。
+# 数据量和 schedule 都对齐 91 号（它对齐的是 DFT/ICLR2026 §4.1 对 Qwen2.5-Math
+# 系列的配方）。本线沿用同一套不是因为 FLAN 属于那篇论文的实验，而是因为三条
+# Stage 1 线必须只差数据 —— Stage 3 要比较「从 IF 出发」和「从 math 出发」的
+# 遗忘，起点的训练强度不同就没法归因。
 #
-# 本池 50000 行 / 40:40:10:10 / MAXLEN 1536 ≈ 14.3M tok/epoch。所以：
+# 1 epoch 也正好是 FLAN v2 自己的标准配方：它实际是无限量的，不重复样本，而且
+# 30 token 的答案重复几遍很容易变成背答案。
 #
-#     EPOCHS=1  ->  14.3M  = Conifer 预算的 42%
-#     EPOCHS=2  ->  28.5M  = 83%
-#     EPOCHS=2.4 -> 34.2M  = 对齐（非整数，实际取 2 或 3）
-#     EPOCHS=3  ->  42.8M  = 125%
+# 本池 100000 行 / 40:40:10:10 / MAXLEN 1536 ≈ 28.6M tok/epoch。
 #
-# 默认 1 是因为 FLAN v2 实际是无限量的，1 epoch 不重复样本是它的标准配方，而且
-# 30 token 的答案重复三遍很容易变成背答案。但**这不是对齐 token**，报结果时要么
-# 说清是 42% 预算，要么把池子扩到约 12 万行再跑 1 epoch。MODE=data 的长度报告会
-# 把这三个数和「对齐需要几个 epoch」直接打出来，以它为准。
+# **warmup 不是可选项**。train.py 在加 --lr_scheduler 之前是裸 torch.optim.Adam、
+# 恒定 LR、无 warmup。全参微调在 5e-5 下第一次更新落在一个离自己最优点很远的
+# 模型上，没有 warmup 的那一步就是 loss 尖峰的来源。schedule 按**优化器更新**
+# 推进：99000 行 / BATCH 8 = 12375 micro-batch，除以 accumulation_steps 8 =
+# 1547 次更新，前 155 次是 warmup。训练开头 train.py 会打一行
+#     `lr schedule: cosine over ... updates, warmup ... updates`
+# **对不上就说明池子行数或 BATCH/ACCUM 和这里的假设不一致，停下来查**。
 #
 # 还有一个比总 token 更重要的口径差：**带 loss 的答案 token**。label 只在答案上，
-# 而 FLAN 的答案均值约 30 token、Conifer 约 218。即使总 token 对齐了，监督信号
-# 也差一个量级。长度报告单独打了这一行。
+# 而 FLAN 的答案均值约 30 token。所以本线的 28.6M 总 token 里真正带监督的只有
+# 约 3M，和 math 线（Numina 答案 P50=351）差一个量级。长度报告单独打了这一行，
+# 跨线比较 val loss 的绝对值时必须记得这件事。
 #
 # -----------------------------------------------------------------------------
 # 【MAXLEN 1536：和 90 号同值，但截断的后果完全不同】
@@ -106,12 +139,23 @@
 # 1024 下 fs_opt 升到 4.6%。1536 沿用 90 号既够用又保持可比，不用为 FLAN 单独调。
 #
 # -----------------------------------------------------------------------------
-# 【评测比 90 号贵三倍：FollowBench 是新加的】
+# 【评测预算：三个都从 2048 降到 1024，这是 4096 窗口逼出来的】
 #
-# IFEval 541 行 @1024 + IFBench 300 行 @2048 + FollowBench 820 行 @2048。
-# 按 92 号的估计，FollowBench 约是 IFBench 的 3 倍时间，所以一次 eval 的总量大约
-# 是 90 号的 3-4 倍。base 那一行还会更慢（Qwen3-1.7B-Base 没经过 instruct tuning，
-# 不会正常收尾，每个 prompt 都跑满 max_new_tokens）。
+# IFEval 541 行 + IFBench 300 行 + FollowBench 820 行，全部 @1024。
+#
+# 为什么不能更大：Qwen2.5-Math-1.5B 的 max_position_embeddings=4096，prompt +
+# 生成一旦越过它，输出落在 RoPE 外推区、不可信。FollowBench 的 example 类
+# prompt P90=2516，配 2048 的生成预算就是 4564 —— 已经出界。1024 让 P90 那档
+# 落在 3540，留出余量；prompt 本身就超 4096 的极少数行（max=5019）任何预算都
+# 救不了，要么 FB_CATEGORIES 排除 example，要么在读数时把它们当已知损失。
+#
+# 为什么够用：训练数据的答案 P50 只有 18 token，Model-IF 学到的回答长度被这个
+# 分布封住，1024 远超它。base 那一行会更慢也更容易跑满预算（一个数学专用模型
+# 面对 IF prompt 不会正常收尾），但那正是要测的东西。
+#
+# 改这三个值必须整张结果表一起重评，不能和旧数字混用。
+#
+# 按 92 号的估计 FollowBench 约是 IFBench 的 3 倍时间，所以它占一次 eval 的大头。
 #
 # 所以本脚本允许把评测拆开跑，用三个独立开关：
 #     MODE=eval,DO_FOLLOWBENCH=0          先把便宜的两个跑掉
@@ -132,7 +176,7 @@
 #
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，第 2 条必须先在登录节点做完
-#   1) 模型   ${MODEL_DIR}/${MODEL_NAME}   (Qwen3-1.7B-Base)
+#   1) 模型   ${MODEL_DIR}/${MODEL_NAME}   (Qwen2.5-Math-1.5B)
 #   2) FLAN v2 取样（**登录节点，约 10 min，600MB 网络，原始 gz 不落盘**）：
 #        python -m onereplay.scripts.download_flan_v2 \
 #          --out_dir ${REPO_ROOT}/datasets/flan_v2
@@ -141,9 +185,13 @@
 #      都不会写到盘上，所以不占你那 150GB 冗余。
 #      日志里会打一张平稳性表（TVD(block, window)），实测四路都在 0.010-0.012，
 #      这是「只能从 gz 流头部读」不引入偏置的依据。
-#      默认取样量对本脚本是够的：40/40/10/10 建 50k 训练池 + 2k heldout 需要
-#      20800/20800/5200/5200 行；就算切 disjoint replay 也只要 28800/28800/
-#      7200/7200，都在 60k/60k/15k/15k 之内。
+#      **默认取样量对 100k 池刚好够用，余量很小，先核一眼**：40/40/10/10 建
+#      100k 训练池 + 2k heldout 需要 40800/40800/10200/10200 行，默认下载的是
+#      60k/60k/15k/15k。zs 两路余量 47%、fs 两路余量 47%，够；但如果当初是用
+#      非默认 --rows 下的，或者要切 disjoint replay（再加 20k，需要
+#      48800/48800/12200/12200），就要先在登录节点核对四个 jsonl 的行数：
+#        wc -l ${REPO_ROOT}/datasets/flan_v2/flan_v2_*.jsonl
+#      不够就重跑 download_flan_v2 并调 --rows。
 #      改大 FLAN_TARGET_ROWS 之后要回去看 MODE=data 的输出：配额没凑满时
 #      prepare 会打一行 "!! 配额没满足" 并说明该调哪个 --rows。注意那只是
 #      **警告不是报错**，退出码仍是 0，所以别只看作业成功就往下走。
@@ -153,29 +201,28 @@
 #
 # 【用法】
 #   # 0) 建池 + 看长度报告和 token 预算（CPU 即可，约 5 min）
-#   qsub -v MODE=data onereplay/pbs/94_part1_if_flanv2.pbs
+#   qsub -v MODE=data onereplay/pbs/94_s1_train_if.pbs
 #
 #   # 1) 冒烟：20 步，看 loss 在动、peak memory 和 tokens/s
-#   qsub -v MODE=smoke onereplay/pbs/94_part1_if_flanv2.pbs
+#   qsub -v MODE=smoke onereplay/pbs/94_s1_train_if.pbs
 #
-#   # 2) 选 LR（数据换了，不能照搬 90 号选出来的值）
-#   qsub -v MODE=lr_sweep onereplay/pbs/94_part1_if_flanv2.pbs
+#   # 2) 正式训练（100k / 1 epoch）+ 评测。LR 由配方给定 5e-5，不需要 sweep。
+#   qsub -v MODE=train onereplay/pbs/94_s1_train_if.pbs
 #
-#   # 3) 正式训练（1 epoch 约 25-45 min）+ 评测
-#   qsub -v MODE=train,LR=2e-5 onereplay/pbs/94_part1_if_flanv2.pbs
+#   # 3) 只评测，且拆开跑以免卡 walltime
+#   qsub -v MODE=eval,DO_FOLLOWBENCH=0          onereplay/pbs/94_s1_train_if.pbs
+#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0  onereplay/pbs/94_s1_train_if.pbs
 #
-#   # 4) 只评测，且拆开跑以免卡 walltime
-#   qsub -v MODE=eval,LR=2e-5,DO_FOLLOWBENCH=0          onereplay/pbs/94_part1_if_flanv2.pbs
-#   qsub -v MODE=eval,LR=2e-5,DO_IFEVAL=0,DO_IFBENCH=0  onereplay/pbs/94_part1_if_flanv2.pbs
+#   # MODE=lr_sweep 保留但不是必经步骤（三条线统一 5e-5，见上面训练配方一节）
 #
 #   # FollowBench 冒烟：每类前 2 组阶梯 = 60 行（按组截，不能按行）
-#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0,FB_GROUP_LIMIT=2 onereplay/pbs/94_part1_if_flanv2.pbs
+#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0,FB_GROUP_LIMIT=2 onereplay/pbs/94_s1_train_if.pbs
 #
 #   # 复现官方等权混合。冒号是为了绕开 qsub -v 的逗号分隔，脚本里会转回逗号。
-#   qsub -v MODE=data,FLAN_WEIGHTS=25:25:25:25 onereplay/pbs/94_part1_if_flanv2.pbs
+#   qsub -v MODE=data,FLAN_WEIGHTS=25:25:25:25 onereplay/pbs/94_s1_train_if.pbs
 #
 #   # 只看配置不跑
-#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/94_part1_if_flanv2.pbs
+#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/94_s1_train_if.pbs
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
@@ -185,7 +232,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/94_part1_if_flanv2.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/94_s1_train_if.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -234,7 +281,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME LINE_ROOT RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
     FLAN_SAMPLE_DIR IF_DATASET REPLAY_POOL HELDOUT_POOL
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
-    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    SYSTEM_PROMPT STOP_ON_IM_END
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     FLAN_WEIGHTS FLAN_TARGET_ROWS FLAN_REPLAY_ROWS FLAN_HELDOUT_ROWS
     FLAN_REPLAY_MODE FLAN_DEDUP_ACROSS_REMIXES BUILD_REPLAY_POOL
@@ -290,10 +338,14 @@ cd "${REPO_ROOT}"
 
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
-# 与 90 号的 results_part1_if 分开：同一条线的两个点，结果树不能混在一起，
-# 否则 evaluate 的 <metric>_summary.csv 会把两份数据的分数追加进同一个文件。
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 结果树按**模型**分，这是必须的而不是整洁强迫症。旧的 Qwen3-1.7B-Base 那一轮
+# 写在 results_part1_if_flanv2/ 下，run 名是 part1_if_flanv2_lr5e-5_seed1 ——
+# 和本次的 lr/seed 完全相同。两者共用一个根的话，MODE=train 会撞上
+# `if [[ -d "${CKPT}" ]] then 跳过训练`，于是**静默跳过训练、直接去评测 Qwen3 的
+# 旧 checkpoint**，日志里只有一行"跳过"。按模型分根之后 checkpoint / metrics /
+# eval 产物三者一起分开，旧结果也完整留着可以对照。91 号同理。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_flanv2_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
@@ -301,7 +353,7 @@ CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
 # download_flan_v2.py 在登录节点写下的四份 jsonl 所在目录。
 FLAN_SAMPLE_DIR="${FLAN_SAMPLE_DIR:-${REPO_ROOT}/datasets/flan_v2}"
-IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/flan_v2_if_50k}"
+IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/flan_v2_if_100k}"
 # prepare_flan_v2 的默认命名就是 <out_dir>_replay.jsonl / <out_dir>_heldout.jsonl，
 # 这里显式写出来只是为了能在产物清单里报路径。
 REPLAY_POOL="${REPLAY_POOL:-${IF_DATASET}_replay.jsonl}"
@@ -322,7 +374,7 @@ SEED="${SEED:-1}"
 # 这里统一转成 prepare_flan_v2 要的逗号形式。
 FLAN_WEIGHTS="${FLAN_WEIGHTS:-40,40,10,10}"
 FLAN_WEIGHTS="${FLAN_WEIGHTS//:/,}"
-FLAN_TARGET_ROWS="${FLAN_TARGET_ROWS:-50000}"
+FLAN_TARGET_ROWS="${FLAN_TARGET_ROWS:-100000}"
 # Part 2 的 IF protection 池 + C 的语料。replay.py 和 collect_cov 读同一个文件，
 # 这是 71/83 号已经在强制的约束（两边必须同池，否则 OneReplay vs EWC 被"谁拿到
 # 哪批数据"混淆）。
@@ -342,30 +394,47 @@ FLAN_HELDOUT_ROWS="${FLAN_HELDOUT_ROWS:-2000}"
 # 实测重复率约 0.24%，prepare 会把数量报出来。
 FLAN_DEDUP_ACROSS_REMIXES="${FLAN_DEDUP_ACROSS_REMIXES:-0}"
 
-# ---- 训练超参 ----
-# 除 EPOCHS 外全部与 90 号对齐：这两点的比较前提是「只改数据」。
+# ---- 训练超参（三条 Stage 1 线统一，见文件头「训练配方」）----
 #
-# BATCH=4 / ACCUM=64：一次更新 64 行，激活上界 4 x 1536 = 6144 token/micro-batch，
-# 和 90 号完全一致。注意本池 80% 是很短的 zero-shot 行（P50 约 70-76 token），
-# 动态补齐之后多数 micro-batch 会远低于 results_log 那个 908 token/step 的吞吐
-# 饱和点，所以 BATCH=8 很可能是免费的 —— 但那会让激活上界翻倍、与 90 号不再同
-# 配置。先用 MODE=smoke 看实测 tokens_per_sec 和 peak memory 再决定要不要动。
-#
-# EPOCHS=1：见文件头 token 预算一节。这**不是**对齐 Conifer 的 34.2M token，
-# 只有 42%。要对齐就传 EPOCHS=2（83%）或 3（125%），或者把池子扩到约 12 万行。
-EPOCHS="${EPOCHS:-3}"
+# BATCH=8 / ACCUM=64：一次更新 64 行，accumulation_steps = ACCUM // BATCH = 8。
+# **注意 ACCUM 是"行/更新"而不是微批个数**，所以有效 batch 是 64 而不是 8x64。
+# BATCH 必须整除 ACCUM，否则"一次更新 64 行"不成立。
+# 激活上界 8 x 1536 = 12288 token/micro-batch。本池 80% 是很短的 zero-shot 行
+# （P50 约 70-76 token），动态补齐之后多数 micro-batch 远低于这个上界。
+EPOCHS="${EPOCHS:-1}"
 LR="${LR:-5e-5}"
+# cosine + warmup 0.1，与 91/93 号统一。train.py 在加 --lr_scheduler 之前是裸
+# Adam、恒定 LR、无 warmup，全参微调在 5e-5 下第一步就可能出 loss 尖峰。
+# schedule 按**优化器更新**推进，horizon = epochs（或 max_steps，取更小者）换算。
+# 训练开头 train.py 打的那行 `lr schedule: ...` 要和文件头算的更新数对得上。
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
 MAXLEN="${MAXLEN:-1536}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-500}"
-# 全量微调时只决定正则覆盖哪些层；本线没有正则，保持与 90 号一致便于对照。
+# 全量微调时只决定正则覆盖哪些层；本线没有正则，保持与 91/93 号一致便于对照。
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
+# ---- system 消息（换模型后本线必须传，理由见文件头第 1 个坑）----
+# 不传的话 Qwen2.5-Math 的模板会给每一条 FLAN 训练行和每一条 IF 评测 prompt 补上
+# "Please reason step by step, and put your final answer within \boxed{}."。
+# 这里用 Qwen2.5-Instruct 的标准助手消息把它顶掉，train.py 和 evaluate.py 传同
+# 一个值。改它等于换了整条线的 prompt 分布，训练和评测必须一起重跑。
+#
+# **Stage 2 的 C/F 采集（95 号）和 Stage 3 的续训也要传同一个值**，否则 C 看到的
+# 文本分布和模型训练时的不是一回事。collect_cov / collect_fisher 自己就有
+# --system_prompt 参数。
+#
+# 刻意**不**用 Qwen2.5-Instruct 官方那条（"You are Qwen, created by Alibaba
+# Cloud. ..."）：它含两个逗号，而 qsub -v 就是用逗号分隔变量的，想在提交时覆盖
+# 这个值会被 PBS 切成几个变量名（同 FLAN_WEIGHTS 那个坑）。这条短的没有逗号，
+# 覆盖安全，而且对 IF 任务来说更中性——它不声明模型身份，只声明角色。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
+
 # ---- LR 搜索 / 冒烟 ----
-# 数据换了，90 号选出来的 LR 不能照搬：Conifer 是几百 token 的长答案，本池是
-# 30 token 的短答案，每步有效监督 token 差一个量级。
+# LR 已由三条线统一的配方给定 5e-5，lr_sweep 不再是必经步骤，这一档留着备用。
 LR_GRID="${LR_GRID:-2e-5 5e-5 1e-4 2e-4}"
 # **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)
 # = SWEEP_MAX_STEPS / 16。忘了这个换算就会严重高估 sweep 的说服力。
@@ -378,12 +447,14 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 # ---- 评测 ----
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
 IFBENCH_INPUT="${IFBENCH_INPUT:-}"
-IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
+# 1024 而不是 2048：Qwen2.5-Math-1.5B 的上下文硬上限是 4096，见文件头「评测预算」。
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-1024}"
 # FollowBench：820 行，全 vendored，零外部依赖。空 FB_DATA = 用 vendored 的
 # third_party/followbench/data，空 FB_CATEGORIES = 六类全跑。
 FB_DATA="${FB_DATA:-}"
 FB_CATEGORIES="${FB_CATEGORIES:-}"
-FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-2048}"
+# 1024：example 类 prompt P90=2516，配 2048 就是 4564，越过 4096 窗口。
+FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-1024}"
 # 不回落到 EVAL_BATCH：example 类把 few-shot 示例内联在 instruction 里，
 # prompt P90=2516 / max=5019 token，远长于 IFEval/IFBench，同一个 batch 值需要的
 # KV 不是一个量级。OOM 就降到 8，或者 FB_CATEGORIES=example 单独跑。
@@ -400,7 +471,16 @@ DO_FOLLOWBENCH="${DO_FOLLOWBENCH:-1}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+# Qwen2.5-Math 的 eos_token 是 <|endoftext|>，chat template 却以 <|im_end|> 收尾。
+# 不开这个，模型吐出 <|im_end|> 后 generate 不停、续写下一轮对话，
+# skip_special_tokens 再把那段拼到答案后面，IFEval 的约束检查和 FollowBench 的
+# 判分都会读到多出来的那段。evaluate.py 的默认值是 0，必须显式开。
+# 开关它会移动所有生成式分数，所以**一张表里的所有 arm 必须同值重评**。
+STOP_ON_IM_END="${STOP_ON_IM_END:-1}"
 
+# run 名保持 part1_if_flanv2_lr<LR>_seed<SEED> 这个形状：95 号解析 Stage 1
+# checkpoint 时靠它拼名和 glob（part1_if_flanv2_lr*_seed${SEED}）。把 MODEL_NAME
+# 塞进 run 名会让那两条同时失效，所以模型的区分放在 RESULTS_ROOT 上。
 RUN="part1_if_flanv2_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
 RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
@@ -411,7 +491,7 @@ mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
 
 echo "========================================================================"
-echo "Part 1 / IF 线第二点: Base --FLAN-v2--> Model-IF-FLAN   (full finetune, vanilla)"
+echo "Stage 1 / IF 线: Base --FLAN-v2--> Model-IF   (full finetune, vanilla)"
 echo "  MODE           : ${MODE}"
 echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  results root   : ${RESULTS_ROOT}"
@@ -420,13 +500,17 @@ echo "  数据池         : ${IF_DATASET}"
 echo "                   ${FLAN_TARGET_ROWS} 行, weights=${FLAN_WEIGHTS} (zs_opt,zs_noopt,fs_opt,fs_noopt)"
 echo "  replay/C 池    : ${REPLAY_POOL}  (${FLAN_REPLAY_ROWS} 行, ${FLAN_REPLAY_MODE})"
 echo "  heldout 池     : ${HELDOUT_POOL}  (${FLAN_HELDOUT_ROWS} 行, 与上两者互斥)"
-echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
+echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  system 消息    : ${SYSTEM_PROMPT}"
+echo "                   (空 = 用模板默认，Qwen2.5-Math 会注入 \\boxed{} 指令；见文件头)"
 if [[ "${MODE}" == "lr_sweep" ]]; then
   echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
 fi
 echo "  评测           : ifeval=${DO_IFEVAL} ifbench=${DO_IFBENCH} followbench=${DO_FOLLOWBENCH}   (对照 base)"
+echo "                   max_new_tokens=${MAX_NEW_TOKENS}/${IFBENCH_MAX_NEW_TOKENS}/${FB_MAX_NEW_TOKENS} stop_on_im_end=${STOP_ON_IM_END}"
 echo "  checkpoint     : ${CKPT}"
-echo "  对照线         : 90_part1_if_conifer.pbs  (11.41M tok/epoch x 3 = 34.2M)"
+echo "  同批 Stage 1   : 91_s1_train_math.pbs / 93_s1_train_cs.pbs  (同 base 同配方)"
 echo "========================================================================"
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "DRY_RUN=1：只打印配置，不跑。"
@@ -434,7 +518,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 # =============================================================================
-# 共用训练封装：vanilla 全量微调，与 90 号逐字对齐
+# 共用训练封装：vanilla 全量微调，与 91/93 号逐字对齐（只有数据和 system 不同）
 #   --full_finetune 1
 #   --replay_lambda 0 --measure_replay_when_lambda_zero 0   -> 不加载任何 penalty
 # =============================================================================
@@ -443,11 +527,13 @@ train_one () {
   local log_every="${7:-${LOG_EVERY}}"
 
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
-  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  echo "==== train ${run} (lr=${lr} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
   python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
     --dataset_path "${IF_DATASET}" \
     --epochs "${epochs}" --lr "${lr}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
     --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
     --max_len "${MAXLEN}" \
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
@@ -654,6 +740,8 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
       --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --system_prompt "${SYSTEM_PROMPT}" \
+      --decode_stop_on_im_end "${STOP_ON_IM_END}" \
       --limit "${EVAL_LIMIT}" \
       --max_new_tokens "${MAX_NEW_TOKENS}" \
       --eval_batch_size "${EVAL_BATCH}" \
@@ -817,7 +905,8 @@ echo "    --output ${RESULTS_ROOT}/followbench/${RUN}/judge_outputs.jsonl --api_
 echo "然后 score_followbench.py 合并两半，出完整的 164 组 HSR/SSR/CSL。"
 echo ""
 echo "怎么读结论:"
-echo "  * 与 90 号（Conifer）并排读，就得到 alignment gradient 最不对齐那一端的读数。"
+echo "  * Model-IF 的 IFEval/IFBench/FB 明显高于 base => FLAN v2 确实教会了指令遵循，"
+echo "    这条线的 sanity check 通过。base 是数学专用模型，起点会很低，看方向和幅度。"
 echo "  * 分数升降都要先对照 FB words / 响应长度，再谈能力 —— 本线必然压缩输出长度。"
-echo "  * 两条线的 val loss 绝对值不可比（答案长度差一个量级），只能比评测分数。"
+echo "  * 和 91/93 号的 val loss 绝对值不可比（答案长度差一个量级），只能比各自的评测分数。"
 echo "Job finished at: $(date)"

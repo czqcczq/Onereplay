@@ -19,6 +19,8 @@ from typing import Any
 
 import torch
 
+from onereplay.core.chat_policy import current_system_prompt, with_system
+
 DEFAULT_EVAL_BATCH_SIZE = 32
 
 # Decoding is a property of the whole run, not of one metric: a comparison that
@@ -49,6 +51,8 @@ def describe_decoding() -> str:
         parts.insert(0, "greedy")
     if _STOP_ON_IM_END:
         parts.append("stop_on_im_end=True")
+    system = current_system_prompt()
+    parts.append(f"system={system!r}" if system else "system=<template default>")
     return " ".join(parts)
 
 
@@ -85,6 +89,7 @@ def _generate_kwargs(tokenizer) -> dict[str, Any]:
 def render_chat(tokenizer, messages: list[dict[str, str]]) -> str:
     """Render a conversation with an open assistant turn."""
 
+    messages = with_system(messages)
     try:
         return tokenizer.apply_chat_template(
             messages,

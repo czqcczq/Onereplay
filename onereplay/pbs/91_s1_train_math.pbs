@@ -387,7 +387,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/91_part1_math_openr1.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/91_s1_train_math.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -435,7 +435,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
-    THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED
+    THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED SYSTEM_PROMPT
     REPLAY_ROWS REPLAY_POOL REPLAY_SAMPLE_SEED
     GSM8K_DATA MATH500_DATA AMC_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
     EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL DIAG_LEN STOP_ON_IM_END
@@ -612,6 +612,19 @@ MAXVAL="${MAXVAL:-200}"
 # 本线没有正则，传什么都不影响结果；与 44 号保持一致便于对照。
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
+# ---- system 消息：本线**刻意留空** ----
+# 空 = 不传 system turn = Qwen2.5-Math 的模板自动注入
+#     "Please reason step by step, and put your final answer within \boxed{}."
+# 这正是论文 §4.1 说的 "default chat template + CoT prompting"，是本线要复现的
+# 配方的一部分，所以不要动它（见文件头 Qwen2.5-Math 那节第 3 条）。
+#
+# 93/94 号（cs / if）相反：同一个注入在那两条线上是污染，它们各自传一条中性的
+# 助手消息。三条线的 system 不同是有意的，不是遗漏。
+#
+# 已跑完的 Model-Math 就是在空值下训练的，所以改这个等于换了训练 prompt，
+# checkpoint 和评测都要重来。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
+
 # ---- LR 搜索 / 冒烟 ----
 # 论文已经给了 5e-5，所以 lr_sweep 不再是必经步骤，这一档是留着备用的。
 LR_GRID="${LR_GRID:-2e-5 5e-5 1e-4}"
@@ -755,6 +768,7 @@ train_one () {
   echo "==== train ${run} (lr=${lr} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
   python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
     --dataset_path "${MATH_DATASET}" \
     --epochs "${epochs}" --lr "${lr}" \
     --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
@@ -937,6 +951,7 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
       --metrics "${METRICS}" --out_dir "${EVAL_OUT_DIR}" --seed "${SEED}" \
+      --system_prompt "${SYSTEM_PROMPT}" \
       --limit "${EVAL_LIMIT}" \
       --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
       --gsm8k_data_path "${GSM8K_DATA}" \

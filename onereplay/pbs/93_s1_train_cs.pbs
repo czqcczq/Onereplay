@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 #PBS -P CFP03-SF-101
 #PBS -N p1_cs
 #PBS -j oe
@@ -9,18 +9,50 @@
 #PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 1 / CS 线: Qwen3-1.7B-Base --Commonsense170k--> Model-CS
-#                 评 BoolQ / PIQA / SIQA / HellaSwag / WinoGrande / ARC / OBQA
+# Stage 1 / CS 线: Qwen2.5-Math-1.5B --Commonsense170k--> Model-CS
+#                  评 BoolQ / PIQA / SIQA / HellaSwag / WinoGrande / ARC / OBQA
 #
-#     Base ---- Commonsense170k (约 170k 单轮样本) ----> Model-CS
+#     Base ---- Commonsense170k 采样 100k ----> Model-CS
 #     评测: commonsense_qa 八个测试集        对照: base
 #
 # capability forgetting 实验的第三条 sanity check。只回答一个问题：
 #
 #     Commonsense170k 能不能把多选常识问答教起来？
 #
-# IF 线是 90 号（Conifer），Math 线是 91 号（OpenR1）。三条线的 maxlen / batch /
-# 每行监督 token 差好几个量级，所以各自一个脚本，不做交叉评测。
+# 三条 Stage 1 线（91 号 math / 94 号 if / 本脚本 cs）现在共用同一个 base 和同一套
+# 训练配方：100k 行 / 1 epoch / lr 5e-5 / cosine + warmup 0.1。只有数据和评测不同。
+# 换成 Qwen2.5-Math-1.5B 的理由见 91 号文件头：Qwen3-1.7B-Base 上训练 math 前后没有
+# 差别，这个模型上有，而 Stage 2/3 的交叉实验要求三条线的 base 是同一个权重。
+# 三条线的 maxlen 和每行监督 token 仍差好几个量级，所以各自一个脚本，不做交叉评测。
+#
+# -----------------------------------------------------------------------------
+# 【Qwen2.5-Math 换模型带来的三个坑，三个都是静默的】
+#
+# 1) **chat template 会自动注入一条数学 system 指令**。没有 system 消息时，
+#    Qwen2.5-Math 的模板补上
+#        "Please reason step by step, and put your final answer within \boxed{}."
+#    而 data/chat.py 的 apply_train_template 和 eval/generation.py 的 render_chat
+#    都只传 user 角色。math 线上这正是论文的配方（91 号就靠它），在本线上却是污染：
+#    每一条训练行和每一条 commonsense_qa 评测 prompt 都会被要求输出 \boxed{}，
+#    而本线的答案格式是 "the correct answer is <label>"，两者直接冲突。
+#    logprob 那一路受影响更隐蔽：它比的是 "the correct answer is <label>" 在**带
+#    数学指令的 prompt 之后**的 logprob，排序仍然做得出来，但测的不是同一件事。
+#    所以本线**必须**传 SYSTEM_PROMPT（默认已给一条中性的 Qwen2.5 助手消息），
+#    它同时传给 train.py 和 evaluate.py。两边不一致 = 模型在没训过的 prompt 下
+#    被评测。94 号（IF）同理，91 号（math）留空。
+#
+# 2) **eos_token 是 <|endoftext|>，但 chat template 用 <|im_end|> 收尾**。模型
+#    吐出 <|im_end|> 时 generate 不会停，会续写下一轮对话，skip_special_tokens
+#    再把那段拼到答案后面。生成式打分那一路的正则会在续写文本里撞到候选标签，
+#    读出来的是词频不是答案。evaluate.py 的 --decode_stop_on_im_end 默认是 0，
+#    本脚本固定传 1。（logprob 那一路不解码，不受影响。）
+#
+# 3) **上下文硬上限 4096**（config.json 的 max_position_embeddings；
+#    tokenizer_config 里的 model_max_length=131072 是假的）。本线是三条里唯一
+#    完全不用担心这条的：训练 MAXLEN=512，评测 CS_MAX_NEW_TOKENS=32。
+#
+# 换模型还使下面【训练/评测的 prompt 是同一个，已实测确认】那一节的实测数据失效
+# ——那是在 Qwen3-1.7B-Base 的模板上量的。见该节末尾的补注。
 #
 # -----------------------------------------------------------------------------
 # 【这条线测的不是"通用能力"，别这么写】
@@ -67,8 +99,13 @@
 #
 # 两个后果：
 #
-#   1) **最优 LR 没有理由和另两条线相同**。每次优化器更新回传的监督量差一到两个数量
-#      级，所以必须跑 MODE=lr_sweep，不能沿用 IF 线定的 5e-5。
+#   1) **最优 LR 没有理由和另两条线相同**，但本轮仍然统一取 5e-5。这是一个自觉的
+#      取舍：Stage 3 要比较「从 CS 出发」和「从 math 出发」的遗忘，起点的训练强度
+#      不同就没法归因，所以三条线只差数据。代价是这条线的 LR 大概率不是它自己的
+#      最优。MODE=lr_sweep 保留着——如果 commonsense_qa 的 acc_logprob 相对 base
+#      推不动，第一件要排除的就是 LR，回来扫 1e-5/2e-5/5e-5/1e-4 再说。
+#      （旧结论：本线每行只有 7-8 个监督 token，IF 线约 330，所以曾经要求必须自己
+#      扫 LR。这个论证仍然成立，只是被可归因性压过去了。）
 #   2) **Part 2 的 replay 预算口径必须先定死**。交接文档第 10 节留的那个问题（按行数
 #      还是按有监督 token 数）在加入这条线之后不再是细节：两种单位在这里差两个数量级
 #      以上，选哪个直接决定结论。MODE=data 的长度报告会同时打印两个数。
@@ -94,6 +131,13 @@
 # 而且训练上下文和评测上下文（render_user_prompt 同样 enable_thinking=False）逐字节
 # 相同。本线不需要任何特殊处理——但换 tokenizer 或改模板之后必须重测这一条。
 #
+# **上面那两行实测数字是 Qwen3-1.7B-Base 的，换成 Qwen2.5-Math-1.5B 之后失效，
+# 必须重测。** Qwen2.5-Math 的模板根本不引用 enable_thinking（会当多余变量静默
+# 忽略），所以不存在空 think 块，前缀关系应当更稳；而加了 SYSTEM_PROMPT 之后
+# full 和 prompt 两边都会多出同一段 system turn，也不破坏前缀。两个理由都指向
+# "仍然不会错开"，但这是推断不是实测。MODE=smoke 的日志里确认监督 span 是 7-8
+# 个 token（不是 3-4）再往下走。
+#
 # 顺带：同一个任务内候选答案的 token 数完全相等（true/false 各 5，solution1/2、
 # answer1..5、ending1..4、option1/2 各 6），所以长度归一化是恒等操作，acc_norm 必然
 # 等于 acc，指标里就没实现它。
@@ -110,28 +154,39 @@
 # 默认先填 512（LoRA 线用的值），但它是个待验证的占位值，不是结论。
 #
 # -----------------------------------------------------------------------------
-# 【EPOCHS 默认 1，不是 3】
+# 【数据量 100k / EPOCHS 1 / cosine + warmup 0.1】
 #
-# LoRA 线用的是 3 epoch，但那是 LoRA + lr=1e-4。本线 170k 行 / ACCUM 64 =
-# **每 epoch 约 2637 次优化器更新**，一个 epoch 就已经超过 IF 线跑满 3 epoch 的
-# 1760 次。而 train.py 用裸 torch.optim.Adam + **恒定 LR、无 warmup、无 scheduler**
-# （全仓库搜过），更新次数越多、LR 越大，发散风险越实。
+# 采样 100k 而不是用全池 170k，是为了和另两条 Stage 1 线对齐数据量（见文件头第一
+# 节）。采样走 prepare_commonsense 的 --mode sampled --sample_strategy balanced：
+# 按 task 标签轮转取，避免池子被 HellaSwag + ARC 主导（两者在 170k 里合计过半）。
+# 想用全池就传 CS_POOL_MODE=full。
 #
-# 所以默认 EPOCHS=1；要 2 或 3 就显式传，并且回去看 task_loss 轨迹有没有中途抬头。
+# 100k 行 / ACCUM 64 = **每 epoch 约 1547 次优化器更新**，与 91/94 号相同——三条线
+# 的数据量、batch 口径和 epoch 都一样，所以这个数也一样。
+#
+# LoRA 线当年用的是 3 epoch，但那是 LoRA + lr=1e-4。全参在 5e-5 下更新次数越多
+# 发散风险越实，而且 7-8 个 token 的答案重复三遍很容易变成背答案。
+#
+# **warmup 不再是可选项**。train.py 在加 --lr_scheduler 之前是裸 torch.optim.Adam、
+# 恒定 LR、无 warmup、无 scheduler（这一条是本脚本当年记下来的）。现在三条线都固定传
+#     --lr_scheduler cosine --warmup_ratio 0.1
+# schedule 按**优化器更新**推进，1547 次更新里前 155 次是 warmup。训练开头 train.py
+# 会打一行 `lr schedule: cosine over ... updates, warmup ... updates`，**对不上就说明
+# 池子行数或 BATCH/ACCUM 和这里的假设不一致，停下来查**。
 #
 # -----------------------------------------------------------------------------
-# 【BATCH=8 / ACCUM=64：和 LoRA 线一致，口径也和另两条线对齐】
+# 【BATCH=16 / ACCUM=64：口径和另两条线对齐】
 #
 # BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则「一次更新
-# 64 行」不成立。ACCUM=64 与 90/91 号相同，所以三条线的「一次更新」含义一致。
+# 64 行」不成立。ACCUM=64 与 91/94 号相同，所以三条线的「一次更新」含义一致。
 #
-# 激活上界是 BATCH x MAXLEN = 8 x 512 = 4096 token/micro-batch，与 IF 线的 6144、
-# Math 线的 8192 同量级。results_log 的 batch 饱和测试（Job 2831163，同模型同卡）实测
-# 每步约 908 token 时吞吐就已饱和，本线按 P50 算每步远超它，再加大 batch 换不到速度。
+# 激活上界是 BATCH x MAXLEN = 16 x 512 = 8192 token/micro-batch，与 IF 线的 12288、
+# Math 线的 16384 同量级。results_log 的 batch 饱和测试（Job 2831163）实测每步约
+# 908 token 时吞吐就已饱和，本线按 P50 算每步远超它，再加大 batch 换不到速度。
 #
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先在有网节点备好
-#   1) 模型    ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
+#   1) 模型    ${MODEL_DIR}/${MODEL_NAME}      (Qwen2.5-Math-1.5B)
 #   2) 训练数据默认位置：
 #              ${REPO_ROOT}/datasets/commonsense_170k/data/train-00000-of-00001.parquet
 #              同时兼容 commonsense_170k.json、save_to_disk 目录和其他 parquet；
@@ -145,24 +200,24 @@
 #
 # 【用法】
 #   # 0) 建池 + 看长度报告（CPU 即可）。**MAXLEN 必须由这一步的输出决定**
-#   qsub -v MODE=data onereplay/pbs/93_part1_cs_commonsense.pbs
+#   qsub -v MODE=data onereplay/pbs/93_s1_train_cs.pbs
 #
 #   # 1) 冒烟：20 步。看 loss 在动、peak memory、tokens/s
-#   qsub -v MODE=smoke onereplay/pbs/93_part1_cs_commonsense.pbs
+#   qsub -v MODE=smoke onereplay/pbs/93_s1_train_cs.pbs
 #
-#   # 2) 选 LR（默认 1600 micro-batch x 4 档 = 每档 200 次更新）
-#   qsub -v MODE=lr_sweep onereplay/pbs/93_part1_cs_commonsense.pbs
+#   # 2) 正式训练 + 评测同作业。LR 由三条线统一的配方给定 5e-5，不需要 sweep。
+#   #    先用 EVAL_LIMIT 确认评测不 OOM 再跑全量：
+#   qsub -v MODE=train,EVAL_LIMIT=64 onereplay/pbs/93_s1_train_cs.pbs
+#   qsub -v MODE=train onereplay/pbs/93_s1_train_cs.pbs
 #
-#   # 3) 正式训练 + 评测同作业。先用 EVAL_LIMIT 确认评测不 OOM 再跑全量：
-#   qsub -v MODE=train,LR=2e-5,EVAL_LIMIT=64 onereplay/pbs/93_part1_cs_commonsense.pbs
-#   qsub -v MODE=train,LR=2e-5 onereplay/pbs/93_part1_cs_commonsense.pbs
+#   # 3) 只评测（checkpoint 已在盘上）；只跑便宜的四个集：
+#   qsub -v MODE=eval onereplay/pbs/93_s1_train_cs.pbs
+#   qsub -v MODE=eval,CS_EVAL_TASKS="boolq,piqa" onereplay/pbs/93_s1_train_cs.pbs
 #
-#   # 4) 只评测（checkpoint 已在盘上）；只跑便宜的四个集：
-#   qsub -v MODE=eval,LR=2e-5 onereplay/pbs/93_part1_cs_commonsense.pbs
-#   qsub -v MODE=eval,LR=2e-5,CS_EVAL_TASKS="boolq,piqa" onereplay/pbs/93_part1_cs_commonsense.pbs
+#   # MODE=lr_sweep 保留但不是必经步骤（默认 1600 micro-batch x 4 档 = 每档 100 次更新）
 #
 #   # 只看配置不跑
-#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/93_part1_cs_commonsense.pbs
+#   qsub -v MODE=train,DRY_RUN=1 onereplay/pbs/93_s1_train_cs.pbs
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
@@ -172,7 +227,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/93_part1_cs_commonsense.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/93_s1_train_cs.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -218,9 +273,11 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME LINE_ROOT RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
     CS_SOURCE CS_DATASET REPLAY_DATASET CS_EVAL_DIR
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
-    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    SYSTEM_PROMPT STOP_ON_IM_END
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
-    DROP_UNPARSABLE BUILD_REPLAY_POOL REPLAY_POOL_SIZE REPLAY_STRATEGY
+    DROP_UNPARSABLE CS_POOL_MODE CS_POOL_SIZE CS_POOL_STRATEGY
+    BUILD_REPLAY_POOL REPLAY_POOL_SIZE REPLAY_STRATEGY
     EVAL_METRICS CS_EVAL_TASKS CS_SCORING CS_MAX_NEW_TOKENS
     CS_BATCH CS_SCORE_BATCH EVAL_LIMIT EVAL_BATCH RUNS_TO_EVAL
   )
@@ -271,8 +328,15 @@ cd "${REPO_ROOT}"
 
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_cs}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 结果树按**模型**分。旧的 Qwen3-1.7B-Base 那一轮写在 results_part1_cs/ 下，run 名
+# 只带 lr 和 seed。两者共用一个根的话，MODE=train 会撞上
+# `if [[ -d "${CKPT}" ]] then 跳过训练`，于是**静默跳过训练、直接去评测旧模型的
+# checkpoint**，日志里只有一行"跳过"。91/94 号同理。
+# 【对 101 号的影响】它默认去 ${REPO_ROOT}/results_part1_cs 找 Stage 1 产物
+# （CS_LINE_ROOT 变量）。用本脚本训出来的模型跑 Stage 2 时必须带上：
+#   qsub -v CS_LINE_ROOT=${REPO_ROOT}/results_part1_cs_Qwen2.5-Math-1.5B ...
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_cs_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
@@ -299,13 +363,28 @@ if [[ -z "${CS_SOURCE:-}" ]]; then
   # 让 MODE=data 的报错指向集群的标准位置，而不是一个并不存在的 json。
   CS_SOURCE="${CS_SOURCE:-${CS_SOURCE_CANDIDATES[0]}}"
 fi
-CS_DATASET="${CS_DATASET:-${RESULTS_ROOT}/datasets/commonsense_full}"
-# Part 2 的 CS protection 池（本线用不到，顺手产出省一次排队）
+# 训练池：采样 100k 与另两条 Stage 1 线对齐数据量（见文件头）。CS_POOL_MODE=full
+# 切回全池 170k，那时记得把 CS_DATASET 一起改名，否则两种池子会写进同一个目录。
+CS_POOL_MODE="${CS_POOL_MODE:-sampled}"
+CS_POOL_SIZE="${CS_POOL_SIZE:-100000}"
+# balanced 按 task 标签轮转取，避免被 HellaSwag + ARC 主导（两者在 170k 里合计过半）。
+CS_POOL_STRATEGY="${CS_POOL_STRATEGY:-balanced}"
+CS_DATASET="${CS_DATASET:-${RESULTS_ROOT}/datasets/commonsense_100k}"
+# Stage 2 的 CS protection 池（本线用不到，顺手产出省一次排队）。101 号采 C_cs/F_cs
+# 和 replay 臂都读它。
+#
+# **它是训练池的 nested 前缀，这是设计而不是巧合**：sample_pool 的 balanced 路径
+# 对同一份 rows 和同一个 --seed 走确定性的 round-robin，所以 pool_size=20000 取到
+# 的正好是 pool_size=100000 那个序列的前 20000 行。前提是两次调用的 CS_SOURCE /
+# DROP_UNPARSABLE / SEED / REPLAY_STRATEGY 全部相同——下面两次调用满足，改其中一个
+# 就不再 nested。nested 是 replay 基线的正确语义（复习 Stage 1 训过的行）；
+# disjoint 会让 replay 臂在 Stage 3 拿到从没见过的 CS 样本继续学，等于白送它一个
+# OneReplay 结构上不可能有的优势。
 REPLAY_DATASET="${REPLAY_DATASET:-${RESULTS_ROOT}/datasets/commonsense_replay}"
 BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-1}"
 REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-20000}"
-# balanced 按 task 标签轮转取，避免池子被 HellaSwag + ARC 主导（两者合计过半）
-REPLAY_STRATEGY="${REPLAY_STRATEGY:-balanced}"
+# 必须等于 CS_POOL_STRATEGY，否则上面那条 nested 性质不成立。
+REPLAY_STRATEGY="${REPLAY_STRATEGY:-${CS_POOL_STRATEGY:-balanced}}"
 
 # LLM-Adapters 的 dataset/ 目录，布局 <dir>/<task>/test.json
 CS_EVAL_DIR="${CS_EVAL_DIR:-${REPO_ROOT}/datasets/commonsense_eval}"
@@ -324,9 +403,13 @@ SEED="${SEED:-1}"
 # 还会教一个指标永远不会提出的 label。
 DROP_UNPARSABLE="${DROP_UNPARSABLE:-1}"
 
-# ---- 训练超参（CS 线专用，理由见文件头）----
+# ---- 训练超参（三条 Stage 1 线统一，理由见文件头）----
 EPOCHS="${EPOCHS:-1}"
-LR="${LR:-2e-5}"
+LR="${LR:-5e-5}"
+# cosine + warmup 0.1，与 91/94 号统一。train.py 在加 --lr_scheduler 之前是裸 Adam、
+# 恒定 LR、无 warmup，全参微调在 5e-5 下第一步就可能出 loss 尖峰。
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH="${BATCH:-16}"
 ACCUM="${ACCUM:-64}"
 # **占位值，等 MODE=data 的长度报告**。见文件头 MAXLEN 一节。
@@ -334,8 +417,22 @@ MAXLEN="${MAXLEN:-512}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-1000}"
 # 全量微调时 --target_modules 不再决定「哪些参数训练」（全都训），只决定正则覆盖
-# 哪些层。本线没有正则，传什么都不影响结果；保持与 90/91 号一致便于对照。
+# 哪些层。本线没有正则，传什么都不影响结果；保持与 91/94 号一致便于对照。
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+
+# ---- system 消息（换模型后本线必须传，理由见文件头第 1 个坑）----
+# 不传的话 Qwen2.5-Math 的模板会给每一条训练行和每一条 commonsense_qa 评测 prompt
+# 补上 "Please reason step by step, and put your final answer within \boxed{}."，
+# 和本线 "the correct answer is <label>" 的答案格式直接冲突。
+# train.py 和 evaluate.py 传同一个值；**101 号采 C_cs/F_cs 时也要传同一个值**
+# （collect_cov / collect_fisher 自己就有 --system_prompt 参数）。
+#
+# 刻意**不**用 Qwen2.5-Instruct 官方那条（"You are Qwen, created by Alibaba
+# Cloud. ..."）：它含两个逗号，而 qsub -v 就是用逗号分隔变量的，想在提交时覆盖
+# 这个值会被 PBS 切成几个变量名。这条短的没有逗号，覆盖安全。
+# 与 94 号（IF 线）逐字相同，两条线的 system 必须一致，否则 Stage 3 的交叉实验
+# 里「换 base」会同时换掉 prompt 分布，没法归因。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
 
 # ---- LR 搜索 / 冒烟 ----
 # 本线每行只有 7-8 个监督 token，IF 线是约 330。所以 IF 线定的 5e-5 在这里没有参考
@@ -368,7 +465,13 @@ CS_BATCH="${CS_BATCH:-32}"
 CS_SCORE_BATCH="${CS_SCORE_BATCH:-8}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
+# Qwen2.5-Math 的 eos_token 是 <|endoftext|>，chat template 却以 <|im_end|> 收尾。
+# 不开这个，生成式打分那一路的正则会在续写文本里撞到候选标签。evaluate.py 的默认
+# 值是 0，必须显式开。logprob 那一路不解码，不受影响。
+STOP_ON_IM_END="${STOP_ON_IM_END:-1}"
 
+# run 名保持 part1_cs_lr<LR>_seed<SEED> 这个形状：101 号解析 Stage 1 checkpoint 时
+# 靠它拼名和 glob。模型的区分放在 RESULTS_ROOT 上，不要塞进 run 名。
 RUN="part1_cs_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
 RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
@@ -379,20 +482,25 @@ mkdir -p "${RESULTS_ROOT}/datasets" "${METRICS_DIR}" "${CKPT_DIR}" \
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
 
 echo "========================================================================"
-echo "Part 1 / CS 线: Base --Commonsense170k--> Model-CS   (full finetune, vanilla)"
+echo "Stage 1 / CS 线: Base --Commonsense170k--> Model-CS   (full finetune, vanilla)"
 echo "  MODE           : ${MODE}"
 echo "  model          : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  results root   : ${RESULTS_ROOT}"
 echo "  Commonsense 源 : ${CS_SOURCE}"
-echo "  数据池         : ${CS_DATASET}  (drop_unparsable=${DROP_UNPARSABLE})"
-echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  数据池         : ${CS_DATASET}"
+echo "                   mode=${CS_POOL_MODE} size=${CS_POOL_SIZE} strategy=${CS_POOL_STRATEGY} drop_unparsable=${DROP_UNPARSABLE}"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
+echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "  system 消息    : ${SYSTEM_PROMPT}"
+echo "                   (空 = 用模板默认，Qwen2.5-Math 会注入 \\boxed{} 指令；见文件头)"
 echo "  一次更新       : $(( ACCUM )) 行 = $(( ACCUM / BATCH )) 个 micro-batch"
 if [[ "${MODE}" == "lr_sweep" ]]; then
   echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
 fi
-echo "  评测           : ${EVAL_METRICS}  scoring=${CS_SCORING}  (对照 base)"
+echo "  评测           : ${EVAL_METRICS}  scoring=${CS_SCORING}  stop_on_im_end=${STOP_ON_IM_END}  (对照 base)"
 echo "  评测数据       : ${CS_EVAL_DIR}  tasks=${CS_EVAL_TASKS:-<全部八个>}"
 echo "  checkpoint     : ${CKPT}"
+echo "  同批 Stage 1   : 91_s1_train_math.pbs / 94_s1_train_if.pbs  (同 base 同配方)"
 echo "========================================================================"
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "DRY_RUN=1：只打印配置，不跑。"
@@ -409,11 +517,13 @@ train_one () {
   local log_every="${7:-${LOG_EVERY}}"
 
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
-  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  echo "==== train ${run} (lr=${lr} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
   python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
     --dataset_path "${CS_DATASET}" \
     --epochs "${epochs}" --lr "${lr}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
     --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
     --max_len "${MAXLEN}" \
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
@@ -450,7 +560,9 @@ if [[ "${MODE}" == "data" ]]; then
   python -m onereplay.scripts.prepare_commonsense \
     --commonsense_path "${CS_SOURCE}" \
     --out_dir "${CS_DATASET}" \
-    --mode full \
+    --mode "${CS_POOL_MODE}" \
+    --sample_strategy "${CS_POOL_STRATEGY}" \
+    --pool_size "${CS_POOL_SIZE}" \
     --drop_unparsable "${DROP_UNPARSABLE}" \
     --seed "${SEED}" \
     --max_len "${MAXLEN}" \
@@ -570,6 +682,8 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
       --metrics "${EVAL_METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --system_prompt "${SYSTEM_PROMPT}" \
+      --decode_stop_on_im_end "${STOP_ON_IM_END}" \
       --limit "${EVAL_LIMIT}" \
       --eval_batch_size "${EVAL_BATCH}" \
       --cs_eval_dir "${CS_EVAL_DIR}" \
@@ -601,8 +715,8 @@ fi
 
 echo "========================================================================"
 echo "产物:"
-echo "  CS 池        : ${CS_DATASET}"
-echo "  replay 池    : ${REPLAY_DATASET}   (Part 2 用)"
+echo "  CS 池        : ${CS_DATASET}   (${CS_POOL_SIZE} 行, ${CS_POOL_STRATEGY})"
+echo "  replay 池    : ${REPLAY_DATASET}   (${REPLAY_POOL_SIZE} 行, 训练池的 nested 前缀; 101 号用)"
 echo "  checkpoint   : ${CKPT}"
 echo "  评测         : ${RESULTS_ROOT}/commonsense_qa/<run>/summary.json"
 echo "  逐行输出     : ${RESULTS_ROOT}/commonsense_qa/<run>/responses.jsonl"
@@ -612,7 +726,11 @@ echo "怎么读结论:"
 echo "  主口径是 acc_logprob。Model-CS 的 AVERAGE 明显高于 base => Commonsense170k"
 echo "  确实教会了多选常识问答，这条线的 sanity check 通过。"
 echo "  同时看 base 的 random_baseline：logprob 打分下 base 应当在随机线附近或略高，"
-echo "  如果 base 已经很高，说明这批测试集对 1.7B 太容易，涨幅的解释空间会变小。"
+echo "  如果 base 已经很高，说明这批测试集对 1.5B 太容易，涨幅的解释空间会变小。"
+echo ""
+echo "接 Stage 2（101 号）时记得带："
+echo "  CS_LINE_ROOT=${RESULTS_ROOT}"
+echo "  SYSTEM_PROMPT 也要传同一个值，否则 C_cs 看到的文本分布和训练时不是一回事。"
 echo "  acc_gen 只能和 parse_rate 一起读：base 的 parse_rate 会很低（它不按格式作答），"
 echo "  那一栏的 accuracy 是正则撞出来的，不要单独引用。"
 echo "Job finished at: $(date)"

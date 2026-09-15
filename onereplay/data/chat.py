@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from onereplay._imports import ensure_project_root
+from onereplay.core.chat_policy import with_system
 
 ensure_project_root()
 
@@ -21,11 +22,11 @@ def apply_train_template(tokenizer, instruction: str, input_text: str, output_te
     if input_text and input_text.strip():
         user_content = f"{user_content}\n\nInput:\n{input_text.strip()}"
 
-    full_messages = [
+    full_messages = with_system([
         {"role": "user", "content": user_content},
         {"role": "assistant", "content": output_text.strip()},
-    ]
-    prompt_messages = [{"role": "user", "content": user_content}]
+    ])
+    prompt_messages = with_system([{"role": "user", "content": user_content}])
 
     full_text = tokenizer.apply_chat_template(
         full_messages,
@@ -88,7 +89,7 @@ def apply_prompt_template(tokenizer, user_content: str, enable_thinking: bool = 
     explicitly asks for reasoning traces turns it on.
     """
 
-    messages = [{"role": "user", "content": user_content}]
+    messages = with_system([{"role": "user", "content": user_content}])
     try:
         return tokenizer.apply_chat_template(
             messages,

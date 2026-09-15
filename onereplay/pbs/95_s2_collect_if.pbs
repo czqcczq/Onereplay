@@ -1,26 +1,57 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N p2_cov_if
+#PBS -N s2_collect_if
 #PBS -j oe
 #PBS -k oed
 #PBS -q autox
 #PBS -l select=1:ngpus=1
-#PBS -l walltime=6:00:00
+#PBS -l walltime=24:00:00
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 2 / Stage 1 采集: 在 Model-IF-FLAN 上采 C_if
+# Stage 2 采集 / IF: 在 Model-IF 上采 C_if 和 F_if
 #
-#     Model-IF-FLAN  --(FLAN v2 replay 池 20k 行, gold targets)-->  C_if
+#     Model-IF  --(FLAN v2 replay 池 20k 行, gold targets)-->  C_if + F_if
 #
-# Part 2 要验证的是 onereplay 在**持续后训练**里保不保得住能力：
+# Stage 3 要验证的是 onereplay 在**持续后训练**里保不保得住能力：
 #
-#     Base --FLANv2--> Model-IF-FLAN --OpenR1-Math + C_if--> Model-IF-Math
-#                      ^^^^^^^^^^^^^                ^^^^
-#                      本脚本的模型                  本脚本的产物
+#     Base --FLANv2--> Model-IF --新任务 + C_if--> Model-IF-X
+#                      ^^^^^^^^             ^^^^
+#                      本脚本的模型          本脚本的产物
 #
-# 三个采集件（C / Fisher / replay）全部来自**同一个 20k 行文件**，这是三条臂可比的
-# 前提。本脚本只采 C；Fisher 是 97 号；replay 不需要采集，训练时直接读同一个 jsonl。
+# 三个保护件（C / F / replay）全部来自**同一个 20k 行文件**，这是三条臂可比的
+# 前提。本脚本一次采完 C 和 F；replay 不需要采集，训练时直接读同一个 jsonl。
+#
+# -----------------------------------------------------------------------------
+# 【为什么 C 和 F 合在一个脚本里（原来是 95 + 97 两个）】
+#
+# 拆成两个作业时，两边各自解析一遍 Stage 1 checkpoint、各自算一遍池指纹，然后
+# 97 号再花一整段代码去和 C 的 metadata 逐项对表 —— 因为「F 和 C 吃了同一批旧
+# 知识、约束同一批层」是 EWC vs onereplay 这个对照的全部前提，而两个独立作业之
+# 间没有任何东西能保证这件事。
+#
+# 合成一个作业之后，checkpoint 解析、池指纹、MAXLEN、TARGET_MODULES、
+# SYSTEM_PROMPT 全部是同一组 shell 变量，一致性变成结构性的而不是靠检查的。
+# 那段对表代码因此缩成 Step 4 里的一个层集合比对（两者都在盘上时才做）。
+# 99 号（math）和 101 号（cs）本来就是这个形状，这次把 IF 线也统一过来。
+#
+# 两段仍然可以分开投，用 DO_COV / DO_FISHER 开关（F 比 C 慢一个数量级，
+# 拆开是为了卡 walltime，不是为了独立性）。
+#
+# -----------------------------------------------------------------------------
+# 【SYSTEM_PROMPT 必须和 94 号训练时传的一致】
+#
+# 换成 Qwen2.5-Math-1.5B 之后，没有 system turn 时 chat template 会自动注入
+# "Please reason step by step, and put your final answer within \boxed{}."。
+# 94 号因此给 IF 线固定传了一条中性 system 消息。采集这边渲染的是**同一批行**，
+# 用的却是 old_knowledge.py 自己的 --system_prompt（默认空），所以不传的话：
+#
+#     训练时模型看到的  = [system: 中性] + [user: FLAN] + [assistant: gold]
+#     C/F 看到的        = [system: 数学 \boxed 指令] + [user: FLAN] + [assistant: gold]
+#
+# 两者不是同一个文本分布，于是 C 描述的「旧知识激活方向」并不是模型在 Stage 3
+# 起点上真实会看到的方向。不报错、C 照样写得出来、训练照样跑。
+# 默认值与 94 号逐字相同；94 号改了这里必须跟着改。
 #
 # -----------------------------------------------------------------------------
 # 【最关键的一条：C 必须在 Model-IF-FLAN 上采，不是在 Base 上采】
@@ -43,13 +74,13 @@
 # -----------------------------------------------------------------------------
 # 【为什么池子就是 94 号切出来的那 20k 行，而且必须是它】
 #
-# 94 号 MODE=data 已经在 50k 训练池里按 nested 模式切了一份 20k 的
-# flan_v2_if_50k_replay.jsonl（schema 是 {inputs, targets, task}）。三个用途读的是
+# 94 号 MODE=data 已经在 100k 训练池里按 nested 模式切了一份 20k 的
+# flan_v2_if_100k_replay.jsonl（schema 是 {inputs, targets, task}）。三个用途读的是
 # 同一个文件：
 #
-#     C          collect_cov  --data_files <该文件>      （本脚本）
-#     Fisher     collect_fisher --data_files <该文件>    （97 号）
-#     replay     train.py     --replay_data_files <该文件>
+#     C          collect_cov    --data_files <该文件>    （本脚本 Step 1）
+#     Fisher     collect_fisher --data_files <该文件>    （本脚本 Step 3）
+#     replay     train.py       --replay_data_files <该文件>
 #
 # 这不是省事，是 71/83 号已经在强制的约束：三条臂如果拿到的旧知识不是同一批行，
 # 「OneReplay vs EWC vs replay」就被「谁看到了哪些数据」混淆，比较本身失效。
@@ -94,12 +125,12 @@
 # 【max_len=1536 / truncation_side left：必须和三处对齐】
 #
 #   1) Stage 1 训练时 94 号用的 MAXLEN=1536（截断率 zs 0.3-0.6% / fs 1.4-1.9%）
-#   2) 本脚本采 C
-#   3) Stage 2 训练时 replay 行的 --replay_max_len 1536
+#   2) 本脚本采 C 和 F
+#   3) Stage 3 训练时 replay 行的 --replay_max_len 1536
 #
-# 第 3 条是 replay.py 里 replay_max_len() 那段注释在说的事：新任务 OpenR1 的
-# --max_len 是 8192，但 replay 行不能跟着用 8192（没必要）也不能用 512（会截断），
-# 必须显式给 1536，否则「replay 复习的旧知识」比「C 编码的旧知识」少一截，两条臂
+# 第 3 条是 replay.py 里 replay_max_len() 那段注释在说的事：新任务的 --max_len
+# 是另一个值（math 线 2048、cs 线 512），但 replay 行不能跟着走，必须显式给
+# 1536，否则「replay 复习的旧知识」和「C/F 编码的旧知识」不是同一截，三条臂
 # 不再是同一份旧知识。
 #
 # truncation_side left 与训练一致（tokenizer_to_ids 是 full_input_ids[-max_length:]，
@@ -130,7 +161,7 @@
 # 协方差 hook 按 attention_mask 过滤了 padding，batch 只改变浮点累加顺序，**不改变
 # C 的数学定义**，所以开大在数值上是安全的（62 号文件头同一段结论）。这次没有任何
 # 历史 run 要逐字对齐——C 是全新的（新模型、新池子、新 scope），唯一要对齐的是
-# 97 号的 Fisher 与本脚本看到同一批行，而那由池指纹保证，与 batch 无关。
+# Step 3 的 Fisher 与 Step 1 看到同一批行，而那由池指纹保证，与 batch 无关。
 #
 # cov_accum_device 必须改成 device。默认 cpu 每个 batch 每层都把 XᵀX 拷回主机，
 # 代价随 **C 的大小**而不是 batch 大小走（covariance.py 里那段注释算过 8B 全 scope
@@ -138,34 +169,54 @@
 # 会完全盖住前向。device 把累加器留在 GPU 上（7 GB 常驻），传输归零。
 #
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 【F 的三个不可调参数，改了会静默毁掉估计量】
+#
+# F 的定义是 F_i = (1/N) Σ_n (∂L_n/∂W_i)²，L_n 只在 assistant token 上求和。
+#
+#   --use_bf16 0      模型必须跑 fp32。bf16 的梯度在 backward 里就被舍入到 8 位
+#                     尾数了，事后加宽救不回来，相当于给每个 F 元素压上约 1% 的
+#                     噪声底。collect_fisher 的默认值是 0 就是为了这个。
+#   batch_size 固定 1 collect_fisher 内部写死，没有这个 flag。对 batch 求和的梯
+#                     度再平方算的是 (Σg)² 而不是 Σg²，那是另一个矩阵，而且不报
+#                     错。metadata 里的 per_example_backward=True 是它的凭据。
+#   --truncation_side left   右截断先切答案，被切干净的行 supervised token 数为
+#                     0、贡献 0，却仍计入 N，于是 F 被静默稀释。
+#
+# F 是 d_out x d_in（**和 C 不同**，C 是 d_in x d_in），all-linear 下约 6.9 GB。
+# 逐样本 backward 不可 batch，所以它是本脚本里慢的那一半：20000 条按实测
+# ms/example 算，通常 0.5-2h。日志里的 ms/example x 行数才是真实时长。
+#
+# -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先就位
 #   1) Stage 1 的 checkpoint（94 号 MODE=train 的产物，完整权重目录）
 #        ${IF_CKPT_DIR}/part1_if_flanv2_lr<LR>_seed<SEED>/
 #      不传 IF_LR 时脚本会自己去 glob，命中不唯一会报错并列出候选。
 #   2) 20k replay/C 池（94 号 MODE=data 的产物）
-#        ${IF_LINE_ROOT}/datasets/flan_v2_if_50k_replay.jsonl
+#        ${IF_LINE_ROOT}/datasets/flan_v2_if_100k_replay.jsonl
 #   3) mkdir -p ${REPO_ROOT}/logs
 #
 # 【用法】
 #   # 0) 先跑这个：只做 Step 0 的前置检查 + 池指纹，不碰 GPU（几分钟）
-#   qsub -v DRY_RUN=1 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#   qsub -v DRY_RUN=1 onereplay/pbs/95_s2_collect_if.pbs
 #
-#   # 1) 正式采集（Step 0 -> 1 -> 2），约 20-40 min
-#   qsub onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#   # 1) 正式采集 C + F（Step 0 -> 1 -> 2 -> 3 -> 4）
+#   qsub onereplay/pbs/95_s2_collect_if.pbs
+#
+#   # 拆开投（F 慢一个数量级，卡 walltime 时这么做）
+#   qsub -v DO_FISHER=0 onereplay/pbs/95_s2_collect_if.pbs   # 只采 C
+#   qsub -v DO_COV=0    onereplay/pbs/95_s2_collect_if.pbs   # 只采 F（C 已在盘上）
 #
 #   # 指定 Stage 1 的 LR（glob 命中多个时必须传）
-#   qsub -v IF_LR=5e-5 onereplay/pbs/95_part2_cov_if_flanv2.pbs
-#
-#   # 只重看诊断，不重采
-#   qsub -v DO_COV=0 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#   qsub -v IF_LR=5e-5 onereplay/pbs/95_s2_collect_if.pbs
 #
 #   # qv 对照（940 MB，λ 量级与历史 3e-2 那套可比）
-#   qsub -v COV_SCOPE=qv onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#   qsub -v COV_SCOPE=qv onereplay/pbs/95_s2_collect_if.pbs
 #
 #   # 产物已存在也重采
-#   qsub -v FORCE=1 onereplay/pbs/95_part2_cov_if_flanv2.pbs
+#   qsub -v FORCE=1 onereplay/pbs/95_s2_collect_if.pbs
 #
-# 下一步: 97 号采 F_if（必须打印出与本脚本相同的池指纹），然后 96 号 Stage 2 训练
+# 下一步: Stage 3 的持续训练脚本
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
 
@@ -174,7 +225,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/95_part2_cov_if_flanv2.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/95_s2_collect_if.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -219,9 +270,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME IF_LINE_ROOT IF_CKPT_DIR IF_LR IF_RUN IF_CKPT
     RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT
-    DRY_RUN FORCE DO_COV
+    DRY_RUN FORCE DO_COV DO_FISHER
     SEED SAMPLE_SEED MAXLEN COV_SCOPE TARGET_MODULES COV_BATCH COV_ACCUM_DEVICE
-    COV_PATH COV_TAG REF_COV DEBUG_EXAMPLES USE_BF16
+    COV_PATH COV_TAG REF_COV DEBUG_EXAMPLES SYSTEM_PROMPT
+    COV_USE_BF16 FISHER_USE_BF16 FISHER_DEVICE FISHER_PATH MAX_SAMPLES LOG_EVERY
     REF_LAMBDA_FULL REF_LAMBDA_QV
   )
   for _v in "${FORWARD_VARS[@]}"; do
@@ -269,23 +321,25 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 
 cd "${REPO_ROOT}"
+# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+
 # ---- Stage 1（IF 线 / FLAN v2）的产物，本脚本只读 ----
-# 94 号的结果树。C 的模型和池子都来自这里。
-IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
+# 94 号的结果树，按模型分根。C/F 的模型和池子都来自这里。
+# **94 号换了 MODEL_NAME 就必须在这里一起换**，否则会静默采到另一个模型的
+# checkpoint 上（那个目录也存在，run 名还完全一样）。
+IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_flanv2_${MODEL_NAME}}"
 IF_CKPT_DIR="${IF_CKPT_DIR:-${IF_LINE_ROOT}/checkpoints}"
 # prepare_flan_v2 的默认命名：<训练池目录>_replay.jsonl，schema {inputs, targets, task}
-POOL_FILE="${POOL_FILE:-${IF_LINE_ROOT}/datasets/flan_v2_if_50k_replay.jsonl}"
+POOL_FILE="${POOL_FILE:-${IF_LINE_ROOT}/datasets/flan_v2_if_100k_replay.jsonl}"
 # 94 号的 FLAN_REPLAY_ROWS 默认值。Step 0 会断言实际行数等于它。
 POOL_ROWS_EXPECT="${POOL_ROWS_EXPECT:-20000}"
 
-# ---- Part 2 自己的结果树。与 results_part1_* 分开，免得 summary csv 混在一起 ----
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part2_if2math}"
+# ---- Stage 2 自己的结果树。与 results_part1_* 分开，免得 summary csv 混在一起 ----
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_stage2_if_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
-
-# ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采 C）----
-MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
 
 # ---- 阶段开关 ----
 # DRY_RUN 默认 0：Step 0 本身很快（纯 CPU，几分钟），正式作业也会先跑它。
@@ -293,6 +347,7 @@ MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
 DRY_RUN="${DRY_RUN:-0}"
 FORCE="${FORCE:-0}"
 DO_COV="${DO_COV:-1}"
+DO_FISHER="${DO_FISHER:-1}"
 
 # ---- 采集参数 ----
 SEED="${SEED:-1}"
@@ -318,14 +373,27 @@ esac
 COV_BATCH="${COV_BATCH:-8}"
 # device：把 7 GB 累加器留在 GPU 上，省掉每 batch 每层的回传。见文件头。
 COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
-# C 由前向激活累加、hook 里已经 .float() 加宽，所以模型走 bf16 没有精度问题
-# （Fisher 那边不同，97 号要用 fp32，理由见 collect_fisher 的 docstring）。
-USE_BF16="${USE_BF16:-1}"
+# C 由前向激活累加、hook 里已经 .float() 加宽，所以模型走 bf16 没有精度问题。
+COV_USE_BF16="${COV_USE_BF16:-1}"
+# F 完全相反：梯度在 backward 里就被舍入了，事后加宽救不回来。见文件头。
+FISHER_USE_BF16="${FISHER_USE_BF16:-0}"
+# cuda：1.5B 上总占用约 27 GiB，余量很大；放 CPU 每条要过 PCIe 搬 6.9 GB。
+FISHER_DEVICE="${FISHER_DEVICE:-cuda}"
+# 0 = 取池文件全量、不打乱。C 和 F 必须同值，否则两者吃的行数不同。
+MAX_SAMPLES="${MAX_SAMPLES:-0}"
+# collect_fisher 每多少条打一次进度。
+LOG_EVERY="${LOG_EVERY:-1000}"
 # 打两条渲染后的文本。这一步是确认 checkpoint 的 chat template 和 94 号训练时同构，
-# 以及 assistant turn 里放的确实是 FLAN 的 gold target。
+# system turn 在位，以及 assistant turn 里放的确实是 FLAN 的 gold target。
 DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
 
+# ---- system 消息：必须与 94 号训练时逐字相同，理由见文件头 ----
+# collect_cov 和 collect_fisher 自己的 --system_prompt 默认是空串，空串 = 让
+# Qwen2.5-Math 的模板注入那条 \boxed{} 数学指令 = 与 94 号的训练渲染不一致。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
+
 COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_if_flanv2_20k_${COV_TAG}.pt}"
+FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_if_flanv2_20k_${COV_TAG}.pt}"
 # 历史上单阶段线的 C_if（01 号，Base 模型 / FLAN v1 dump / max_len 512）。存在就在
 # Step 2 里打一个 trace 比值，用来把 λ 的起点从历史值折算过来。缺了不影响采集。
 REF_COV="${REF_COV:-${REPO_ROOT}/results/cov/cov_flan_chat_20k_${COV_TAG}.pt}"
@@ -338,7 +406,7 @@ else
   REF_LAMBDA="${REF_LAMBDA_FULL}"
 fi
 
-mkdir -p "$(dirname "${COV_PATH}")" "${DATASET_CACHE}"
+mkdir -p "$(dirname "${COV_PATH}")" "$(dirname "${FISHER_PATH}")" "${DATASET_CACHE}"
 
 # ===========================================================================
 # Step 0: 前置检查（纯 CPU，几分钟）
@@ -348,7 +416,7 @@ mkdir -p "$(dirname "${COV_PATH}")" "${DATASET_CACHE}"
 #   2) 池文件存在
 #   3) 池行数正好等于 POOL_ROWS_EXPECT（不等就说明 94 号的配额没满足，见其 MODE=data
 #      的输出——prepare 配额不满时只打警告、退出码仍是 0）
-#   4) 池指纹落盘打印出来：97 号采 F 时必须打印同一个值
+#   4) 池指纹落盘打印出来：Step 1 的 C 和 Step 3 的 F 共用它
 #   5) 池 schema 里有 inputs / targets 两列
 # ===========================================================================
 echo "==== Step 0: 前置检查 ===="
@@ -451,13 +519,13 @@ PY
 
 # ---- 4) 池指纹 ----
 # 与 Step 1 的 collect_cov 逐字同参（max_samples/sample_shuffle/require_target），
-# 所以这里打印的指纹就是 C 会看到的那批行的指纹。97 号必须打印同一个值。
+# 所以这里打印的指纹就是 C 和 F 会看到的那批行的指纹。
 POOL_FP="$(python -m onereplay.scripts.check_old_knowledge_pool \
   --data_files "${POOL_FILE}" --dataset_split train \
   --cache_dir "${DATASET_CACHE}" --streaming 0 \
   --input_column inputs --target_column targets \
   --require_target 1 \
-  --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+  --max_samples "${MAX_SAMPLES}" --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
   --label if_flanv2_20k | tail -n 1)"
 echo "${POOL_FP}"
 POOL_HASH="${POOL_FP##*fingerprint=}"
@@ -469,21 +537,42 @@ if [[ "${POOL_FP_ROWS}" != "${POOL_ROWS_EXPECT}" ]]; then
   exit 1
 fi
 
+if [[ "${FISHER_USE_BF16}" == "1" ]]; then
+  echo ""
+  echo "!! FISHER_USE_BF16=1：模型走 bf16，梯度会先被舍入到 8 位尾数再平方，"
+  echo "   相当于给每个 F 元素压上约 1% 的噪声底。默认是 0 就是为了这个。"
+  echo "   除非在刻意做精度消融，否则改回 0。"
+fi
+if [[ "${FISHER_DEVICE}" == "cpu" ]]; then
+  echo ""
+  echo "!! FISHER_DEVICE=cpu：每条样本要把 197 个梯度平方搬过 PCIe（约 6.9 GB/条），"
+  echo "   ${POOL_ROWS_EXPECT} 条按 20 GB/s 算是 +1.9h 下限。1.5B 上 cuda 只占约 27 GiB。"
+fi
+if [[ "${MAX_SAMPLES}" != "0" ]]; then
+  echo ""
+  echo "!! MAX_SAMPLES=${MAX_SAMPLES} != 0：C 和 F 都只吃前 ${MAX_SAMPLES} 行。"
+  echo "   这只适合冒烟，Step 4 会因为 N != 池行数而拒绝。正式实验必须是 0。"
+fi
+
 echo ""
 echo "========================================================================"
-echo "Part 2 / Stage 1 采集: C_if  (在 Model-IF-FLAN 上，不是在 Base 上)"
-echo "  采 C 的模型   : ${IF_CKPT}"
-echo "                  ^ 这就是 Stage 2 的 W0；换成 Base 会让 C 与 W0 不同点"
+echo "Stage 2 采集 / IF: C_if + F_if  (在 Model-IF 上，不是在 Base 上)"
+echo "  采集的模型    : ${IF_CKPT}"
+echo "                  ^ 这就是 Stage 3 的 W0；换成 Base 会让 C 与 W0 不同点"
 echo "  对照(未使用)  : ${MODEL_DIR}/${MODEL_NAME}"
 echo "  旧知识池      : ${POOL_FILE}"
 echo "                  ${POOL_ROWS_EXPECT} 行, gold targets, nested ⊂ Stage 1 训练池"
 echo "  池指纹        : ${POOL_HASH}"
-echo "                  ^ 97 号采 F 时必须打印同一个值"
+echo "                  ^ C / F / replay 三边共用这批行，指纹相同才成立"
 echo "  scope         : ${COV_SCOPE}  (${TARGET_MODULES})"
-echo "  采集口径      : max_len=${MAXLEN} truncation=left batch=${COV_BATCH}"
-echo "                  accum_device=${COV_ACCUM_DEVICE} bf16=${USE_BF16}"
-echo "                  max_samples=0 (全量) sample_shuffle=0 require_target=1"
-echo "  产物          : ${COV_PATH}"
+echo "  system 消息   : ${SYSTEM_PROMPT}"
+echo "                  ^ 必须与 94 号训练时传的逐字相同（见文件头）"
+echo "  共用口径      : max_len=${MAXLEN} truncation=left"
+echo "                  max_samples=${MAX_SAMPLES} (0=全量) sample_shuffle=0 require_target=1"
+echo "  C  (Step 1/2) : DO_COV=${DO_COV}  batch=${COV_BATCH} accum_device=${COV_ACCUM_DEVICE} bf16=${COV_USE_BF16}"
+echo "                  -> ${COV_PATH}"
+echo "  F  (Step 3/4) : DO_FISHER=${DO_FISHER}  batch=1(强制) bf16=${FISHER_USE_BF16} device=${FISHER_DEVICE}"
+echo "                  -> ${FISHER_PATH}"
 echo "  历史对照 C    : ${REF_COV} $( [[ -f "${REF_COV}" ]] && echo '(存在, Step 2 会比)' || echo '(不存在, 跳过比值)' )"
 echo "========================================================================"
 
@@ -507,6 +596,7 @@ fi
 #   --truncation_side left       与训练一致；默认空串会走 tokenizer 默认(right, 先切答案)
 #   --max_samples 0 --sample_shuffle 0   文件本身就是那 20k 行，取全量不打乱
 #   --require_target 1           与 replay 的 to_sft_schema 同口径
+#   --system_prompt              与 94 号训练时同一条 system turn（见文件头）
 # ===========================================================================
 if [[ "${DO_COV}" == "1" ]]; then
   if [[ "${FORCE}" != "1" && -f "${COV_PATH}" ]]; then
@@ -515,15 +605,16 @@ if [[ "${DO_COV}" == "1" ]]; then
     echo "==== Step 1: collect C_if -> ${COV_PATH} ===="
     python -m onereplay.scripts.collect_cov \
       --model_dir "${IF_CKPT_DIR}" --model_name "${IF_RUN}" \
-      --seed "${SEED}" --use_bf16 "${USE_BF16}" \
+      --seed "${SEED}" --use_bf16 "${COV_USE_BF16}" \
       --data_files "${POOL_FILE}" --dataset_split train \
       --cache_dir "${DATASET_CACHE}" --streaming 0 \
       --input_column inputs --target_column targets \
       --require_target 1 \
       --use_chat_template 1 --include_target_in_chat 1 \
+      --system_prompt "${SYSTEM_PROMPT}" \
       --enable_thinking 0 --concat_prompt_target 0 \
       --debug_print_examples "${DEBUG_EXAMPLES}" \
-      --max_samples 0 --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+      --max_samples "${MAX_SAMPLES}" --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
       --batch_size "${COV_BATCH}" --max_len "${MAXLEN}" \
       --truncation_side left \
       --target_modules "${TARGET_MODULES}" \
@@ -548,13 +639,13 @@ fi
 #      trace 按家族分布。down_proj 的 trace 会比别人大一个量级，这是正常的：
 #      它的输入是 SwiGLU 之后的 6144 维激活。
 #   D) λ 的起点 —— 约束强度 ∝ λ · trace(C)，所以历史 λ 要按 trace 反比折算。
-#      **这只是起点，不是结论**：新任务换了（Commonsense512 -> OpenR1@8192），
-#      task_loss 的尺度也不一样，λ 必须在 96 号里用 PROBE 短跑实测罚项/任务损失
-#      的比例再定。
+#      **这只是起点，不是结论**：Stage 3 的新任务 task_loss 尺度和历史那轮不同，
+#      λ 必须在 Stage 3 的脚本里用 lambda_probe 短跑实测罚项/任务损失的比例再定。
 # ===========================================================================
 echo "==== Step 2: 诊断 C_if ===="
 python - "${COV_PATH}" "${POOL_HASH}" "${MAXLEN}" "${TARGET_MODULES}" \
-         "${REF_COV}" "${REF_LAMBDA}" "${IF_CKPT}" <<'PY'
+         "${REF_COV}" "${REF_LAMBDA}" "${IF_CKPT}" \
+         "${MAX_SAMPLES}" "${SYSTEM_PROMPT}" <<'PY'
 import json
 import sys
 from collections import defaultdict
@@ -562,10 +653,21 @@ from pathlib import Path
 
 import torch
 
-cov_path, want_fp, want_max_len, want_modules, ref_path, ref_lambda, ckpt = sys.argv[1:8]
+(
+    cov_path,
+    want_fp,
+    want_max_len,
+    want_modules,
+    ref_path,
+    ref_lambda,
+    ckpt,
+    want_max_samples,
+    want_system,
+) = sys.argv[1:10]
 want_max_len = int(want_max_len)
 want_modules = [item for item in want_modules.split(",") if item]
 ref_lambda = float(ref_lambda)
+want_max_samples = int(want_max_samples)
 
 # 预期模块数从 config.json 的层数算，不写死。lm_head 全模型只有一个，其余每层一个
 # —— 与 68/70 号的 expect 公式同一套。写死 197 的话，改 TARGET_MODULES（比如按 8B
@@ -587,8 +689,11 @@ checks = [
     ("truncation_side", "left", "truncation_side 不是 left：切掉的是答案而不是 few-shot 示例"),
     ("require_target", 1, "require_target 不是 1：与 replay 的过滤口径不一致"),
     ("sample_shuffle", 0, "sample_shuffle 不是 0"),
-    ("max_samples", 0, "max_samples 不是 0（应当取全量）"),
+    ("max_samples", want_max_samples, "max_samples 与本作业传的不一致"),
     ("cov_normalization", "none", "cov_normalization 不是 none"),
+    # 空串 = 让 Qwen2.5-Math 的模板注入 \boxed{} 数学指令，那与 94 号的训练渲染
+    # 不是同一个文本分布。94 号改了默认值，这里会跟着一起变。
+    ("system_prompt", want_system, "system_prompt 与 94 号训练时传的不一致"),
 ]
 for key, want, message in checks:
     got = meta.get(key)
@@ -626,8 +731,8 @@ if "lm_head" in covariances or any(name.endswith("lm_head") for name in covarian
     # lm_head 这一侧看（用最终隐状态的协方差），embedding 查表那一侧完全没有约束
     # ——embed_tokens 是 nn.Embedding，find_target_linear_module_names 永远不会命中它。
     # 不会重复计数（snapshot_reference_weights 按 storage 去重），但覆盖是"半边"的。
-    print("   note: lm_head 在覆盖内。该权重与 embed_tokens 共享存储（Qwen3-1.7B 是")
-    print("         tie_word_embeddings=true），罚项只约束 lm_head 这一侧的输入协方差。")
+    print("   note: lm_head 在覆盖内。该权重与 embed_tokens 共享存储（Qwen2.5-Math-1.5B")
+    print("         也是 tie_word_embeddings=true），罚项只约束 lm_head 这一侧的输入协方差。")
 
 # ---- C) 数值健康 + trace ----
 print()
@@ -687,9 +792,9 @@ else:
     print(f"   历史 λ 参考: 全量 all-linear 7.5e-3 (44 号) / LoRA qv 3e-2 (32/63 号)")
 print()
 print("   **λ 不要在这里定死。** 约束强度 ∝ λ·trace(C)，但罚项要和**任务损失**比较才有")
-print("   意义，而 Part 2 的新任务是 OpenR1@8192（长 CoT，task_loss 的尺度和")
-print("   Commonsense@512 完全不同）。96 号有 MODE=lambda_probe：短跑几十次更新，打印")
-print("   reg_loss / task_loss 的实际比例，据此选 λ。上面这个数只是 grid 的中心。")
+print("   意义，而 Stage 3 的新任务 task_loss 尺度和历史那轮不同。Stage 3 的脚本有")
+print("   lambda_probe：短跑几十次更新，打印 reg_loss / task_loss 的实际比例，据此选 λ。")
+print("   上面这个数只是 grid 的中心。")
 
 print()
 if problems:
@@ -701,39 +806,323 @@ print("诊断通过：C_if 可用。")
 PY
 
 # ===========================================================================
+# Step 3: 采 F
+#
+# 凡是决定「看到哪些 token」的参数都与 Step 1 逐字相同 —— 这正是把 C 和 F 合进
+# 一个脚本的理由：它们读的是同一组 shell 变量，不可能不一致。
+#
+# 与 Step 1 不同的只有三项，每一项都是 F 的定义要求的（见文件头）:
+#   --use_bf16 ${FISHER_USE_BF16}   默认 0，fp32
+#   --fisher_device                 累加器放哪
+#   （没有 --batch_size：collect_fisher 内部固定 1，逐样本梯度不可 batch）
+#   （没有 --enable_thinking / --concat_prompt_target / --debug_print_examples：
+#     old_knowledge.py 用 getattr 读前两个、默认就是 0，与 Step 1 显式传的 0
+#     等价；加了 argparse 会报错。）
+#
+# include_target_in_chat 必须是 1 且 collect_fisher 会强制检查：没有 assistant
+# turn 就没有被监督的 token，F 会全是 0。
+# ===========================================================================
+echo ""
+if [[ "${DO_FISHER}" == "1" ]]; then
+  if [[ "${FORCE}" != "1" && -f "${FISHER_PATH}" ]]; then
+    echo "跳过采 F：${FISHER_PATH} 已存在（FORCE=1 可强制重采）"
+  else
+    echo "==== Step 3: collect F_if -> ${FISHER_PATH} ===="
+    echo "${POOL_FP_ROWS} 次逐样本 backward，fp32，预计 0.5-2h。"
+    echo "**拿日志里的 ms/example x ${POOL_FP_ROWS} 才是真实时长**，区间只够判断有没有卡住。"
+    python -m onereplay.scripts.collect_fisher \
+      --model_dir "${IF_CKPT_DIR}" --model_name "${IF_RUN}" \
+      --seed "${SEED}" --use_bf16 "${FISHER_USE_BF16}" \
+      --data_files "${POOL_FILE}" --dataset_split train \
+      --cache_dir "${DATASET_CACHE}" --streaming 0 \
+      --input_column inputs --target_column targets \
+      --require_target 1 \
+      --use_chat_template 1 --include_target_in_chat 1 \
+      --system_prompt "${SYSTEM_PROMPT}" \
+      --max_samples "${MAX_SAMPLES}" --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+      --max_len "${MAXLEN}" \
+      --truncation_side left \
+      --target_modules "${TARGET_MODULES}" \
+      --fisher_device "${FISHER_DEVICE}" \
+      --log_every "${LOG_EVERY}" \
+      --output_path "${FISHER_PATH}"
+  fi
+else
+  echo "DO_FISHER=0：跳过采 F。"
+fi
+
+# ===========================================================================
+# Step 4: 诊断 F
+#
+# 五组数，各挡一类错误：
+#   A) metadata 自检 —— 估计量定义、池指纹、N、口径有没有真的传上去。
+#      这些错了 F 仍会写出一个合法文件，只有 metadata 能证明它是对的。
+#   B) 与 C 的层集合对比 —— 必须是**同一批模块名**，否则两个方法约束的不是同一
+#      批层。合脚本之后这一条几乎不可能失败，留着是为了挡 DO_COV=0 + 换了
+#      COV_SCOPE 重投这种情况。
+#   C) 数值健康 —— F 是平方和，逐元素必须 >= 0；NaN/Inf；以及"零元素比例"
+#      （F=0 的权重在 EWC 下完全不受约束，这个比例太高说明 20k 行不够）。
+#   D) 估计量健康 —— ESS / length_exponent / zero_supervision_rows。
+#      这三个数决定 F 是不是真的建立在 20000 条上，而不是被少数长答案主导。
+#   E) λ 起点 —— 1/mean。EWC 的 λ 和 onereplay 的 λ 不可比，必须独立 sweep。
+# ===========================================================================
+if [[ -f "${FISHER_PATH}" ]]; then
+  echo ""
+  echo "==== Step 4: 诊断 F_if ===="
+  python - "${FISHER_PATH}" "${COV_PATH}" "${POOL_HASH}" "${MAXLEN}" "${TARGET_MODULES}" \
+    "${IF_RUN}" "${IF_CKPT}" "${POOL_FP_ROWS}" "${SYSTEM_PROMPT}" <<'PY'
+import json
+import math
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import torch
+
+(
+    fisher_path,
+    cov_path,
+    want_fp,
+    want_max_len,
+    want_modules_raw,
+    want_model,
+    ckpt,
+    want_rows,
+    want_system,
+) = sys.argv[1:10]
+want_max_len = int(want_max_len)
+want_modules = [item for item in want_modules_raw.split(",") if item]
+want_rows = int(want_rows)
+
+payload = torch.load(fisher_path, map_location="cpu")
+fishers = payload["fishers"]
+meta = payload.get("metadata", {})
+counts = payload.get("counts", {})
+
+problems: list[str] = []
+
+# ---------------------------------------------------------------- A) metadata
+print("[A] metadata 自检")
+print(f"  estimator          : {meta.get('estimator')}")
+print(f"  loss_reduction     : {meta.get('loss_reduction')}   supervision: {meta.get('supervision')}")
+print(f"  per_example_backward: {meta.get('per_example_backward')}")
+print(f"  num_examples (N)   : {meta.get('num_examples')}")
+print(f"  model_name         : {meta.get('model_name')}")
+print(f"  pool_fingerprint   : {meta.get('pool_fingerprint')}")
+print(f"  max_len / trunc    : {meta.get('max_len')} / {meta.get('truncation_side')}")
+print(f"  use_bf16           : {meta.get('use_bf16')}")
+print(f"  system_prompt      : {meta.get('system_prompt')!r}")
+print(f"  target_modules     : {','.join(meta.get('target_modules', []))}")
+
+if meta.get("per_example_backward") is not True:
+    problems.append(
+        "per_example_backward 不是 True —— 对 batch 求和的梯度再平方算的是 (Σg)²，"
+        "不是 Σg²，那不是 Fisher"
+    )
+if str(meta.get("model_name", "")) != want_model:
+    problems.append(f"model_name={meta.get('model_name')} != 本作业的基座 {want_model}")
+if str(meta.get("pool_fingerprint", "")) != want_fp:
+    problems.append(
+        f"pool_fingerprint={meta.get('pool_fingerprint')} != Step 0 算的 {want_fp}"
+    )
+if int(meta.get("max_len", -1)) != want_max_len:
+    problems.append(f"max_len={meta.get('max_len')} != {want_max_len}")
+if str(meta.get("truncation_side", "")) != "left":
+    problems.append(
+        f"truncation_side={meta.get('truncation_side')} != left。右截断先切答案，"
+        "被切干净的行 supervised token 数为 0、贡献 0，会静默稀释 F"
+    )
+if int(meta.get("use_bf16", -1)) != 0:
+    problems.append("use_bf16 != 0：梯度被舍入到 8 位尾数才平方，F 带约 1% 噪声底")
+if str(meta.get("system_prompt", "")) != want_system:
+    problems.append(
+        f"system_prompt={meta.get('system_prompt')!r} != 本作业的 {want_system!r}。"
+        "F 和 C 必须渲染同一个文本分布"
+    )
+if int(meta.get("num_examples", 0)) != want_rows:
+    problems.append(
+        f"N={meta.get('num_examples')} != 池行数 {want_rows}。F 和 C 必须吃同样多的行"
+    )
+
+# ------------------------------------------------------- B) 层集合 vs C
+print("\n[B] 层覆盖")
+num_layers = int(json.loads((Path(ckpt) / "config.json").read_text())["num_hidden_layers"])
+expected = sum(1 if item == "lm_head" else num_layers for item in want_modules)
+print(f"  模块数             : {len(fishers)}  (期望 {expected} = "
+      f"{num_layers} 层 x {len([m for m in want_modules if m != 'lm_head'])}"
+      + (" + lm_head" if "lm_head" in want_modules else "") + ")")
+if len(fishers) != expected:
+    problems.append(
+        f"模块数 {len(fishers)} != 期望 {expected}。--target_modules 里某个名字"
+        "在这个模型上没命中（find_target_linear_module_names 是后缀匹配）"
+    )
+
+families: dict[str, list[str]] = defaultdict(list)
+for name in fishers:
+    families[name.split(".")[-1]].append(name)
+for family in sorted(families):
+    shapes = {tuple(fishers[name].shape) for name in families[family]}
+    print(f"    {family:<12} {len(families[family]):>4} 个   shape={sorted(shapes)}")
+
+if Path(cov_path).is_file():
+    cov_payload = torch.load(cov_path, map_location="cpu")
+    cov_keys = set(cov_payload["covariances"])
+    fisher_keys = set(fishers)
+    if cov_keys == fisher_keys:
+        print(f"  与 C 的层集合     : 完全一致（{len(cov_keys)} 个模块）ok")
+    else:
+        only_c = sorted(cov_keys - fisher_keys)[:5]
+        only_f = sorted(fisher_keys - cov_keys)[:5]
+        problems.append(
+            f"F 和 C 的层集合不同。只有 C 有: {only_c}；只有 F 有: {only_f}。"
+            "两个方法必须约束同一批层，否则比较的是覆盖范围而不是权重矩阵"
+        )
+    # 同一个作业里采的话这几项不可能不同；DO_COV=0 重投时它们能挡住换过参数的 C。
+    cov_meta = cov_payload.get("metadata", {})
+    for key in ("pool_fingerprint", "max_len", "truncation_side", "system_prompt", "model_name"):
+        c_value, f_value = cov_meta.get(key), meta.get(key)
+        if str(c_value) != str(f_value):
+            problems.append(f"C 与 F 的 {key} 不同: C={c_value!r} F={f_value!r}")
+else:
+    print(f"  与 C 的层集合     : 跳过（{cov_path} 不存在）")
+
+# -------------------------------------------------------- C) 数值健康
+print("\n[C] 数值健康")
+total_elements = sum(matrix.numel() for matrix in fishers.values())
+bad_finite: list[str] = []
+negative: list[str] = []
+zero_elements = 0
+family_mean: dict[str, list[float]] = defaultdict(list)
+global_max = 0.0
+weighted_sum = 0.0
+for name, matrix in fishers.items():
+    matrix = matrix.float()
+    if not torch.isfinite(matrix).all():
+        bad_finite.append(name)
+        continue
+    minimum = float(matrix.min())
+    if minimum < 0.0:
+        negative.append(f"{name}({minimum:.3e})")
+    zero_elements += int((matrix == 0).sum())
+    weighted_sum += float(matrix.sum())
+    global_max = max(global_max, float(matrix.max()))
+    family_mean[name.split(".")[-1]].append(float(matrix.mean()))
+
+mean_magnitude = weighted_sum / max(total_elements, 1)
+print(f"  元素总数           : {total_elements / 1e9:.3f}G "
+      f"({total_elements * 4 / 1024 ** 3:.2f} GiB fp32)")
+print(f"  mean / max         : {mean_magnitude:.4e} / {global_max:.4e}")
+print(f"  零元素比例         : {zero_elements / max(total_elements, 1) * 100:.2f}%")
+print("    F=0 的权重在 EWC 下完全不受约束。比例很高说明 20k 行没能激活那部分参数。")
+if bad_finite:
+    problems.append(f"有 NaN/Inf 的层: {bad_finite[:5]}")
+if negative:
+    problems.append(
+        f"有负元素的层: {negative[:5]}。F 是梯度平方的均值，逐元素必然 >= 0，"
+        "出负数说明累加过程出了问题"
+    )
+print("  各家族 mean（量级差异是正常的，梯度尺度本身按层类型分布）:")
+for family in sorted(family_mean):
+    values = family_mean[family]
+    print(f"    {family:<12} {sum(values) / len(values):.4e}")
+
+# ------------------------------------------------------- D) 估计量健康
+print("\n[D] 估计量健康")
+report = meta.get("length_weighting", {})
+if report:
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    examples = float(report.get("examples", 0) or 0)
+    ess = float(report.get("effective_sample_size", 0) or 0)
+    ess_ratio = float(report.get("ess_ratio", 0) or 0)
+    zero_rows = float(report.get("zero_supervision_rows", 0) or 0)
+    exponent = float(report.get("length_exponent", float("nan")))
+    print()
+    print(f"  ESS = {ess:.0f} / {examples:.0f}  ({ess_ratio:.3f})")
+    print("    「F 实际建立在多少条样本上」。ESS 远小于 N 意味着少数长答案主导了估计，")
+    print("    那 F 描述的就不是这 20k 行的平均敏感度，而是那几条的。")
+    print("    FLAN 的答案 P50 只有 18 token、均值约 30，长尾主要来自 few-shot 行。")
+    if ess_ratio < 0.05:
+        problems.append(
+            f"ess_ratio={ess_ratio:.3f} < 0.05：F 几乎只由 {ess:.0f} 条样本决定。"
+            "EWC 的对照仍然能跑，但要在报告里写明这件事"
+        )
+    print(f"  zero_supervision_rows = {zero_rows:.0f}")
+    print("    这些行没有任何被监督的 token，贡献 0 但仍计入 N（add_empty）。")
+    print("    左截断下应当接近 0；数值明显不为 0 说明 targets 里有空值或截断口径不对。")
+    if zero_rows > 0.01 * max(examples, 1.0):
+        problems.append(
+            f"zero_supervision_rows={zero_rows:.0f} 超过 1% 的行没有监督 token，"
+            "F 被静默稀释了这么多"
+        )
+    if not math.isnan(exponent):
+        print(f"  length_exponent = {exponent:.3f}")
+        print("    ||g_n||² ~ T_n^a 的拟合指数。逐 token 梯度互不相关给 a=1，")
+        print("    完全对齐给 a=2。落在 1-2 之间是正常的；明显超出 2 值得回头看数据。")
+else:
+    problems.append("metadata 里没有 length_weighting，无法判断估计量是否健康")
+
+if meta.get("prompt_prefix_mismatches"):
+    print(f"\n  prompt_prefix_mismatches = {meta['prompt_prefix_mismatches']}")
+    print("    这些行的 prompt 渲染不是完整渲染的干净 token 前缀，mask 退化到共同前缀。")
+    print("    少量正常（chat template 的边界 token）；成千上万条就要查 template 了。")
+
+counts_values = set(counts.values())
+if len(counts_values) > 1:
+    problems.append(f"各层的 example 计数不一致: {sorted(counts_values)[:5]}")
+
+# ---------------------------------------------------------- E) λ 起点
+print("\n[E] EWC 的 λ 起点")
+print(f"  F 的 mean = {mean_magnitude:.4e}  ->  1/mean = {1.0 / max(mean_magnitude, 1e-30):.4e}")
+print("  从这个量级起，按十倍一档往两边扩。")
+print("  **不要借用 onereplay 的 λ**：F 是梯度平方、C 是激活二阶矩，量级差好几个数量级。")
+print("  train.py 的 --regularizer help 原话: the two scales are not comparable and")
+print("  need separate sweeps。EWC 臂要自己跑一遍 lambda_probe。")
+
+print()
+if problems:
+    print("=" * 72)
+    for item in problems:
+        print(f"!! {item}")
+    print("=" * 72)
+    raise SystemExit("F_if 诊断未通过")
+print("诊断全部通过：F_if 可用。")
+PY
+fi
+
+# ===========================================================================
 # 产物与下一步
 # ===========================================================================
 echo ""
 echo "========================================================================"
-COV_SIZE="$(du -h "${COV_PATH}" | cut -f1)"
+COV_SIZE="$( [[ -f "${COV_PATH}" ]] && du -h "${COV_PATH}" | cut -f1 || echo '未采')"
+FISHER_SIZE="$( [[ -f "${FISHER_PATH}" ]] && du -h "${FISHER_PATH}" | cut -f1 || echo '未采')"
 cat <<EOF
-产物:
+产物（共用同一个模型、同一批行、同一套渲染）:
+  模型   : ${IF_CKPT}
+  池子   : ${POOL_FILE}  (${POOL_ROWS_EXPECT} 行)
+  指纹   : ${POOL_HASH}
+  scope  : ${COV_SCOPE}  (${TARGET_MODULES})
+  system : ${SYSTEM_PROMPT}
+
   C_if = ${COV_PATH}   (${COV_SIZE})
-    采在  : ${IF_CKPT}
-    池子  : ${POOL_FILE}  (${POOL_ROWS_EXPECT} 行)
-    指纹  : ${POOL_HASH}
-    scope : ${COV_SCOPE}  (${TARGET_MODULES})
+  F_if = ${FISHER_PATH}   (${FISHER_SIZE})
 
 本线**不需要混合**：只保护一个域（IF），所以 C_if 直接就是训练用的 C。
 62/68 号那种 mix_covariances 步骤在这里没有对应物。
 
-下一步:
-  1) 采 F_if（EWC 对照臂用）。必须打印出与上面**完全相同**的池指纹:
-       ${POOL_HASH}
-     qsub onereplay/pbs/97_part2_fisher_if_flanv2.pbs
-     （F 是 d_out x d_in，all-linear 下约 6.9 GB；batch 写死 1，是三个采集里最慢的）
+接到 Stage 3 的持续训练上，四条臂共用这三份旧知识:
+  vanilla    不加载任何 penalty
+  onereplay  --regularizer onereplay --cov_path ${COV_PATH} --replay_lambda <λ_or>
+  ewc        --regularizer ewc --fisher_path ${FISHER_PATH} --replay_lambda <λ_ewc>
+  replay     --replay_data_files ${POOL_FILE} --replay_max_len ${MAXLEN}
 
-  2) Stage 2 训练 + 评测（96 号）。四条臂共用这三份旧知识:
-       vanilla    不加载任何 penalty
-       onereplay  --cov_path ${COV_PATH}  --replay_lambda <λ>
-       ewc        --regularizer ewc --fisher_path <F_if>
-       replay     --replay_data_files ${POOL_FILE} --replay_max_len ${MAXLEN}
-     IF 保留用 ifeval + followbench（不用 ifbench），新任务用 gsm8k + math500。
+λ_or 和 λ_ewc 必须**各自独立** sweep，量级不可互借（见 Step 2 [D] 和 Step 4 [E]）。
+Stage 3 评测：旧能力用 ifeval + followbench（不用 ifbench），新任务按目标域定。
 
-  3) 可选诊断：C 的谱结构（能看出罚项主要在压哪些方向）。7 GB 的 C 跑全量很慢，
-     先只看 attention 那几层:
-       python -m onereplay.scripts.inspect_cov_layers \\
-         --cov_path ${COV_PATH} \\
-         --base_model_dir ${IF_CKPT} --top 20
+可选诊断：C 的谱结构（能看出罚项主要在压哪些方向）。7 GB 的 C 跑全量很慢，
+先只看 attention 那几层:
+  python -m onereplay.scripts.inspect_cov_layers \\
+    --cov_path ${COV_PATH} \\
+    --base_model_dir ${IF_CKPT} --top 20
 EOF
 echo "Job finished at: $(date)"

@@ -32,6 +32,7 @@ from onereplay.core.modeling import (  # noqa: E402
     set_seed,
     snapshot_reference_weights,
 )
+from onereplay.core.chat_policy import configure_system_prompt  # noqa: E402
 from onereplay.core.regularizer import EWCRegularizer, ReplayRegularizer  # noqa: E402
 from onereplay.data.chat import build_loader, build_opd_loader  # noqa: E402
 from onereplay.data.commonsense import load_and_prepare_dataset  # noqa: E402
@@ -60,6 +61,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_dir", type=str, default="/home/weiliu1/huggingface/models/")
     parser.add_argument("--model_name", type=str, default="Qwen3-1.7B")
     parser.add_argument("--use_bf16", type=int, default=1)
+    # Qwen2.5-Math's template injects "put your final answer within \boxed{}"
+    # when no system turn is given, so every FLAN and Commonsense row would be
+    # trained under a math instruction. Those lines pass a neutral system
+    # message; the math line leaves this empty and keeps the injected one,
+    # which is the recipe it is reproducing. evaluate.py and the C/F collectors
+    # must be given the same value, or the model is measured and regularized
+    # under a prompt it was never trained on.
+    parser.add_argument("--system_prompt", type=str, default="")
 
     parser.add_argument(
         "--dataset_path",
@@ -541,6 +550,7 @@ def main() -> None:
     for attr, value in sorted(vars(args).items()):
         print(f"\t{attr.upper()}={value}")
     set_seed(args.seed)
+    configure_system_prompt(args.system_prompt)
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     model, tokenizer = load_causal_lm_and_tokenizer(
