@@ -915,8 +915,17 @@ if [[ -f "${TRAIN_LOG}" ]]; then
   if [[ -n "${REPLAY_FILE}" ]]; then
     assert_log "replay targets: gold-target (column ${REPLAY_TARGET_COLUMN} of the self-distilled file)" \
       "训到的不是 gold_targets 列。读成 targets 列就变成 1.7B 的自蒸馏答案了，那是另一条臂。"
-    assert_log "replay pool: tokenizing at max_len=${REPLAY_MAXLEN} (new task stays at ${MAXLEN})" \
-      "replay 的 token 预算没生效，长行会丢题干，保护的旧知识少于 C 编码的那份。"
+    # data/replay.py 里那句 tokenizing 日志是有条件的（`if max_len != args.max_len`）：
+    # 两个预算相等时它什么都不打。这条线上新任务是 1024，而 math/code 的 REPLAY_MAXLEN
+    # 恰好也是 1024，所以照抄 CS 线（那边新任务 512）的断言会在配置完全正确时误报。
+    # 相等时退回查 train.py 启动时回显的 args 行 —— 那一行两种情况下都在。
+    if [[ "${REPLAY_MAXLEN}" != "${MAXLEN}" ]]; then
+      assert_log "replay pool: tokenizing at max_len=${REPLAY_MAXLEN} (new task stays at ${MAXLEN})" \
+        "replay 的 token 预算没生效，长行会丢题干，保护的旧知识少于 C 编码的那份。"
+    else
+      assert_log "REPLAY_MAX_LEN=${REPLAY_MAXLEN}" \
+        "replay 的 token 预算没传进去。本域它与新任务同为 ${MAXLEN}，replay.py 不会为它单独打日志，所以只能查 args 回显。"
+    fi
   else
     assert_log "replay targets: gold-target" "if 域读的应该是 FLAN 自己的 targets"
   fi
