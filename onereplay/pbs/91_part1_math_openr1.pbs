@@ -218,13 +218,13 @@
 # 【时间预算：换 Numina + 2048 之后便宜了一个数量级】
 #
 # Numina 的答案 P50=351 / P90=778 / max=2666，题目 P50≈104，所以全序列 P50 约 480
-# token。10 万行 => tok/epoch **约 48M**，而 OpenR1 时代（45792 行 x MAXLEN 8192）
-# 是 190.0M，差 4 倍。（这组长度是 50k 池上用 Qwen3 tokenizer 量的；100k 是同一套
-# 按 source 比例的配额，分布应当一致，**以新池的 manifest length 段为准**。）
+# token。100k 池实测（manifest length 段，n=3000 抽样）：全序列 P50=487 / P90=961 /
+# P99=1462 / max=3045，答案 P50=350 / P90=787。MAXLEN=2048 下 tok/epoch **55.6M**，
+# 而 OpenR1 时代（45792 行 x MAXLEN 8192）是 190.0M。
 #
 # 吞吐仍然没有全参微调的实测值，而且 T=2048 时 attention 的 O(T^2) 项比 8192 那版
 # 轻得多，所以不该再套那个 5-8k token/s。**别猜，跑 MODE=smoke 看 tokens_per_sec**，
-# 用 48M / 它算真实 epoch 秒数。按 8-15k token/s 粗估 1 epoch 约 0.9-1.7 h。
+# 用 55.6M / 它算真实 epoch 秒数。按 8-15k token/s 粗估 1 epoch 约 1.0-1.9 h。
 #
 # 所以和 OpenR1 时代不同：正式训练不再必须 DO_EVAL=0。但仍然建议拆开跑 —— 评测
 # 两个 run x 三个指标是独立的墙钟，混在一个作业里失败要重跑训练。
@@ -352,12 +352,12 @@
 #
 # 【用法】按顺序。数据池已备好，所以不再需要第 0 步。
 #   # 1) 冒烟：70 步，不保存。两个目的：看 peak memory（2048x4 的真实峰值），
-#   #    以及拿 tokens_per_sec 去除 24M tok/epoch 算真实 epoch 时长。
+#   #    以及拿 tokens_per_sec 去除 55.6M tok/epoch 算真实 epoch 时长。
 #   #    **顺便确认日志里出现了 lr= 字段**，没有就说明 scheduler 没接上。
 #   qsub -v MODE=smoke onereplay/pbs/91_part1_math_openr1.pbs
 #
 #   # 2) 正式训练。LR/scheduler 都已是论文值，默认就对，不用再传。
-#   #    1 epoch 约 0.5-0.8 h，所以可以带评测一起跑；想拆开就加 DO_EVAL=0。
+#   #    1 epoch 约 1.0-1.9 h，所以可以带评测一起跑；想拆开就加 DO_EVAL=0。
 #   qsub -v MODE=train onereplay/pbs/91_part1_math_openr1.pbs
 #
 #   # 3) 评测单独跑（或上一步带 DO_EVAL=0 之后补）。默认 cap=2048 / batch=128，
@@ -597,7 +597,7 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 # 现在 MAXLEN 降到 2048，8 x 2048 = 16384 理论上装得下，但没有实测，而且
 # 4 x 2048 已经远在吞吐饱和点之上（见文件头「显存与 batch」），加大换不到速度。
 # 要动就先 MODE=smoke 看峰值。
-BATCH="${BATCH:-4}"
+BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
 # 2048 = 论文 §4.1 的 "maximum input length"。Numina 的答案 P50=351 / P90=778 /
 # max=2666，所以 2048 会截断一小部分行，**不是零截断**。截断是保尾丢头的，提交前
@@ -784,7 +784,7 @@ if [[ "${MODE}" == "data" ]]; then
     echo "拒绝 MODE=data：${MATH_DATASET} 已经是一个 save_to_disk 池"
     echo "  （有 dataset_dict.json）。prepare_openr1_math 会把 --out_dir 整目录覆盖掉。"
     echo "  Numina 50k 已经备好，直接 MODE=smoke / MODE=train。若真要重建 OpenR1 池，"
-    echo "  另指定 MATH_DATASET=<新目录>，不要指向 datasets/numina_math_50k。"
+    echo "  另指定 MATH_DATASET=<新目录>，不要指向 datasets/numina_math_100k。"
     exit 1
   fi
   if [[ ! -f "${OPENR1_PARQUET}" ]]; then
@@ -830,7 +830,7 @@ fi
 #
 #   1) **显存**：MAXLEN x BATCH = 2048 x 4 是否真的装得下，峰值离卡容量还有多少余量。
 #   2) **吞吐**：日志里的 tokens_per_sec。全参微调没有实测值，文件头那个
-#      "1 epoch 0.5-0.8 h" 是按 8-15k tok/s 估的。用实测值除 24M tok/epoch
+#      "1 epoch 1.0-1.9 h" 是按 8-15k tok/s 估的。用实测值除 55.6M tok/epoch
 #      才是真实 epoch 时长。
 #   3) **scheduler 真的接上了**：日志的 step 行里必须出现 lr= 字段，而且它应当在
 #      warmup 期内上升。没有这个字段就说明 --lr_scheduler 没传到（train.py 只在
@@ -848,7 +848,7 @@ if [[ "${MODE}" == "smoke" ]]; then
   train_one "smoke_math" 1 "${LR}" "${CKPT_DIR}/smoke_math" "${SMOKE_STEPS}" 0 1
   echo "冒烟完成。看三件事（前两个在 ${METRICS_DIR}/smoke_math.jsonl 里）："
   echo "  peak_memory_gb  -> 2048x4 的真实峰值，离卡容量还剩多少"
-  echo "  tokens_per_sec  -> 用 24M / 它 = 单卡真实 epoch 秒数"
+  echo "  tokens_per_sec  -> 用 55.6M / 它 = 单卡真实 epoch 秒数"
   echo "  上面 step 日志里有没有 lr= 字段 -> 没有就是 scheduler 没接上，停下来查"
   exit 0
 fi
