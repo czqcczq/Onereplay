@@ -9,16 +9,70 @@
 #PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 1 / Math 线: Qwen3-1.7B-Base --OpenR1--> Model-Math，评 GSM8K + MATH-500
+# Part 1 / Math 线: Qwen2.5-Math-1.5B --NuminaMath-CoT--> Model-Math
+#                   评 MATH-500 + AMC + GSM8K
 #
-#     Base ---- Openr1-Math-46k-8192 (45792 条长推理) ----> Model-Math
-#     评测: GSM8K, MATH-500          对照: base
+#     Base ---- NuminaMath-CoT ----> Model-Math
+#     评测: MATH-500, AMC, GSM8K     对照: base
 #
 # capability forgetting 实验的 sanity check 之一。只回答一个问题：
 #
-#     OpenR1 能不能把 mathematical reasoning 教起来？
+#     NuminaMath 能不能把 mathematical reasoning 教起来？
 #
 # 必须先确认能，Part 2 里测到的 Math 下降才叫遗忘。
+#
+# -----------------------------------------------------------------------------
+# 【为什么换成 Qwen2.5-Math-1.5B，以及配方对标哪篇论文】
+#
+# 对标 "On the Generalization of SFT: A Reinforcement Learning Perspective with
+# Reward Rectification" (DFT, ICLR 2026) 的 Table 1。它那一行
+#     Qwen2.5-Math-1.5B          Math500 31.66  均值 15.92
+#     Qwen2.5-Math-1.5B w/SFT    Math500 43.76  均值 18.01
+# 是这条线的外部参照：同模型、同数据集、同量级配方下，vanilla SFT 该把 MATH-500
+# 从 31.66 抬到 43.76。我们只要 base -> Model-Math 的方向和幅度对得上，就说明
+# Part 1 的 sanity check 立住了。
+#
+# 论文 §4.1 明写的配方（本脚本已对齐的部分）：
+#   NuminaMath-CoT 随机采 10 万条 / 全参 SFT / 1 epoch / AdamW / lr 5e-5 /
+#   max input length 2048 / cosine decay / warmup ratio 0.1 / default chat template
+#
+# 刻意不对齐的只剩一处：
+#
+#   1) effective batch 64 而不是论文的 256（ACCUM=64, BATCH=4）。设备不同，而且
+#      论文自己的 Figure 3 右图专门 sweep 了 batch 32/64/128/256，结论是"没有
+#      一致趋势"，64 落在它扫过的区间内。改 ACCUM 反而会让 accumulation_steps
+#      和 90/93 号那几条线失去可比性。
+#
+#   2) （已消除）数据量。原来的 datasets/numina_math_50k 是 5 万条，现在换成
+#      datasets/numina_math_100k，和论文的 10 万条对齐。
+#      写到**新目录**，不要覆盖现有池（Part 2/3 的 replay 池是从它上面切的）。
+#
+# 论文没写、属于合理推断的：BF16（verl 默认）、loss 只算 assistant 段（同上）。
+# 论文没给 weight decay，所以 train.py 的裸 torch.optim.Adam 其实已经对齐 ——
+# Adam(wd=0) 和 AdamW(wd=0) 是同一个更新式。
+#
+# -----------------------------------------------------------------------------
+# 【Qwen2.5-Math 换模型带来的三个坑，两个是静默的】
+#
+# 1) **上下文硬上限 4096**。config.json 的 max_position_embeddings=4096
+#    （tokenizer_config 里的 model_max_length=131072 是假的，别看它）。所以
+#    MAXLEN=2048 是安全的，而评测 cap 一旦设到 4096，prompt+生成就越过了窗口，
+#    RoPE 外推区的输出不可信。MATH_MAX_NEW_TOKENS 因此定在 2048。
+#
+# 2) **eos_token 是 <|endoftext|>，但 chat template 用 <|im_end|> 收尾**。训练后
+#    模型吐出 <|im_end|> 时 generate 不会停，会继续编造下一轮对话，
+#    skip_special_tokens 再把那段拼到答案后面 —— 于是 \boxed{} 之后还有数字，
+#    math500 的打分器取最后一个 boxed 跨度、gsm8k 退回取最后一个数字，两边都会
+#    取错。所以评测**必须** --decode_stop_on_im_end 1（本脚本已固定传）。
+#    这和 Qwen3-1.7B-Base 是同一个坑，只是 evaluate.py 的默认值是 0。
+#
+# 3) Qwen2.5-Math 的 chat template 在**没有 system 消息**时会自动注入
+#        "Please reason step by step, and put your final answer within \boxed{}."
+#    这正是论文说的 "default chat template + CoT prompting"。data/chat.py 的
+#    apply_train_template 和 eval/generation.py 的 render_chat 都只传 user 角色，
+#    所以训练和评测拿到的是同一条 system —— 这一点是对齐的，不用改。
+#    副作用是 INSTRUCTION_STYLE=eval_aligned 又在 user turn 里写了一遍同样的要求，
+#    指令重复。训练/评测同口径所以不影响可比性，想更贴论文就传 bare。
 #
 # IF 线是 90_part1_if_conifer.pbs。两条线拆开管，因为这条线的 maxlen 是 IF 的 4 倍、
 # batch 只有 1/4，超参和显存预算完全是另一套。不做交叉评测。
@@ -36,14 +90,31 @@
 #   「LoRA 的隐式正则」混在一起。全量是干净的对照底座。
 #
 # -----------------------------------------------------------------------------
-# 【LR 不能照搬 LoRA 的 1e-4，也不该照搬 IF 线选出来的值】
+# 【LR 现在由论文给定：5e-5 + cosine + warmup 0.1，不再需要 sweep】
 #
-# 44 号脚本记录过：全量在 lr=1e-5 下 val loss ep3 = 0.07364，比 LoRA (lr=1e-4) 的
-# 0.04494 还差 64%，是欠训练。所以起点定在 2e-5，但先 MODE=lr_sweep 用数据选。
+# 论文 §4.1 对 Qwen2.5-Math 系列就是 lr=5e-5（只有 LLaMA-3.1-8B 降到 2e-5），
+# 配 cosine decay 和 warmup ratio 0.1。既然是照配方复现，LR 直接取 5e-5，
+# MODE=lr_sweep 保留但不是必经步骤。
 #
-# 而且这条线和 IF 线的最优 LR 没有理由相同：Conifer 的答案中位约 330 token，这里
-# strip_tags 后中位约 2726 token，单步的有效监督 token 差近一个量级，梯度尺度完全
-# 不是一回事。两条线各 sweep 一次。
+# **warmup 不是可选项**。train.py 在加 --lr_scheduler 之前是裸 torch.optim.Adam
+# 恒定 LR、无 warmup、无 scheduler（93 号脚本里记过这件事）。全参微调在 5e-5 下，
+# 第一次更新落在一个离自己最优点很远的模型上，没有 warmup 的那一步就是 loss
+# 尖峰的来源。所以本脚本固定传：
+#     --lr_scheduler cosine --warmup_ratio 0.1
+#
+# schedule 的推进单位是**优化器更新**而不是 micro-batch，horizon 由 --epochs
+# （或 --max_steps，取更小者）换算。所以 MODE=lr_sweep 的每一档是在自己那
+# 3200 步 / 200 次更新的预算上走**完整**的 cosine，而不是停在一条长 schedule 的
+# 半山腰 —— 否则 sweep 比的是"谁的 LR 还没降下来"，不是谁更好。
+#
+# 正式训练是 99000 行 / BATCH=4 = 24750 micro-batch，除以 accumulation_steps 16 =
+# **1547 次更新**，其中前 155 次是 warmup。
+# metrics jsonl 里会记 lr_scheduler / warmup_updates /
+# total_updates / lr_end，train 日志每个窗口打一次 lr=，发散先去看那条轨迹。
+#
+# 旧的 LR 讨论（Qwen3-1.7B + OpenR1 时代，恒定 LR 无 scheduler）留档：44 号记录过
+# 全量在 lr=1e-5 下 val loss ep3 = 0.07364，比 LoRA (lr=1e-4) 的 0.04494 还差 64%，
+# 是欠训练，所以那时起点定在 2e-5。换模型换配方之后这组数不再适用。
 #
 # -----------------------------------------------------------------------------
 # 【Part 1 不需要采 C】
@@ -54,9 +125,15 @@
 # 文件，也不存 W0 快照。纯 vanilla，省掉一个 Stage 和 W0 那 3.4 GB。
 #
 # -----------------------------------------------------------------------------
-# 【<think> 必须 strip_tags：否则 Math 分数会假阴性】
+# 【<think> / strip_tags：在 Qwen2.5-Math + Numina 下已是空操作，本节是留档】
 #
-# 这是这条线最容易踩、而且踩了不报错的坑。
+# 现在的情况：NuminaMath 的 solution 里没有 <think> 标签，所以 --think_handling
+# strip_tags 什么也不做。而 Qwen2.5-Math 的 chat template 根本不引用
+# enable_thinking 这个变量 —— apply_chat_template 会把它当成一个多余的模板变量
+# 静默忽略（不会抛 TypeError，所以 render_chat 的那个 except 分支也不会触发），
+# prompt 末尾不会出现空 think 块。这一节对本次运行没有可执行含义。
+#
+# 留档是因为它记录了一个踩了不报错的坑，换回长推理数据集时必须重读：
 #
 # eval/generation.py 把所有生成式评测的 prompt 都渲染成 enable_thinking=False。在
 # Qwen3 的 chat template 下，这会在 prompt 末尾放一个**空的** <think></think> 块，
@@ -84,15 +161,20 @@
 # 被 strip 掉的那对标签。
 #
 # -----------------------------------------------------------------------------
-# 【eval_aligned 只对齐 MATH-500，不对齐 GSM8K —— 这是有意的】
+# 【eval_aligned 对齐 MATH-500 和 AMC，不对齐 GSM8K —— 这是有意的】
 #
-# 两个评测的 prompt 本来就不是一套：
-#   math500.build_prompt : "Reason step by step, then give the final answer as \boxed{...}"
-#   gsm8k.build_prompt   : "Reason briefly, then end your answer with '#### ' + 最终数字"
+# 三个评测的 prompt 不是一套。AMC 走的是 math500.py 里的 AMCMetric，它继承
+# MATH500Metric、**共用同一个 build_prompt 和同一套 is_equiv 打分**，只是换了
+# 数据文件；GSM8K 是独立的一套：
+#   math500/amc.build_prompt : "Reason step by step, then give the final answer as \boxed{...}"
+#   gsm8k.build_prompt       : "Reason briefly, then end your answer with '#### ' + 最终数字"
 #
-# eval_aligned 对齐的是前者。于是这两个指标读出来的含义不同：
+# eval_aligned 对齐的是前者。于是这三个指标读出来的含义不同：
 #   MATH-500 = 同分布的能力上限（训练/评测同一套指令和答案格式）
+#   AMC      = 同口径但更难（竞赛题，指令格式和训练一致，只是题目分布更难）
 #   GSM8K    = 跨格式泛化（模型要在没见过的 '####' 指令下仍然做对）
+#
+# 所以 AMC 低于 MATH-500 是难度，不是格式问题；GSM8K 低则要先排除格式。
 #
 # GSM8K 的打分不会因此假阴性：predicted_answer 在响应里找不到 '####' 时，会退回
 # 取全文最后一个数字，而 \boxed{18} 结尾的响应最后一个数字正是 18。GSM8K 的 gold
@@ -103,21 +185,27 @@
 # 再下"数学能力没学到"的结论。
 #
 # -----------------------------------------------------------------------------
-# 【显存与 batch：为什么是 BATCH=1，而且这不损失速度】
+# 【显存与 batch：ACCUM/BATCH 刻意不动，而且这不损失速度】
 #
-# 1.7B 全量 + Adam（torch.optim.Adam，状态跟参数 dtype 走 bf16）的常驻部分：
-#     权重 bf16 3.4 + 梯度 bf16 3.4 + 两个动量 6.9 ≈ 13.8 GB
-# 剩下全是激活。collator 是 DataCollatorForTokenClassification，按 **batch 内最长**
-# 动态补齐，所以激活的上界由 BATCH x MAXLEN 决定：
+# 1.5B 全量 + Adam（torch.optim.Adam，状态跟参数 dtype 走 bf16）的常驻部分：
+#     权重 bf16 3.1 + 梯度 bf16 3.1 + 两个动量 6.2 ≈ 12.3 GB
+# 比 Qwen3-1.7B 那一版还少 1.5 GB。剩下全是激活。collator 是
+# DataCollatorForTokenClassification，按 **batch 内最长**动态补齐，所以激活的
+# 上界由 BATCH x MAXLEN 决定：
 #     IF 线   4 x 1536 = 6144 token/micro-batch
-#     Math 线 1 x 8192 = 8192 token/micro-batch
-# 两条线刻意取在同一量级，IF 能跑 Math 就能跑。
+#     Math 线 4 x 2048 = 8192 token/micro-batch
+# 两条线刻意取在同一量级，IF 能跑 Math 就能跑。注意 OpenR1 时代这里是 1 x 8192，
+# 换 Numina（答案短一个量级）之后是 4 x 2048 —— 每步 token 数没变，只是形状变了。
 #
 # 关键是**加大 batch 换不到速度**。results_log 的 batch 饱和测试（Job 2831163，
-# 同一个模型同一张卡）实测：micro-batch=8 x max_len 512、每步约 908 token 时 GPU
-# 吞吐已经吃满，加到 16 总时间比 1.015、tokens/s 反而从 10181 掉到 10026，只多花
-# 18 GB 显存。饱和取决于**每步 token 数**而不是样本数，而本线 BATCH=1 时每步已经
-# 约 3900 token（P50），是那个饱和点的 4 倍多。所以 BATCH=1 不是妥协，是免费的安全。
+# 同一张卡）实测：micro-batch=8 x max_len 512、每步约 908 token 时 GPU 吞吐已经
+# 吃满，加到 16 总时间比 1.015、tokens/s 反而从 10181 掉到 10026，只多花 18 GB
+# 显存。饱和取决于**每步 token 数**而不是样本数，而本线每步 8192 token 是那个
+# 饱和点的 9 倍。所以 BATCH=4 不是妥协。
+#
+# ACCUM=64 也刻意不动：论文用的 effective batch 是 256，但它自己的 Figure 3
+# sweep 过 32/64/128/256 且没有一致趋势，而改 ACCUM 会让 accumulation_steps 和
+# 90/93 号那几条线失去可比性 —— 那个代价比对齐一个已被证明不敏感的超参更大。
 #
 # 那次测量的显存斜率（约 20 MB/token）不能照搬到这里：它是 LoRA、max_len=512、
 # 短样本分布下拟合的，padding 行为完全不同。真实峰值只能测——这就是 MODE=smoke
@@ -127,28 +215,47 @@
 # 等 Part 2 要在 Math 的 batch 里混入 Conifer replay 行时再重新算这一节。
 #
 # -----------------------------------------------------------------------------
-# 【时间预算：这条线比 IF 贵 17 倍，先算再提交】
+# 【时间预算：换 Numina + 2048 之后便宜了一个数量级】
 #
-# 实测 tok/epoch（全量 45792 行，MAXLEN=8192）= 190.0M，而 IF 线是 11.4M。
+# Numina 的答案 P50=351 / P90=778 / max=2666，题目 P50≈104，所以全序列 P50 约 480
+# token。10 万行 => tok/epoch **约 48M**，而 OpenR1 时代（45792 行 x MAXLEN 8192）
+# 是 190.0M，差 4 倍。（这组长度是 50k 池上用 Qwen3 tokenizer 量的；100k 是同一套
+# 按 source 比例的配额，分布应当一致，**以新池的 manifest length 段为准**。）
 #
-# 吞吐没有全量微调的实测值（上面那 10181 token/s 是 LoRA + 短序列）。两点会让它更慢：
-# 优化器要更新 1.72e9 个参数（但 ACCUM=64 摊薄后可忽略），以及 T=8192 时 attention
-# 的 O(T^2) 计算已占到线性层的一半以上，单 token 成本约 1.5x。按 5-8k token/s 估：
-#     1 epoch ≈ 6.6-10.5 h      2 epoch ≈ 13-21 h
+# 吞吐仍然没有全参微调的实测值，而且 T=2048 时 attention 的 O(T^2) 项比 8192 那版
+# 轻得多，所以不该再套那个 5-8k token/s。**别猜，跑 MODE=smoke 看 tokens_per_sec**，
+# 用 48M / 它算真实 epoch 秒数。按 8-15k token/s 粗估 1 epoch 约 0.9-1.7 h。
 #
-# 所以：正式训练**必须** DO_EVAL=0 单独占一个作业，评测另开一个。想稳妥先跑 1 epoch
-# （EPOCHS=1），它对"OpenR1 能不能教会数学"这个 sanity check 已经足够；确认有效再考虑
-# 加第二个 epoch。想更快先用 MAX_TRAIN_SAMPLES 子采样把链路跑通。
+# 所以和 OpenR1 时代不同：正式训练不再必须 DO_EVAL=0。但仍然建议拆开跑 —— 评测
+# 两个 run x 三个指标是独立的墙钟，混在一个作业里失败要重跑训练。
+#
+# EPOCHS=1 是论文的值（§4.1 没明写，但 100000/256 ≈ 391 次更新正好对上 Figure 1
+# 横轴的 0-400；附录 A.5 说 OpenR1 那组"except epochs 设为 3"也反证了主实验是 1）。
 #
 # -----------------------------------------------------------------------------
-# 【MAXLEN 与左截断】
+# 【MAXLEN=2048 是论文值，但它在 Numina 上不是零截断 —— 提交前先核一眼】
 #
-# tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，**保尾丢头**。这条线超长的
-# 样本丢掉的是开头的题目，留下推理尾巴，模型于是学会「凭空续写推理」。loss 曲线
-# 看不出异常。
+# tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，**保尾丢头**。超长的样本
+# 丢掉的是开头的题目，留下推理尾巴，模型于是学会「凭空续写推理」。loss 曲线看不出
+# 异常，这是这条线最容易踩而且踩了不报错的坑。
 #
-# 已在本地对**全部 45792 行**做过实测（Qwen3 tokenizer + 同一套 chat template +
-# strip_tags/eval_aligned），所以 MAXLEN 不用再猜：
+# 论文 §4.1 的 "maximum input length 2048" 也是在 10 万条上跑的。50k 池实测的分布
+# 是：答案 P50=351 / P90=778 / **max=2666**，题目 P50=104 / max 也有上千。所以
+# 2048 会截断**一小部分**行（答案 max 已经超过它），不是零。prepare_numina_math 的
+# docstring 说"4096 截断 0 行"，那是 4096 的结论，不能推到 2048。
+#
+# 真实比例不要猜，去看池子旁边的 numina_math_100k_manifest.json 里的 length 段
+# （MODE=data 生成时打的那张表），确认两件事：
+#     truncated 占比很小（个位数百分比以内），且 **question gone = 0**
+# question gone 就是"答案本身填满预算、左截断后一个题目 token 都不剩"的行数，只要
+# 它不为 0，模型就会在那些行上学到无题目续写。
+#
+# 如果 question gone 不为 0，选择是 MAXLEN=3072（Numina 全池都装得下，且仍在
+# Qwen2.5-Math 的 4096 上下文内），代价只是偏离论文值 —— 而这个偏离比在几百行上
+# 训"无题目续写"要安全得多。
+#
+# 下面这张表是 **OpenR1 时代**（45792 行 R1 长推理 + MAXLEN 8192）的留档，和现在的
+# Numina 池无关，留着是为了说明左截断能造成多大破坏：
 #
 #   全序列  P50=3900  P75=5551  P90=6957  P95=7524  P99=8004  max=9004
 #   答案    P50=3767  P75=5416  P90=6819                      max=7993
@@ -158,29 +265,37 @@
 #      1024    45467  99.3%      45238      46.8M
 #      2048    39499  86.3%      38412      91.0M
 #      3072    29996  65.5%      28845     126.6M
-#      4096    21359  46.6%      20326     152.8M   <- 曾经的默认值，会毁掉数据
+#      4096    21359  46.6%      20326     152.8M   <- OpenR1 时代曾经的默认值
 #      6144     8235  18.0%       7560     182.2M
-#      8192       25   0.1%          0     190.0M   <- 现在的默认值
+#      8192       25   0.1%          0     190.0M   <- OpenR1 时代最终用的值
 #     10240        0   0.0%          0     190.0M
 #
 # 「题目全丢」= 答案本身就填满了预算、左截断后一个题目 token 都不剩的行数。4096 下
 # 有 20326 行（44.4%）落在这一类，模型会在近一半的数据上学到"无题目续写推理"。
-# 这个错误不会报错、loss 曲线也正常，只会让 Part 2 测到的"遗忘"无法解释。
+# 这个错误不会报错、loss 曲线也正常，只会让 Part 2 测到的"遗忘"无法解释。这就是
+# 上面要求核对 question gone 的理由。
 #
-# 8192 下只剩 25 行超长（数据集本身按 8192 筛过，超出的是 prompt 前缀和模板开销），
-# 且题目全丢为 0，代价只是 tok/epoch 从 182M 涨到 190M。
-#
-# MODE=data 会在集群上重算这张表（用的是同一套逻辑）。如果哪天换了 tokenizer、改了
-# instruction_style 或 think_handling，必须重看，不能沿用上面这组数。
+# 换了 tokenizer、改了 instruction_style 或 think_handling 都必须重看长度报告，
+# 不能沿用任何旧数。
 #
 # -----------------------------------------------------------------------------
-# 【评测预算必须大于训练答案长度】换 Numina 之后回到 4096，下面整节是 OpenR1 的留档
+# 【评测预算必须大于训练答案长度】现在是 2048，下面整节是 OpenR1 的留档
 #
-# 先说现在的结论。训练数据换成 NuminaMath-CoT 之后训练答案 P50=351 / P90=778 /
-# max=2666，4096 是它的 5 倍以上，正常收尾的响应根本够不着。而且 8192 那一版**实测
-# 没有改善 MATH-500**：撞上限的行是陷在重复自我复核的循环里，任何 cap 都填得满，
-# 多给的 4096 步只是白烧解码时间（同一批题在两个 cap 下的 Jaccard=0.649，说明是题目
-# 难度驱动的循环，不是预算不够）。所以默认回到 4096。
+# 先说现在的结论：**2048**，有两个独立的理由同时指向它。
+#
+# 一是够用。NuminaMath-CoT 的训练答案 P50=351 / P90=778 / max=2666，每条训练目标
+# 末尾都补了 EOS（data/chat.py 的 apply_train_template），所以模型学到的回答长度
+# 分布基本被 2666 封住，2048 能覆盖绝大多数正常收尾的响应。而且 OpenR1 时代实测过
+# 把 cap 从 4096 提到 8192 **没有改善 MATH-500**：撞上限的行是陷在重复自我复核的
+# 循环里，任何 cap 都填得满（同一批题在两个 cap 下的 Jaccard=0.649，说明是题目难度
+# 驱动的循环，不是预算不够）。给更多预算只是白烧解码时间。
+#
+# 二是不能更大。Qwen2.5-Math-1.5B 的 max_position_embeddings=4096，prompt 大约
+# 150 token，cap 设到 4096 就把生成推到了 RoPE 外推区，那段输出不可信。论文虽然写
+# max generation 4096，但它对 Qwen2.5-Math 也撞着同一个天花板 —— 实际上短响应根本
+# 用不到，所以这个偏离只在纸面上。
+#
+# 改这个值必须整张结果表一起重评，不能和旧数字混用。
 #
 # 下面这一节记录的是 OpenR1 时代为什么必须要 8192 —— 换数据集之前它是对的，留着是
 # 为了说明「什么情况下 4096 会骗你」，不要按它去调现在的默认值。
@@ -220,38 +335,43 @@
 #
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网，以下都要先在有网节点备好
-#   1) 模型      ${MODEL_DIR}/${MODEL_NAME}      (Qwen3-1.7B-Base)
-#   2) OpenR1    ${REPO_ROOT}/datasets/Openr1-Math-46k-8192/openr1.parquet (232MB, 单文件)
-#                huggingface-cli download Elliott/Openr1-Math-46k-8192 --repo-type dataset
-#                脚本也会退而去 datasets/openr1/ 和 data_check/Openr1-Math-46k-8192/ 找；
-#                都不在就提交时传 OPENR1_PARQUET=<绝对路径>。
-#   3) 评测集    ${REPO_ROOT}/datasets/math/{gsm8k,math500}_test.jsonl
+#   1) 模型      ${MODEL_DIR}/${MODEL_NAME}      (Qwen2.5-Math-1.5B)
+#                huggingface-cli download Qwen/Qwen2.5-Math-1.5B \
+#                  --local-dir ${REPO_ROOT}/models/Qwen2.5-Math-1.5B
+#                这是**本次唯一的新增下载**。评测集和数据池都已就位。
+#   2) 数据池    ${REPO_ROOT}/datasets/numina_math_100k/  (save_to_disk)
+#                用 prepare_numina_math.py --sample_rows 100000 --require_boxed 1
+#                --tokenizer_path <Qwen2.5-Math-1.5B> 生成，**out_dir 必须是新目录**：
+#                指向已有池时 check_out_dir 会放行并覆盖掉它。
+#                旁边的 numina_math_100k_manifest.json 是核 MAXLEN 的依据，见上面
+#                「MAXLEN=2048」那一节。正式训练**不要**走 MODE=data。
+#   3) 评测集    ${REPO_ROOT}/datasets/math/{gsm8k,math500,amc}_test.jsonl
 #                （和 32/33/45 号同一目录，不是 datasets/math_eval/）
+#                三个文件都已存在。缺哪个就自动跳过那个指标，不会中断作业。
 #   4) mkdir -p ${REPO_ROOT}/logs   （即上面 #PBS -o 指的目录，不存在的话作业没日志）
 #
-# 【用法】务必按顺序，2 之前不要提交长作业
-#   # 0) 建池 + 复算长度报告（CPU 即可，约 10-15 min）
-#   qsub -v MODE=data onereplay/pbs/91_part1_math_openr1.pbs
-#
-#   # 1) 冒烟：20 步。这一步的**唯一目的是看 peak memory**——8192 长序列下单卡到底
-#   #    占多少，离卡容量还有多少余量。没跑过它不要提交正式训练。
+# 【用法】按顺序。数据池已备好，所以不再需要第 0 步。
+#   # 1) 冒烟：70 步，不保存。两个目的：看 peak memory（2048x4 的真实峰值），
+#   #    以及拿 tokens_per_sec 去除 24M tok/epoch 算真实 epoch 时长。
+#   #    **顺便确认日志里出现了 lr= 字段**，没有就说明 scheduler 没接上。
 #   qsub -v MODE=smoke onereplay/pbs/91_part1_math_openr1.pbs
 #
-#   # 2) 选 LR（150 步 x 4 档，长序列每步都慢，约 2-4 h）
-#   qsub -v MODE=lr_sweep onereplay/pbs/91_part1_math_openr1.pbs
+#   # 2) 正式训练。LR/scheduler 都已是论文值，默认就对，不用再传。
+#   #    1 epoch 约 0.5-0.8 h，所以可以带评测一起跑；想拆开就加 DO_EVAL=0。
+#   qsub -v MODE=train onereplay/pbs/91_part1_math_openr1.pbs
 #
-#   # 3) 正式训练。DO_EVAL=0 是必须的：1 epoch 已约 7-10 h，塞不进评测。
-#   #    建议先只跑 1 个 epoch，确认分数起来了再考虑加第二个。
-#   qsub -v MODE=train,LR=2e-5,EPOCHS=1,DO_EVAL=0 onereplay/pbs/91_part1_math_openr1.pbs
+#   # 3) 评测单独跑（或上一步带 DO_EVAL=0 之后补）。默认 cap=2048 / batch=128，
+#   #    两个 run x 三个指标。产物写到 ${RESULTS_ROOT}/eval_cap2048/，按 cap 分目录
+#   #    所以不会和 OpenR1 时代 4096/8192 的数字混进一张表。
+#   #    **LR 必须和训练时一致**（默认都是 5e-5），否则会去找不存在的 checkpoint 目录。
+#   qsub -v MODE=eval onereplay/pbs/91_part1_math_openr1.pbs
 #
-#   # 4) 评测另开一个作业。默认 cap=4096 / batch=128，两个 run 合计约 1.6 h。产物写到
-#   #    ${RESULTS_ROOT}/eval_cap4096/，按 cap 分目录所以不会和别的预算混在一张表里。
-#   #    这次 checkpoint 是 lr=5e-5，**必须带 LR=5e-5**，否则会去找不存在的
-#   #    part1_math_lr2e-5_seed1。
-#   qsub -v MODE=eval,LR=5e-5 onereplay/pbs/91_part1_math_openr1.pbs
-#
-#   # 想先便宜地把整条链路跑通，用子集（约 1-2 h）
+#   # 想先便宜地把整条链路跑通，用子集（几分钟）
 #   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_part1_math_openr1.pbs
+#
+#   # 可选：LR sweep。论文已经给了 5e-5，所以这步不是必经的。每档在自己的
+#   # SWEEP_MAX_STEPS 预算上走完整 cosine。
+#   qsub -v MODE=lr_sweep onereplay/pbs/91_part1_math_openr1.pbs
 #
 #   # 5) 反向线（Math -> IF）要用的 20k 旧知识池。训练池逐字不变，已有 checkpoint
 #   #    不受影响，所以在 Model-Math 训完之后补跑是安全的（约 10-15 min，纯 CPU）。
@@ -313,12 +433,12 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
     OPENR1_PARQUET MATH_DATASET
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
-    EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED
     REPLAY_ROWS REPLAY_POOL REPLAY_SAMPLE_SEED
-    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
-    EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL DIAG_LEN
+    GSM8K_DATA MATH500_DATA AMC_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
+    EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL DIAG_LEN STOP_ON_IM_END
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -367,8 +487,20 @@ cd "${REPO_ROOT}"
 
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_numina_math}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 结果树按**模型**分，这是必须的而不是整洁强迫症。旧的 Qwen3-1.7B-Base 那一轮就写在
+# results_part1_numina_math/ 下，run 名是 part1_math_lr5e-5_seed1 —— 和本次的
+# lr/seed 完全相同。两者共用一个根的话，MODE=train 会撞上
+# `if [[ -d "${CKPT}" ]] then 跳过训练`，于是**静默跳过训练、直接去评测 Qwen3 的旧
+# checkpoint**，日志里只有一行"跳过"。按模型分根之后 checkpoint / metrics / eval
+# 产物三者一起分开，旧结果也完整留着可以对照。
+#
+# 【对 99/100 号的影响】它们默认去 ${REPO_ROOT}/results_part1_numina_math/checkpoints
+# 找 Stage 1 的 checkpoint（MATH_LINE_ROOT 变量）。用本脚本训出来的模型跑 Part 3 时
+# 必须带上：
+#   qsub -v MATH_LINE_ROOT=${REPO_ROOT}/results_part1_numina_Qwen2.5-Math-1.5B ...
+# 忘了传不会静默出错：它们的 glob 命中 0 个就 exit 1 并打出找过的目录。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part1_numina_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
@@ -397,8 +529,8 @@ fi
 # train.py --dataset_path 要的是 save_to_disk 根目录（里面有 dataset_dict.json
 # 和 train/），不是 train/data-*.arrow，也不是旁边的 *_test.jsonl。
 # load_and_prepare_dataset 会读 dataset["train"]，再按 val_fraction 切 val。
-# 官方 100 行 test（numina_math_50k_test.jsonl）训练侧不读。
-MATH_DATASET="${MATH_DATASET:-${REPO_ROOT}/datasets/numina_math_50k}"
+# 官方 100 行 test（numina_math_100k_test.jsonl）训练侧不读。
+MATH_DATASET="${MATH_DATASET:-${REPO_ROOT}/datasets/numina_math_100k}"
 
 # ---- 反向线（Math -> IF）的旧知识池 ----
 # 本线自己不需要它。它是 99/100/101 号的输入：Math 变成"被保护的能力"时，C_math /
@@ -434,20 +566,45 @@ REQUIRE_BOXED="${REQUIRE_BOXED:-0}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 
 # ---- 训练超参（Math 线专用）----
-# seqlen 是 IF 线的 4 倍，BATCH 相应降到 1/4；ACCUM 仍是 64 行/更新，与 IF 线可比。
-EPOCHS="${EPOCHS:-3}"
+# ACCUM 仍是 64 行/更新，与 IF 线可比。论文的 effective batch 是 256，刻意不对齐，
+# 理由见文件头「显存与 batch」那一节。**注意 ACCUM 是"行/更新"而不是微批个数**：
+# accumulation_steps = ACCUM // BATCH = 16，所以有效 batch 是 64 而不是 4x64=256。
+# 1 epoch 是论文值（§4.1 没明写，但 100000/256 ≈ 391 次更新对上 Figure 1 的横轴）。
+# 本配置是 99000/64 = 1547 次更新，多出的 4 倍纯粹来自 batch 小 4 倍，数据量已对齐。
+EPOCHS="${EPOCHS:-1}"
 LR="${LR:-5e-5}"
+# 论文 §4.1: cosine decay + warmup ratio 0.1。train.py 在加 --lr_scheduler 之前是
+# 恒定 LR、无 warmup，全参微调在 5e-5 下第一步就可能出 loss 尖峰。schedule 按
+# **优化器更新**推进，horizon = epochs（或 max_steps，取更小者）换算出的更新数。
+#
+# 本配置（100k 池 / VAL_FRAC=0.01 / BATCH=4 / ACCUM=64 / 1 epoch）下的确定值：
+#   99000 行 -> 24750 micro-batch -> ceil(24750/16) = **1547 次更新**，warmup **155** 次。
+# 训练一开始 train.py 会打一行
+#   `lr schedule: cosine over 1547 updates (1547/epoch x 1), warmup 155 updates ...`
+# **对不上就说明池子行数或 BATCH/ACCUM 和这里的假设不一致，停下来查**。
+#
+# horizon 必须和 trainer 真实的 optimizer.step() 次数严格相等，不是"差不多就行"：
+# base.py 在 `step % accumulation_steps == 0 or step == total_steps` 两个条件上都
+# step，24750 = 16x1546+14 所以尾部那次 flush 让实际步数正好 1547。HF 的 cosine 在
+# 越过 num_training_steps 之后 progress>1、余弦**回升**，horizon 短一步就会让 LR
+# 在末尾反向抬头。已数值核验过两者都是 1547。
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 # BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
-# 64 行"不成立。取 1 的理由见文件头「显存」与「饱和点」两节：8192 长序列下单卡
-# 一次只放一条，靠 ACCUM=64 把有效 batch 补回来。
-# NuminaMath 实测：BATCH=8 在 MAXLEN=4096 下 OOM（8 x 4096 = 32768 token/micro-batch，
-# 是 OpenR1 时代 1 x 8192 的四倍激活）。4 跑得动，且 4 x 4096 = 16384 token/step 已经
-# 远在吞吐饱和点之上，所以这不是速度上的妥协。
+# 64 行"不成立。BATCH=4 x MAXLEN 2048 = 8192 token/micro-batch，和 OpenR1 时代的
+# 1 x 8192 是同一个激活预算，所以那时能跑现在一定能跑。
+# 历史实测：BATCH=8 在 MAXLEN=4096 下 OOM（8 x 4096 = 32768 token/micro-batch）。
+# 现在 MAXLEN 降到 2048，8 x 2048 = 16384 理论上装得下，但没有实测，而且
+# 4 x 2048 已经远在吞吐饱和点之上（见文件头「显存与 batch」），加大换不到速度。
+# 要动就先 MODE=smoke 看峰值。
 BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-64}"
-# 实测（全量 45792 行，Qwen3 tokenizer + chat template）：全序列 P50=3900 P90=6957
-# P99=8004 max=9004。4096 会截断 46.6%、其中 20326 行连题目都不剩，绝不能用。
-MAXLEN="${MAXLEN:-4096}"
+# 2048 = 论文 §4.1 的 "maximum input length"。Numina 的答案 P50=351 / P90=778 /
+# max=2666，所以 2048 会截断一小部分行，**不是零截断**。截断是保尾丢头的，提交前
+# 先看 numina_math_100k_manifest.json 的 length 段确认 question gone = 0；不为 0 就
+# 提到 3072（Numina 全池装得下，且仍在 Qwen2.5-Math 的 4096 上下文内）。
+# 详见文件头「MAXLEN=2048」那一节。
+MAXLEN="${MAXLEN:-2048}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 # 长序列的 val 也贵，取小一点；跨 run 比较时必须保持同一个值。
 MAXVAL="${MAXVAL:-200}"
@@ -456,17 +613,21 @@ MAXVAL="${MAXVAL:-200}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
 # ---- LR 搜索 / 冒烟 ----
+# 论文已经给了 5e-5，所以 lr_sweep 不再是必经步骤，这一档是留着备用的。
 LR_GRID="${LR_GRID:-2e-5 5e-5 1e-4}"
 # **数的是 micro-batch，不是优化器步**。更新次数 = SWEEP_MAX_STEPS / (ACCUM/BATCH)，
-# 而本线 BATCH=1 所以分母是 **64** —— 每次更新要烧掉 64 个 micro-batch。
+# 本线 BATCH=4 所以分母是 **16** —— 3200 步 = 200 次更新 = 12800 行 = 26% 的 epoch。
 #
-# 曾经的默认值 150 是个严重的陷阱：只有 **2 次权重更新**，比出来的完全是噪声。IF 线
-# （BATCH=4，分母 16）的 300 步也只有 18 次更新，实测那一轮的排序就被"谁走得快"主导、
-# 天然偏袒大 LR，详见 90 号脚本里记的结果。
+# 曾经的默认值 150 是个严重的陷阱：分母 64 时只有 **2 次权重更新**，比出来的完全是
+# 噪声。IF 线（同样分母 16）的 300 步也只有 18 次更新，实测那一轮的排序就被"谁走得
+# 快"主导、天然偏袒大 LR，详见 90 号脚本里记的结果。
 #
-# 3200 步 = 50 次更新 = 3200 行 = 7% 的 epoch ≈ 13.3M token。按 5-8k tok/s 估
-# **每档 28-44 min**，3 档约 1.5-2.5 h。这条线的 sweep 就是这么贵，因为 ACCUM/BATCH=64。
-# 想再省就砍 grid（本线的先验区间就是 1e-5~5e-5），不要砍步数——2 次更新的表没有信息。
+# 每档约 6M token，按 8-15k tok/s 估 **每档 7-13 min**，3 档半小时内。比 OpenR1
+# 时代（每档 28-44 min）便宜得多，因为序列短了 4 倍。
+#
+# 注意 sweep 的每一档都在自己 3200 步 / 200 次更新的预算上走**完整**的 cosine
+# （train.py 的 horizon 取 min(epochs 换算, max_steps 换算)），所以比的是"同样
+# 走完一条完整 schedule 后谁更低"，而不是"谁的 LR 还没降下来"。
 SWEEP_MAX_STEPS="${SWEEP_MAX_STEPS:-3200}"
 SMOKE_STEPS="${SMOKE_STEPS:-70}"
 # 每多少个 micro-batch 打一行 task_loss。sweep 要看**轨迹**而不只是末值——发散表现为
@@ -477,13 +638,26 @@ SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-64}"
 # ---- 评测（只测 Math 能力）----
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 4096：NuminaMath-CoT 的训练答案 P50=351 / P90=778 / max=2666，正常收尾的响应离
-# 4096 还差一个数量级。8192 是 OpenR1 时代定的（R1 traces 答案 P50=3767 / P99=8004，
-# 那时 cap=4096 让 Model-Math 56.2% 撞上限、55% 抽不出答案）。但把 cap 提到 8192 之后
-# **MATH-500 并没有变好** —— 撞上限的行是陷在重复循环里的，任何 cap 都填得满。
-# 换成 Numina 之后这个假象的成因（长 CoT 文体）已经不存在，8192 只剩下白烧解码时间。
+# AMC 走 math500.py 的 AMCMetric（继承 MATH500Metric，共用 build_prompt 和 is_equiv，
+# 只换数据文件和输出目录），所以加上它零成本。注意这个文件来自
+# AI-MO/aimo-validation-amc，是 AMC12 2022+2023 共 83 题，**不是论文 AMC23 的 40 题**，
+# 所以绝对值不能直接对 Table 1，只能读 base -> Model-Math 的方向。
+AMC_DATA="${AMC_DATA:-${REPO_ROOT}/datasets/math/amc_test.jsonl}"
+# Qwen2.5-Math 的 eos_token 是 <|endoftext|>，而 chat template 的 assistant turn 以
+# <|im_end|> 收尾。不开这个，模型吐出 <|im_end|> 后 generate 不停，会续写下一轮对话，
+# skip_special_tokens 再把那段拼到答案后面 —— \boxed{} 之后多出数字，math500 取错
+# boxed 跨度、gsm8k 兜底取错"最后一个数字"。evaluate.py 的默认值是 0，必须显式开。
+# 开关它会移动所有生成式分数，所以**一张表里的所有 arm 必须同值重评**。
+STOP_ON_IM_END="${STOP_ON_IM_END:-1}"
+# 2048：两个理由同时指向它（详见文件头「评测预算」那一节）。
+#   够用   —— Numina 训练答案 P50=351 / P90=778 / max=2666，且每条训练目标末尾都补了
+#            EOS，所以模型学到的回答长度基本被 2666 封住。
+#   不能更大 —— Qwen2.5-Math-1.5B 的 max_position_embeddings=4096，prompt 约 150 token，
+#            cap 设到 4096 就把生成推进 RoPE 外推区，那段输出不可信。
+# 8192 是 OpenR1 时代定的（R1 traces 答案 P50=3767 / P99=8004），且实测把 cap 从 4096
+# 提到 8192 **没有改善 MATH-500** —— 撞上限的行是陷在重复循环里的，任何 cap 都填得满。
 # 改这个值必须整张结果表一起重评，不能和旧数字混用。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-2048}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
 # math 的解码 batch 刻意给大值，理由不是显存而是 generate 的退出条件。
@@ -493,44 +667,50 @@ EVAL_BATCH="${EVAL_BATCH:-32}"
 # 1-(1-0.122)^32 = 98.4%，也就是几乎每批都要跑满 MATH_MAX_NEW_TOKENS 步。所以墙钟
 # 正比于**批数**，跟平均响应长度无关。
 #
-# decode 阶段是权重带宽瓶颈：每一步都要把 3.4GB 的 bf16 权重读一遍，不管批内是 32
-# 行还是 128 行，单步耗时几乎不变。批数却少 4 倍——1819 道题（GSM8K 1319 +
-# MATH-500 500）从 58 批降到 15 批，实测 3h 掉到 45min 量级。
+# decode 阶段是权重带宽瓶颈：每一步都要把 3.1GB 的 bf16 权重读一遍，不管批内是 32
+# 行还是 128 行，单步耗时几乎不变。少的是批数，所以墙钟正比于批数。
 #
-# KV cache 账（Qwen3-1.7B：28 层 / 8 个 KV head / head_dim 128 / bf16）：
-#   每 token 28x2x8x128x2 = 112 KiB
-#   -> 一条序列 prompt+4096 约 4600 token = 0.49 GiB（8192 那档是 0.93 GiB，正好一半）
+# **换成 Qwen2.5-Math-1.5B 之后 KV cache 便宜了 4 倍**，这一节的账要重算：
+#   Qwen3-1.7B      28 层 / **8** 个 KV head / head_dim 128 / bf16 -> 每 token 112 KiB
+#   Qwen2.5-Math-1.5B 28 层 / **2** 个 KV head / head_dim 128 / bf16 -> 每 token  28 KiB
+# KV head 从 8 降到 2（GQA 分组更狠），再叠上 cap 从 4096 降到 2048，单序列显存是
+# 原来的 1/8：prompt+2048 约 2200 token = 2200 x 28 KiB = **60 MiB/序列**。
 #
-# 批数不是 1819/batch：两个指标各自分桶，= ceil(1319/B) + ceil(500/B)。墙钟正比于
-# 批数 x cap（几乎每批都跑满 cap），锚在实测的"8192 下 29 批约 3h"上，cap 减半后
-# 每批耗时也减半：
+# 批数 = ceil(1319/B) + ceil(500/B) + ceil(83/B)（GSM8K / MATH-500 / AMC 各自分桶，
+# 不是 1902/B）。下表按上面的单序列 60 MiB 推算，**是算出来的不是实测的**：
 #
-#   B    批数   KV 稳态   +concat 瞬时   +权重/上下文   峰值     140GiB 占用   一个 run
-#   64    29    31.4 GiB    1.1 GiB        5.2 GiB     37.7 GiB    27%        1.5 h
-#   96    20    47.2 GiB    1.7 GiB        5.2 GiB     54.1 GiB    39%        1.05 h
-#  128    15    62.9 GiB    2.2 GiB        5.2 GiB     70.3 GiB    50%        0.8 h   <- 默认
-#  192    11    94.4 GiB    3.4 GiB        5.2 GiB    103.0 GiB    74%        0.6 h
+#   B    批数   KV 稳态   +concat 瞬时   +权重/上下文   峰值      140GiB 占用
+#   64    30     3.8 GiB    0.13 GiB       5.1 GiB      9.0 GiB      6%
+#  128    16     7.5 GiB    0.27 GiB       5.1 GiB     12.9 GiB      9%    <- 默认
+#  256     9    15.0 GiB    0.54 GiB       5.1 GiB     20.7 GiB     15%
+#  512     5    30.1 GiB    1.07 GiB       5.1 GiB     36.3 GiB     26%
 #
 # "concat 瞬时"是 HF DynamicCache 每步每层做 torch.cat 时新旧张量并存的那一层，
-# = KV 稳态 / 28 层。"权重/上下文" = 3.2 GiB bf16 权重 + 约 2 GiB CUDA context 和
+# = KV 稳态 / 28 层。"权重/上下文" = 3.1 GiB bf16 权重 + 约 2 GiB CUDA context 和
 # cuBLAS workspace（逐步的 logits 只有 batch x 151936 x 4 B，128 下 74 MiB，可忽略）。
 #
-# 取 128：cap 从 8192 降到 4096 之后 KV 减半，128 的占用只有 50%（8192 时代 128 要占
-# 92%，所以那时默认是 96）。再往上 192 只多省 12 min 却推到 74%，不值。
-# **所有臂必须同值重评**，所以这个值要在跑第一个 run 之前定死，中途换会让贪心输出
-# 漂移、整张表不可比。80GB 卡上传 64。
+# 默认仍取 128：它在 OpenR1/4096/1.7B 那轮实测占了 70.3 GiB 并跑通过，现在同一个值
+# 只占约 13 GiB，安全边际极大。想再快就上 256（批数 16->9）或 512（->5），显存都还
+# 很宽裕 —— 但**必须在跑第一个 run 之前定死**：换 batch 会换 left padding 宽度和
+# kernel 选择，贪心输出会有微小漂移，中途换会让整张表不可比
+# （generation.py 开头那段 "a mix of old and new numbers is not comparable"）。
 # 真实峰值不用猜——evaluate 每个指标跑完会打一行 peak GPU memory，看那个数再决定。
 #
 # 换 batch 会换 left padding 的宽度和 kernel 选择，贪心输出可能有微小漂移，所以
 # **同一张结果表里的所有 run 必须用同一个 MATH_BATCH 重评**——generation.py 开头
 # 那段"a mix of old and new numbers is not comparable"就是在说这件事。
 MATH_BATCH="${MATH_BATCH:-128}"
-# 评测产物和 4096 那次拆开：旧数字留在 ${RESULTS_ROOT}/{gsm8k,math500}/ 作对照，
-# 这次写到 eval_cap${MATH_MAX_NEW_TOKENS}/。checkpoint 仍从 ${CKPT_DIR} 读，不受影响。
+# 两层隔离：RESULTS_ROOT 已经按模型分开（所以 Qwen3 那一轮的数字完全碰不到），
+# 这一层再按 cap 分目录，于是同一个模型下 2048 / 4096 / 8192 三个预算的结果也不会
+# 混进同一张表。checkpoint 仍从 ${CKPT_DIR} 读，不受影响。
 # 想覆盖原目录就提交时传 EVAL_OUT_DIR=${RESULTS_ROOT} FORCE_EVAL=1。
 EVAL_OUT_DIR="${EVAL_OUT_DIR:-${RESULTS_ROOT}/eval_cap${MATH_MAX_NEW_TOKENS}}"
 DIAG_LEN="${DIAG_LEN:-1}"
 
+# run 名**刻意保持** part1_math_lr<LR>_seed<SEED> 这个形状：99/100 号发现 Stage 1
+# checkpoint 的三条路径里有两条依赖它（MATH_LR 拼名、以及 glob
+# "part1_math_lr*_seed${SEED}"）。把 MODEL_NAME 塞进 run 名会让那两条同时失效，
+# 所以模型的区分放在 RESULTS_ROOT 上，见上面 RESULTS_ROOT 的注释。
 RUN="part1_math_lr${LR}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
 RUNS_TO_EVAL="${RUNS_TO_EVAL:-base trained}"
@@ -549,8 +729,11 @@ echo "  数据池         : ${MATH_DATASET}"
 echo "                   (save_to_disk 根目录；val 从该池 val_fraction 切，不读 *_test.jsonl)"
 echo "  think / prompt : ${THINK_HANDLING} / ${INSTRUCTION_STYLE}"
 echo "                   (Numina 无 <think> 标签，strip_tags 是空操作；prompt 仍 eval_aligned)"
-echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
-echo "  评测           : gsm8k, math500   (对照 base, max_new_tokens=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH})"
+echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
+echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
+echo "                   (对标 DFT/ICLR2026 Table 1 的 Qwen2.5-Math-1.5B w/SFT 行)"
+echo "  评测           : math500, amc, gsm8k   (对照 base)"
+echo "                   max_new_tokens=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} stop_on_im_end=${STOP_ON_IM_END}"
 echo "  eval out       : ${EVAL_OUT_DIR}   (FORCE_EVAL=${FORCE_EVAL})"
 echo "  checkpoint     : ${CKPT}"
 echo "========================================================================"
@@ -569,11 +752,12 @@ train_one () {
   local log_every="${7:-${LOG_EVERY}}"
 
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
-  echo "==== train ${run} (lr=${lr} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
+  echo "==== train ${run} (lr=${lr} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} maxlen=${MAXLEN} batch=${BATCH} max_steps=${max_steps}) ===="
   python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
     --dataset_path "${MATH_DATASET}" \
     --epochs "${epochs}" --lr "${lr}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
     --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
     --max_len "${MAXLEN}" \
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
@@ -644,20 +828,28 @@ fi
 # =============================================================================
 # MODE=smoke：跑几十步、不保存。这条线的冒烟要同时量两件事：
 #
-#   1) **显存**：MAXLEN x BATCH = 8192 x 1 是否真的装得下，峰值离卡容量还有多少余量。
-#   2) **吞吐**：日志里的 tokens_per_sec。全量微调没有实测值，文件头那个
-#      "1 epoch 6.6-10.5 h" 是按 5-8k tok/s 估的。用实测值除 190.0M tok/epoch
-#      才是真实 epoch 时长 —— 这直接决定要不要上 DDP。
+#   1) **显存**：MAXLEN x BATCH = 2048 x 4 是否真的装得下，峰值离卡容量还有多少余量。
+#   2) **吞吐**：日志里的 tokens_per_sec。全参微调没有实测值，文件头那个
+#      "1 epoch 0.5-0.8 h" 是按 8-15k tok/s 估的。用实测值除 24M tok/epoch
+#      才是真实 epoch 时长。
+#   3) **scheduler 真的接上了**：日志的 step 行里必须出现 lr= 字段，而且它应当在
+#      warmup 期内上升。没有这个字段就说明 --lr_scheduler 没传到（train.py 只在
+#      scheduler 非 None 时打它），那这一轮就是恒定 LR，不是论文配方。
 #
-# 20 步（=20 micro-batch）对 tokens_per_sec 够用：它是按 train_sec 算的窗口均值，
+# 70 步（=70 micro-batch）对 tokens_per_sec 够用：它是按 train_sec 算的窗口均值，
 # 但前几步含 cold start，所以看日志里 win= 那个窗口值更准。
-# 另外确认 trainable params ≈ 1.72e9、loss 在动。
+# 另外确认 trainable params ≈ 1.54e9、loss 在动。
+#
+# 注意 SMOKE_STEPS=70 时 horizon 也只有 ceil(70/16)=5 次更新，warmup 占 1 次，
+# 所以 lr 会在 5 步内走完一整条 cosine —— 这是预期行为，冒烟不是在看 LR 曲线形状，
+# 只是确认字段在、数值在动。
 # =============================================================================
 if [[ "${MODE}" == "smoke" ]]; then
   train_one "smoke_math" 1 "${LR}" "${CKPT_DIR}/smoke_math" "${SMOKE_STEPS}" 0 1
-  echo "冒烟完成。看两个数（都在 ${METRICS_DIR}/smoke_math.jsonl 里）："
-  echo "  peak_memory_gb  -> 8192x1 的真实峰值，离卡容量还剩多少"
-  echo "  tokens_per_sec  -> 用 190.0M / 它 = 单卡真实 epoch 秒数，据此决定要不要 DDP"
+  echo "冒烟完成。看三件事（前两个在 ${METRICS_DIR}/smoke_math.jsonl 里）："
+  echo "  peak_memory_gb  -> 2048x4 的真实峰值，离卡容量还剩多少"
+  echo "  tokens_per_sec  -> 用 24M / 它 = 单卡真实 epoch 秒数"
+  echo "  上面 step 日志里有没有 lr= 字段 -> 没有就是 scheduler 没接上，停下来查"
   exit 0
 fi
 
@@ -723,6 +915,11 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
   else
     echo "跳过 MATH-500：未找到 ${MATH500_DATA}"
   fi
+  if [[ -f "${AMC_DATA}" ]]; then
+    METRICS="${METRICS},amc"
+  else
+    echo "跳过 AMC：未找到 ${AMC_DATA}"
+  fi
   METRICS="${METRICS#,}"
   [[ -n "${METRICS}" ]] || { echo "没有可用指标，评测退出"; exit 1; }
 
@@ -744,7 +941,9 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
       --gsm8k_data_path "${GSM8K_DATA}" \
       --math500_data_path "${MATH500_DATA}" \
+      --amc_data_path "${AMC_DATA}" \
       --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+      --decode_stop_on_im_end "${STOP_ON_IM_END}" \
       --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
   }
 
@@ -756,7 +955,9 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
           run_eval "${RUN}" "${CKPT}"
         else
           echo "跳过 ${RUN}：checkpoint 不存在（${CKPT}）"
-          echo "这次训练用的是 lr=5e-5，MODE=eval 必须带 LR=5e-5，默认 LR=2e-5 会对不上。"
+          echo "MODE=eval 的 LR/SEED 必须和训练时一致（默认都是 lr=5e-5 seed=1），"
+          echo "否则拼出来的 run 名对不上。另外确认 RESULTS_ROOT 指向的是同一个模型的树："
+          echo "  当前 = ${RESULTS_ROOT}"
         fi
         ;;
       *) echo "未知 run: ${which}" ;;
@@ -772,7 +973,7 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
         trained) name="${RUN}" ;;
         *) continue ;;
       esac
-      for metric in gsm8k math500; do
+      for metric in gsm8k math500 amc; do
         f="${EVAL_OUT_DIR}/${metric}/${name}/responses.jsonl"
         [[ -f "${f}" ]] && DIAG_FILES+=("${f}")
       done
@@ -826,14 +1027,21 @@ echo "========================================================================"
 echo "产物:"
 echo "  Math 池      : ${MATH_DATASET}"
 echo "  checkpoint   : ${CKPT}"
-echo "  评测         : ${EVAL_OUT_DIR}/{gsm8k,math500}/<run>/summary.json"
-echo "  汇总 csv     : ${EVAL_OUT_DIR}/{gsm8k,math500}_summary.csv"
-echo "  4096 旧结果  : ${RESULTS_ROOT}/{gsm8k,math500}/  （未覆盖）"
+echo "  评测         : ${EVAL_OUT_DIR}/{gsm8k,math500,amc}/<run>/summary.json"
+echo "  汇总 csv     : ${EVAL_OUT_DIR}/{gsm8k,math500,amc}_summary.csv"
+echo "  Qwen3 旧结果 : ${REPO_ROOT}/results_part1_numina_math/  （另一个模型，未触碰）"
 echo ""
-echo "怎么读结论: Model-Math 的 GSM8K/MATH-500 明显高于 base => OpenR1 确实教会了"
-echo "            数学推理，这条线的 sanity check 通过。"
-echo "            MATH-500 是同分布上限（训练 prompt 与它一致），GSM8K 是跨格式泛化"
-echo "            （它要求 '####' 格式，训练时没见过），后者偏低是正常的。"
+echo "接 Part 3（99/100 号）时记得带："
+echo "  MATH_LINE_ROOT=${RESULTS_ROOT}"
+echo ""
+echo "怎么读结论: Model-Math 的 MATH-500/AMC/GSM8K 明显高于 base => NuminaMath 确实"
+echo "            教会了数学推理，这条线的 sanity check 通过。"
+echo "            MATH-500 是同分布上限（训练 prompt 与它一致），AMC 同口径但更难，"
+echo "            GSM8K 是跨格式泛化（要求 '####'，训练时没见过），后者偏低是正常的。"
+echo "            外部参照是 DFT/ICLR2026 Table 1：Qwen2.5-Math-1.5B 的 MATH-500"
+echo "            31.66 -> w/SFT 43.76。**但那是 temperature 1.0 的 Average@16，"
+echo "            我们这里是 greedy@1，绝对值通常偏高，只能比方向和幅度。**"
+echo "            AMC 的文件是 AMC12 2022+2023 83 题，不是论文的 AMC23 40 题。"
 echo "            先看作业末尾的 length diagnostic：hit-cap 还高就不是能力不行，是预算"
-echo "            仍不够。四个数字必须和 4096 那次分开读，不能混进同一张表。"
+echo "            仍不够。这批数字必须和 4096/8192 那两次分开读，不能混进同一张表。"
 echo "Job finished at: $(date)"

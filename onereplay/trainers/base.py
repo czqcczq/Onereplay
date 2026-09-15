@@ -27,6 +27,7 @@ class BaseTrainer:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device | str,
+        scheduler: Any | None = None,
         regularizer: Any | None = None,
         replay_lambda: float = 0.0,
         batch_size: int = 8,
@@ -41,6 +42,9 @@ class BaseTrainer:
     ) -> None:
         self.model = model
         self.optimizer = optimizer
+        # Stepped once per optimizer update, immediately after it. None keeps
+        # the LR at its initial value for every caller that predates this.
+        self.scheduler = scheduler
         self.device = device
         self.regularizer = regularizer
         self.replay_lambda = float(replay_lambda)
@@ -65,6 +69,15 @@ class BaseTrainer:
         self.probe_every = probe_every
         self.global_step = 0
         self.probe_sec_total = 0.0
+
+    def current_lr(self) -> float:
+        """LR the next update will use. Read off the optimizer, not the
+        schedule, so it reflects what actually moved the weights."""
+
+        # optimizer is None on the scoring-only path (score_probe_ce builds a
+        # trainer purely to reuse evaluate_probe), which never steps.
+        groups = getattr(self.optimizer, "param_groups", None)
+        return float(groups[0]["lr"]) if groups else 0.0
 
     def profiled_devices(self) -> list[torch.device | str]:
         """Devices whose peak memory belongs to this trainer's cost."""
@@ -283,6 +296,8 @@ class BaseTrainer:
             if step % accumulation_steps == 0 or step == total_steps:
                 with self.timer.track("optimizer"):
                     self.optimizer.step()
+                    if self.scheduler is not None:
+                        self.scheduler.step()
                     self.optimizer.zero_grad()
 
             total_task_loss += stats["task_loss"] * num_samples
@@ -298,10 +313,14 @@ class BaseTrainer:
                 now = time.time()
                 window_steps = step - window_first_step + 1
                 window_ms = (now - window_start) / max(window_steps, 1) * 1000
+                # Only printed on a scheduled run: a constant-LR run's log lines
+                # stay byte-identical to every one already in results_log.
+                lr_field = f"lr={self.current_lr():.3e} " if self.scheduler is not None else ""
                 print(
                     f"step {step}/{total_steps} "
                     f"task_loss={stats['task_loss']:.6f} "
                     f"replay_reg={window_reg:.6e} "
+                    f"{lr_field}"
                     f"{(now - epoch_start) / step * 1000:.0f}ms/step "
                     f"win={window_ms:.1f}ms/step "
                     f"mem={current_memory_gb(self.device):.2f}GiB",
@@ -370,6 +389,10 @@ class BaseTrainer:
                 "train_replay_reg": replay_reg,
                 "train_lambda_reg": self.replay_lambda * replay_reg,
                 "val_loss": val_loss,
+                # Named for the end of the epoch rather than "lr", which
+                # extra_record uses for the configured peak. On a cosine run the
+                # two differ and both are needed to place the curve.
+                "lr_end": self.current_lr(),
                 "elapsed_sec": time.time() - start_time,
                 "replay_lambda": self.replay_lambda,
                 "eval_sec": eval_sec,

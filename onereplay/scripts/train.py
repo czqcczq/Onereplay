@@ -92,6 +92,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--accumulation_size", type=int, default=64)
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        choices=["constant", "cosine", "linear", "constant_with_warmup"],
+        default="constant",
+        help=(
+            "LR schedule over optimizer updates. constant is the default so "
+            "every run recorded before this flag existed reproduces exactly; "
+            "the recipes that specify a schedule (NuminaMath full-parameter SFT "
+            "at lr 5e-5) need cosine with --warmup_ratio 0.1. The horizon is "
+            "--epochs worth of updates, or --max_steps worth when that caps the "
+            "epoch, so an lr_sweep arm walks a complete schedule over its own "
+            "truncated budget instead of stopping partway down a full one."
+        ),
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of total updates spent warming up. Ignored by "
+            "--lr_scheduler constant. Full-parameter fine-tuning at 5e-5 needs "
+            "this: the first updates land on a model whose loss is far from its "
+            "own optimum, and an unwarmed step of that size is where the loss "
+            "spike comes from."
+        ),
+    )
     parser.add_argument("--log_every", type=int, default=500)
     parser.add_argument("--max_steps", type=int, default=0)
     parser.add_argument(
@@ -184,7 +211,7 @@ def parse_args() -> argparse.Namespace:
             "dR/dDeltaW = 2 DeltaW C, which the forward pass already computed, and "
             "writes it into .grad before optimizer.step(); same penalty, half the "
             "arithmetic, and per-layer temporaries instead of all-layers. No effect on "
-            "the LoRA path, which is already rank x rank and costs ~1.6% of a step."
+            "the LoRA path, which is already rank x rank and costs ~1.6%% of a step."
         ),
     )
     parser.add_argument(
@@ -349,7 +376,7 @@ def parse_args() -> argparse.Namespace:
             "Row shares matching --replay_mix_files, normalized, e.g. "
             "'0.5,0.5' or '0.8,0.2'. Rows are not the unit the loss averages "
             "over: with FLAN at 90 supervised tokens per row and MetaMath at "
-            "357, equal rows put ~79% of the replay loss on math, and 0.8/0.2 "
+            "357, equal rows put ~79%% of the replay loss on math, and 0.8/0.2 "
             "rows is what equalizes supervised tokens. The startup log prints "
             "both shares; compare them against scripts/stat_replay_pools.py."
         ),
@@ -655,9 +682,45 @@ def main() -> None:
         lr=args.lr,
     )
 
+    # The schedule advances once per optimizer update, not once per micro-batch,
+    # so its horizon has to be counted in the same unit the trainer steps in.
+    # train_one_epoch also steps on the final partial window (step ==
+    # total_steps), hence the ceiling rather than a floor: undercounting here
+    # would drive the cosine past its endpoint and hand the last few updates a
+    # negative or clipped LR.
+    scheduler = None
+    steps_per_epoch = len(train_loader)
+    if args.max_steps > 0:
+        steps_per_epoch = min(steps_per_epoch, args.max_steps)
+    updates_per_epoch = -(-steps_per_epoch // accumulation_steps)
+    total_updates = max(1, updates_per_epoch * args.epochs)
+    warmup_updates = max(0, round(total_updates * args.warmup_ratio))
+    if args.lr_scheduler != "constant":
+        from transformers import get_scheduler
+
+        scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=warmup_updates,
+            num_training_steps=total_updates,
+        )
+        print(
+            f"lr schedule: {args.lr_scheduler} over {total_updates} updates "
+            f"({updates_per_epoch}/epoch x {args.epochs}), "
+            f"warmup {warmup_updates} updates (ratio={args.warmup_ratio}), "
+            f"peak lr={args.lr}",
+            flush=True,
+        )
+    elif args.warmup_ratio > 0:
+        raise ValueError(
+            "--warmup_ratio > 0 has no effect with --lr_scheduler constant; "
+            "pass --lr_scheduler cosine (or constant_with_warmup) as well."
+        )
+
     common = {
         "model": model,
         "optimizer": optimizer,
+        "scheduler": scheduler,
         "device": device,
         "regularizer": regularizer,
         "replay_lambda": args.replay_lambda,
@@ -752,6 +815,14 @@ def main() -> None:
             "probe_every_updates": args.probe_every_updates,
             "max_train_samples": args.max_train_samples,
             "max_val_samples": args.max_val_samples,
+            # A loss curve only means something next to the schedule that
+            # produced it, and "lr: 5e-5" alone no longer identifies a run now
+            # that the same peak can be constant or cosine-decayed.
+            "lr": args.lr,
+            "lr_scheduler": args.lr_scheduler,
+            "warmup_ratio": args.warmup_ratio,
+            "warmup_updates": warmup_updates if args.lr_scheduler != "constant" else 0,
+            "total_updates": total_updates,
         },
         save_path=args.save_path if args.save == 1 else "",
         tokenizer=tokenizer,
