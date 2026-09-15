@@ -122,15 +122,15 @@
 # 不会覆盖 full 版。
 #
 # -----------------------------------------------------------------------------
-# 【max_len=1536 / truncation_side left：必须和三处对齐】
+# 【max_len=2048 / truncation_side left：必须和三处对齐】
 #
-#   1) Stage 1 训练时 94 号用的 MAXLEN=1536（截断率 zs 0.3-0.6% / fs 1.4-1.9%）
+#   1) Stage 1 训练时 94 号用的 MAXLEN=2048（MODE=data 子样本 trunc 0.9%）
 #   2) 本脚本采 C 和 F
-#   3) Stage 3 训练时 replay 行的 --replay_max_len 1536
+#   3) Stage 3 训练时 replay 行的 --replay_max_len 2048
 #
 # 第 3 条是 replay.py 里 replay_max_len() 那段注释在说的事：新任务的 --max_len
 # 是另一个值（math 线 2048、cs 线 512），但 replay 行不能跟着走，必须显式给
-# 1536，否则「replay 复习的旧知识」和「C/F 编码的旧知识」不是同一截，三条臂
+# 2048，否则「replay 复习的旧知识」和「C/F 编码的旧知识」不是同一截，三条臂
 # 不再是同一份旧知识。
 #
 # truncation_side left 与训练一致（tokenizer_to_ids 是 full_input_ids[-max_length:]，
@@ -353,7 +353,7 @@ DO_FISHER="${DO_FISHER:-1}"
 SEED="${SEED:-1}"
 SAMPLE_SEED="${SAMPLE_SEED:-1}"
 # 必须等于 94 号训练时的 MAXLEN，也必须等于 Stage 2 的 --replay_max_len（见文件头）
-MAXLEN="${MAXLEN:-1536}"
+MAXLEN="${MAXLEN:-2048}"
 # full = 与 44 号一致的 all-linear，197 个模块、约 7.1 GB。理由见文件头 scope 一节。
 COV_SCOPE="${COV_SCOPE:-full}"
 case "${COV_SCOPE}" in
@@ -685,7 +685,7 @@ print("A) 采集口径（metadata，证明参数真的传上去了）")
 problems = []
 checks = [
     ("pool_fingerprint", want_fp, "池指纹与 Step 0 不一致：C 看到的行不是那 20k 行"),
-    ("max_len", want_max_len, "max_len 不是 1536：与 Stage 1 训练和 replay_max_len 不对齐"),
+    ("max_len", want_max_len, "max_len 不是 2048：与 Stage 1 训练和 replay_max_len 不对齐"),
     ("truncation_side", "left", "truncation_side 不是 left：切掉的是答案而不是 few-shot 示例"),
     ("require_target", 1, "require_target 不是 1：与 replay 的过滤口径不一致"),
     ("sample_shuffle", 0, "sample_shuffle 不是 0"),
@@ -784,7 +784,7 @@ if Path(ref_path).is_file():
               f"mean={r:.3f} min={ratios.min().item():.3f} max={ratios.max().item():.3f}")
         print(f"   历史 λ={ref_lambda:g} 按 trace 反比折算 -> λ ≈ {ref_lambda / r:.3e}")
         print("   注意历史 C 与本次差了三件事（模型 Base vs Model-IF-FLAN、FLAN dump 版本、")
-        print("   max_len 512 vs 1536），所以这个比值只是量级参考，不是等强度换算。")
+        print("   max_len 512 vs 2048），所以这个比值只是量级参考，不是等强度换算。")
     else:
         print(f"   历史 C 的层集合与本次无交集（scope 不同?），跳过比值")
 else:

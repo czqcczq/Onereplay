@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 #PBS -P CFP03-SF-101
 #PBS -N p1_if_flan
 #PBS -j oe
@@ -47,7 +47,7 @@
 #
 # 3) **上下文硬上限 4096**（config.json 的 max_position_embeddings；
 #    tokenizer_config 里的 model_max_length=131072 是假的）。这一条只咬评测：
-#    训练 MAXLEN=1536 远在窗口内，但 FollowBench 的 example 类把 few-shot 示例
+#    训练 MAXLEN=2048 远在窗口内，但 FollowBench 的 example 类把 few-shot 示例
 #    内联进 instruction，prompt P90=2516 / max=5019 token。prompt 本身就超窗口
 #    的那几行没救（要么 FB_CATEGORIES 排除 example，要么接受），但生成预算必须
 #    收住：三个 MAX_NEW_TOKENS 因此都从 2048 降到 1024（见下面「评测预算」一节）。
@@ -111,7 +111,8 @@
 # 1 epoch 也正好是 FLAN v2 自己的标准配方：它实际是无限量的，不重复样本，而且
 # 30 token 的答案重复几遍很容易变成背答案。
 #
-# 本池 100000 行 / 40:40:10:10 / MAXLEN 1536 ≈ 28.6M tok/epoch。
+# 本池 100000 行 / 40:40:10:10 / MAXLEN 2048。1536 时长度报告给过 ≈28.6M tok/epoch；
+# 提到 2048 只多收那 4% 的长尾，总量几乎不变，真正带 loss 的仍是约 3M 答案 token。
 #
 # **warmup 不是可选项**。train.py 在加 --lr_scheduler 之前是裸 torch.optim.Adam、
 # 恒定 LR、无 warmup。全参微调在 5e-5 下第一次更新落在一个离自己最优点很远的
@@ -127,7 +128,7 @@
 # 跨线比较 val loss 的绝对值时必须记得这件事。
 #
 # -----------------------------------------------------------------------------
-# 【MAXLEN 1536：和 90 号同值，但截断的后果完全不同】
+# 【MAXLEN 2048：救的是 zs 长尾，不是 few-shot 的 8.8%】
 #
 # tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，保尾丢头。
 #
@@ -136,8 +137,15 @@
 # 「示例1 示例2 … 真正的问题」，问题在最后。所以被截的行只是退化成更少 shot 的
 # 同一道题，题干和指令都在。这是良性的。
 #
-# 实测截断率（40/40/10/10，MAXLEN=1536）：zs 约 0.3-0.6%，fs 约 1.4-1.9%。
-# 1024 下 fs_opt 升到 4.6%。1536 沿用 90 号既够用又保持可比，不用为 FLAN 单独调。
+# Qwen2.5-Math tokenizer + 中性 system 下，MODE=data 实测（40/40/10/10）：
+#     trunc@1536  zs 1.8-2.2% / fs_opt 8.8% / fs_noopt 6.5% / 子样本整体 4.8%
+#     trunc@2048  整体 0.9%
+# few-shot 那一截切掉是良性的；zs 的 P99 已经 2142-2291，1536 会切掉零样本题干
+# 前半段，所以默认提到 2048。3072 只再降到 0.3%，峰值显存按最长那条付，不划算。
+# 仍在 4096 硬上限内。评测生成预算 1024 是 FollowBench prompt 太长逼出来的，
+# 和训练 MAXLEN 不是一回事，不要跟着改。
+#
+# 改这个值必须连 95 号采集和 Stage 3 的 --replay_max_len 一起改。
 #
 # -----------------------------------------------------------------------------
 # 【评测预算：三个都从 2048 降到 1024，这是 4096 窗口逼出来的】
@@ -400,8 +408,9 @@ FLAN_DEDUP_ACROSS_REMIXES="${FLAN_DEDUP_ACROSS_REMIXES:-0}"
 # BATCH=8 / ACCUM=64：一次更新 64 行，accumulation_steps = ACCUM // BATCH = 8。
 # **注意 ACCUM 是"行/更新"而不是微批个数**，所以有效 batch 是 64 而不是 8x64。
 # BATCH 必须整除 ACCUM，否则"一次更新 64 行"不成立。
-# 激活上界 8 x 1536 = 12288 token/micro-batch。本池 80% 是很短的 zero-shot 行
-# （P50 约 70-76 token），动态补齐之后多数 micro-batch 远低于这个上界。
+# 激活上界 8 x 2048 = 16384 token/micro-batch。本池 80% 是很短的 zero-shot 行
+# （P50 约 100-117 token），动态补齐之后多数 micro-batch 远低于这个上界；
+# 碰到长 few-shot 的那一拍会顶到 2048。MODE=smoke 看一眼 peak memory。
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-5e-5}"
 # cosine + warmup 0.1，与 91/93 号统一。train.py 在加 --lr_scheduler 之前是裸
@@ -412,7 +421,7 @@ LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
-MAXLEN="${MAXLEN:-1536}"
+MAXLEN="${MAXLEN:-2048}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-500}"
 # 全量微调时只决定正则覆盖哪些层；本线没有正则，保持与 91/93 号一致便于对照。
