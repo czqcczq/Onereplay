@@ -508,15 +508,11 @@ LR="${LR:-5e-5}"
 # 训练开头 train.py 打的那行 `lr schedule: ...` 要和文件头算的更新数对得上。
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
-# BATCH 默认按 source 分。FLAN 池 80% 是很短的 zero-shot 行，动态补齐后多数
-# micro-batch 远低于 8x2048 的上界；Conifer 的答案 p50 就有 144 词、p90 315 词，
-# 批内最长更常顶到 MAXLEN，所以给 4。两条 source 的有效 batch 都是 ACCUM=64
-# 行/更新，所以这只影响显存和吞吐，不影响两者可比。
-if [[ "${IF_SOURCE}" == "conifer" ]]; then
-  BATCH="${BATCH:-4}"
-else
-  BATCH="${BATCH:-8}"
-fi
+# 两条 source 同一个 BATCH。Conifer 看着"行更长"所以一度给它 4，但实测的截断表
+# 说全 38.9k 行在 1024 预算下就已经零截断（答案 token P50=183 / P90=310 /
+# max=690），也就是 full_length 顶多 1024 上下，BATCH=8 的实际激活约 8k token，
+# 还低于 FLAN 线 8x2048 的名义上界。给 4 是白扔一倍吞吐。
+BATCH="${BATCH:-8}"
 ACCUM="${ACCUM:-64}"
 # 两条 source 用同一个 2048，训练预算才可比。但**截断的后果方向是相反的**，这
 # 一条必须知道：tokenizer_to_ids 保留序列**末尾**。FLAN 的问题在 prompt 末尾，
