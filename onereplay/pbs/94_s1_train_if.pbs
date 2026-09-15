@@ -298,6 +298,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     FLAN_ANSWER_BUCKETS FLAN_ANSWER_WEIGHTS
     CONIFER_MODE CONIFER_FORMAT_ONLY CONIFER_MAX_TURNS
     CONIFER_INCLUDE_PF CONIFER_DROP_REFUSALS
+    MIX_CONIFER_POOL MIX_FLAN_POOL MIX_CONIFER_ROWS MIX_FLAN_ROWS MIX_FLAN_MIN_WORDS
     IFEVAL_INPUT IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS
     FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
     DO_IFEVAL DO_IFBENCH DO_FOLLOWBENCH
@@ -377,11 +378,19 @@ MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
 # 所以 SYSTEM_PROMPT、STOP_ON_IM_END、IF 评测口径这些修复自动共享，不会出现
 # 某条线漏掉某个修复的情况——这也是不去复活已删的 90_part1_if_conifer.pbs 的
 # 理由：那份是这些修复之前的版本。
+#
+# mix 是第三条：Conifer 全量 + FLAN 的长答案部分。两个 source 在 IFEval 上占的
+# 约束类型是互不重叠的（Conifer 拿 number_bullet_lists 6.5%→32.3%、
+# multiple_sections 14.3%→35.7%、json_format 0%→41.2%，FLAN 把前两个压到 0；
+# FLAN 拿 no_comma 34.8%→71.2%、forbidden_words 36.7%→69.4%，Conifer 两个都
+# 没动），所以混合是冲着两半一起拿。比例是**长度决定**而不是行数决定，见
+# mix_if_pools.py 的文件头。
 IF_SOURCE="${IF_SOURCE:-flan}"
 case "${IF_SOURCE}" in
   flan)    IF_SOURCE_TAG="flanv2" ;;
   conifer) IF_SOURCE_TAG="conifer" ;;
-  *) echo "IF_SOURCE 只能是 flan 或 conifer，得到 '${IF_SOURCE}'" >&2; exit 2 ;;
+  mix)     IF_SOURCE_TAG="ifmix" ;;
+  *) echo "IF_SOURCE 只能是 flan / conifer / mix，得到 '${IF_SOURCE}'" >&2; exit 2 ;;
 esac
 # 结果树按**模型**分，这是必须的而不是整洁强迫症。旧的 Qwen3-1.7B-Base 那一轮
 # 写在 results_part1_if_flanv2/ 下，run 名是 part1_if_flanv2_lr5e-5_seed1 ——
@@ -412,6 +421,16 @@ if [[ "${IF_SOURCE}" == "conifer" ]]; then
   # 所以默认不建 replay/heldout 池。接 Part 2 之前要先定：给 prepare_conifer 加
   # jsonl 输出，还是让 collect_cov 也能读 save_to_disk。别默默跳过这个决定。
   REPLAY_POOL="${REPLAY_POOL:-${RESULTS_ROOT}/datasets/conifer_if_replay}"
+  HELDOUT_POOL="${HELDOUT_POOL:-}"
+  BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-0}"
+elif [[ "${IF_SOURCE}" == "mix" ]]; then
+  IF_DATASET="${IF_DATASET:-${RESULTS_ROOT}/datasets/if_mix}"
+  # 两个半边各自落盘再合并，而不是一步到位：它们可以单独检查，而且换比例重跑
+  # 只需要重跑合并那一步（两个半边已存在时会跳过重建）。
+  MIX_CONIFER_POOL="${MIX_CONIFER_POOL:-${RESULTS_ROOT}/datasets/conifer_if_full}"
+  MIX_FLAN_POOL="${MIX_FLAN_POOL:-${RESULTS_ROOT}/datasets/flan_v2_if_long}"
+  # 同 conifer：Part 2 的 jsonl 对接还没做，所以不建 replay/heldout 池。
+  REPLAY_POOL="${REPLAY_POOL:-${RESULTS_ROOT}/datasets/if_mix_replay}"
   HELDOUT_POOL="${HELDOUT_POOL:-}"
   BUILD_REPLAY_POOL="${BUILD_REPLAY_POOL:-0}"
 else
@@ -491,6 +510,19 @@ CONIFER_INCLUDE_PF="${CONIFER_INCLUDE_PF:-1}"
 # 不是均匀分布的：拒答集中在每个阶梯的最后一级（4.61% vs 别处 2.23%），因为阶梯
 # 会一直加码到生成器不肯配合。留着会让 sampled/hardest 选中拒答而不是难度。
 CONIFER_DROP_REFUSALS="${CONIFER_DROP_REFUSALS:-1}"
+
+# ---- 混合池选项（只在 IF_SOURCE=mix 时读）----
+# 0 = Conifer 全取（约 38.9k，它没有更多了）。
+MIX_CONIFER_ROWS="${MIX_CONIFER_ROWS:-0}"
+# FLAN 那一半的行数。默认 20000 是让 Conifer 占约 2/3：模型输出长度紧跟池子的
+# 答案长度（FLAN 6 词→输出 32 词，Conifer 144 词→输出 189 词），所以短答案占多数
+# 会把产出型约束重新压回去。方向上加容易减难，先保守，看结果再往上加。
+MIX_FLAN_ROWS="${MIX_FLAN_ROWS:-20000}"
+# FLAN 那一半只取答案 >= 这个词数的行：FLAN 池 35% 的行只有 1-2 词，正是它们压崩
+# 了长度。实现走 prepare_flan_v2 的长度重平衡（短桶权重 0 = 永不取）。
+# 注意容量上限：原始 150k 采样池里 >=15 词约 50.8k 行、>=50 词只有约 12.2k 行，
+# 所以 MIX_FLAN_ROWS 和这个门槛要一起看，要不到会直接报错而不是静默少取。
+MIX_FLAN_MIN_WORDS="${MIX_FLAN_MIN_WORDS:-15}"
 
 # ---- 训练超参（三条 Stage 1 线统一，见文件头「训练配方」）----
 #
@@ -612,6 +644,10 @@ if [[ "${IF_SOURCE}" == "conifer" ]]; then
   echo "  Conifer 原始   : ${CONIFER_PATH}"
   echo "  数据池         : ${IF_DATASET}   (mode=${CONIFER_MODE}, 全量约 38.9k 行)"
   echo "  replay 池      : ${REPLAY_POOL}   (BUILD_REPLAY_POOL=${BUILD_REPLAY_POOL})"
+elif [[ "${IF_SOURCE}" == "mix" ]]; then
+  echo "  数据池         : ${IF_DATASET}"
+  echo "    Conifer 半边 : ${MIX_CONIFER_POOL}   (取 ${MIX_CONIFER_ROWS} 行, 0=全取)"
+  echo "    FLAN 半边    : ${MIX_FLAN_POOL}   (取 ${MIX_FLAN_ROWS} 行, 答案 >= ${MIX_FLAN_MIN_WORDS} 词)"
 else
   echo "  FLAN 取样目录  : ${FLAN_SAMPLE_DIR}"
   echo "  数据池         : ${IF_DATASET}"
@@ -731,6 +767,71 @@ if [[ "${MODE}" == "data" ]]; then
     echo ""
     echo "它流式读 SirNeural/flan_v2 的 flan_* 四个文件，原始 gz 不落盘。"
     exit 1
+  fi
+
+  if [[ "${IF_SOURCE}" == "mix" ]]; then
+    [[ -e "${CONIFER_PATH}" ]] || { echo "缺 Conifer 数据: ${CONIFER_PATH}"; exit 1; }
+
+    # 两个半边分别落盘，已存在就跳过：换混合比例时只要删掉合并产物重跑，
+    # 不用把两个半边也重建一遍。
+    if [[ -d "${MIX_CONIFER_POOL}" ]]; then
+      echo "==== data: Conifer 半边已存在，跳过 -> ${MIX_CONIFER_POOL} ===="
+    else
+      echo "==== data: Conifer 半边 -> ${MIX_CONIFER_POOL} ===="
+      python -m onereplay.scripts.prepare_conifer \
+        --conifer_path "${CONIFER_PATH}" \
+        --out_dir "${MIX_CONIFER_POOL}" \
+        --mode "${CONIFER_MODE}" \
+        --format_constraints_only "${CONIFER_FORMAT_ONLY}" \
+        --max_turns_per_conv "${CONIFER_MAX_TURNS}" \
+        --include_process_feedback "${CONIFER_INCLUDE_PF}" \
+        --drop_refusals "${CONIFER_DROP_REFUSALS}" \
+        --seed "${SEED}" \
+        --max_len "${MAXLEN}" \
+        --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+    fi
+
+    if [[ -d "${MIX_FLAN_POOL}" ]]; then
+      echo ""
+      echo "==== data: FLAN 长答案半边已存在，跳过 -> ${MIX_FLAN_POOL} ===="
+      echo "     改 MIX_FLAN_ROWS / MIX_FLAN_MIN_WORDS 要先删掉它，否则用的是旧池"
+    else
+      echo ""
+      echo "==== data: FLAN 长答案半边（答案 >= ${MIX_FLAN_MIN_WORDS} 词）-> ${MIX_FLAN_POOL} ===="
+      # 短桶权重 0 = 永不取，所以取到的行答案都 >= MIX_FLAN_MIN_WORDS 词。
+      # replay/heldout 都给 0：混合线的 Part 2 还没对接，现在切了也没人读。
+      python -m onereplay.scripts.prepare_flan_v2 \
+        --sample_dir "${FLAN_SAMPLE_DIR}" \
+        --out_dir "${MIX_FLAN_POOL}" \
+        --target_rows "${MIX_FLAN_ROWS}" \
+        --weights "${FLAN_WEIGHTS}" \
+        --answer_word_buckets "${MIX_FLAN_MIN_WORDS}" \
+        --answer_bucket_weights "0,100" \
+        --replay_rows 0 \
+        --heldout_rows 0 \
+        --dedup_across_remixes "${FLAN_DEDUP_ACROSS_REMIXES}" \
+        --seed "${SEED}" \
+        --max_len "${MAXLEN}" \
+        --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+    fi
+
+    echo ""
+    echo "==== data: 合并两个半边 -> ${IF_DATASET} ===="
+    python -m onereplay.scripts.mix_if_pools \
+      --pools "${MIX_CONIFER_POOL},${MIX_FLAN_POOL}" \
+      --rows "${MIX_CONIFER_ROWS},${MIX_FLAN_ROWS}" \
+      --out_dir "${IF_DATASET}" \
+      --seed "${SEED}" \
+      --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+
+    echo ""
+    echo "数据准备完成。看两件事："
+    echo "  1) 「混合后答案词数 p50」—— 那是对训练后输出长度的预测。两轮实测："
+    echo "     FLAN 池 6 词 -> 输出 32 词；Conifer 池 144 词 -> 输出 189 词。"
+    echo "  2) 截断表 —— Conifer 的约束写在 user turn 开头，截断保留末尾，是静默的。"
+    echo "换比例：删掉 ${IF_DATASET}，改 MIX_FLAN_ROWS 重跑 data，两个半边会复用。"
+    echo "然后 MODE=smoke。"
+    exit 0
   fi
 
   echo "==== data: FLAN v2 取样 -> ${IF_DATASET} ===="
