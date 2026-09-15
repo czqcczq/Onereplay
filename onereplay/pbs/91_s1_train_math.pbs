@@ -435,7 +435,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODE DRY_RUN DO_TRAIN DO_EVAL SEED FORCE_EVAL
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
-    THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED SYSTEM_PROMPT
+    THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED SYSTEM_PROMPT SYSTEM_PROMPT_PRESET
     REPLAY_ROWS REPLAY_POOL REPLAY_SAMPLE_SEED
     GSM8K_DATA MATH500_DATA AMC_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
     EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL DIAG_LEN STOP_ON_IM_END
@@ -623,6 +623,31 @@ TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,
 #
 # 已跑完的 Model-Math 就是在空值下训练的，所以改这个等于换了训练 prompt，
 # checkpoint 和评测都要重来。
+#
+# ---- 换模型时的陷阱 ----
+# 上面"留空"依赖的是 Qwen2.5-Math 会自己注入那条指令。**其他模型不会**：
+# Qwen3-*-Base 的模板只在 messages[0] 是 system 时才输出 system 块。而
+#   - math500 / amc 的答案提取靠 \boxed{}；
+#   - Numina 的训练答案自带 \boxed{}。
+# 所以在非 Math 模型上留空会让 base 臂因为没写 \boxed{} 而被读成"不会做"、训练后
+# 臂因为从数据里学会了写 \boxed{} 而正常，凭空夸大训练效果——正好毁掉"换模型能不
+# 能让 math 更好"这个问题的答案。auto 因此按模型补齐，Qwen2.5-Math 仍然留空，
+# 已跑完的那轮不受影响。
+# 另外这条指令的文本里有逗号，而 qsub -v 用逗号分隔变量，没法直接传 SYSTEM_PROMPT，
+# 这也是要一个开关的原因。
+SYSTEM_PROMPT_PRESET="${SYSTEM_PROMPT_PRESET:-auto}"
+if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
+  case "${SYSTEM_PROMPT_PRESET}" in
+    none) ;;
+    math) SYSTEM_PROMPT="Please reason step by step, and put your final answer within \\boxed{}." ;;
+    auto)
+      if [[ "${MODEL_NAME}" != *Math* ]]; then
+        SYSTEM_PROMPT="Please reason step by step, and put your final answer within \\boxed{}."
+      fi
+      ;;
+    *) echo "SYSTEM_PROMPT_PRESET 只能是 auto / math / none，得到 '${SYSTEM_PROMPT_PRESET}'" >&2; exit 2 ;;
+  esac
+fi
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 
 # ---- LR 搜索 / 冒烟 ----
