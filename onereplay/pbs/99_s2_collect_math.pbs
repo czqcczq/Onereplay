@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 #PBS -P CFP03-SF-101
 #PBS -N p3_cf_math
 #PBS -j oe

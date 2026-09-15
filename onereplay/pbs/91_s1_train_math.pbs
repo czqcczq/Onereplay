@@ -354,28 +354,28 @@
 #   # 1) 冒烟：70 步，不保存。两个目的：看 peak memory（2048x4 的真实峰值），
 #   #    以及拿 tokens_per_sec 去除 55.6M tok/epoch 算真实 epoch 时长。
 #   #    **顺便确认日志里出现了 lr= 字段**，没有就说明 scheduler 没接上。
-#   qsub -v MODE=smoke onereplay/pbs/91_part1_math_openr1.pbs
+#   qsub -v MODE=smoke onereplay/pbs/91_s1_train_math.pbs
 #
 #   # 2) 正式训练。LR/scheduler 都已是论文值，默认就对，不用再传。
 #   #    1 epoch 约 1.0-1.9 h，所以可以带评测一起跑；想拆开就加 DO_EVAL=0。
-#   qsub -v MODE=train onereplay/pbs/91_part1_math_openr1.pbs
+#   qsub -v MODE=train onereplay/pbs/91_s1_train_math.pbs
 #
 #   # 3) 评测单独跑（或上一步带 DO_EVAL=0 之后补）。默认 cap=2048 / batch=128，
 #   #    两个 run x 三个指标。产物写到 ${RESULTS_ROOT}/eval_cap2048/，按 cap 分目录
 #   #    所以不会和 OpenR1 时代 4096/8192 的数字混进一张表。
 #   #    **LR 必须和训练时一致**（默认都是 5e-5），否则会去找不存在的 checkpoint 目录。
-#   qsub -v MODE=eval onereplay/pbs/91_part1_math_openr1.pbs
+#   qsub -v MODE=eval onereplay/pbs/91_s1_train_math.pbs
 #
 #   # 想先便宜地把整条链路跑通，用子集（几分钟）
-#   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_part1_math_openr1.pbs
+#   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_s1_train_math.pbs
 #
 #   # 可选：LR sweep。论文已经给了 5e-5，所以这步不是必经的。每档在自己的
 #   # SWEEP_MAX_STEPS 预算上走完整 cosine。
-#   qsub -v MODE=lr_sweep onereplay/pbs/91_part1_math_openr1.pbs
+#   qsub -v MODE=lr_sweep onereplay/pbs/91_s1_train_math.pbs
 #
 #   # 5) 反向线（Math -> IF）要用的 20k 旧知识池。训练池逐字不变，已有 checkpoint
 #   #    不受影响，所以在 Model-Math 训完之后补跑是安全的（约 10-15 min，纯 CPU）。
-#   qsub -v MODE=data,REPLAY_ROWS=20000 onereplay/pbs/91_part1_math_openr1.pbs
+#   qsub -v MODE=data,REPLAY_ROWS=20000 onereplay/pbs/91_s1_train_math.pbs
 #      也可以不重跑本脚本，直接用 99 号的 MODE=pool 从已存的训练池上切（几分钟，
 #      两条路径调的是同一个 carve_replay_pool，产物逐字相同）。
 #

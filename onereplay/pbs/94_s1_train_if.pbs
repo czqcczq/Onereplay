@@ -10,10 +10,11 @@
 #
 # =============================================================================
 # Stage 1 / IF 线: Qwen2.5-Math-1.5B --FLAN-v2--> Model-IF
-#                  评 IFEval + IFBench + FollowBench
+#                  评 IFEval + FollowBench（默认不含 IFBench）
 #
 #     Base ---- FLAN v2 / Flan 2021 (100000 单轮样本) ----> Model-IF
-#     评测: IFEval, IFBench, FollowBench      对照: base
+#     评测: IFEval, FollowBench      对照: base
+#     IFBench 开关还在（DO_IFBENCH=1），但这条线的报告口径不含它。
 #
 # 三条 Stage 1 线（91 号 math / 93 号 cs / 本脚本 if）现在共用同一个 base 和
 # 同一套训练配方：100k 行 / 1 epoch / lr 5e-5 / cosine + warmup 0.1。只有数据
@@ -158,10 +159,10 @@
 # 按 92 号的估计 FollowBench 约是 IFBench 的 3 倍时间，所以它占一次 eval 的大头。
 #
 # 所以本脚本允许把评测拆开跑，用三个独立开关：
-#     MODE=eval,DO_FOLLOWBENCH=0          先把便宜的两个跑掉
-#     MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0  再单独跑 FollowBench
-# 三个指标都开时放在同一次 evaluate 调用里、只加载模型一次，这是默认；拆开是为了
-# 卡 walltime。
+#     MODE=eval,DO_FOLLOWBENCH=0          先跑 IFEval
+#     MODE=eval,DO_IFEVAL=0               再单独跑 FollowBench
+# 默认只开 IFEval + FollowBench，一次 evaluate 只加载模型一次；拆开是为了卡 walltime。
+# 想加 IFBench 显式传 DO_IFBENCH=1，它不是这条线的报告口径。
 #
 # 用三个开关而不是一个 EVAL_METRICS=ifeval,ifbench 列表，是因为 **qsub -v 自己就用
 # 逗号分隔变量**，带逗号的值会被 PBS 切开成两个变量名。同理下面 FLAN_WEIGHTS 在
@@ -209,14 +210,14 @@
 #   # 2) 正式训练（100k / 1 epoch）+ 评测。LR 由配方给定 5e-5，不需要 sweep。
 #   qsub -v MODE=train onereplay/pbs/94_s1_train_if.pbs
 #
-#   # 3) 只评测，且拆开跑以免卡 walltime
-#   qsub -v MODE=eval,DO_FOLLOWBENCH=0          onereplay/pbs/94_s1_train_if.pbs
-#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0  onereplay/pbs/94_s1_train_if.pbs
+#   # 3) 只评测，且拆开跑以免卡 walltime（默认就没有 IFBench）
+#   qsub -v MODE=eval,DO_FOLLOWBENCH=0 onereplay/pbs/94_s1_train_if.pbs
+#   qsub -v MODE=eval,DO_IFEVAL=0      onereplay/pbs/94_s1_train_if.pbs
 #
 #   # MODE=lr_sweep 保留但不是必经步骤（三条线统一 5e-5，见上面训练配方一节）
 #
 #   # FollowBench 冒烟：每类前 2 组阶梯 = 60 行（按组截，不能按行）
-#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0,FB_GROUP_LIMIT=2 onereplay/pbs/94_s1_train_if.pbs
+#   qsub -v MODE=eval,DO_IFEVAL=0,FB_GROUP_LIMIT=2 onereplay/pbs/94_s1_train_if.pbs
 #
 #   # 复现官方等权混合。冒号是为了绕开 qsub -v 的逗号分隔，脚本里会转回逗号。
 #   qsub -v MODE=data,FLAN_WEIGHTS=25:25:25:25 onereplay/pbs/94_s1_train_if.pbs
@@ -464,9 +465,9 @@ FB_BATCH="${FB_BATCH:-16}"
 # 读 followbench_group_limit，已核对代码），所以截它只能用这个。
 FB_GROUP_LIMIT="${FB_GROUP_LIMIT:-0}"
 # 三个独立开关而不是一个逗号列表：qsub -v 用逗号分隔变量（见文件头）。
-# 全开时三个指标共用一次模型加载；关掉一部分是为了把 walltime 拆开。
+# 默认 IFEval + FollowBench。IFBench 留着开关，但这条线的报告口径不含它。
 DO_IFEVAL="${DO_IFEVAL:-1}"
-DO_IFBENCH="${DO_IFBENCH:-1}"
+DO_IFBENCH="${DO_IFBENCH:-0}"
 DO_FOLLOWBENCH="${DO_FOLLOWBENCH:-1}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
@@ -672,12 +673,12 @@ if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
 fi
 
 # =============================================================================
-# MODE=eval：base 与 Model-IF-FLAN 各测 IFEval + IFBench + FollowBench
+# MODE=eval：base 与 Model-IF 各测 IFEval + FollowBench（默认不含 IFBench）
 #
-# 一次 evaluate 调用只加载模型一次，三个指标共用。DO_IFEVAL / DO_IFBENCH /
-# DO_FOLLOWBENCH 可以把它们拆到不同作业里，因为三个加起来大约是 90 号的 3-4 倍
-# 时间（FollowBench 820 行占大头）。跳过检查按**请求的那几个**指标算，所以拆开
-# 跑时第二批不会被第一批的产物挡掉。
+# 一次 evaluate 调用只加载模型一次，打开的指标共用。DO_IFEVAL / DO_FOLLOWBENCH
+# 可以把它们拆到不同作业里（FollowBench 820 行占大头）。跳过检查按**请求的那
+# 几个**指标算，所以拆开跑时第二批不会被第一批的产物挡掉。
+# 需要 IFBench 时传 DO_IFBENCH=1。
 #
 # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
 # is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
