@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N p5_x2cs
+#PBS -N s3_cs
 #PBS -j oe
 #PBS -k oed
 #PBS -q autox
@@ -123,8 +123,8 @@
 #
 #        python -m onereplay.scripts.calibrate_lambda \
 #          --results_root ${RESULTS_ROOT} \
-#          --pattern 'part5_cs_onereplay_lr*_lam*_seed1' \
-#          --floor_run part5_cs_vanilla_lr<LR>_seed1 \
+#          --pattern 's3_cs_onereplay_lr*_lam*_seed1' \
+#          --floor_run s3_cs_vanilla_lr<LR>_seed1 \
 #          --target <vanilla 的 val_loss>
 #
 #      floor 必须是同配置的 vanilla run —— λ→0 收敛到的就是它，没有 floor 这个拟合
@@ -179,8 +179,8 @@
 #         所以拆法：**训练 + 新任务评测放一个作业，旧能力评测另开**。
 #
 #   # 0) 只打印计划和前置检查，不碰 GPU（**先跑这个**）
-#   qsub -v DRY_RUN=1 onereplay/pbs/103_part5_if2commonsence.pbs
-#   qsub -v DRY_RUN=1,SOURCE=math onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v DRY_RUN=1 onereplay/pbs/103_s3_train_cs.pbs
+#   qsub -v DRY_RUN=1,SOURCE=math onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 1) 冒烟：vanilla + 一条 protected 臂各 70 步，看 peak memory 和
 #   #    「covers N layers」那行。**这一步定 BATCH，必须在任何正式臂之前做完。**
@@ -188,54 +188,54 @@
 #   #    要用 ARM=ewc：三臂里它最吃显存（只有 autograd 路径，所有覆盖层的 fp32
 #   #    DeltaW 活到 backward 返回），拿 vanilla 或 onereplay 探出来的余量是假的。
 #   #    这里的 λ 只是个标量乘数、不影响显存，所以还没标定 λ 也可以先探，随便给一个。
-#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1e7 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1e7 onereplay/pbs/103_s3_train_cs.pbs
 #   # 默认 BATCH=8 是按 4B 架构估的保守值（见下面 BATCH 那一段的表）。想提到 16 就先
 #   # 实测这一档，过了再三臂一起用；不过按估算它只剩约 9 GiB 余量，别抱期望。
-#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1e7,BATCH=16 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1e7,BATCH=16 onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 2) 选 λ（短跑几档，只看 λ·R / task_loss 的比值）
 #   #    ！两条臂的 λ 要各标一次，靠 PROBE_ARM 区分，grid 不通用（见下面 PROBE_ARM 一节）
 #   #    起点建议 7.5e-3：44 号是在同一个新任务(Commonsense@512)上定的，同尺度
-#   qsub -v MODE=lambda_probe onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=lambda_probe onereplay/pbs/103_s3_train_cs.pbs
 #   # 已经单独交了完整 vanilla 的话，probe 里那档 λ=0 可以省掉
-#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0 onereplay/pbs/103_s3_train_cs.pbs
 #   # 只验一个 λ（最快，约 20 次更新）
 #   qsub -v MODE=lambda_probe,PROBE_VANILLA=0,LAMBDA_GRID=7.5e-3 \
-#     onereplay/pbs/103_part5_if2commonsence.pbs
+#     onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 2b) 标定 EWC 的 λ。不传 LAMBDA_GRID 时会读 F 文件，围绕 1/mean(F) 现算三档
 #   #     （x0.1 / x1 / x10），所以第一次扫不需要你先知道 F 的量级。
 #   qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0 \
-#     onereplay/pbs/103_part5_if2commonsence.pbs
+#     onereplay/pbs/103_s3_train_cs.pbs
 #   # 看完表后只验一档（比值要落在 task_loss 的 1%~10%）
 #   qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0,LAMBDA_GRID=1.2e7 \
-#     onereplay/pbs/103_part5_if2commonsence.pbs
+#     onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 3) vanilla 臂（必须跑，是遗忘的标尺）。训练+新任务评测同作业，旧能力评测另开。
-#   qsub -v MODE=train,ARM=vanilla,DO_OLD=0 onereplay/pbs/103_part5_if2commonsence.pbs
-#   qsub -v MODE=eval,ARM=vanilla,DO_CS=0 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=train,ARM=vanilla,DO_OLD=0 onereplay/pbs/103_s3_train_cs.pbs
+#   qsub -v MODE=eval,ARM=vanilla,DO_CS=0 onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 4) onereplay 臂（λ 用第 2 步选出来的）
-#   qsub -v MODE=train,ARM=onereplay,LAMBDA=7.5e-3,DO_OLD=0 onereplay/pbs/103_part5_if2commonsence.pbs
-#   qsub -v MODE=eval,ARM=onereplay,LAMBDA=7.5e-3,DO_CS=0 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=train,ARM=onereplay,LAMBDA=7.5e-3,DO_OLD=0 onereplay/pbs/103_s3_train_cs.pbs
+#   qsub -v MODE=eval,ARM=onereplay,LAMBDA=7.5e-3,DO_CS=0 onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 4b) ewc 臂（λ 用第 2b 步选出来的；ARM=ewc 不接受默认 λ，不传会直接退出）
-#   qsub -v MODE=train,ARM=ewc,LAMBDA=1.2e7,DO_OLD=0 onereplay/pbs/103_part5_if2commonsence.pbs
-#   qsub -v MODE=eval,ARM=ewc,LAMBDA=1.2e7,DO_CS=0 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=train,ARM=ewc,LAMBDA=1.2e7,DO_OLD=0 onereplay/pbs/103_s3_train_cs.pbs
+#   qsub -v MODE=eval,ARM=ewc,LAMBDA=1.2e7,DO_CS=0 onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 5) Stage 3 的起点也要评一遍，它是所有对照的「before」那一行
-#   qsub -v MODE=eval,ARM=anchor onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=eval,ARM=anchor onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 换来源：上面每一条都加 SOURCE=math 就是「从 Model-Math 出发」那一组
-#   qsub -v MODE=train,ARM=vanilla,SOURCE=math,DO_OLD=0 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v MODE=train,ARM=vanilla,SOURCE=math,DO_OLD=0 onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # SOURCE=if 默认按 conifer 那条 IF 池找基座。如果 IF 线是按 94 号的**脚本默认值**
 #   # （IF_SOURCE=flan）训的，加这一个变量，W0 路径和 run 前缀会一起切过去
-#   qsub -v DRY_RUN=1,IF_SOURCE_TAG=flanv2 onereplay/pbs/103_part5_if2commonsence.pbs
+#   qsub -v DRY_RUN=1,IF_SOURCE_TAG=flanv2 onereplay/pbs/103_s3_train_cs.pbs
 #
 #   # 便宜地把链路跑通
 #   qsub -v MODE=train,ARM=onereplay,MAX_TRAIN_SAMPLES=4000,EPOCHS=1,DO_EVAL=0 \
-#     onereplay/pbs/103_part5_if2commonsence.pbs
+#     onereplay/pbs/103_s3_train_cs.pbs
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
@@ -245,7 +245,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/103_part5_if2commonsence.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/103_s3_train_cs.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -407,12 +407,15 @@ case "${SOURCE}" in
   if)
     # 94 号把 IF 池分成三条 source，tag 直接进结果树和 run 名（flan→flanv2 /
     # conifer / mix→ifmix）。留成一个旋钮，换池只改这一个值、两条路径一起跟着走。
-    IF_SOURCE_TAG="${IF_SOURCE_TAG:-conifer}"
+    IF_SOURCE_TAG="${IF_SOURCE_TAG:-ifmix}"
     SRC_LINE_ROOT="${SRC_LINE_ROOT:-${REPO_ROOT}/results_part1_${IF_SOURCE_TAG}_${MODEL_NAME}}"
     SRC_RUN_PREFIX="${SRC_RUN_PREFIX:-part1_if_${IF_SOURCE_TAG}}"
     CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_stage2_if_${MODEL_NAME}}"
-    COV_BASENAME="${COV_BASENAME:-cov_if_flanv2_20k}"
-    FISHER_BASENAME="${FISHER_BASENAME:-fisher_if_flanv2_20k}"
+    # C/F 文件名跟着 tag 走，与 95 号同一套命名。以前三条 source 采出来的都叫
+    # cov_if_flanv2_20k，文件名分不出基座是哪个池 —— W0 从这里取、C/F 也从这里取，
+    # 两者错配不会报错，只会静默算出无意义的罚项。
+    COV_BASENAME="${COV_BASENAME:-cov_if_${IF_SOURCE_TAG}_20k}"
+    FISHER_BASENAME="${FISHER_BASENAME:-fisher_if_${IF_SOURCE_TAG}_20k}"
     # 旧能力：**不评 ifbench**，与 94/96 号一致，理由见文件头第 3 条纪律
     OLD_METRICS_ALL="ifeval,followbench"
     OLD_LABEL="IF"
@@ -680,7 +683,10 @@ FB_DATA="${FB_DATA:-}"
 FB_CATEGORIES="${FB_CATEGORIES:-}"
 # 1024 而不是 2048：这是 94 号的值，而 anchor 那一行的 FollowBench 分数应当与 94 号
 # 逐字相同（同 checkpoint、同 greedy 解码、同 batch），生成预算不同就对不上了。
-# **96 号这里仍是 2048，两条线的 IF 旧能力分因此暂时不可互比**，改哪边都要整张表重评。
+# 96 号原来是 2048，已经一并改成 1024，所以三条 Stage 3 线的 IF 旧能力分现在可互比。
+# 那个 2048 曾被记成"窗口所限"，但 Qwen3 的 max_position_embeddings 是 32768（本地
+# Qwen3-1.7B-Base 的 config 实测）—— 91/93/94 里"上下文硬上限 4096"讲的是
+# Qwen2.5-Math-1.5B，换模型后已不适用。取 1024 的真实理由只是与 94 号对齐。
 FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-1024}"
 # 不回落到 EVAL_BATCH：example 类的 prompt P90=2516 / max=5019 token，KV 不是一个量级。
 FB_BATCH="${FB_BATCH:-16}"
@@ -740,9 +746,9 @@ SRC_RUN="${SRC_RUN:-$(basename "${SRC_CKPT}")}"
 # λ 进名字，所以换 λ 不会覆盖；ARM 进名字，所以各臂不会互相覆盖。SOURCE 不进名字，
 # 它已经分在 RESULTS_ROOT 上了（与 96 号同一个约定）。
 case "${ARM}" in
-  vanilla)   RUN="part5_cs_vanilla_lr${LR}_seed${SEED}" ;;
-  onereplay) RUN="part5_cs_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
-  ewc)       RUN="part5_cs_ewc_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
+  vanilla)   RUN="s3_cs_vanilla_lr${LR}_seed${SEED}" ;;
+  onereplay) RUN="s3_cs_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
+  ewc)       RUN="s3_cs_ewc_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
   anchor)    RUN="${ANCHOR_RUN}" ;;
   *) echo "未知 ARM=${ARM}，可选 vanilla / onereplay / ewc / anchor"; exit 1 ;;
 esac
@@ -1481,8 +1487,8 @@ print(f"       然后 qsub -v MODE=eval,ARM={arm},LAMBDA=<同上>,DO_CS=0 <本�
 print("  2) 报结果时用 matched plasticity —— 各臂在同一个新任务 val_loss 上比:")
 print("       python -m onereplay.scripts.calibrate_lambda \\")
 print("         --results_root <RESULTS_ROOT> \\")
-print(f"         --pattern 'part5_cs_{arm}_lr*_lam*_seed1' \\")
-print("         --floor_run part5_cs_vanilla_lr<LR>_seed1 --target <vanilla val_loss>")
+print(f"         --pattern 's3_cs_{arm}_lr*_lam*_seed1' \\")
+print("         --floor_run s3_cs_vanilla_lr<LR>_seed1 --target <vanilla val_loss>")
 if arm == "ewc":
     print()
     print("注意：onereplay 与 ewc 各自标定出的 λ 之间**没有可比性**，不要因为一个是")
@@ -2085,9 +2091,9 @@ echo "               commonsense_qa 那份是**每 run 每 task 一行 + AVERAGE
 echo ""
 echo "完整的一轮需要这几个 run，缺任何一个结论都不成立:"
 echo "  ${ANCHOR_RUN}                                    Stage 3 的起点（before）"
-echo "  part5_cs_vanilla_lr${LR}_seed${SEED}                 无保护（遗忘的标尺）"
-echo "  part5_cs_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}  C_${SOURCE} 保护"
-echo "  part5_cs_ewc_lr${LR}_lam<λ_ewc>_seed${SEED}          F_${SOURCE} 保护（λ 与 onereplay 不可比）"
+echo "  s3_cs_vanilla_lr${LR}_seed${SEED}                 无保护（遗忘的标尺）"
+echo "  s3_cs_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}  C_${SOURCE} 保护"
+echo "  s3_cs_ewc_lr${LR}_lam<λ_ewc>_seed${SEED}          F_${SOURCE} 保护（λ 与 onereplay 不可比）"
 if [[ "${SOURCE}" == "if" ]]; then
 echo ""
 echo "FollowBench 的 judge 那半边（470 行，要在有网的地方跑）:"

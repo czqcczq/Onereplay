@@ -200,8 +200,13 @@
 #        ${IF_LINE_ROOT}/datasets/flan_v2_if_100k_replay.jsonl
 #   3) mkdir -p ${REPO_ROOT}/logs
 #
-# 【用法】
-#   # 0) 先跑这个：只做 Step 0 的前置检查 + 池指纹，不碰 GPU（几分钟）
+# 【用法】默认 IF_SOURCE=mix，跑另外两条 source 就每一步都带上它
+#   # 0) 切 20k 旧知识池（纯 CPU，几分钟；只读训练池，不改它）
+#   #    conifer / mix 需要这一步；flan 线会说"已存在，跳过"，因为
+#   #    prepare_flan_v2 建训练池时顺手就写了那个 jsonl。
+#   qsub -v MODE=pool onereplay/pbs/95_s2_collect_if.pbs
+#
+#   # 1) 只做 Step 0 的前置检查 + 池指纹，不碰 GPU（几分钟）
 #   qsub -v DRY_RUN=1 onereplay/pbs/95_s2_collect_if.pbs
 #
 #   # 1) 正式采集 C + F（Step 0 -> 1 -> 2 -> 3 -> 4）
@@ -273,8 +278,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME IF_LINE_ROOT IF_CKPT_DIR IF_LR IF_RUN IF_CKPT
-    RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT
-    DRY_RUN FORCE DO_COV DO_FISHER
+    # IF_SOURCE 一转发，容器内的 case 会重新派生 tag / 训练池 / 池文件 / C-F 文件名。
+    IF_SOURCE TRAIN_POOL
+    RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT POOL_ROWS
+    MODE DRY_RUN FORCE DO_COV DO_FISHER
     SEED SAMPLE_SEED MAXLEN COV_SCOPE TARGET_MODULES COV_BATCH COV_ACCUM_DEVICE
     COV_PATH COV_TAG REF_COV DEBUG_EXAMPLES SYSTEM_PROMPT
     COV_USE_BF16 FISHER_USE_BF16 FISHER_DEVICE FISHER_PATH MAX_SAMPLES LOG_EVERY
@@ -331,15 +338,29 @@ MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 # 描述的不是这个 checkpoint 的激活分布。要回 1.5B 就传 MODEL_NAME=Qwen2.5-Math-1.5B。
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 
-# ---- Stage 1（IF 线 / FLAN v2）的产物，本脚本只读 ----
+# ---- Stage 1（IF 线）的产物，本脚本只读 ----
+# 取值与 94 号逐字相同。默认 mix：conifer 单独训的结果比不过 mix，IF 线已经定在
+# mix 上。换池只改这一个值，下面五样（结果树 / 训练池 / 20k 池 / run 名 / C-F 文件名）
+# 一起跟着切 —— 少切一样不会报错，只会静默采到另一条线的东西上。
+IF_SOURCE="${IF_SOURCE:-mix}"
+case "${IF_SOURCE}" in
+  flan)    IF_SOURCE_TAG="flanv2";  IF_TRAIN_POOL_DIR="flan_v2_if_100k" ;;
+  conifer) IF_SOURCE_TAG="conifer"; IF_TRAIN_POOL_DIR="conifer_if_full" ;;
+  mix)     IF_SOURCE_TAG="ifmix";   IF_TRAIN_POOL_DIR="if_mix" ;;
+  *) echo "IF_SOURCE 只能是 flan / conifer / mix，得到 '${IF_SOURCE}'" >&2; exit 2 ;;
+esac
 # 94 号的结果树，按模型分根。C/F 的模型和池子都来自这里。
 # **94 号换了 MODEL_NAME 就必须在这里一起换**，否则会静默采到另一个模型的
 # checkpoint 上（那个目录也存在，run 名还完全一样）。
-IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_flanv2_${MODEL_NAME}}"
+IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_${IF_SOURCE_TAG}_${MODEL_NAME}}"
 IF_CKPT_DIR="${IF_CKPT_DIR:-${IF_LINE_ROOT}/checkpoints}"
-# prepare_flan_v2 的默认命名：<训练池目录>_replay.jsonl，schema {inputs, targets, task}
-POOL_FILE="${POOL_FILE:-${IF_LINE_ROOT}/datasets/flan_v2_if_100k_replay.jsonl}"
-# 94 号的 FLAN_REPLAY_ROWS 默认值。Step 0 会断言实际行数等于它。
+# Stage 1 的**训练池**（save_to_disk）。MODE=pool 从它里面切 20k，其余步骤不读它。
+TRAIN_POOL="${TRAIN_POOL:-${IF_LINE_ROOT}/datasets/${IF_TRAIN_POOL_DIR}}"
+# 20k 旧知识池，schema {inputs, targets, ...}，三个用途共读（见文件头）。
+# flan 线上这正好是 prepare_flan_v2 自己写的那个文件名，所以那条线的路径没变；
+# conifer / mix 两条 source 的 prepare 脚本不产 jsonl，由本脚本 MODE=pool 现切。
+POOL_FILE="${POOL_FILE:-${IF_LINE_ROOT}/datasets/${IF_TRAIN_POOL_DIR}_replay.jsonl}"
+# 与 94 号的 FLAN_REPLAY_ROWS 同值。Step 0 会断言实际行数等于它。
 POOL_ROWS_EXPECT="${POOL_ROWS_EXPECT:-20000}"
 
 # ---- Stage 2 自己的结果树。与 results_part1_* 分开，免得 summary csv 混在一起 ----
@@ -350,10 +371,16 @@ export HF_DATASETS_CACHE="${DATASET_CACHE}"
 # ---- 阶段开关 ----
 # DRY_RUN 默认 0：Step 0 本身很快（纯 CPU，几分钟），正式作业也会先跑它。
 # 想只做检查就显式传 DRY_RUN=1。
+# MODE=pool 只切 20k 池然后退出（纯 CPU），其余值走正常的采集流程。与 99/101 号同名。
+# flan 线不需要这一步：prepare_flan_v2 建训练池时顺手就写了那个 jsonl。
+MODE="${MODE:-collect}"
 DRY_RUN="${DRY_RUN:-0}"
 FORCE="${FORCE:-0}"
 DO_COV="${DO_COV:-1}"
 DO_FISHER="${DO_FISHER:-1}"
+# MODE=pool 从训练池头部取多少行。等于 POOL_ROWS_EXPECT，单独留一个名字是因为
+# Step 0 的断言读的是后者，两者分开才能在断言失败时看出是哪一边错了。
+POOL_ROWS="${POOL_ROWS:-${POOL_ROWS_EXPECT}}"
 
 # ---- 采集参数 ----
 SEED="${SEED:-1}"
@@ -398,8 +425,11 @@ DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
 # Qwen2.5-Math 的模板注入那条 \boxed{} 数学指令 = 与 94 号的训练渲染不一致。
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
 
-COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_if_flanv2_20k_${COV_TAG}.pt}"
-FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_if_flanv2_20k_${COV_TAG}.pt}"
+# 文件名里带 IF_SOURCE_TAG。以前三条 source 采出来的 C/F 都叫 cov_if_flanv2_20k，
+# 文件名分不出基座是在哪个池上训的，唯一判据只有 W0 路径 —— 而 Stage 3 是按文件名
+# 去取 C/F 的，配错的后果不是报错，是「W0 来自 mix、C 采自 flanv2」这种静默无意义。
+COV_PATH="${COV_PATH:-${RESULTS_ROOT}/cov/cov_if_${IF_SOURCE_TAG}_20k_${COV_TAG}.pt}"
+FISHER_PATH="${FISHER_PATH:-${RESULTS_ROOT}/fisher/fisher_if_${IF_SOURCE_TAG}_20k_${COV_TAG}.pt}"
 # 历史上单阶段线的 C_if（01 号，Base 模型 / FLAN v1 dump / max_len 512）。存在就在
 # Step 2 里打一个 trace 比值，用来把 λ 的起点从历史值折算过来。缺了不影响采集。
 REF_COV="${REF_COV:-${REPO_ROOT}/results/cov/cov_flan_chat_20k_${COV_TAG}.pt}"
@@ -413,6 +443,136 @@ else
 fi
 
 mkdir -p "$(dirname "${COV_PATH}")" "$(dirname "${FISHER_PATH}")" "${DATASET_CACHE}"
+
+# ===========================================================================
+# MODE=pool: 从 Stage 1 训练池切 20k 旧知识池（纯 CPU，几分钟）
+#
+# 只有 conifer / mix 两条 source 需要这一步。prepare_conifer 和 mix_if_pools 都只写
+# save_to_disk，而 prepare_flan_v2 建训练池时顺手写了 <池>_replay.jsonl —— 所以 flan
+# 线跑这一步会直接说「已存在，跳过」。
+#
+# 【为什么落成一个固定文件，而不是让三步各自 --max_samples 20000】
+# collect_cov / collect_fisher 都有 --sample_shuffle，各自抽一次就是三批不同的行。
+# 文件头那条约束（71/83 号在强制的）要求 C、Fisher、replay 读**同一批行**，否则
+# 「OneReplay vs EWC vs replay」被「谁看到了哪些数据」混淆，比较本身失效。
+#
+# 【为什么是头部 20k 而不是随机抽】
+# mix_if_pools / prepare_conifer 写盘前已经按 --seed 跨来源打乱过，所以前缀就是一个
+# 可复现的等比随机样本 —— 下面会把 pool_source 的占比和全池对照着打出来验证这一点。
+# 再抽一次只会多一个种子要对账。
+#
+# 【为什么是 nested（池 ⊂ 训练池）】
+# 与 flan 线一致，理由见文件头：Stage 1 真的在这些行上训过，gold targets 的 replay
+# 因此是标准 experience replay，不需要自蒸馏。
+#
+# 注：train.py 的 val 切分（VAL_FRAC）是带自己 seed 的乱序切分，所以这 20k 里会混进
+# 约 1% 没被训练过的 val 行。flan / math / cs 三条线都有同样的性质，不单独处理。
+# ===========================================================================
+if [[ "${MODE}" == "pool" ]]; then
+  if [[ "${FORCE}" != "1" && -f "${POOL_FILE}" ]]; then
+    echo "池子已存在，跳过: ${POOL_FILE}"
+    echo "  行数: $(wc -l < "${POOL_FILE}")   （FORCE=1 可强制重切）"
+    echo "Job finished at: $(date)"
+    exit 0
+  fi
+  [[ -d "${TRAIN_POOL}" ]] || {
+    echo "缺 Stage 1 训练池: ${TRAIN_POOL}"
+    echo "先跑: qsub -v MODE=data,IF_SOURCE=${IF_SOURCE} onereplay/pbs/94_s1_train_if.pbs"
+    exit 1
+  }
+  echo "==== MODE=pool: ${TRAIN_POOL} -> ${POOL_FILE} ===="
+  python - "${TRAIN_POOL}" "${POOL_FILE}" "${POOL_ROWS}" <<'PY'
+import json
+import sys
+from collections import Counter
+from pathlib import Path
+
+from datasets import load_from_disk
+
+train_pool, out_path, want_rows = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+# inputs/targets 是三个用途共读的两列（collect_cov / collect_fisher 的
+# --input_column/--target_column 默认值，replay 的 to_sft_schema 也只读这两列，
+# 多余的列它会自己 remove）。pool_source 留着是为了能复查混合比例有没有被前缀切歪，
+# source_index 是回训练池对账的钥匙。
+REQUIRED = ("instruction", "input", "output")
+
+dataset = load_from_disk(train_pool)
+if isinstance(dataset, dict):
+    if "train" not in dataset:
+        raise SystemExit(f"{train_pool} 里没有 train split，实际有 {sorted(dataset)}")
+    dataset = dataset["train"]
+
+missing = [column for column in REQUIRED if column not in dataset.column_names]
+if missing:
+    raise SystemExit(
+        f"{train_pool} 缺列 {missing}，实际有 {sorted(dataset.column_names)}。\n"
+        "这个池子不是 prepare_conifer / mix_if_pools 写的，或者 schema 变过了。"
+    )
+
+total = len(dataset)
+print(f"训练池行数: {total:,}")
+if want_rows > total:
+    raise SystemExit(
+        f"池子只有 {total:,} 行，切不出 {want_rows:,} 行。\n"
+        "调小 POOL_ROWS（同时要调 POOL_ROWS_EXPECT，Step 0 会断言两者相等）。"
+    )
+
+subset = dataset.select(range(want_rows))
+
+# ---- input 必须全空 ----
+# apply_train_template 在 input 非空时会往 user turn 里拼 "\n\nInput:\n<input>"，
+# 而这里只把 instruction 写成 inputs。prepare_conifer 和 prepare_flan_v2 都硬编码
+# "input": ""，所以两者等价 —— 但这是个静默前提，schema 一变 C 就会比训练少一段
+# prompt，所以在这里断言而不是相信它。
+non_empty = sum(1 for value in subset["input"] if (value or "").strip())
+if non_empty:
+    raise SystemExit(
+        f"有 {non_empty} 行的 input 列非空。训练时这部分会拼进 user turn，"
+        "而本脚本只写 instruction，C/F 会比训练少看一段 prompt。"
+    )
+
+has_source = "pool_source" in subset.column_names
+if has_source:
+    full = Counter(dataset["pool_source"])
+    cut = Counter(subset["pool_source"])
+    print("\n混合比例（前缀切法应当保持全池占比）:")
+    for label in sorted(full):
+        print(
+            f"  {label:<24} 全池 {full[label]:>6,} ({full[label]/total:>6.1%})"
+            f"   ->  20k 池 {cut[label]:>6,} ({cut[label]/want_rows:>6.1%})"
+        )
+    drift = max(
+        abs(cut[label] / want_rows - full[label] / total) for label in full
+    )
+    print(f"  最大占比偏移 {drift:.2%}", "（正常）" if drift < 0.02 else "（偏大，检查池子是不是没打乱）")
+
+Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+written = 0
+with open(out_path, "w", encoding="utf-8") as handle:
+    for index in range(want_rows):
+        row = subset[index]
+        record = {
+            "inputs": row["instruction"],
+            "targets": row["output"],
+            "source_index": index,
+        }
+        if has_source:
+            record["pool_source"] = row["pool_source"]
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        written += 1
+
+answers = sorted(len((subset[i]["output"] or "").split()) for i in range(want_rows))
+p50 = answers[len(answers) // 2]
+p90 = answers[int(len(answers) * 0.9)]
+print(f"\n写出 {written:,} 行 -> {out_path}")
+print(f"答案词数 p50={p50} p90={p90}（对照 94 号建池时报的同一口径）")
+PY
+  echo ""
+  echo "下一步: qsub -v DRY_RUN=1,IF_SOURCE=${IF_SOURCE} onereplay/pbs/95_s2_collect_if.pbs"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
 
 # ===========================================================================
 # Step 0: 前置检查（纯 CPU，几分钟）
@@ -431,18 +591,18 @@ echo "==== Step 0: 前置检查 ===="
 # 允许三种指定方式，从具体到宽松：IF_CKPT（绝对路径）> IF_LR（拼 run 名）> glob 自动发现。
 if [[ -z "${IF_CKPT:-}" ]]; then
   if [[ -n "${IF_LR:-}" ]]; then
-    IF_RUN="${IF_RUN:-part1_if_flanv2_lr${IF_LR}_seed${SEED}}"
+    IF_RUN="${IF_RUN:-part1_if_${IF_SOURCE_TAG}_lr${IF_LR}_seed${SEED}}"
     IF_CKPT="${IF_CKPT_DIR}/${IF_RUN}"
   else
     # 自动发现：sweep_* / smoke_* 是 94 号的临时目录（save=0，本不该存在，但保险起见排除）
     mapfile -t _CANDS < <(
       find "${IF_CKPT_DIR}" -maxdepth 1 -mindepth 1 -type d \
-        -name "part1_if_flanv2_lr*_seed${SEED}" 2>/dev/null | sort
+        -name "part1_if_${IF_SOURCE_TAG}_lr*_seed${SEED}" 2>/dev/null | sort
     )
     if (( ${#_CANDS[@]} == 0 )); then
-      echo "在 ${IF_CKPT_DIR} 下找不到 part1_if_flanv2_lr*_seed${SEED}"
-      echo "先跑: qsub -v MODE=train,LR=<lr> onereplay/pbs/94_part1_if_flanv2.pbs"
-      echo "或显式指定: qsub -v IF_CKPT=/abs/path onereplay/pbs/95_part2_cov_if_flanv2.pbs"
+      echo "在 ${IF_CKPT_DIR} 下找不到 part1_if_${IF_SOURCE_TAG}_lr*_seed${SEED}"
+      echo "先跑: qsub -v MODE=train,IF_SOURCE=${IF_SOURCE},LR=<lr> onereplay/pbs/94_s1_train_if.pbs"
+      echo "或显式指定: qsub -v IF_CKPT=/abs/path onereplay/pbs/95_s2_collect_if.pbs"
       exit 1
     fi
     if (( ${#_CANDS[@]} > 1 )); then

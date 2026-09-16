@@ -393,7 +393,11 @@ MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 # FLAN 拿 no_comma 34.8%→71.2%、forbidden_words 36.7%→69.4%，Conifer 两个都
 # 没动），所以混合是冲着两半一起拿。比例是**长度决定**而不是行数决定，见
 # mix_if_pools.py 的文件头。
-IF_SOURCE="${IF_SOURCE:-flan}"
+#
+# 默认改成 mix：实测下来 conifer 单独训的 IF 分比不过 mix，IF 线已经定在 mix 上，
+# 95/96/100/103 的默认值也一起指过去了。还想跑另外两条 source 就显式传 IF_SOURCE，
+# 结果树按 tag 分根，三条互不覆盖。
+IF_SOURCE="${IF_SOURCE:-mix}"
 case "${IF_SOURCE}" in
   flan)    IF_SOURCE_TAG="flanv2" ;;
   conifer) IF_SOURCE_TAG="conifer" ;;

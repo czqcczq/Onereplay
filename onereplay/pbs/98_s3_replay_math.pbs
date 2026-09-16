@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N p2_math_rp
+#PBS -N s3_math_rp
 #PBS -j oe
 #PBS -k oed
 #PBS -q autox
@@ -9,7 +9,28 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 2 replay 臂: Model-IF-FLAN --NuminaMath-CoT--> Model-IF-Math，用重放保护 IF
+# !! 这份还停在 Qwen3-1.7B-Base 那一轮，不要直接投 !!
+#
+# 改名成 s3_* 只是让它和同阶段的脚本排在一起，**内容没有跟着 96 号一起更新**。
+# 与 96_s3_train_math.pbs 的现行配方逐项对照：
+#
+#             98 号（本文件）        96 号（vanilla/onereplay/ewc 三臂）
+#   模型      Qwen3-1.7B-Base        Qwen3-4B-Base
+#   BATCH     4                      2
+#   ACCUM     128                    64        -> 有效 batch 512 vs 128
+#   MAXLEN    4096                   2048
+#   EPOCHS    3                      1
+#   数据      numina_math_50k        numina_math_100k
+#   来源      写死 Model-IF-FLAN     SOURCE=if|cs 可切
+#   缺        --lr_scheduler / --warmup_ratio / --decode_stop_on_im_end
+#
+# 而且它写的是另一棵树（results_part2_if2numina，连模型名都没带），也**没有
+# check_config_consistency 闸门**——96 号那三臂之间的配置漂移会在开 GPU 前被拦下，
+# 这里不会。照现状投出去，replay 臂的数字和另外三臂不可比，而且没有任何提示。
+#
+# 要用它就得先对齐上面整张表，并把结果树并进 96 号那棵。
+# =============================================================================
+# Stage 3 replay 臂: Model-IF --NuminaMath-CoT--> Model-IF-Math，用重放保护 IF
 #
 #     batch 级严格混合：每个 micro-batch = 2 行 Numina + 2 行 FLAN(20k 池)
 #     BATCH=4 与 vanilla / onereplay 一致，ACCUM 从 64 抬到 128
@@ -106,21 +127,21 @@
 #
 # 【用法】
 #   # 先看计划和前置检查，不碰 GPU
-#   qsub -v DRY_RUN=1 onereplay/pbs/98_part2_math_replay.pbs
+#   qsub -v DRY_RUN=1 onereplay/pbs/98_s3_replay_math.pbs
 #
 #   # 冒烟：70 步，看峰值显存 + describe() 打的那两个占比
-#   qsub -v MODE=smoke onereplay/pbs/98_part2_math_replay.pbs
+#   qsub -v MODE=smoke onereplay/pbs/98_s3_replay_math.pbs
 #
 #   # 正式训练（步数是 96 号的 2 倍，先看 Step 0 的调度账再定要不要拆作业）
-#   qsub -v MODE=train,DO_EVAL=0 onereplay/pbs/98_part2_math_replay.pbs
+#   qsub -v MODE=train,DO_EVAL=0 onereplay/pbs/98_s3_replay_math.pbs
 #
 #   # 评测（拆两半，加起来装不进一个 24h）
-#   qsub -v MODE=eval,DO_IF=0 onereplay/pbs/98_part2_math_replay.pbs
-#   qsub -v MODE=eval,DO_MATH=0 onereplay/pbs/98_part2_math_replay.pbs
+#   qsub -v MODE=eval,DO_IF=0 onereplay/pbs/98_s3_replay_math.pbs
+#   qsub -v MODE=eval,DO_MATH=0 onereplay/pbs/98_s3_replay_math.pbs
 #
 #   # 便宜地把链路跑通
 #   qsub -v MODE=train,MAX_TRAIN_SAMPLES=2000,EPOCHS=1,DO_EVAL=0 \
-#     onereplay/pbs/98_part2_math_replay.pbs
+#     onereplay/pbs/98_s3_replay_math.pbs
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
 # =============================================================================
@@ -130,7 +151,7 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/98_part2_math_replay.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/98_s3_replay_math.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
@@ -425,7 +446,7 @@ IF_RUN="${IF_RUN:-$(basename "${IF_CKPT}")}"
 [[ -d "${IF_CKPT}" ]] || { echo "缺 Stage 1 checkpoint（基座）: ${IF_CKPT}"; exit 1; }
 [[ -f "${IF_CKPT}/config.json" ]] || { echo "${IF_CKPT} 不是可加载的模型目录"; exit 1; }
 
-RUN="part2_math_replay_lr${LR}_rb${REPLAY_PER_BATCH}_seed${SEED}"
+RUN="s3_math_replay_lr${LR}_rb${REPLAY_PER_BATCH}_seed${SEED}"
 CKPT="${CKPT_DIR}/${RUN}"
 
 # ---- 新任务池 ----
@@ -965,8 +986,8 @@ echo "  评测       : ${RESULTS_ROOT}/{gsm8k,math500,ifeval,followbench}/${RUN}
 echo ""
 echo "Part 2 现在的四条臂（全部共用同一批 20k FLAN 旧知识）:"
 echo "  if_anchor                                       Stage 2 的起点（before）"
-echo "  part2_math_vanilla_lr${LR}_seed${SEED}                    无保护（遗忘的标尺）"
-echo "  part2_math_onereplay_lr${LR}_lam<λ>_seed${SEED}       C_if 罚项"
+echo "  s3_math_vanilla_lr${LR}_seed${SEED}                    无保护（遗忘的标尺）"
+echo "  s3_math_onereplay_lr${LR}_lam<λ>_seed${SEED}       C_if 罚项"
 echo "  ${RUN}   真的重放旧数据"
 echo "  (EWC 臂用 97 号采的 F，训练脚本还没写)"
 echo "Job finished at: $(date)"
