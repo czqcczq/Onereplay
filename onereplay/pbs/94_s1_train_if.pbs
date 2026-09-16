@@ -123,11 +123,20 @@
 #
 # **warmup 不是可选项**。train.py 在加 --lr_scheduler 之前是裸 torch.optim.Adam、
 # 恒定 LR、无 warmup。全参微调在 5e-5 下第一次更新落在一个离自己最优点很远的
-# 模型上，没有 warmup 的那一步就是 loss 尖峰的来源。schedule 按**优化器更新**
-# 推进：99000 行 / BATCH 8 = 12375 micro-batch，除以 accumulation_steps 8 =
-# 1547 次更新，前 155 次是 warmup。训练开头 train.py 会打一行
+# 模型上，没有 warmup 的那一步就是 loss 尖峰的来源。
+#
+# schedule 按**优化器更新**推进，而 ACCUM 是「行/更新」，所以更新数 = 训练行数 /
+# ACCUM，**和 BATCH 无关**（BATCH 只决定 accumulation_steps = ACCUM/BATCH）。
+# 三条 source 的池子大小不同，更新数因此不同：
+#
+#   IF_SOURCE=flan      100k 行   -> 约 1550 次更新，warmup 约 155
+#   IF_SOURCE=mix       58.9k 行  -> 约  910 次更新，warmup 约  91   <- 当前默认
+#   IF_SOURCE=conifer   38.9k 行  -> 约  600 次更新，warmup 约  60
+#
+# 训练开头 train.py 会打一行
 #     `lr schedule: cosine over ... updates, warmup ... updates`
-# **对不上就说明池子行数或 BATCH/ACCUM 和这里的假设不一致，停下来查**。
+# 和上表对得上就行（差几次是 val 切分取整，MAXVAL=500 会封顶 1% 那个比例）。
+# **数量级对不上才说明池子行数或 ACCUM 和这里的假设不一致，停下来查**。
 #
 # 还有一个比总 token 更重要的口径差：**带 loss 的答案 token**。label 只在答案上，
 # 而 FLAN 的答案均值约 30 token。所以本线的 28.6M 总 token 里真正带监督的只有

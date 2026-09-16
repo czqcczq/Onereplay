@@ -377,7 +377,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME SRC_LINE_ROOT SRC_CKPT_DIR SRC_LR SRC_RUN SRC_CKPT
     # SOURCE 一转发，容器内的 case 会重新派生出其余来源相关的值，所以只有可被用户
     # 覆盖的那几个（带 :- 的）需要跟着转发。
-    SOURCE SRC_RUN_PREFIX COV_BASENAME FISHER_BASENAME
+    SOURCE SRC_RUN_PREFIX COV_BASENAME FISHER_BASENAME SRC_POOL_FILE
+    REPLAY_PER_BATCH REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN
+    REPLAY_POOL_SIZE REPLAY_SAMPLE_SEED
     IF_SOURCE IF_LINE_ROOT IF_DATASET RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
     CF_ROOT COV_PATH COV_SCOPE FISHER_PATH
     MODE ARM DRY_RUN DO_TRAIN DO_EVAL DO_IF DO_OLD SEED FORCE_TRAIN FORCE_EVAL
@@ -470,6 +472,9 @@ case "${SOURCE}" in
     CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_stage2_math_${MODEL_NAME}}"
     COV_BASENAME="${COV_BASENAME:-cov_math_numina_20k}"
     FISHER_BASENAME="${FISHER_BASENAME:-fisher_math_numina_20k}"
+    # ARM=replay 读的 20k 池：**必须是 C/F 采集时读的同一个文件**（99 号 MODE=pool 的
+    # 产物）。它落在 REPO_ROOT/datasets 下而不是结果树里，因为 math 训练池是共享的。
+    SRC_POOL_FILE="${SRC_POOL_FILE:-${REPO_ROOT}/datasets/numina_math_100k_replay.jsonl}"
     # 与 91 号的评测口径一致。生成 + 抽 \boxed{}，所以分数必须配着 hit-cap 读。
     OLD_METRICS_ALL="gsm8k,math500"
     OLD_LABEL="MATH"
@@ -480,6 +485,8 @@ case "${SOURCE}" in
     CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_stage2_cs_${MODEL_NAME}}"
     COV_BASENAME="${COV_BASENAME:-cov_cs_commonsense_20k}"
     FISHER_BASENAME="${FISHER_BASENAME:-fisher_cs_commonsense_20k}"
+    # ARM=replay 读的 20k 池：**必须是 C/F 采集时读的同一个文件**（101 号 MODE=pool）。
+    SRC_POOL_FILE="${SRC_POOL_FILE:-${SRC_LINE_ROOT}/datasets/commonsense_replay_20k.jsonl}"
     # commonsense_qa 是 8 个 LLM-Adapters 测试集的准确率，Part 1 下结论用的就是它；
     # 另一个 commonsense 指标是 Commonsense170k 池上的 held-out loss，不是同一回事。
     OLD_METRICS_ALL="commonsense_qa"
@@ -571,6 +578,36 @@ FORCE_EVAL="${FORCE_EVAL:-0}"
 # Stage 1 相同，accumulation_steps 从 16 变 32，梯度在数学上等价。
 BATCH="${BATCH:-2}"
 ACCUM="${ACCUM:-64}"
+
+# ---- ARM=replay 的混合参数 ----
+# 0.5/0.5 严格 batch 级混合：每个 micro-batch 一半新任务、一半旧知识。
+# **--replay_per_batch 是绝对行数不是比例**，train.py 内部 new_per_batch = BATCH - 它，
+# 所以对半分就是 BATCH/2，micro-batch 总行数仍是 BATCH —— 激活显存和 vanilla 同量，
+# 又没有 C/F 常驻，所以 replay 是四条臂里最省显存的那条，不会成为 BATCH 的瓶颈。
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-$(( BATCH / 2 ))}"
+# 20k 池的两列。95/99/101 号 MODE=pool 落的 jsonl 统一是 {inputs, targets, ...}，
+# 也正是 collect_cov / collect_fisher 的 --input_column/--target_column 默认值。
+REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN:-inputs}"
+REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-targets}"
+# 取满 20k。与 C/F 的口径一致：三条臂吃的是同一批行。
+REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-20000}"
+REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
+# replay 臂的 micro-batch 只有一半是新任务，所以传给 train.py 的 --accumulation_size
+# 要翻倍才凑得够同样的 ACCUM 行新数据。这样每次更新的新任务量和 vanilla 逐字相同，
+# 总更新次数也相同（loader 的 epoch 由新任务数据定义，旧知识池是循环复用的）。
+# 代价是每次更新过两倍的行，**墙钟时间约为 vanilla 的两倍**，排 walltime 要算进去。
+# train.py 会打一行
+#     `accumulation: N steps x M new-task rows = <ACCUM> new-task rows per update`
+# 四条臂这一行末尾的数字必须相同，不同就说明这里的换算和实际不一致，停下来查。
+if [[ "${ARM}" == "replay" ]]; then
+  if (( BATCH % 2 != 0 )); then
+    echo "ARM=replay 要求 BATCH 是偶数（对半分），当前 BATCH=${BATCH}"
+    exit 1
+  fi
+  ACCUM_TRAIN=$(( ACCUM * 2 ))
+else
+  ACCUM_TRAIN="${ACCUM}"
+fi
 # 2048：与 94 号同值。Conifer 全 38.9k 行在 1024 预算下就零截断（答案 token P50=183 /
 # P90=310 / max=690，见 94 号的截断表），2048 下截断率是 0。
 # 这个值不能随便降：tokenizer_to_ids 的截断是 full_input_ids[-max_length:]（保尾丢头），
@@ -789,8 +826,10 @@ case "${ARM}" in
   vanilla)   RUN="s3_if_vanilla_lr${LR}_seed${SEED}" ;;
   onereplay) RUN="s3_if_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
   ewc)       RUN="s3_if_ewc_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
+  # replay 没有 λ，混合比例进名字：换比例不会覆盖上一次的结果。
+  replay)    RUN="s3_if_replay_lr${LR}_r${REPLAY_PER_BATCH}of${BATCH}_seed${SEED}" ;;
   anchor)    RUN="${ANCHOR_RUN}" ;;
-  *) echo "未知 ARM=${ARM}，可选 vanilla / onereplay / ewc / anchor"; exit 1 ;;
+  *) echo "未知 ARM=${ARM}，可选 vanilla / onereplay / ewc / replay / anchor"; exit 1 ;;
 esac
 
 # ewc 臂不接受默认 λ。onereplay 的 7.5e-3 在 F 的尺子上毫无意义（差好几个数量级），
@@ -857,6 +896,22 @@ if [[ "${MODE}" != "eval" ]]; then
   esac
   if [[ "${CHECK_ARM}" == "onereplay" ]]; then NEEDS_COV=1; fi
   if [[ "${CHECK_ARM}" == "ewc" ]]; then NEEDS_FISHER=1; fi
+fi
+
+# replay 臂读的是 20k 池本身而不是 C/F，但读的必须是同一份文件，所以这里一起查。
+if [[ "${ARM}" == "replay" && "${MODE}" != "eval" ]]; then
+  [[ -f "${SRC_POOL_FILE}" ]] || {
+    echo "缺 ${OLD_LABEL} 的 20k 旧知识池: ${SRC_POOL_FILE}"
+    echo "它是 95 / 99 / 101 号 MODE=pool 的产物，和 C/F 读的是同一个文件。"
+    exit 1
+  }
+  _POOL_ROWS="$(wc -l < "${SRC_POOL_FILE}")"
+  if [[ "${_POOL_ROWS}" != "${REPLAY_POOL_SIZE}" ]]; then
+    echo "20k 池行数 ${_POOL_ROWS} != REPLAY_POOL_SIZE=${REPLAY_POOL_SIZE}"
+    echo "  C/F 是按全池采的；replay 只取前 ${REPLAY_POOL_SIZE} 行的话，三条臂"
+    echo "  吃的就不是同一批行了。对齐它，或显式传 REPLAY_POOL_SIZE=${_POOL_ROWS}。"
+    exit 1
+  fi
 fi
 
 if (( NEEDS_COV )); then
@@ -1087,7 +1142,12 @@ allow = allow == "1"
 # lr 在里面是因为它写进 run 名，配置漂了但 run 名没漂会让结果表读错。
 WATCHED = {
     "batch_size": int(batch),
-    "accumulation_size": int(accum),
+    # 比 new_per_update 而不是 accumulation_size：replay 臂的 micro-batch 只有一半是
+    # 新任务，它的 --accumulation_size 是别人的两倍，但**每次更新的新任务行数**一样。
+    # 后者才是"各臂吃到同样多新数据"这件事的不变量，train.py 已经把它记进 metrics
+    # （非 replay 臂等于 accumulation_size，replay 臂等于 accum_steps x new_per_batch）。
+    # 拿 accumulation_size 比会把一个正确的 replay 臂判成漂移。
+    "new_per_update": int(accum),
     "lr": float(lr),
 }
 
@@ -1120,7 +1180,7 @@ for path in sorted(glob.glob(os.path.join(metrics_dir, "*.jsonl"))):
 
 if not others:
     print("配置闸门: 这棵树下还没有训完的其他臂，本次配置将成为后续臂的基准。")
-    print(f"  batch_size={batch} accumulation_size={accum} lr={lr}")
+    print(f"  batch_size={batch} new_per_update={accum} lr={lr}")
     raise SystemExit(0)
 
 drift = []
@@ -1148,10 +1208,12 @@ print(f"配置闸门: 对照 {len(others)} 条已训完的臂")
 for name, row in others:
     print(
         f"  {name:<36} batch={row.get('batch_size')} "
-        f"accum={row.get('accumulation_size')} lr={row.get('lr')} "
+        f"accum={row.get('accumulation_size')} "
+        f"new/upd={row.get('new_per_update')} lr={row.get('lr')} "
         f"updates={row.get('total_updates')}"
     )
-print(f"  {'(本次) ' + this_run:<36} batch={batch} accum={accum} lr={lr}")
+# accum 那一列 replay 臂会是别人的两倍，这是对的；要看齐的是 new/upd 这一列。
+print(f"  {'(本次) ' + this_run:<36} new/upd={accum} lr={lr} batch={batch}")
 
 if not drift and len(by_updates) <= 1:
     print("  -> 一致，可以训练。")
@@ -1233,6 +1295,24 @@ train_one () {
     vanilla)
       reg_args=(--replay_lambda 0 --measure_replay_when_lambda_zero 0)
       ;;
+    replay)
+      # 没有正则项（--replay_lambda 0，和 vanilla 同款），旧知识靠**真的再训一遍**。
+      # --replay_ratio 0 是必须的：per_batch 和 ratio 是两套口径，ratio 非 0 会让
+      # 混合比例由它决定而不是由 replay_per_batch 决定。
+      # --replay_max_len 跟 MAXLEN 同值：旧知识池的行如果按更短的预算截断，
+      # C/F 看到的序列和 replay 训的序列就不是一回事了。
+      reg_args=(
+        --replay_lambda 0 --measure_replay_when_lambda_zero 0
+        --replay_ratio 0
+        --replay_per_batch "${REPLAY_PER_BATCH}"
+        --replay_data_files "${SRC_POOL_FILE}"
+        --replay_input_column "${REPLAY_INPUT_COLUMN}"
+        --replay_target_column "${REPLAY_TARGET_COLUMN}"
+        --replay_pool_size "${REPLAY_POOL_SIZE}"
+        --replay_sample_seed "${REPLAY_SAMPLE_SEED}"
+        --replay_max_len "${MAXLEN}"
+      )
+      ;;
     *)
       echo "train_one 不支持 arm=${arm}"; return 1
       ;;
@@ -1244,7 +1324,7 @@ train_one () {
     --model_dir "${SRC_CKPT_DIR}" --model_name "${SRC_RUN}" --seed "${SEED}" \
     --dataset_path "${IF_DATASET}" \
     --epochs "${epochs}" --lr "${LR}" \
-    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM_TRAIN}" \
     --max_len "${MAXLEN}" \
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
     --eval_batch_size "${BATCH}" \

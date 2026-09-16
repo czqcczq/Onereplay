@@ -1,0 +1,697 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_csqa
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 只跑 commonsense_qa，不训练，不评其它指标。
+#
+# 扫 ${RESULTS_ROOT}/adapters/ 下所有 run，逐个评 LLM-Adapters 那八个测试集
+# （BoolQ / PIQA / SIQA / HellaSwag / WinoGrande / ARC-e / ARC-c / OBQA）。
+#
+# 和 73（IFBench）、92（FollowBench）是同一类脚本：给已经训完的臂补一个当初
+# 没评的指标。8B 那批（67/70/71/72/74/81/82/83）的 AVAIL 里只有 ifeval /
+# gsm8k / math500 / humaneval / mbpp —— 全是「学完之后别的能力掉了多少」。
+# 「到底学会了没有」那一侧一直只有训练循环里的 val_loss 一个数，本脚本补的
+# 就是这一侧。
+#
+# -----------------------------------------------------------------------------
+# !! 两组 adapter 跑同一个指标，读法完全不同 —— 这是本脚本分组展示的理由
+#
+#   cs_* （67/70/71/72，Commonsense170k 训练）
+#       这八个测试集是 Commonsense170k 训练池的另一半：同样八个数据集，
+#       train split 拿去训练，test split 拿来评测。所以对 cs_* 臂，
+#       acc_logprob 是 **in-domain 任务准确率**，读作「学会了没有、学到什么
+#       程度」。它和 val_loss 测同一个分布，但不是同一个量：val_loss 是 gold
+#       的绝对概率，acc_logprob 是 gold 相对其它候选的排序，两者可以分叉。
+#       期望：明显高于 base。推不动就先怀疑 LR，别急着怀疑方法。
+#
+#   ds_* （74/81/82/83，DialogSum 训练）
+#       DialogSum 线从来没见过这八个数据集，也没见过
+#       "the correct answer is <label>" 这个答案格式。所以对 ds_* 臂，
+#       这个数是 **OOD 干扰信号**，读作「学摘要有没有把常识问答带坏」，
+#       对照系是 base 而不是 cs_*。期望：贴着 base，掉下去才是坏消息。
+#
+#   把两组放进同一张表按 AVERAGE 排名是没有意义的：一组在测学习，一组在测
+#   遗忘。下面的汇总按组分开打，每组各自和 base 比。
+#
+# -----------------------------------------------------------------------------
+# !! 主口径是 acc_logprob，不是 acc_gen
+#   acc_gen 走的是 LLM-Adapters 原版的做法：解码之后正则抽标签。那个测量在
+#   没学过这个格式的模型上不可信 —— 模型不答题、只续写，正则于是在续写文本里
+#   撞到 "true"/"false"，读出来的是英文词频而不是常识。base 的地板分虚高，
+#   train-base 的涨幅被同等放大。ds_* 全组都处在这个状态，base 更是。
+#
+#   所以主表用 acc_logprob：把该行自己的候选逐个拼成
+#   "the correct answer is <label>"，比这段 continuation 的 logprob 之和取
+#   argmax。闭集排序，不存在「抽不出答案」，base 和 trained 是同一种测量。
+#   acc_gen 照样算（一次模型加载两个都出），它回答的是另一个真问题——有没有
+#   学会按训练格式作答——但它的 accuracy 只能和 parse_rate 一起读，
+#   第二张表就是干这个的。
+#
+#   只要 logprob、把耗时砍掉将近一半: CS_SCORING=logprob
+#
+# -----------------------------------------------------------------------------
+# !! SYSTEM_PROMPT 必须留空，别照抄 93 号
+#   93 号（Qwen2.5-Math-1.5B / Qwen3-4B-Base 那条线）默认传一条中性 system
+#   消息，因为 Qwen2.5-Math 的模板在没有 system 消息时会自己补上
+#   "Please reason step by step, and put your final answer within \boxed{}"，
+#   那对本答案格式是污染。
+#
+#   8B 这批不是那个情况：67/70/71/72/74/81/82/83 训练时**都没有传
+#   --system_prompt**（全仓 grep 无匹配），Qwen3-8B 的模板也不注入任何东西。
+#   评测这里传了任何非空值，评的就是一个模型从没被训练过的 prompt。
+#   所以默认空串，并且不要改 —— 除非你连训练一起重跑。
+#
+# -----------------------------------------------------------------------------
+# 投递顺序：base 优先，然后按训练数据集前缀分组，默认 ds 在前
+#
+#   一次要评的 run 可能有十几二十个，而八个集加起来约 2.2 万题，24h 的
+#   walltime 装不下全部。所以顺序和落盘方式都按「随时可能被 walltime 砍断」
+#   来设计：
+#
+#     1) base 永远第一个。它是两组共同的分母，没有它谁的数都读不了。
+#        而且它只需要跑一次，之后每次重投都会跳过。
+#     2) 然后按 GROUP_ORDER（默认 "ds cs"）分组，组内按名字排序，保证顺序
+#        可复现、重投接得上。
+#     3) 每评完一个 run 立刻打印它自己那一行，每评完一组打印该组的小表 ——
+#        不等全部结束。作业被砍时前面的结果已经在屏幕上、也已经在盘上。
+#     4) 已有 summary.json 的 run 直接跳过。所以断点续跑就是原样再投一次，
+#        重评要显式 FORCE_EVAL=1。
+#
+#   想反过来先看 Commonsense170k 那组: GROUP_ORDER="cs ds"
+#
+# -----------------------------------------------------------------------------
+# 前置条件:
+#   1) 评测数据就位，布局 <CS_EVAL_DIR>/<task>/test.json。在有网节点上:
+#        git clone --depth 1 https://github.com/AGI-Edgerunners/LLM-Adapters
+#        cp -r LLM-Adapters/dataset ${REPO_ROOT}/datasets/commonsense_eval
+#      （你 ls 过的那个 commonsense_eval 目录里还有 AQuA/AddSub/MultiArith/
+#        SVAMP/SingleEq/gsm8k/mathqa/mawps —— 那八个是 math_10k 线的评测集，
+#        模板是 CoT + "The answer is"，和本指标不是一回事。不用手动排除，
+#        CS_EVAL_TASKS 留空只会跑常识那八个。）
+#   2) adapter 就位；日志目录: mkdir -p /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# -----------------------------------------------------------------------------
+# 用法:
+#   # 默认：扫 adapters/ 下所有 run + base，ds 组优先，跳过已有结果
+#   qsub onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 先看计划、看准确的题量和耗时预估，不真跑
+#   qsub -v DRY_RUN=1 onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 冒烟：只评 base 的前 32 条，确认路径和显存都对
+#   qsub -v RUNS=base,CS_LIMIT=32 onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 只评指定的几个
+#   qsub -v RUNS="cs_vanilla_8b_r16all_lr1e-4_seed1 base" \
+#     onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 只跑 Commonsense170k 那组（GROUP_FILTER 按前缀筛）
+#   qsub -v GROUP_FILTER=cs onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 省时间：只要主口径，且只跑便宜的四个集（HellaSwag 一个就占 45%）
+#   qsub -v CS_SCORING=logprob,CS_EVAL_TASKS="boolq,piqa,winogrande,openbookqa" \
+#     onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 显存不够就把打分那一路的 batch 再调小
+#   qsub -v CS_SCORE_BATCH=2 onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+#   # 已有结果也强制重评
+#   qsub -v FORCE_EVAL=1 onereplay/pbs/84_commonsense_qa_eval.pbs
+#
+# 预计耗时: 全量八集、CS_SCORING=both，8B 上约 1.5–2 h 一个模型；
+#   logprob 单口径约 40–70 min。前置检查会按真实题量重算一遍并打印。
+#   walltime 24h 大约够 12–15 个模型（both）；要评的多就分批投 RUNS，
+#   或者靠「已有结果跳过」多投几次。
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（与其它 pbs 脚本保持一致）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/84_commonsense_qa_eval.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+# ---- 本次作业专属的临时目录 ----
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTERS_DIR CS_EVAL_DIR
+    SEED RUN RUNS ADAPTER OUT_NAME OUT_SUFFIX
+    GROUP_ORDER GROUP_FILTER WITH_BASE FORCE_EVAL DRY_RUN
+    CS_EVAL_TASKS CS_SCORING CS_LIMIT CS_MAX_NEW_TOKENS
+    CS_BATCH CS_SCORE_BATCH SYSTEM_PROMPT STOP_ON_IM_END
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.device_count())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+ADAPTERS_DIR="${ADAPTERS_DIR:-${RESULTS_ROOT}/adapters}"
+# LLM-Adapters 的 dataset/ 目录，布局 <dir>/<task>/test.json
+CS_EVAL_DIR="${CS_EVAL_DIR:-${REPO_ROOT}/datasets/commonsense_eval}"
+
+# ---- 评测参数 ----
+SEED="${SEED:-1}"
+DRY_RUN="${DRY_RUN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+WITH_BASE="${WITH_BASE:-1}"
+OUT_SUFFIX="${OUT_SUFFIX:-}"
+# 空 = 跑全部八个。HellaSwag 一个集 10042 行、约占总题量 45%。
+CS_EVAL_TASKS="${CS_EVAL_TASKS:-}"
+CS_SCORING="${CS_SCORING:-both}"
+CS_LIMIT="${CS_LIMIT:-0}"          # >0 时每个集只评前 N 条（冒烟用，不是正式结果）
+# 答案只有 7-8 个 token，32 足够收尾，再多只是烧时间。
+CS_MAX_NEW_TOKENS="${CS_MAX_NEW_TOKENS:-32}"
+CS_BATCH="${CS_BATCH:-32}"         # 解码那一路
+# 打分那一路的瓶颈和解码不同：它要 materialize 一个 [batch, seq, 151936] 的
+# logit 张量、且完全不复用 KV cache。8B 上 8 偏大，默认降到 4。
+CS_SCORE_BATCH="${CS_SCORE_BATCH:-4}"
+# !! 留空。理由见文件头：8B 这批训练时一个都没传 --system_prompt。
+SYSTEM_PROMPT="${SYSTEM_PROMPT-}"
+STOP_ON_IM_END="${STOP_ON_IM_END:-0}"
+
+# 分组与顺序。前缀 = run 名第一个下划线之前那段（cs / ds / ...）。
+GROUP_ORDER="${GROUP_ORDER:-ds cs}"
+GROUP_FILTER="${GROUP_FILTER:-}"   # 非空时只评这些前缀，空格分隔
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+
+if [[ ! -d "${CS_EVAL_DIR}" ]]; then
+  set +x
+  echo "缺评测数据目录: ${CS_EVAL_DIR}"
+  echo "在有网节点上准备（布局 <dir>/<task>/test.json）:"
+  echo "  git clone --depth 1 https://github.com/AGI-Edgerunners/LLM-Adapters"
+  echo "  cp -r LLM-Adapters/dataset ${CS_EVAL_DIR}"
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 要评的 run，以及它们的顺序
+# ---------------------------------------------------------------------------
+if [[ -z "${RUNS:-}" ]]; then
+  if [[ -n "${RUN:-}" ]]; then
+    RUNS="${RUN}"
+  else
+    RUNS=""
+    if [[ -d "${ADAPTERS_DIR}" ]]; then
+      for d in "${ADAPTERS_DIR}"/*/; do
+        [[ -d "${d}" ]] || continue
+        RUNS="${RUNS} $(basename "${d}")"
+      done
+    fi
+    RUNS="${RUNS# }"
+  fi
+fi
+# base 的 adapter 路径是空串：evaluate.py 认这个，直接加载裸模型。
+if [[ "${WITH_BASE}" == "1" && " ${RUNS} " != *" base "* ]]; then
+  RUNS="base ${RUNS}"
+fi
+
+if [[ -z "${RUNS// /}" ]]; then
+  echo "没有可评的 run：${ADAPTERS_DIR} 下是空的，且 WITH_BASE=0"
+  exit 1
+fi
+
+group_of () {
+  local run=$1
+  if [[ "${run}" == "base" ]]; then echo "base"; else echo "${run%%_*}"; fi
+}
+
+in_list () {
+  local needle=$1; shift
+  local item
+  for item in "$@"; do [[ "${item}" == "${needle}" ]] && return 0; done
+  return 1
+}
+
+# GROUP_FILTER 先筛一遍（base 始终保留，它是两组共同的分母）。
+if [[ -n "${GROUP_FILTER}" ]]; then
+  FILTERED=""
+  for run in ${RUNS}; do
+    g="$(group_of "${run}")"
+    if [[ "${g}" == "base" ]] || in_list "${g}" ${GROUP_FILTER}; then
+      FILTERED="${FILTERED} ${run}"
+    fi
+  done
+  RUNS="${FILTERED# }"
+fi
+
+# 排序：base 最先（分母），然后按 GROUP_ORDER 分组、组内字典序，
+# GROUP_ORDER 里没列到的前缀排在最后。组内排序固定，重投才接得上。
+SORTED="$(printf '%s\n' ${RUNS} | sort -u)"
+ORDERED=""
+for run in ${SORTED}; do
+  [[ "${run}" == "base" ]] && ORDERED="${ORDERED} base"
+done
+for g in ${GROUP_ORDER}; do
+  for run in ${SORTED}; do
+    [[ "${run}" == "base" ]] && continue
+    [[ "$(group_of "${run}")" == "${g}" ]] && ORDERED="${ORDERED} ${run}"
+  done
+done
+for run in ${SORTED}; do
+  [[ "${run}" == "base" ]] && continue
+  in_list "$(group_of "${run}")" ${GROUP_ORDER} || ORDERED="${ORDERED} ${run}"
+done
+RUNS="${ORDERED# }"
+
+resolve_adapter () {
+  local run=$1
+  if [[ "${run}" == "base" ]]; then echo ""; return; fi
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${ADAPTER:-}" && "${n}" -eq 1 ]]; then echo "${ADAPTER}"; return; fi
+  echo "${ADAPTERS_DIR}/${run}"
+}
+
+resolve_out_name () {
+  local run=$1
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${OUT_NAME:-}" && "${n}" -eq 1 ]]; then echo "${OUT_NAME}"; return; fi
+  echo "${run}${OUT_SUFFIX}"
+}
+
+# ---------------------------------------------------------------------------
+# 前置：题量、候选数、耗时预估，以及谁会跑谁会跳过。
+# 题量直接从测试文件读，不靠记忆里的数字 —— 顺带验证了 CS_EVAL_DIR 布局对不对。
+# ---------------------------------------------------------------------------
+set +x
+echo "========================================================================"
+echo "commonsense_qa（只评这一个指标）"
+echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  adapters = ${ADAPTERS_DIR}"
+echo "  结果树   = ${RESULTS_ROOT}"
+echo "  评测数据 = ${CS_EVAL_DIR}   tasks=${CS_EVAL_TASKS:-<全部八个>}"
+echo "  打分     = ${CS_SCORING}   (主口径 acc_logprob)"
+echo "  batch    = 解码 ${CS_BATCH} / 打分 ${CS_SCORE_BATCH}   seed ${SEED}"
+echo "  system   = '${SYSTEM_PROMPT}'   (必须空，见文件头)"
+echo "  分组顺序 = ${GROUP_ORDER}${GROUP_FILTER:+   只评前缀: ${GROUP_FILTER}}"
+echo "------------------------------------------------------------------------"
+
+python - "${CS_EVAL_DIR}" "${CS_EVAL_TASKS}" "${CS_LIMIT}" "${CS_SCORING}" <<'PY'
+import sys
+from pathlib import Path
+
+from onereplay.eval.metrics.commonsense_qa import (
+    DEFAULT_TASKS,
+    find_task_file,
+    load_task,
+    parse_labels,
+)
+
+root = Path(sys.argv[1])
+requested = [t.strip() for t in sys.argv[2].split(",") if t.strip()]
+limit = int(sys.argv[3] or 0)
+scoring = sys.argv[4]
+tasks = requested or list(DEFAULT_TASKS)
+
+print(f"{'task':<18}{'rows':>8}{'candidate fwd':>16}")
+total_rows = total_pairs = 0
+missing = []
+for task in tasks:
+    path = find_task_file(root, task)
+    if path is None:
+        missing.append(task)
+        continue
+    rows = load_task(path, limit)
+    pairs = sum(len(parse_labels(str(r.get("instruction", "")), task)) for r in rows)
+    total_rows += len(rows)
+    total_pairs += pairs
+    print(f"{task:<18}{len(rows):>8}{pairs:>16}")
+print(f"{'TOTAL':<18}{total_rows:>8}{total_pairs:>16}")
+if missing:
+    print(f"!! 这些 task 找不到 test.json，会被跳过: {missing}")
+if not total_rows:
+    sys.exit(f"!! {root} 下一个 test.json 都没找到，检查布局是不是 <dir>/<task>/test.json")
+
+# 经验吞吐，8B / bf16 / 单卡。只用来排作业，跑完第一个 run 就拿真实值替换它。
+LOGPROB_FWD_PER_SEC = 30.0
+GEN_ROWS_PER_SEC = 8.0
+minutes = 0.0
+if scoring in ("logprob", "both"):
+    minutes += total_pairs / LOGPROB_FWD_PER_SEC / 60
+if scoring in ("gen", "both"):
+    minutes += total_rows / GEN_ROWS_PER_SEC / 60
+print(f"\n单个模型粗估 {minutes:.0f} min（scoring={scoring}）。这是量级，不是承诺。")
+print("HellaSwag 通常占总量的 45% 上下；只想快速看趋势就用 CS_EVAL_TASKS 砍掉它。")
+PY
+
+echo "------------------------------------------------------------------------"
+printf "%-8s %-52s %s\n" "组" "run" "状态"
+PENDING=0
+for run in ${RUNS}; do
+  adapter="$(resolve_adapter "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+  g="$(group_of "${run}")"
+  if [[ "${run}" != "base" && ! -d "${adapter}" ]]; then
+    printf "%-8s %-52s %s\n" "${g}" "${run}" "!! 缺 adapter: ${adapter}"
+    continue
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/commonsense_qa/${out_name}/summary.json" ]]; then
+    printf "%-8s %-52s %s\n" "${g}" "${run}" "已有结果，跳过"
+  else
+    printf "%-8s %-52s %s\n" "${g}" "${run}" "待评 -> commonsense_qa/${out_name}"
+    PENDING=$((PENDING + 1))
+  fi
+done
+echo "------------------------------------------------------------------------"
+echo "待评 ${PENDING} 个。按上面的单模型预估自己乘一下，超 24h 就分批投 RUNS，"
+echo "或者原样重投几次——已有结果会被跳过，作业被 walltime 砍断也不用从头来。"
+if [[ "${CS_LIMIT}" != "0" ]]; then
+  echo "!! CS_LIMIT=${CS_LIMIT}：冒烟模式，产出的 summary.json 只覆盖每个集的前若干条，不是正式结果。"
+fi
+echo "========================================================================"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：以上为计划与前置检查，未评测。确认后 qsub -v DRY_RUN=0 ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+set -x
+
+# ---------------------------------------------------------------------------
+# 评测。一个 run 一次 evaluate 调用，两种打分共用一次模型加载。
+# ---------------------------------------------------------------------------
+eval_one () {
+  local run=$1
+  local adapter out_name
+  adapter="$(resolve_adapter "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+
+  if [[ "${run}" != "base" && ! -d "${adapter}" ]]; then
+    echo "跳过 ${run}：缺 adapter ${adapter}"
+    return 0
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/commonsense_qa/${out_name}/summary.json" ]]; then
+    echo "已有结果，跳过: ${RESULTS_ROOT}/commonsense_qa/${out_name}/summary.json"
+    return 0
+  fi
+
+  echo "==== eval commonsense_qa: ${run} -> ${RESULTS_ROOT}/commonsense_qa/${out_name} ===="
+  local -a adapter_arg=()
+  if [[ -n "${adapter}" ]]; then adapter_arg=(--adapter_path "${adapter}"); fi
+
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    "${adapter_arg[@]}" --run_name "${out_name}" \
+    --metrics commonsense_qa --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --decode_stop_on_im_end "${STOP_ON_IM_END}" \
+    --cs_eval_dir "${CS_EVAL_DIR}" \
+    --cs_eval_tasks "${CS_EVAL_TASKS}" \
+    --cs_scoring "${CS_SCORING}" \
+    --cs_limit "${CS_LIMIT}" \
+    --cs_max_new_tokens "${CS_MAX_NEW_TOKENS}" \
+    --cs_batch_size "${CS_BATCH}" \
+    --cs_score_batch_size "${CS_SCORE_BATCH}"
+}
+
+# 每评完一个就打一行，每评完一组就打该组的表。作业被砍时前面的都已经落屏落盘。
+report () {
+  local scope=$1; shift
+  set +x
+  python - "${RESULTS_ROOT}" "${OUT_SUFFIX}" "${scope}" "$@" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+suffix, scope = sys.argv[2], sys.argv[3]
+runs = sys.argv[4:]
+
+SHORT = {
+    "boolq": "BoolQ", "piqa": "PIQA", "social_i_qa": "SIQA",
+    "hellaswag": "HellaS", "winogrande": "WinoG",
+    "ARC-Easy": "ARC-e", "ARC-Challenge": "ARC-c", "openbookqa": "OBQA",
+}
+
+
+def load(name):
+    path = root / "commonsense_qa" / name / "summary.json"
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return None
+
+
+def macro(summary, key):
+    """Unweighted mean over tasks, for the columns summary.json has no average of."""
+    values = [e[key] for e in summary["per_task"].values() if key in e]
+    return sum(values) / len(values) if values else None
+
+
+# 同一个 run 在一次调用里可能被传两次（单条反馈里带上了 base），去重但保序。
+seen = set()
+rows = []
+for run in runs:
+    if run in seen:
+        continue
+    seen.add(run)
+    summary = load(f"{run}{suffix}" if suffix else run)
+    if summary:
+        rows.append((run, summary))
+if not rows:
+    sys.exit(0)
+# 问了不止 base、回来的却只有 base：这一组还一个结果都没有。
+# 打一张只有分母的表是噪音，跳过。
+if len(seen) > 1 and all(run == "base" for run, _ in rows):
+    sys.exit(0)
+
+tasks = sorted({t for _, s in rows for t in s.get("tasks", [])},
+               key=lambda t: list(SHORT).index(t) if t in SHORT else 99)
+base = next((s for r, s in rows if r == "base"), None)
+base_avg = base.get("average_acc_logprob") if base else None
+
+# run 名长到 60 字符（ds_onereplay_8b_ifgold_..._regonce），写死列宽会串行。
+width = max([len(r) for r, _ in rows] + [len("(random baseline)"), 20]) + 2
+rule = "=" * (width + 9 * len(tasks) + 18)
+print()
+print(rule)
+print(f"[{scope}] acc_logprob %（主口径。候选闭集排序，base 与 trained 同一种测量）")
+print(rule)
+head = "".join(f"{SHORT.get(t, t):>9}" for t in tasks)
+print(f"{'run':<{width}}{head}{'AVG':>9}{'Δbase':>9}")
+for run, summary in rows:
+    cells = ""
+    for task in tasks:
+        entry = summary["per_task"].get(task)
+        acc = entry.get("acc_logprob") if entry else None
+        cells += f"{acc * 100:>9.2f}" if acc is not None else f"{'--':>9}"
+    avg = summary.get("average_acc_logprob")
+    avg_cell = f"{avg * 100:>9.2f}" if avg is not None else f"{'--':>9}"
+    if base_avg is not None and avg is not None and run != "base":
+        delta = f"{(avg - base_avg) * 100:>+9.2f}"
+    else:
+        delta = f"{'--':>9}"
+    print(f"{run:<{width}}{cells}{avg_cell}{delta}")
+
+rnd = next((s.get("average_random_baseline") for _, s in rows
+            if s.get("average_random_baseline") is not None), None)
+if rnd is not None:
+    pad = " " * (9 * len(tasks))
+    print(f"{'(random baseline)':<{width}}{pad}{rnd * 100:>9.2f}")
+
+# 生成口径单独一张表：它的 accuracy 离开 parse_rate 不可读。
+gen_rows = [(r, s) for r, s in rows if s.get("average_acc_gen") is not None]
+if gen_rows:
+    print()
+    print(f"[{scope}] 生成口径（学没学会按训练格式作答）。acc_gen 只能和 parse_rate 一起读")
+    print(f"{'run':<{width}}{'acc_gen':>10}{'parse_rate':>12}{'acc_on_parsed':>15}")
+    for run, summary in gen_rows:
+        on_parsed = macro(summary, "acc_gen_on_parsed")
+        on_parsed_cell = f"{on_parsed * 100:>15.2f}" if on_parsed is not None else f"{'--':>15}"
+        print(
+            f"{run:<{width}}"
+            f"{summary['average_acc_gen'] * 100:>10.2f}"
+            f"{summary['average_parse_rate'] * 100:>12.2f}"
+            f"{on_parsed_cell}"
+        )
+    print("parse_rate 低 = 模型没在用这个答案格式，那一行的 acc_gen 不用看，读 acc_logprob。")
+PY
+  set -x
+}
+
+CURRENT_GROUP=""
+GROUP_RUNS=()
+for run in ${RUNS}; do
+  g="$(group_of "${run}")"
+  if [[ -n "${CURRENT_GROUP}" && "${g}" != "${CURRENT_GROUP}" ]]; then
+    report "${CURRENT_GROUP} 组" "${GROUP_RUNS[@]}"
+    GROUP_RUNS=()
+  fi
+  CURRENT_GROUP="${g}"
+  GROUP_RUNS+=("${run}")
+
+  eval_one "${run}"
+  # 单条即时反馈：不用等整组跑完就能看出这个臂有没有动。带上 base，
+  # 否则 Δbase 那列没有分母，只剩一个读不出意思的绝对值。
+  if [[ "${run}" == "base" ]]; then
+    report "${run}" "${run}"
+  else
+    report "${run}" base "${run}"
+  fi
+done
+if [[ -n "${CURRENT_GROUP}" ]]; then
+  report "${CURRENT_GROUP} 组" "${GROUP_RUNS[@]}"
+fi
+
+# ---------------------------------------------------------------------------
+# 总表：还是按组分开打，理由见文件头（一组在测学习，一组在测遗忘）。
+# base 不单独成表——它作为分母进每一张表。
+# ---------------------------------------------------------------------------
+set +x
+ALL_GROUPS=""
+for g in ${GROUP_ORDER}; do
+  for run in ${RUNS}; do
+    if [[ "$(group_of "${run}")" == "${g}" ]]; then
+      ALL_GROUPS="${ALL_GROUPS} ${g}"
+      break
+    fi
+  done
+done
+for run in ${RUNS}; do
+  g="$(group_of "${run}")"
+  [[ "${g}" == "base" ]] && continue
+  in_list "${g}" ${ALL_GROUPS} || ALL_GROUPS="${ALL_GROUPS} ${g}"
+done
+
+for g in ${ALL_GROUPS}; do
+  MEMBERS=()
+  # base 进每一张表，否则 Δbase 那列没有分母。
+  if [[ " ${RUNS} " == *" base "* ]]; then
+    MEMBERS+=("base")
+  fi
+  for run in ${RUNS}; do
+    [[ "$(group_of "${run}")" == "${g}" ]] && MEMBERS+=("${run}")
+  done
+  if (( ${#MEMBERS[@]} > 0 )); then
+    report "总表 / ${g}" "${MEMBERS[@]}"
+  fi
+done
+
+echo ""
+echo "========================================================================"
+echo "怎么读"
+echo "========================================================================"
+echo "cs_* 组：这八个测试集就是 Commonsense170k 的另一半，读作 in-domain 任务准确率。"
+echo "  AVERAGE 明显高于 base => 确实学会了。推不动就先回去查 LR，别先怀疑方法；"
+echo "  本线每行只有 7-8 个监督 token，val_loss 对此很不灵敏，acc_logprob 才是判据。"
+echo ""
+echo "ds_* 组：DialogSum 线没见过这八个集，这个数是 OOD 干扰信号，对照系是 base。"
+echo "  贴着 base = 没被带坏；明显低于 base 才是遗忘。别拿它和 cs_* 比高低。"
+echo ""
+echo "别只看 AVERAGE：八个集的题量差一个数量级（OBQA 500 / HellaSwag 10042），"
+echo "宏平均给了 OBQA 和 HellaSwag 同样的权重。逐 task 那几列要一起看。"
+echo "题量小的集上 1pp 可能就是几条题，配对显著性:"
+echo "   python -m onereplay.scripts.compare_significance \\"
+echo "     --results_root ${RESULTS_ROOT} --metrics commonsense_qa \\"
+echo "     --runs base,<run> --baseline base"
+echo ""
+echo "产物:"
+for run in ${RUNS}; do
+  out_name="$(resolve_out_name "${run}")"
+  [[ -f "${RESULTS_ROOT}/commonsense_qa/${out_name}/summary.json" ]] && \
+    echo "  ${RESULTS_ROOT}/commonsense_qa/${out_name}/summary.json"
+done
+echo "  逐行输出: ${RESULTS_ROOT}/commonsense_qa/<run>/responses.jsonl"
+echo "  汇总 csv: ${RESULTS_ROOT}/commonsense_qa_summary.csv   (每 run 每 task 一行 + AVERAGE)"
+echo "Job finished at: $(date)"

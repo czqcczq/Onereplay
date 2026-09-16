@@ -9,7 +9,20 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# !! 这份还停在 Qwen3-1.7B-Base 那一轮，不要直接投 !!
+# !! 已被 96 号的 ARM=replay 取代，不要再投这一份 !!
+#
+# replay 现在是 96/100/103 的第四条臂，和 vanilla / onereplay / ewc 同脚本、同结果树、
+# 同一道 check_config_consistency 闸门：
+#
+#   qsub -v MODE=train,ARM=replay,SOURCE=if onereplay/pbs/96_s3_train_math.pbs
+#
+# 0.5/0.5 的混合和 ACCUM 翻倍都在那边自动换算（REPLAY_PER_BATCH=BATCH/2，
+# --accumulation_size 传 ACCUM*2），所以四条臂每次更新的新任务行数都是 64。
+# 本文件只作为那一轮的历史记录保留，下面是它与现行配方的差异：
+#
+# ---- 以下为旧说明 ----
+#
+# 这份还停在 Qwen3-1.7B-Base 那一轮。
 #
 # 改名成 s3_* 只是让它和同阶段的脚本排在一起，**内容没有跟着 96 号一起更新**。
 # 与 96_s3_train_math.pbs 的现行配方逐项对照：
