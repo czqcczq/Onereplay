@@ -26,20 +26,27 @@
 # 三条线的 maxlen 和每行监督 token 仍差好几个量级，所以各自一个脚本，不做交叉评测。
 #
 # -----------------------------------------------------------------------------
-# 【Qwen2.5-Math 换模型带来的三个坑，三个都是静默的】
+# 【换模型带来的三个坑，三个都是静默的】
 #
-# 1) **chat template 会自动注入一条数学 system 指令**。没有 system 消息时，
-#    Qwen2.5-Math 的模板补上
+# 下面每条都注明了对当前模型（Qwen3-4B-Base）是否还成立，别按旧印象跳读。
+#
+# 1) **SYSTEM_PROMPT 必须显式传，理由随模型变但结论不变**。
+#    在 Qwen2.5-Math-1.5B 上，模板会在没有 system 消息时补上
 #        "Please reason step by step, and put your final answer within \boxed{}."
 #    而 data/chat.py 的 apply_train_template 和 eval/generation.py 的 render_chat
-#    都只传 user 角色。math 线上这正是论文的配方（91 号就靠它），在本线上却是污染：
+#    都只传 user 角色。那在 math 线上正是论文的配方（91 号就靠它），在本线上却是污染：
 #    每一条训练行和每一条 commonsense_qa 评测 prompt 都会被要求输出 \boxed{}，
 #    而本线的答案格式是 "the correct answer is <label>"，两者直接冲突。
 #    logprob 那一路受影响更隐蔽：它比的是 "the correct answer is <label>" 在**带
 #    数学指令的 prompt 之后**的 logprob，排序仍然做得出来，但测的不是同一件事。
-#    所以本线**必须**传 SYSTEM_PROMPT（默认已给一条中性的 Qwen2.5 助手消息），
-#    它同时传给 train.py 和 evaluate.py。两边不一致 = 模型在没训过的 prompt 下
-#    被评测。94 号（IF）同理，91 号（math）留空。
+#
+#    换成 Qwen3-4B-Base 之后模板不注入任何东西，所以上面那个污染在当前模型上已经不
+#    存在了。但 SYSTEM_PROMPT 的默认值**仍然保留**那条中性助手消息，两个原因：已跑
+#    完的结果都是在它下面测的，去掉等于换了 prompt、和历史不可比；而且 base 模型有
+#    一条 system 更容易进入助手模式，对 base 臂的评测更公平。
+#    它同时传给 train.py 和 evaluate.py。两边不一致 = 模型在没训过的 prompt 下被
+#    评测。94 号（IF）同理；91 号（math）反过来，在 4B 上它必须**补上** \boxed{}
+#    指令，因为模板不再送。101 号采集必须和这里逐字一致。
 #
 # 2) **eos_token 是 <|endoftext|>，但 chat template 用 <|im_end|> 收尾**。模型
 #    吐出 <|im_end|> 时 generate 不会停，会续写下一轮对话，skip_special_tokens
@@ -328,7 +335,8 @@ cd "${REPO_ROOT}"
 
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 全线模型，理由见 91 号同处。要回 1.5B 就传 MODEL_NAME=Qwen2.5-Math-1.5B。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 # 结果树按**模型**分。旧的 Qwen3-1.7B-Base 那一轮写在 results_part1_cs/ 下，run 名
 # 只带 lr 和 seed。两者共用一个根的话，MODE=train 会撞上
 # `if [[ -d "${CKPT}" ]] then 跳过训练`，于是**静默跳过训练、直接去评测旧模型的
@@ -410,6 +418,11 @@ LR="${LR:-5e-5}"
 # 恒定 LR、无 warmup，全参微调在 5e-5 下第一步就可能出 loss 尖峰。
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+# 16 看着比 91/94 号的 4 大很多，其实是同一个显存预算：那两条线是 MAXLEN=2048，
+# 4x2048 = 8192 token/micro-batch，这条线 MAXLEN=512，16x512 也是 8192。logits 这
+# 一项同样对齐（都是 8192 个位置 x vocab 151936），而它在 4B 上是仅次于激活的大头。
+# 所以换 Qwen3-4B-Base 之后 91/94 要从 8 降到 4、这条不用动，三条线的峰值都在
+# 约 97 GB。真要改就先 MODE=smoke 看峰值，别只按行数直觉调。
 BATCH="${BATCH:-16}"
 ACCUM="${ACCUM:-64}"
 # **占位值，等 MODE=data 的长度报告**。见文件头 MAXLEN 一节。
@@ -492,7 +505,8 @@ echo "                   mode=${CS_POOL_MODE} size=${CS_POOL_SIZE} strategy=${CS
 echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
 echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
 echo "  system 消息    : ${SYSTEM_PROMPT}"
-echo "                   (空 = 用模板默认，Qwen2.5-Math 会注入 \\boxed{} 指令；见文件头)"
+echo "                   (Qwen3 的模板不注入 system，所以空 = 真的没有 system turn；"
+echo "                    101 号采集必须传一样的值，见文件头第 1 条)"
 echo "  一次更新       : $(( ACCUM )) 行 = $(( ACCUM / BATCH )) 个 micro-batch"
 if [[ "${MODE}" == "lr_sweep" ]]; then
   echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"

@@ -9,57 +9,101 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Part 3: Model-Math --FLANv2--> Model-Math-IF，用 C_math 保护 math 能力
+# Stage 3 / 新任务 = IF: Model-<SOURCE> --Conifer--> Model-<SOURCE>-IF
+#                        用 C_<SOURCE> 保护旧能力，与 EWC 的 F_<SOURCE> 对照
 #
-#     Model-Math ---- FLAN v2 (50000 单轮样本) ----> Model-Math-IF
-#                \                              /
-#                 \---- λ·tr(ΔW C_math ΔWᵀ) --/
+#     Model-<SOURCE> ---- Conifer (约 38.9k 行) ----> Model-<SOURCE>-IF
+#                    \                          /
+#                     \-- λ·tr(ΔW C ΔWᵀ) -----/     (ewc 臂换成 Σ F ΔW²)
 #
-#     评测  旧能力保留: GSM8K + MATH-500      新任务: IFEval + FollowBench
-#     四行  math_anchor (Stage 2 起点) / vanilla (无保护) / onereplay (C_math) / ewc (F_math)
+#     评测  新任务: IFEval + FollowBench     旧能力保留: 由 SOURCE 决定
+#     四行  <SOURCE>_anchor (Stage 2 起点) / vanilla / onereplay / ewc
 #
-# 这是 96 号的**反方向**。96 号是「先学 IF，再学 Math，保 IF」；本线把两个域调换：
-#
-#     96 号  Base --FLANv2--> Model-IF-FLAN --Numina + C_if  --> 保 IF
-#     100号  Base --Numina--> Model-Math    --FLANv2 + C_math--> 保 Math
-#                             ^^^^^^^^^^^^             ^^^^^^^^
-#                             本脚本的基座              本脚本的保护矩阵
-#
-# 两个方向都做才能说「onereplay 保的是能力，不是某个特定域碰巧好保」。反方向还检验一个
-# 更强的说法：math 是长 CoT 能力、比指令跟随更脆，如果 C 在这个方向也守住了，结论更硬。
-#
-# 大部分逻辑照抄 94 号（新任务 FLAN 的数据池 / BATCH/ACCUM/MAXLEN/LR）与 96 号（正则、
-# EWC 对照、评测框架、λ 标定），下面只讲**不一样的地方**和**为什么**。
+# **本脚本取代 102_part4_commonsence2if.pbs。** 那份是「来源固定 cs」的硬编码副本，
+# 与本脚本除了基座和保护矩阵之外逐行相同；现在两个来源由 SOURCE=math|cs 切换，
+# 于是 102 号不再需要维护。它留在仓库里只作历史参照，**不要再往它上面加修复**：
+# 已经发现过两次「一条线打了补丁、另一条漏掉」的事故（见下面「与 S1/S2 的对表」）。
 #
 # -----------------------------------------------------------------------------
-# 【与 94 号（正向 IF 训练）的四处结构性差别】
+# 【这条线在三条 Stage 3 线里的位置】
 #
-# 1) 基座不是 Qwen3-1.7B-Base，而是 91 号训出来的 Model-Math。
+# Stage 3 按**新任务**分三个脚本，每个脚本的来源可切换。本脚本是「新任务 = IF」那条：
+#
+#     96 号   新任务 = Numina 数学      SOURCE=if | cs
+#     100号   新任务 = Conifer 指令跟随  SOURCE=math | cs      <- 本脚本
+#     （第三条按同一形态排）
+#
+# 三条线合起来才能说「onereplay 保的是能力，不是某个域碰巧好保」。本线尤其检验一个
+# 更强的说法：Conifer 是**产出结构**型数据（答案 p50 = 144 词、54.7% 带列表），它对
+# 权重的推动方向和数学 CoT、和闭集多选都不一样，如果 C 在这个方向也守住了，结论更硬。
+#
+# 代码形态刻意与 96 号保持一致（同一套 SOURCE 派生、同一个配置闸门、同一套两侧
+# system 拆分），这样任何一处修复都能逐字搬到另一条线，不会再出现单边漏修。
+#
+# -----------------------------------------------------------------------------
+# 【SOURCE：这条线唯一可换的东西，换它要同时换四样】
+#
+# 新任务固定是 Conifer 指令跟随，可换的是「从哪个 Stage 1 模型出发」。少换一样都不会
+# 报错，只会静默产出一个没有意义的结果：
+#   W0         基座 checkpoint，罚项的锚点
+#   C / F      **在那个 checkpoint 上**采的二阶统计量
+#   旧能力评测  「保留了多少」说的是哪个能力
+#   旧侧 system 那个能力在 Stage 1 时是在哪条 system 下测出来的（见下面 system 一节）
+# 所以四者由同一个 SOURCE 派生，不各自传参。
+#
+#   SOURCE=math  从 91 号的 Model-Math（NuminaMath-CoT）出发，量 IF 训练吃掉多少数学
+#   SOURCE=cs    从 93 号的 Model-CS（Commonsense170k）出发，量 IF 训练吃掉多少常识
+#
+# 两个旧能力的**测量性质**差很多，读结果时必须知道：
+#
+#   SOURCE=math  GSM8K/MATH-500 是生成 + 抽 \boxed{}，分数和输出长度纠缠。Conifer 把
+#                输出推长推杂，数学分既可能因为走不到 \boxed{} 而虚低，也可能因为长
+#                CoT 被保住而虚高 —— 每个数学分必须配着 hit-cap 一起读（见 DIAG_LEN）。
+#   SOURCE=cs    acc_logprob 是闭集排序（对每个候选算 "the correct answer is <label>"
+#                的 continuation logprob 再 argmax），不解码、不正则匹配、永远不会
+#                「抽不出答案」，**因此不受输出长度漂移影响**，遗忘量可以直接读。
+#                这是本线的方法学优势。代价是它只回答「还能不能在闭集里排对」，
+#                「还会不会按训练格式作答」由 acc_gen + parse_rate 回答，而后者在本线
+#                必然被推动（Model-CS 只会吐 7-8 个 token，Conifer 答案 p50 是 144 词）。
+#
+# 结果树也带 SOURCE：两个来源的 anchor、vanilla、各臂会重名，共用一棵树会让 evaluate
+# 把两组分数追加进同一个 <metric>_summary.csv，而它们不可比。
+#
+# -----------------------------------------------------------------------------
+# 【与 94 号（Stage 1 的正向 IF 训练）的四处结构性差别】
+#
+# 1) 基座不是 Qwen3-4B-Base，而是 91 / 93 号训出来的 Stage 1 模型。
 #    train.py 从 --model_dir/--model_name 拼路径加载，全量 checkpoint 是完整权重 +
-#    tokenizer，所以直接把 91 号的输出目录当基座传进去，一行代码都不用改。
+#    tokenizer，所以直接把 Stage 1 的输出目录当基座传进去，一行代码都不用改。
 #
-# 2) 加了正则：--cov_path C_math --replay_lambda λ。94 号是 --replay_lambda 0
-#    --measure_replay_when_lambda_zero 0（build_regularizer 返回 None，纯 vanilla）。
+# 2) 加了正则：--cov_path C / --fisher_path F 配 --replay_lambda λ。94 号是
+#    --replay_lambda 0 --measure_replay_when_lambda_zero 0（build_regularizer 返回
+#    None，纯 vanilla）。
 #
-# 3) vanilla 臂是**必须**的，不是可选对照。
-#    「onereplay 保住了 math」这句话只有和「不保护会掉多少」并排才有内容。而且各臂
-#    必须同 LR / 同 EPOCHS / 同 seed / 同数据池，否则差异里混进别的东西。
+# 3) vanilla 臂是**必须**的，不是可选对照。「onereplay 保住了旧能力」这句话只有和
+#    「不保护会掉多少」并排才有内容。而且各臂必须同 LR / 同 EPOCHS / 同 seed / 同
+#    数据池 / 同 batch，否则差异里混进别的东西 —— 这一条由配置闸门强制（见下面）。
 #
-# 4) 评测多了数学保留那一半（GSM8K + MATH-500），这才是本作业的主指标；IFEval +
-#    FollowBench 这次是**新任务**侧。**不评 IFBench**（与 96 号一致）：Part 1 第 8c 节
-#    结论是 IFBench 三个家族测长篇散文的涌现统计量、对输出长度极度敏感，而 SFT 必然
-#    改变输出长度，那 161 条对遗忘研究是噪声源。
+# 4) 评测多了旧能力那一半，那才是本作业的主指标；IFEval + FollowBench 这次是**新任务**
+#    侧。**不评 IFBench**（与 96 号一致，用户已定）：Part 1 第 8c 节的诊断结论是
+#    IFBench 的 ratio/sentence/words 三个家族测的是长篇散文的涌现统计量、对输出长度
+#    极度敏感，而 SFT 必然改变输出长度 —— 那 161 条对遗忘研究是噪声源。
 #
 # -----------------------------------------------------------------------------
-# 【C_math 从哪来，以及它为什么必须是 99 号采的那一份】
+# 【C / F 从哪来，以及它们为什么必须是对应那份】
 #
 # 罚项是 λ·tr(ΔW C ΔWᵀ)，ΔW = W − W0，而 W0 是 train.py 在训练开始时从**加载进来的
-# 模型**快照的（build_regularizer 之后紧跟 snapshot_reference_weights）。本脚本的
-# 基座是 Model-Math，所以 W0 = Model-Math 的权重，C 也必须是在同一个模型上采的 ——
-# 这正是 99 号做的事（--model_name = MATH_RUN）。拿 Base 上采的 C 来配，是两个不同点上
-# 的量拼在一起，不报错、loss 曲线也正常，只会让保护变弱且无法解释。
+# 模型**快照的（build_regularizer 之后紧跟 snapshot_reference_weights）。本脚本的基座
+# 是 Stage 1 的 checkpoint，所以 W0 = 那个 checkpoint 的权重，C 也必须是在同一个模型上
+# 采的 —— 这正是 99 号（math）/ 101 号（cs）做的事（它们的 --model_name 就是 Stage 1
+# 的 run 名）。拿 Base 上采的 C 来配，是两个不同点上的量拼在一起，不报错、loss 曲线
+# 也正常，只会让保护变弱且无法解释。
 #
-# Step 0 会读 C 文件的 metadata，把 model_name 和本作业的基座名对表，不一致就退出。
+# SOURCE=cs 这个方向尤其容易犯：93 号那 170k 行只教一件事，读完题之后输出
+# "the correct answer is <label>"，隐状态分布被改得很彻底，Base 的 C 和它差得远。
+#
+# Step 0 会读 C / F 的 metadata，把 model_name 和本作业的基座名对表，不一致就退出；
+# 还会交叉校验 F 与 C 的池指纹和层集合（两条臂必须约束同一批层、看同一批旧知识行）。
 #
 # -----------------------------------------------------------------------------
 # 【--reg_impl analytic 不是调优选项，是这条线的必需项】
@@ -67,44 +111,74 @@
 # train.py 的默认是 autograd。全量微调下两条路径算的是同一个罚项，但内存不同，而
 # regularizer.py resolve_full_layers 的注释把数字记下来了：analytic 路径**按层**把
 # W0 casts 成 fp32，「keeps one layer of temporaries alive rather than 197」。
-# autograd 那条会把整个 W0 的 fp32 副本留一整轮 —— 在 Qwen3-1.7B 上是 6.41 GiB fp32
-# 叠在 3.20 GiB bf16 之上。
+# autograd 那条会把整个 W0 的 fp32 副本留一整轮。
 #
-# 保留 analytic 一是省这 6.4 GiB，二是它天然一次更新只注入一次罚项梯度，与
-# --reg_once_per_update 1 一致（传 0 会直接报错，train.py 里有显式检查）。本线的显存
-# 其实比 96 号宽松（新任务 1536 而不是 4096），但没有理由退回 autograd。
+# 保留 analytic 一是省那份 fp32 副本，二是它天然一次更新只注入一次罚项梯度，与
+# --reg_once_per_update 1 一致（传 0 会直接报错，train.py 里有显式检查）。
 #
-# -----------------------------------------------------------------------------
-# 【显存预算：本线比 96 号宽松，但仍要 smoke 实测】
-#
-# 新任务是 FLAN@1536（不是 96 号的 Numina@4096），激活小得多，所以 vanilla 基线的峰值
-# 远低于 96 号那 50 GiB 量级。确定的加数与 96 号相同（同一个架构、同一个 full scope）：
-#   + C_math 常驻 (fp32, 197 层, all-linear)         + 6.58 GiB
-#       6 x 2048² + 6144² = 62.91M/层 x 28 + lm_head 2048² = 1.766G 个 fp32
-#   + W0 快照 (bf16, 1.72G 参数)                      + 3.20 GiB
-#   + analytic 的单层临时量 (最大是 lm_head 的 fp32)   + 约 1.2 GiB
-# H200 140 GiB 余量充足，80GB 卡也够。但 vanilla 基线的 peak **必须先跑 MODE=smoke 实测**，
-# 94 号没有正式记这个数（它也让你跑 smoke）。
-# smoke 还要确认日志里出现这一行（trainers/base.py 在第 1 步打印）：
-#     regularizer covers 197 layers; no penalty matrix for 0 layers
-# missing 非 0 就说明 C 的层名和模型对不上，罚项在偷偷少覆盖几层。
+# **这个开关只对 onereplay 臂有意义。** EWC 没有 analytic 路径（EWCRegularizer 没有
+# accumulate_grad），所以 ewc 臂的显存曲线和 onereplay 不是一回事 —— 见下一节。
 #
 # -----------------------------------------------------------------------------
-# 【正则的计算开销：本线约 3% 而不是 96 号的 0.13%，但绝对量仍可忽略】
+# 【显存预算：BATCH 由最吃的 ewc 臂决定，这一条不能按臂调】
 #
-# analytic 每次优化器更新做一遍 2λ·ΔW·C，每层一次矩阵乘，成本只取决于权重维度、与序列
-# 长度无关，所以还是约 3.4 TFLOP / 更新（down_proj 2.2 + lm_head 0.64 + 其余约 0.5）。
-# 但训练计算随序列长度掉：一次更新 64 行 x 约 150 token x 6 x 1.72e9 ≈ 0.1 PFLOP（FLAN
-# 序列比 Numina 短约 3.6 倍），所以正则占比升到 **约 3%**。仍然小，且 ACCUM=64 把它摊到
-# 一次更新只算一遍。onereplay 臂和 vanilla 臂的墙钟应当接近；差很多先怀疑显存抖动。
+# 三臂的产出是性能开销对照，所以 batch / accum / maxlen / epochs 必须逐字相同。一旦
+# 让 vanilla 用 8、protected 臂因为 OOM 退到 4，那个 8 的 vanilla 就作废了，得重跑。
+# 所以默认值取的是**三臂里最紧的那一条能过的值**，不是 vanilla 能过的值。
+#
+# 最紧的是 ewc，不是 onereplay —— 这一点反直觉，按 C(20.8 GiB) 比 F(16.1 GiB) 大去推
+# 会推错。原因是 **EWC 只有 autograd 路径**：
+#   onereplay  full_covariance_grad_ 带 @torch.no_grad()，逐层算完 del，峰值 = 一层
+#   ewc        full_fisher_regularizer 每层 weight.float() 进计算图，所有覆盖层的
+#              fp32 ΔW 活到 backward 返回。1.7B 上 197 层实测 4.35 GiB，4B 约 10 GiB
+#
+# Qwen3-4B-Base + MAXLEN=2048（与 94 号同值）上按架构算的账，静态 = 权重+梯度+Adam
+# 全 bf16 = 32.2：
+#                      vanilla    ewc    onereplay
+#   静态                  32.2    32.2      32.2
+#   W0 快照 bf16             -     8.0       8.0
+#   F fp32 / C fp32          -    16.1      20.8
+#   正则临时量               -   ~10.3      ~0.2
+#   激活+logits @ BATCH=2  32.3    32.3      32.3
+#   峰值                  ~64.5  ~98.9     ~93.5
+#   峰值 @ BATCH=4        ~96.7 ~131.1    ~125.7   <- ewc 在 140 GiB 上只剩 9 GiB 余量
+#
+# 所以默认 BATCH=2。**但这个账是估算**（激活系数是从 1.5B 那轮实测的 100 GiB 反推的，
+# 误差 ±15%），要提到 4 就先实测，别直接排 24h 作业：
+#
+#     qsub -v MODE=smoke,ARM=ewc,LAMBDA=<随便给一个> onereplay/pbs/100_part3_if_onereplay.pbs
+#
+# **探显存必须 ARM=ewc**：拿 vanilla 探等于没探，那 96.7 GiB 永远过。过了就三臂一起用 4。
+#
+# 这个账和 96 号基本一致（同架构、同 MAXLEN=2048、同 full scope），差别只在激活的实际
+# 分布：Conifer 全 38.9k 行在 1024 预算下就零截断（答案 token P50=183 / P90=310 /
+# max=690，见 94 号的截断表），所以 2048 下多数 micro-batch 远低于上界，而 padding 按
+# batch 内最长算，峰值仍要按上界付。
+#
+# **BATCH 不需要等于 94 号的 4。** 要对齐的是三臂彼此，以及 ACCUM=64 给出的「一次更新
+# 64 行」—— 有效 batch 与 Stage 1 相同，accumulation_steps 从 16 变 32，梯度在数学上
+# 等价（transformer 里没有跨样本的层）。94 号那个 4 是没有正则时的值。
+#
+# -----------------------------------------------------------------------------
+# 【正则的计算开销可以忽略，这里把数算出来免得再猜】
+#
+# analytic 每次优化器更新做一遍 2λ·ΔW·C，每层一次矩阵乘，成本只取决于权重维度、与
+# 序列长度无关。训练计算则随序列长度走：Conifer 一次更新 64 行 x 约 400 token，比
+# 96 号那边（Numina 约 3900 token）短一个量级，所以正则占比从 96 号的约 0.13% 升到
+# **约 1%**。仍然可忽略，而且 ACCUM=64 把它又摊薄一层（reg_once_per_update=1 时一次
+# 更新只算一遍，而不是 32 个 micro-batch 各算一遍）。
+#
+# 所以三臂的墙钟时间应当基本相同；如果实测差很多，先怀疑是显存压力导致的分配器抖动，
+# 不是正则本身贵。MODE=smoke 会把两臂的 tokens_per_sec 并排打出来。
 #
 # -----------------------------------------------------------------------------
 # 【λ 怎么定：这是本脚本唯一一个真正需要人做判断的旋钮】
 #
-# 不要直接照搬历史值。44 号全量 all-linear 用 7.5e-3（Commonsense@512）、96 号那套是在
-# Numina@4096 上定的。约束强度要和**任务损失**比才有意义，而本线的新任务是 FLANv2@1536
-# 的短答案，task_loss 的绝对尺度和它们都不同。C_math 也是新采的（math 隐状态二阶矩），
-# trace(C) 的量级和 C_if 不是一回事，更不能照搬。
+# 不要直接照搬历史值。44 号全量 all-linear 用 7.5e-3，那是**新任务 = Commonsense@512**
+# 时定的；96 号那套是在 Numina@2048 上定的。约束强度要和**任务损失**比才有意义，而本线
+# 的新任务是 Conifer@2048（答案 p50 = 144 词、带列表结构），task_loss 的绝对尺度和它们
+# 都不同。两个 SOURCE 的 λ 也各标一次：C_math 和 C_cs 采在不同的 W0 上，trace 不同、
+# ΔW 在训练早期的增长速度也不必相同。
 #
 # 三步走，都在本脚本里：
 #
@@ -113,10 +187,10 @@
 #      方向（太小等于没开），又不能盖住任务信号（太大等于不学新任务）。
 #      metrics jsonl 里的字段名是 train_lambda_reg（= λ·R）和 train_task_loss。
 #
-#   2) 各档跑完整训练，看 val_loss（新任务 IF 的可塑性）和数学分（旧能力保留）。
+#   2) 各档跑完整训练，看 val_loss（新任务 IF 的可塑性）和旧能力分数（保留多少）。
 #
-#   3) **matched plasticity**：报结果时各臂应当在同一个新任务 val_loss 上比，
-#      否则「onereplay 保住了 math」可能只是因为它少学了新任务。仓库里有现成工具，
+#   3) **matched plasticity**：报结果时各臂应当在同一个新任务 val_loss 上比，否则
+#      「onereplay 保住了旧能力」可能只是因为它少学了新任务。仓库里有现成工具，
 #      它把 val_loss(λ) = floor + a·λ^b 拟合出来再反解：
 #
 #        python -m onereplay.scripts.calibrate_lambda \
@@ -131,72 +205,122 @@
 # λ 写进 run 名，所以换 λ 不会覆盖已有 checkpoint。
 #
 # -----------------------------------------------------------------------------
-# 【读结果的两条纪律，都是 Part 1 留下来的，方向和 96 号相反】
+# 【system 消息：两侧不同，各自对齐 Stage 1，不能共用一个】
 #
-# 1) **报任何分数必须同时报响应长度中位数。** 这是第 8c 节的口径。本线尤其危险：
-#    Stage 1 的 Model-Math 输出 P50 约 3900 token，Stage 2 的 FLAN targets P50 只有
-#    18-19 token（94 号文件头）—— 输出长度会被往**变短**的方向猛推两个数量级。数学
-#    保留分直接受害（走不到 \boxed{} 就读成不会做），IFEval/FollowBench 里也有不少
-#    约束本质在量长度。分数升降先看 words 再谈能力，汇总表每个分数右边紧跟它的 words。
+# Stage 1 三条线只用两种 system：
+#   91 号（math）  "Please reason step by step, and put your final answer within \boxed{}."
+#                  （Qwen3 的模板不注入任何 system，所以这条要靠 SYSTEM_PROMPT_PRESET
+#                    显式补上；Qwen2.5-Math 的模板自己会注入，那时留空）
+#   93/94 号（cs/if）"You are a helpful assistant."   两者**逐字相同**
 #
-# 2) **FollowBench 只有 rule 那一半**（350/820 行、70/164 组，style 类覆盖为 0）。
+# Stage 3 每个评测域必须用**它在 Stage 1 时的那个 system**，否则分数和 Stage 1 的基线
+# 不可比，而「持续训练后保留了多少」全靠和那个基线比。本线的三处用法：
+#
+#   训练渲染        新任务是 Conifer -> 中性助手消息（94 号的值）
+#   新任务评测      ifeval / followbench -> 中性（同上）
+#   旧能力评测      SOURCE=math -> **boxed**（math500 的答案提取依赖 \boxed{}，用中性
+#                                 会让分数虚低，那不是遗忘）
+#                   SOURCE=cs   -> 中性（93 号的值，与 94 号相同）
+#
+# 因为 evaluate.py 一次调用只接受一个 --system_prompt，两侧 system 不同时必须拆成两次
+# evaluate 调用（run_eval_side 就是这个结构）。SOURCE=cs 时两侧恰好相同，但**仍然保持
+# 拆分结构**：三条 Stage 3 线的代码形态要一致，而且两侧的 metric 列表本来就要分组
+# （新任务侧要检查 IFEVAL_INPUT，旧能力侧要检查 CS_EVAL_DIR / 数学评测集）。
+#
+# 代价是两侧分两次调用、模型加载两次。那点加载时间换的是分数可比，值得。
+#
+# -----------------------------------------------------------------------------
+# 【读结果的三条纪律】
+#
+# 1) **报任何生成式分数必须同时报响应长度中位数。** 这是 Part 1 第 8c 节的口径。本线
+#    的长度是往**变长变杂**的方向漂：Stage 1 的 Model-Math 输出 P50 约 480 token 而
+#    Model-CS 只有 7-8 个 token，Conifer 的答案 p50 是 144 词且 54.7% 带列表。
+#    IFEval/FollowBench 里相当一部分约束本质在量长度，数学侧的 \boxed{} 抽取和常识侧的
+#    extract_label 更是直接受害。汇总表默认每个生成式分数右边紧跟它自己的 words 中位数。
+#    SOURCE=cs 的 acc_logprob 是唯一不需要这样读的数（闭集排序、不解码）。
+#
+# 2) **acc_gen 不能脱离 parse_rate 引用，acc_logprob 不能脱离 random_baseline 引用**
+#    （只对 SOURCE=cs）。前者的下降可能只是格式漂移；后者的下限不是 0 —— 候选集只有
+#    2-5 个，塌成单一 label 的模型也能拿到 random_baseline（八任务宏平均约 0.35）。
+#
+# 3) **FollowBench 只有 rule 那一半**（350/820 行、70/164 组，style 类覆盖为 0）。
 #    不要写成「FollowBench = xx%」。judge 那 470 行落到 judge_inputs.jsonl，要在有网
 #    的地方过 judge_followbench.py。详见 92 号文件头的三条纪律。
 #
 # -----------------------------------------------------------------------------
 # 【前置】计算节点无外网
-#   1) Model-Math checkpoint        91 号 MODE=train 的产物（不传 MATH_LR 时自动 glob）
-#   2) C_math (+ F_math for ewc)    99 号的产物 results_part3_math2if/{cov,fisher}/
-#   3) FLAN 数据池                  94 号 MODE=data 的产物 results_part1_if_flanv2/datasets/flan_v2_if_50k
-#   4) 数学评测集                   ${REPO_ROOT}/datasets/math/{gsm8k,math500}_test.jsonl
+#   1) Stage 1 checkpoint   SOURCE=math -> 91 号 / SOURCE=cs -> 93 号 MODE=train 的产物
+#                           （不传 SRC_LR 时自动 glob）
+#   2) C / F                SOURCE=math -> 99 号 / SOURCE=cs -> 101 号的产物
+#   3) Conifer 数据池        94 号 MODE=data,IF_SOURCE=conifer 的产物
+#   4) 旧能力评测集          SOURCE=math -> ${REPO_ROOT}/datasets/math/{gsm8k,math500}_test.jsonl
+#                           SOURCE=cs   -> ${REPO_ROOT}/datasets/commonsense_eval/<task>/test.json
+#                                          （LLM-Adapters 的 dataset/，八个子集约 10MB，
+#                                            93 号文件头有 git clone + cp 那两行）
 #   5) IFEval 输入随仓库自带；FollowBench 完全 vendored（零外部依赖）
 #   6) mkdir -p ${REPO_ROOT}/logs
 #
-# 【用法】ARM 一次只跑一条。本线训练便宜（FLAN@1536 约 0.5-1h），瓶颈是数学保留评测
-#         （4096 预算 / batch 128 约 0.8h）；训练 + 两半评测仍建议拆开，别顶满 walltime。
+# 【用法】ARM 一次只跑一条。本线训练便宜（Conifer 约 38.9k 短序列行 / 1 epoch），瓶颈
+#         是新任务侧的 IF 评测（两个数据集 3-4h）；旧能力侧 math 约 0.8h、cs 约 1-1.5h。
+#         训练 + 两半评测仍建议拆开，别顶满 walltime。
 #
-#   # 0) 只打印计划和前置检查，不碰 GPU（**先跑这个**）
-#   qsub -v DRY_RUN=1 onereplay/pbs/100_part3_if_onereplay.pbs
+#   # 0) 只打印计划和前置检查（含配置闸门），不碰 GPU（**先跑这个**）
+#   qsub -v DRY_RUN=1,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #
-#   # 1) 冒烟：两条臂各 70 步，看 peak memory 和「covers 197 layers」那行
-#   qsub -v MODE=smoke onereplay/pbs/100_part3_if_onereplay.pbs
+#   # 1) 冒烟：vanilla + 一条 protected 臂各 70 步，看 peak memory 和
+#   #    「covers N layers」那行。**这一步定 BATCH，必须在任何正式臂之前做完。**
+#   #
+#   #    要用 ARM=ewc：三臂里它最吃显存（只有 autograd 路径，所有覆盖层的 fp32
+#   #    DeltaW 活到 backward 返回），拿 vanilla 或 onereplay 探出来的余量是假的。
+#   #    这里的 λ 只是个标量乘数、不影响显存，所以还没标定 λ 也可以先探，随便给一个。
+#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1e7,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
+#   # 默认 BATCH=2 是按 4B 架构估的保守值。想提到 4 就先实测这一档，过了再三臂一起用
+#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1e7,BATCH=4,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #
 #   # 2) 选 λ（短跑几档，只看 λ·R / task_loss 的比值）
 #   #    ！两条臂的 λ 要各标一次，靠 PROBE_ARM 区分，grid 不通用（见下面 PROBE_ARM 一节）
-#   qsub -v MODE=lambda_probe onereplay/pbs/100_part3_if_onereplay.pbs
+#   #    ！两个 SOURCE 的 λ 也要各标一次（C_math 与 C_cs 采在不同的 W0 上）
+#   qsub -v MODE=lambda_probe,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #   # 已经单独交了完整 vanilla 的话，probe 里那档 λ=0 可以省掉
-#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0 onereplay/pbs/100_part3_if_onereplay.pbs
+#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #   # 只验一个 λ（最快，约 20 次更新）
-#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0,LAMBDA_GRID=7.5e-3 \
+#   qsub -v MODE=lambda_probe,PROBE_VANILLA=0,LAMBDA_GRID=7.5e-3,SOURCE=math \
 #     onereplay/pbs/100_part3_if_onereplay.pbs
 #
 #   # 2b) 标定 EWC 的 λ。不传 LAMBDA_GRID 时会读 F 文件，围绕 1/mean(F) 现算三档
 #   #     （x0.1 / x1 / x10），所以第一次扫不需要你先知道 F 的量级。
-#   qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0 \
+#   qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0,SOURCE=math \
 #     onereplay/pbs/100_part3_if_onereplay.pbs
 #   # 看完表后只验一档（比值要落在 task_loss 的 1%~10%）
-#   qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0,LAMBDA_GRID=1.2e7 \
+#   qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0,LAMBDA_GRID=1.2e7,SOURCE=math \
 #     onereplay/pbs/100_part3_if_onereplay.pbs
 #
-#   # 3) vanilla 臂（必须跑，是遗忘的标尺）。训练+IF(新任务)评测同作业，数学评测另开。
-#   qsub -v MODE=train,ARM=vanilla,DO_MATH=0 onereplay/pbs/100_part3_if_onereplay.pbs
-#   qsub -v MODE=eval,ARM=vanilla,DO_IF=0 onereplay/pbs/100_part3_if_onereplay.pbs
+#   # 3) vanilla 臂（必须跑，是遗忘的标尺）。训练+新任务评测同作业，旧能力评测另开。
+#   qsub -v MODE=train,ARM=vanilla,DO_OLD=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
+#   qsub -v MODE=eval,ARM=vanilla,DO_IF=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #
 #   # 4) onereplay 臂（λ 用第 2 步选出来的）
-#   qsub -v MODE=train,ARM=onereplay,LAMBDA=7.5e-3,DO_MATH=0 onereplay/pbs/100_part3_if_onereplay.pbs
-#   qsub -v MODE=eval,ARM=onereplay,LAMBDA=7.5e-3,DO_IF=0 onereplay/pbs/100_part3_if_onereplay.pbs
+#   qsub -v MODE=train,ARM=onereplay,LAMBDA=7.5e-3,DO_OLD=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
+#   qsub -v MODE=eval,ARM=onereplay,LAMBDA=7.5e-3,DO_IF=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #
 #   # 4b) ewc 臂（λ 用第 2b 步选出来的；ARM=ewc 不接受默认 λ，不传会直接退出）
-#   qsub -v MODE=train,ARM=ewc,LAMBDA=1.2e7,DO_MATH=0 onereplay/pbs/100_part3_if_onereplay.pbs
-#   qsub -v MODE=eval,ARM=ewc,LAMBDA=1.2e7,DO_IF=0 onereplay/pbs/100_part3_if_onereplay.pbs
-#   # EWC 只有 autograd 路径，显存曲线和 onereplay 不同，正式跑之前单独冒烟一次
-#   qsub -v MODE=smoke,ARM=ewc,LAMBDA=1.2e7 onereplay/pbs/100_part3_if_onereplay.pbs
+#   qsub -v MODE=train,ARM=ewc,LAMBDA=1.2e7,DO_OLD=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
+#   qsub -v MODE=eval,ARM=ewc,LAMBDA=1.2e7,DO_IF=0,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
 #
-#   # 5) Stage 2 的起点（Model-Math）也要评一遍，它是所有对照的「before」那一行
-#   qsub -v MODE=eval,ARM=anchor onereplay/pbs/100_part3_if_onereplay.pbs
+#   # 5) Stage 2 的起点也要评一遍，它是所有对照的「before」那一行
+#   qsub -v MODE=eval,ARM=anchor,SOURCE=math onereplay/pbs/100_part3_if_onereplay.pbs
+#
+#   # 换来源：上面每一条把 SOURCE=math 换成 SOURCE=cs 即可，基座 / C / F / 旧能力评测
+#   # / 旧侧 system / 结果树会一起跟着换。
+#   qsub -v MODE=eval,ARM=anchor,SOURCE=cs onereplay/pbs/100_part3_if_onereplay.pbs
+#
+#   # 只评便宜的几个常识子集（SOURCE=cs 时先确认链路，HellaSwag 一个集占总量约 45%）
+#   #    引号是必须的：-v 用逗号分隔变量，不引起来 piqa 会被当成另一个变量名
+#   qsub -v MODE=eval,ARM=vanilla,DO_IF=0,SOURCE=cs,CS_EVAL_TASKS="boolq,piqa" \
+#     onereplay/pbs/100_part3_if_onereplay.pbs
 #
 #   # 便宜地把链路跑通
-#   qsub -v MODE=train,ARM=onereplay,MAX_TRAIN_SAMPLES=4000,EPOCHS=1,DO_EVAL=0 \
+#   qsub -v MODE=train,ARM=onereplay,MAX_TRAIN_SAMPLES=4000,EPOCHS=1,DO_EVAL=0,SOURCE=math \
 #     onereplay/pbs/100_part3_if_onereplay.pbs
 #
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
@@ -250,19 +374,26 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
 
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
-    MODEL_DIR MODEL_NAME MATH_LINE_ROOT MATH_CKPT_DIR MATH_LR MATH_RUN MATH_CKPT
-    IF_LINE_ROOT IF_DATASET RESULTS_ROOT CF_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
-    COV_PATH COV_SCOPE FISHER_PATH
-    MODE ARM DRY_RUN DO_TRAIN DO_EVAL DO_MATH DO_IF SEED FORCE_TRAIN FORCE_EVAL
+    MODEL_DIR MODEL_NAME SRC_LINE_ROOT SRC_CKPT_DIR SRC_LR SRC_RUN SRC_CKPT
+    # SOURCE 一转发，容器内的 case 会重新派生出其余来源相关的值，所以只有可被用户
+    # 覆盖的那几个（带 :- 的）需要跟着转发。
+    SOURCE SRC_RUN_PREFIX COV_BASENAME FISHER_BASENAME
+    IF_LINE_ROOT IF_DATASET RESULTS_ROOT DATASET_CACHE METRICS_DIR CKPT_DIR
+    CF_ROOT COV_PATH COV_SCOPE FISHER_PATH
+    MODE ARM DRY_RUN DO_TRAIN DO_EVAL DO_IF DO_OLD SEED FORCE_TRAIN FORCE_EVAL
+    ALLOW_CONFIG_DRIFT
     EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL TARGET_MODULES
+    LR_SCHEDULER WARMUP_RATIO STOP_ON_IM_END
+    SYSTEM_PROMPT SYSTEM_PROMPT_PRESET OLD_SYSTEM_PROMPT
     LAMBDA LAMBDA_GRID REG_IMPL REG_ONCE REG_ALLOW_TF32 NORMALIZE_BY_LAYERS
     LAMBDA_GRID_ONEREPLAY EWC_GRID_MULTIPLIERS
     PROBE_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY PROBE_LOG_EVERY
     PROBE_VANILLA PROBE_ARM
-    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS MATH_BATCH DIAG_LEN
     IFEVAL_INPUT MAX_NEW_TOKENS EVAL_BATCH
     FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
-    EVAL_LIMIT RUNS_TO_EVAL
+    GSM8K_DATA MATH500_DATA MATH_MAX_NEW_TOKENS MATH_BATCH
+    CS_EVAL_DIR CS_EVAL_TASKS CS_SCORING CS_MAX_NEW_TOKENS CS_BATCH CS_SCORE_BATCH
+    DIAG_LEN EVAL_LIMIT RUNS_TO_EVAL
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -308,90 +439,189 @@ python --version
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
 cd "${REPO_ROOT}"
-# ---- Stage 1 / Math 线（91 号）的产物：基座就在这里 ----
-# 本线的 W0 = Model-Math（**NuminaMath-CoT 50k** 训出来的，不是 OpenR1 那一版），
-# checkpoint 是 91 号 MODE=train 的产物。换数据集的理由见 96 号文件头：R1 traces 的
-# 答案中位 3767 token，1.7B 学到文体却收敛不了，MATH500 上过半响应循环到预算耗尽。
-MATH_LINE_ROOT="${MATH_LINE_ROOT:-${REPO_ROOT}/results_part1_numina_math}"
-MATH_CKPT_DIR="${MATH_CKPT_DIR:-${MATH_LINE_ROOT}/checkpoints}"
 
-# ---- IF 线（94 号）的产物：新任务的数据池就在这里，本脚本只读不重建 ----
-# 94 号 MODE=data 已经把 FLAN v2 摊平成 {instruction,input,output} 的 save_to_disk
-# （40/40/10/10 remix，50k 行）。本线**不重新建池**：换一遍就等于换了数据，Part 1 的
-# Model-IF-FLAN 分数也不再可比。
-IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_if_flanv2}"
-IF_DATASET="${IF_DATASET:-${IF_LINE_ROOT}/datasets/flan_v2_if_50k}"
+# ---- 原始 Base：evaluate.py 在 --adapter_path 为空时会加载它，本线只有它当占位 ----
+# 这两个要定义在下面所有结果树、数据池和 C/F 路径**之前** —— 它们都把 MODEL_NAME 拼进
+# 路径，而 set -u 下引用还没定义的变量是 unbound variable，脚本会当场退出，而 bash -n
+# 查不出这种前向引用。
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+# 全线模型，理由见 91 号同处。必须和 S1/S2 用的是同一个：W0 是 S1 的 checkpoint、
+# C/F 是在那个 checkpoint 上采的，模型对不上这条线整个没有意义。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 
-# ---- Part 3 自己的结果树 ----
-# 与 OpenR1 那轮分开（那轮在 results_part3_math2if）。**不能共用**：本线的 W0 换成了
-# Numina 版 Model-Math，checkpoint 目录名却完全相同（run 名里没有数据集），共用会让
-# MODE=train 看到旧 checkpoint 就"跳过训练"，或者 FORCE_TRAIN=1 就地覆盖掉旧产物；
-# 评测分数还会追加进同一个 <metric>_summary.csv，两轮混在一张表里且不报错。
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_part3_numina2if}"
+# ---- 旧能力来源：这条线唯一可换的东西（四样一起换，见文件头）----
+SOURCE="${SOURCE:-math}"
+case "${SOURCE}" in
+  math|cs) : ;;
+  *) echo "SOURCE=${SOURCE} 无效，可选 math / cs" >&2; exit 2 ;;
+esac
+ANCHOR_RUN="${SOURCE}_anchor"
+
+# 每个来源的四样东西一起派生。SRC_RUN_PREFIX 是 Stage 1 那条线的 run 名前缀，用来在
+# checkpoints/ 下 glob 出基座；它必须和 S1 脚本里的 RUN= 逐字对应，否则会找不到。
+#   91 号  RUN="part1_math_lr${LR}_seed${SEED}"
+#   93 号  RUN="part1_cs_lr${LR}_seed${SEED}"
+# C/F 的树名与文件名沿用 99 / 101 号的默认值（两者的 RESULTS_ROOT 都不带目标域：
+# C/F 只取决于 Stage 1 的模型和旧知识池，同一份给 <SOURCE>->if 和 <SOURCE>->math 共用）。
+case "${SOURCE}" in
+  math)
+    SRC_LINE_ROOT="${SRC_LINE_ROOT:-${REPO_ROOT}/results_part1_numina_${MODEL_NAME}}"
+    SRC_RUN_PREFIX="${SRC_RUN_PREFIX:-part1_math}"
+    CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_stage2_math_${MODEL_NAME}}"
+    COV_BASENAME="${COV_BASENAME:-cov_math_numina_20k}"
+    FISHER_BASENAME="${FISHER_BASENAME:-fisher_math_numina_20k}"
+    # 与 91 号的评测口径一致。生成 + 抽 \boxed{}，所以分数必须配着 hit-cap 读。
+    OLD_METRICS_ALL="gsm8k,math500"
+    OLD_LABEL="MATH"
+    ;;
+  cs)
+    SRC_LINE_ROOT="${SRC_LINE_ROOT:-${REPO_ROOT}/results_part1_cs_${MODEL_NAME}}"
+    SRC_RUN_PREFIX="${SRC_RUN_PREFIX:-part1_cs}"
+    CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_stage2_cs_${MODEL_NAME}}"
+    COV_BASENAME="${COV_BASENAME:-cov_cs_commonsense_20k}"
+    FISHER_BASENAME="${FISHER_BASENAME:-fisher_cs_commonsense_20k}"
+    # commonsense_qa 是 8 个 LLM-Adapters 测试集的准确率，Part 1 下结论用的就是它；
+    # 另一个 commonsense 指标是 Commonsense170k 池上的 held-out loss，不是同一回事。
+    OLD_METRICS_ALL="commonsense_qa"
+    OLD_LABEL="CS"
+    ;;
+esac
+SRC_CKPT_DIR="${SRC_CKPT_DIR:-${SRC_LINE_ROOT}/checkpoints}"
+
+# ---- 新任务数据池：94 号 IF_SOURCE=conifer 的产物，只读不重建 ----
+# 94 号 MODE=data 已经把 Conifer 摊平成 {instruction,input,output} 的 save_to_disk
+# （Easy-to-Hard 全 turn + Process Feedback，丢掉开头就拒答的行，实测约 38.9k 行）。
+# 本线**不重建池**：换一遍就等于换了数据，Part 1 的 Model-IF 分数不再可比，而且
+# prepare_conifer 的 --seed 一变就是另一批 turn。
+#
+# 路径里的 conifer 是 94 号的 IF_SOURCE_TAG，MODEL_NAME 是它的结果树分根方式 ——
+# 两者都要跟着 94 号，改了要一起改。
+IF_LINE_ROOT="${IF_LINE_ROOT:-${REPO_ROOT}/results_part1_conifer_${MODEL_NAME}}"
+IF_DATASET="${IF_DATASET:-${IF_LINE_ROOT}/datasets/conifer_if_full}"
+
+# ---- Stage 3 自己的结果树 ----
+# 带 SOURCE 和 MODEL_NAME 两层：evaluate 会把分数追加进 ${RESULTS_ROOT}/<metric>_summary.csv，
+# 而两个来源的 run 名完全相同（part3_if_vanilla_lr5e-5_seed1 之类），共用一棵树会让
+# MODE=train 看到另一个来源的 checkpoint 就「跳过训练」，评测分数还会混进同一个 csv。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_stage3_${SOURCE}2if_${MODEL_NAME}}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
-# ---- C_math / F_math 所在的采集树：99 号写在哪里，这里就读哪里 ----
-# 99 号的 RESULTS_ROOT 仍是 results_part3_math2if，它采的是**旧知识 math 侧**
-# （Model-Math + Numina 20k 池），和 Stage 2 的新任务无关，所以不跟着改名。
-# 99 号如果改了输出位置，这里传 CF_ROOT= 覆盖即可。
-CF_ROOT="${CF_ROOT:-${REPO_ROOT}/results_part3_math2if}"
-
-# ---- C_math：99 号的产物（在 Model-Math 上采的 NuminaMath 20k 二阶矩）----
-# 文件名带 numina：OpenR1 那版 C/F 就在同一棵树下，指到它就是拿另一个模型的
-# 二阶矩配本线的 W0，不报错但无法解释。
+# ---- C / F：99（math）或 101（cs）号的产物，采集树与结果树分开 ----
+#
+# **CF_ROOT 带 MODEL_NAME 是关键**：C/F 是在某个具体 checkpoint 上采的二阶统计量，
+# 读错模型的 C/F 不会报错、训练照样跑、罚项照样算出一个数，只是保护方向完全无意义。
+# 采集脚本那边也带 MODEL_NAME，所以两边一起换模型就自动对上。CF_ROOT 和两个 BASENAME
+# 都在上面按 SOURCE 派生了，这里只拼 scope。
+#
+# scope 对 C 和 F 是同一个变量：两者必须覆盖同一批层，否则 onereplay 和 ewc 两条臂
+# 保护的参数集不同，比出来的不是正则方式的差别。
 COV_SCOPE="${COV_SCOPE:-full}"
-COV_PATH="${COV_PATH:-${CF_ROOT}/cov/cov_math_numina_20k_${COV_SCOPE}.pt}"
-# ---- F_math：99 号的产物（ewc 臂用）。scope 跟 C 同一个变量，两者必须同 scope ----
-FISHER_PATH="${FISHER_PATH:-${CF_ROOT}/fisher/fisher_math_numina_20k_${COV_SCOPE}.pt}"
-
-# ---- 原始 Base：evaluate.py 在 --adapter_path 为空时会加载它，本线只有它当占位 ----
-MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-1.7B-Base}"
+COV_PATH="${COV_PATH:-${CF_ROOT}/cov/${COV_BASENAME}_${COV_SCOPE}.pt}"
+FISHER_PATH="${FISHER_PATH:-${CF_ROOT}/fisher/${FISHER_BASENAME}_${COV_SCOPE}.pt}"
 
 # ---- 模式与臂 ----
 MODE="${MODE:-train}"
 # vanilla   无保护，遗忘的标尺（必须跑）
-# onereplay C_math 保护
-# ewc       F_math 保护（onereplay 的正则对照臂）
-# anchor    不训练，只评 Stage 2 的起点 Model-Math（所有对照的 before 那一行）
+# onereplay C 保护
+# ewc       F 保护（onereplay 的正则对照臂）
+# anchor    不训练，只评 Stage 2 的起点（所有对照的 before 那一行）
 ARM="${ARM:-onereplay}"
 DRY_RUN="${DRY_RUN:-0}"
 DO_TRAIN="${DO_TRAIN:-1}"
 DO_EVAL="${DO_EVAL:-1}"
-# 评测拆两半：数学保留侧 4096 token 预算解码仍不便宜（1819 道题），IF 新任务侧
-# 两个数据集加起来也不便宜，一个 24h 作业装不下 训练 + 两半评测。默认都开，靠这两个
-# 开关拆到不同作业。注意本线里 DO_MATH 评的是**旧能力保留**、DO_IF 评的是**新任务**。
-DO_MATH="${DO_MATH:-1}"
+# 评测拆两半：新任务侧两个 IF 数据集 3-4h，旧能力侧 math 约 0.8h / cs 约 1-1.5h，
+# 一个 24h 作业装不下 训练 + 两半评测。默认都开，靠这两个开关拆到不同作业。
+# 注意本线里 DO_IF 评的是**新任务**、DO_OLD 评的是**旧能力保留**。
 DO_IF="${DO_IF:-1}"
+DO_OLD="${DO_OLD:-1}"
 SEED="${SEED:-1}"
+# 1 = 允许本次的 batch/accum/lr 和同一棵结果树下已训完的臂不一致（只警告不拦）。
+# 默认 0，理由见下面的配置闸门。
+ALLOW_CONFIG_DRIFT="${ALLOW_CONFIG_DRIFT:-0}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 
-# ---- 训练超参：与 94 号逐字对齐，改任何一个都会让 Part 1 的对照失效 ----
-# 本线的新任务是 FLANv2（短答案，P50 约 18 token），不是 91 号那种 4096 数学 CoT，所以
-# 这些值来自 94 号而不是 91 号。BATCH=8 / ACCUM=64：一次更新 64 行，激活上界
-# 8 x 1536 = 12288 token/micro-batch。94 号实测这套配置下 FLAN 池（80% 短 zero-shot 行）
-# 远低于吞吐饱和点，BATCH=8 基本是免费的。
-BATCH="${BATCH:-8}"
+# ---- 训练超参：与 94 号逐字对齐，改任何一个都会让 Stage 1 的对照失效 ----
+#
+# 【BATCH 由最吃显存的 ewc 臂决定，这一条不能按臂调】
+# 完整的显存账见文件头同名一节。要点：最紧的是 ewc 而不是 onereplay（EWC 只有
+# autograd 路径，所有覆盖层的 fp32 ΔW 活到 backward 返回），估算是
+#   BATCH=2  vanilla ~64.5 / ewc ~98.9 / onereplay ~93.5 GiB
+#   BATCH=4  vanilla ~96.7 / ewc ~131.1 / onereplay ~125.7 GiB  <- ewc 只剩 9 GiB
+# 于是默认 2。**这是估算（激活系数误差 ±15%）**，要提到 4 必须先
+#   qsub -v MODE=smoke,ARM=ewc,BATCH=4,LAMBDA=<probe 给的值> onereplay/pbs/100_....pbs
+# 拿 vanilla 探等于没探，那 96.7 GiB 永远过。
+#
+# BATCH 不必等于 94 号的 4：要对齐的是三臂彼此。ACCUM=64 让「一次更新 64 行」与
+# Stage 1 相同，accumulation_steps 从 16 变 32，梯度在数学上等价。
+BATCH="${BATCH:-2}"
 ACCUM="${ACCUM:-64}"
-# 1536：与 94 号同值。FLAN 的 few-shot 结构是「示例1 示例2 … 真问题」，左截断只退化成
-# 更少 shot 的同一道题（截断率 zs 约 0.3-0.6% / fs 约 1.4-1.9%），是良性的。
-MAXLEN="${MAXLEN:-1536}"
-# 3 epoch：与 94 号现在的默认一致（它已从 1 epoch 改成 3 并重训过）。这样
-# Model-Math-IF 和 Part 1 的 Model-IF-FLAN 是同样的新任务预算，IF 分可以并排读。
-# 94 号改了而这里不改的话，「Stage 2 学到多少 IF」就混进了预算差异。
-EPOCHS="${EPOCHS:-3}"
-# **各臂必须同 LR**，这是比较的前提。LR 写进 run 名，train 和 eval 要传同一个值。
+# 2048：与 94 号同值。Conifer 全 38.9k 行在 1024 预算下就零截断（答案 token P50=183 /
+# P90=310 / max=690，见 94 号的截断表），2048 下截断率是 0。
+# 这个值不能随便降：tokenizer_to_ids 的截断是 full_input_ids[-max_length:]（保尾丢头），
+# 而 Conifer 把约束写在 user turn 的**开头**，截断会静默切掉约束本身，训出来就是
+# 「对一个没有约束的问题给出看起来受约束的答案」。
+MAXLEN="${MAXLEN:-2048}"
+# 1 epoch，与 94 号当前默认一致（三条 Stage 1 线统一 100k 行 / 1 epoch；Conifer 全量
+# 只有 38.9k 行，它没有更多了）。这样 Model-<SOURCE>-IF 和 Part 1 的 Model-IF 吃的是
+# 同样的新任务预算，IF 分可以并排读。
+EPOCHS="${EPOCHS:-1}"
+# **各臂必须同 LR**，这是比较的前提。5e-5 是三条 Stage 1 线统一的配方值（94 号同值）。
+# LR 写进 run 名，train 和 eval 要传同一个值。
 LR="${LR:-5e-5}"
+# cosine + warmup 0.1，与 91/93/94 号统一。这一项之前**整个 Stage 3 都漏了**，而
+# train.py 在没有 --lr_scheduler 时是裸 Adam 常数 LR —— 三臂之间仍然自洽（都是常数），
+# 但新任务的学习曲线和 Stage 1 那条线不是一个配方，"这批数据能教会这个能力"的结论
+# 就接不到这里。94 号的原话：warmup 不是可选项。
+#
+# 它同时也是 λ 的前提：λ·R 与 task_loss 的比值随 LR 曲线变，用常数 LR 标出来的 λ
+# 搬到 cosine 上未必还落在 1%~10% 区间。所以改这一项之后 lambda_probe 要重跑。
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 VAL_FRAC="${VAL_FRAC:-0.01}"
 MAXVAL="${MAXVAL:-500}"
 # 全量微调下 --target_modules 不决定哪些参数训练（全都训），只在 LoRA 路径有用。
 # 罚项的覆盖范围由 **C 文件的键** 决定，不由这个参数决定。保持与 94 号一致便于对照。
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+
+# ---- system 消息：**两侧不同，各自对齐 Stage 1，不能共用一个** ----
+# 完整论证见文件头同名一节。这里只记结论和出处：
+#
+#   新任务侧（训练渲染 + ifeval/followbench）= 94 号的值，一条中性助手消息。
+#     训练渲染必须用它：新任务就是 Conifer，而 94 号就是在这条 system 下训的。
+#     刻意不用 Qwen2.5-Instruct 官方那条（含两个逗号，而 qsub -v 用逗号分隔变量，
+#     想在提交时覆盖会被 PBS 切成几个变量名）。
+#   旧能力侧 = 它在 Stage 1 时的那个值：
+#     SOURCE=math -> 91 号的 boxed 指令。math500 的答案提取靠 \boxed{}，Numina 的
+#                    训练答案又自带 \boxed{}，用中性那条会让分数虚低 —— 而那不是遗忘。
+#     SOURCE=cs   -> 93 号的中性助手消息，与 94 号逐字相同。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant.}"
+
+# preset 逻辑与 91 / 99 / 96 号逐字相同，只是这条线上它填的是**旧能力侧**的变量：
+# Qwen2.5-Math 留空（它的模板自己注入那条指令），其他模型补齐。四个脚本必须一起改。
+SYSTEM_PROMPT_PRESET="${SYSTEM_PROMPT_PRESET:-auto}"
+if [[ "${SOURCE}" == "math" ]]; then
+  if [[ -z "${OLD_SYSTEM_PROMPT:-}" ]]; then
+    case "${SYSTEM_PROMPT_PRESET}" in
+      none) ;;
+      math) OLD_SYSTEM_PROMPT="Please reason step by step, and put your final answer within \\boxed{}." ;;
+      auto)
+        if [[ "${MODEL_NAME}" != *Math* ]]; then
+          OLD_SYSTEM_PROMPT="Please reason step by step, and put your final answer within \\boxed{}."
+        fi
+        ;;
+      *) echo "SYSTEM_PROMPT_PRESET 只能是 auto / math / none，得到 '${SYSTEM_PROMPT_PRESET}'" >&2; exit 2 ;;
+    esac
+  fi
+  OLD_SYSTEM_PROMPT="${OLD_SYSTEM_PROMPT:-}"
+else
+  # 93 号的值。改它要连 93 号一起改，否则旧能力保留分没有可比的 before。
+  OLD_SYSTEM_PROMPT="${OLD_SYSTEM_PROMPT:-You are a helpful assistant.}"
+fi
 LOG_EVERY="${LOG_EVERY:-500}"
 
 # ---- 正则 ----
@@ -407,19 +637,19 @@ LAMBDA_GRID="${LAMBDA_GRID:-}"
 LAMBDA_GRID_ONEREPLAY="${LAMBDA_GRID_ONEREPLAY:-1e-3 7.5e-3 5e-2}"
 # ewc 的 grid 围绕 1/mean(F) 取几档（十倍一档）。乘数写在这里，中心值现算。
 EWC_GRID_MULTIPLIERS="${EWC_GRID_MULTIPLIERS:-0.1 1 10}"
-# analytic 是本线的必需项，理由见文件头（autograd 会多留 6.41 GiB 的 fp32 W0 副本）。
+# analytic 是本线的必需项，理由见文件头（autograd 会多留整份 fp32 W0 副本）。
 REG_IMPL="${REG_IMPL:-analytic}"
 REG_ONCE="${REG_ONCE:-1}"
 REG_ALLOW_TF32="${REG_ALLOW_TF32:-1}"
 NORMALIZE_BY_LAYERS="${NORMALIZE_BY_LAYERS:-1}"
-# λ probe：数的是 micro-batch，更新次数 = PROBE_MAX_STEPS / (ACCUM/BATCH) = /64。
-# 1280 步 = 20 次更新。probe 只要看 λ·R 与 task_loss 的**量级比**，20 次更新够了
+# λ probe：数的是 micro-batch，更新次数 = PROBE_MAX_STEPS / (ACCUM/BATCH) = /32。
+# 640 步 = 20 次更新。probe 只要看 λ·R 与 task_loss 的**量级比**，20 次更新够了
 # （R 在前几次更新里就从 0 长到稳定量级）；它不是 LR sweep，不需要比末值。
-PROBE_MAX_STEPS="${PROBE_MAX_STEPS:-1280}"
-PROBE_LOG_EVERY="${PROBE_LOG_EVERY:-64}"
+PROBE_MAX_STEPS="${PROBE_MAX_STEPS:-640}"
+PROBE_LOG_EVERY="${PROBE_LOG_EVERY:-32}"
 # probe 里那条 λ=0 的短跑。它**不是** calibrate_lambda 要的地板（那个必须是完整
 # EPOCHS 的 vanilla run），只是让你在同样 20 次更新下看到「罚项把 task_loss 推高了
-# 多少」。选 λ 靠的 λ·R/task_loss 比值只用到 onereplay 臂自己的两个数，所以已经
+# 多少」。选 λ 靠的 λ·R/task_loss 比值只用到 protected 臂自己的两个数，所以已经
 # 单独交了完整 vanilla 的话，这条可以关掉，省 1/4 的 probe 时间。
 PROBE_VANILLA="${PROBE_VANILLA:-1}"
 # MODE=lambda_probe 扫哪条臂。两条臂的 λ 各有自己的尺子（C 是激活二阶矩、F 是梯度
@@ -427,54 +657,79 @@ PROBE_VANILLA="${PROBE_VANILLA:-1}"
 PROBE_ARM="${PROBE_ARM:-onereplay}"
 SMOKE_STEPS="${SMOKE_STEPS:-70}"
 
-# ---- 评测：数学=保留侧与 91 号同预算，IF=新任务侧与 94 号同预算 ----
-GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
-MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
-# 4096：本线的保留目标是 Model-Math 的数学能力，而它是 NuminaMath-CoT 训出来的
-# （训练答案 P50=351 / P90=778 / max=2666），正常收尾的响应离 4096 还差一个数量级。
-# 8192 是 OpenR1 时代的遗留（R1 traces 答案 P50=3767），而 91 号实测把 cap 提到 8192
-# **并没有改善 MATH-500** —— 撞上限的行是陷在重复循环里的，任何 cap 都填得满。
-# 改这个值必须整张结果表一起重评，不能和旧数字混用。
-MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
-# batch 给大值的理由不是显存而是 generate 的退出条件：GSM8K 有 12.2% 的响应不吐 EOS，
-# 而 generate 整批等最慢的一行，所以几乎每批都跑满 cap，墙钟正比于**批数**。decode
-# 是权重带宽瓶颈，批大 4 倍单步几乎不变贵，批数却少 4 倍。
-#
-# KV cache 112 KiB/token（28 层 / 8 个 KV head / head_dim 128 / bf16），cap=4096 下
-# 一条序列 prompt+4096 约 4600 token = 0.49 GiB（8192 那档是 0.93 GiB，正好一半）。
-# 批数不是 1819/B，两个指标各自分桶，= ceil(1319/B) + ceil(500/B)：
-#
-#   B=64  -> 29 批 / 峰值 37.7 GiB (140GiB 的 27%) / 1.5 h
-#   B=96  -> 20 批 / 峰值 54.1 GiB (39%)          / 1.05 h
-#   B=128 -> 15 批 / 峰值 70.3 GiB (50%)          / 0.8 h   <- 默认
-#   B=192 -> 11 批 / 峰值 103 GiB  (74%)          / 0.6 h
-#
-# 取 128：cap 减半之后它只占 50%（8192 时代 128 要占 92%，所以那时默认是 96）。
-# 再往上 192 只多省 12 min 却推到 74%，不值。**所有臂必须同值重评**，所以这个值要在
-# 跑第一个 run 之前定死，中途换会让贪心输出漂移、整张表不可比。80GB 卡上传 64。
-# evaluate 每个指标跑完会打一行 peak GPU memory，按实测值再定。
-# 完整算术见 91 号同名变量。
-MATH_BATCH="${MATH_BATCH:-128}"
-# 评测末尾打长度/截断诊断。这条线**尤其必须**看它，而且方向和 96 号相反：
-# 保留目标是 math（Numina CoT，答案 P50 约 351 token），新任务 FLAN 的答案 P50 只有约
-# 18 token，所以 vanilla 微调会把输出**压短**，而 C_math/F_math 把权重拉回 Model-Math、
-# 倾向于**保住数学文体**。后果：删失（hit-cap）随输出长度变，各臂输出长度又不同 ——
-# vanilla 可能因为输出塌成短答案、走不到 \boxed{} 而数学分虚低（看着像"忘光了"），也可能
-# 因为变短反而逃出 4096 截断而虚高。无论哪种，数学分之间只有配着 hit-cap 一起读才有
-# 可比性。Part 3 那轮实测过这个陷阱：三条臂 acc_all 差到 0.098/0.144/0.456，但在都吐出
-# \boxed 的公共子集上是 0.345/0.318/0.664 —— 差距大半来自格式和截断。见 91 号文件头。
-DIAG_LEN="${DIAG_LEN:-1}"
+# ---- 评测 / 新任务侧（IF）：与 94 号同预算 ----
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+# 1024，与 94 号同值。**理由不是窗口**：Qwen3 的 max_position_embeddings 是 32768
+# （本地 Qwen3-1.7B-Base 的 config.json 实测），FollowBench example 类那个 prompt
+# P90=2516 加 2048 的生成预算离窗口还差一个量级。91/93/94 里"上下文硬上限 4096"讲的
+# 是 **Qwen2.5-Math-1.5B**，换到 Qwen3 之后那条约束已经不存在。
+# 取 1024 的真实理由是和 94 号并排读：生成预算变了，IFEval 的严格分和 FollowBench 的
+# CSL/SSR 都会变，减出来的"遗忘量"会混进预算差。
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 EVAL_BATCH="${EVAL_BATCH:-32}"
 FB_DATA="${FB_DATA:-}"
 FB_CATEGORIES="${FB_CATEGORIES:-}"
-FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-2048}"
+# 1024，与 94 号同值（同上，是可比性而非窗口）。改它必须整张结果表一起重评。
+FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-1024}"
 # 不回落到 EVAL_BATCH：example 类的 prompt P90=2516 / max=5019 token，KV 不是一个量级。
 FB_BATCH="${FB_BATCH:-16}"
 # FollowBench 不读全局 --limit（metric 只认 group_limit），截它只能用这个，而且按**组**。
 FB_GROUP_LIMIT="${FB_GROUP_LIMIT:-0}"
+
+# ---- 评测 / 旧能力侧：math 那一组（SOURCE=math 时才用）----
+GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
+MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
+# 2048，与 91 号当前值一致（96 号同值）。Numina 的训练答案 P50=351 / P90=778 /
+# max=2666，正常收尾的响应离 2048 还有余量。8192 是 OpenR1 时代的遗留，而 91 号实测把
+# cap 从 4096 提到 8192 **并没有改善 MATH-500** —— 撞上限的行是陷在重复循环里的，任何
+# cap 都填得满。改这个值必须整张结果表一起重评，不能和旧数字混用。
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-2048}"
+# batch 给大值的理由不是显存而是 generate 的退出条件：GSM8K 有 12.2% 的响应不吐 EOS，
+# 而 generate 整批等最慢的一行，所以几乎每批都跑满 cap，墙钟正比于**批数**。decode
+# 是权重带宽瓶颈，批大 4 倍单步几乎不变贵，批数却少 4 倍。批数不是 1819/B，两个指标
+# 各自分桶，= ceil(1319/B) + ceil(500/B)：B=128 -> 15 批 / 峰值约 70 GiB (140 的 50%)
+# / 0.8 h，再往上 192 只多省 12 min 却推到 74%，不值。完整算术见 91 号同名变量。
+# **所有臂必须同值重评**，所以这个值要在跑第一个 run 之前定死。80GB 卡上传 64。
+MATH_BATCH="${MATH_BATCH:-128}"
+
+# ---- 评测 / 旧能力侧：cs 那一组（SOURCE=cs 时才用）----
+# 八个 LLM-Adapters 测试集，布局 <dir>/<task>/test.json。93 号文件头有 clone + cp 两行。
+CS_EVAL_DIR="${CS_EVAL_DIR:-${REPO_ROOT}/datasets/commonsense_eval}"
+# 空 = 跑全部八个（boolq piqa social_i_qa hellaswag winogrande ARC-Easy ARC-Challenge
+# openbookqa，约 22.4k 行）。HellaSwag 一个集 10042 行、占约 45%，想先便宜地过链路就
+# 显式列几个。**正式结果必须是八个全跑**：AVERAGE 是宏平均，少一个集就换了指标定义。
+CS_EVAL_TASKS="${CS_EVAL_TASKS:-}"
+# both = logprob + gen 两路都算，一次模型加载共用。两路各回答一个问题，缺一不可：
+#   logprob  闭集排序，主口径，不受输出长度漂移影响（文件头有论证）
+#   gen      还会不会按训练格式作答；它的 accuracy 只能和 parse_rate 一起读
+# 只在赶时间时传 logprob——但那样就拿不到「格式保留」那一半，而本线恰好最该看它
+# （Conifer 把输出从 7-8 个 token 推到 144 词）。
+CS_SCORING="${CS_SCORING:-both}"
+# 答案只有 7-8 个 token，32 足够收尾（与 93 号同值）。**不要为了看长输出把它调大**：
+# 各臂必须同值，改了就得所有臂一起重评。诊断段会打 hit-cap，真撞上限再说。
+CS_MAX_NEW_TOKENS="${CS_MAX_NEW_TOKENS:-32}"
+CS_BATCH="${CS_BATCH:-32}"
+# logprob 那一路的瓶颈和解码不同：它要 materialize 一个 [batch, seq, 151936] 的 logit
+# 张量、且完全不复用 KV cache，所以单独一个更小的默认值（与 93 号同值）。
+CS_SCORE_BATCH="${CS_SCORE_BATCH:-8}"
+
+# 评测末尾打旧能力侧的诊断。两个来源查的不是同一件事（见文件头 SOURCE 一节）：
+#   SOURCE=math  长度/截断。删失是长度相关的，而 Conifer 把输出推长推杂 —— 更多行撞
+#                cap、走不到 \boxed{} 就记 0 分，会被误读成「数学忘光了」。
+#   SOURCE=cs    格式/塌缩。parse_rate、logprob 与 gen 的一致率、预测众数占比，用来
+#                分辨「忘了常识」「忘了格式」「塌成猜一个词」三件事。
+DIAG_LEN="${DIAG_LEN:-1}"
 EVAL_LIMIT="${EVAL_LIMIT:-0}"
+
+# ---- 解码停止条件：**这一项之前整个 Stage 3 都漏了** ----
+# chat template 以 <|im_end|> 收尾，但 evaluate.py 的 --decode_stop_on_im_end 默认是
+# 0，于是模型吐出 <|im_end|> 之后 generate 不停，继续写下一轮对话；skip_special_tokens
+# 再把那段续写拼在答案后面。后果不只是"和 91/93/94 不可比"，而是判分本身错了：
+# IFEval 的"不要用逗号"、"回答分三段"这类约束会被续写的内容违反，FollowBench 的判分
+# 器也会把续写算进去。这条线的新任务就是 IF，受影响最直接。
+#
+# 93 号的原话：一个表里的所有 arm 必须同值。所以它不按臂区分，也不该改。
+STOP_ON_IM_END="${STOP_ON_IM_END:-1}"
 
 mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${DATASET_CACHE}" "${RESULTS_ROOT}/map_cache"
 
@@ -483,42 +738,45 @@ mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${DATASET_CACHE}" "${RESULTS_ROOT}/map_
 # ===========================================================================
 echo "==== Step 0: 前置检查 ===="
 
-# ---- 解析 Stage 1 checkpoint（与 99 号同一套逻辑，必须选到同一个模型）----
-if [[ -z "${MATH_CKPT:-}" ]]; then
-  if [[ -n "${MATH_LR:-}" ]]; then
-    MATH_RUN="${MATH_RUN:-part1_math_lr${MATH_LR}_seed${SEED}}"
-    MATH_CKPT="${MATH_CKPT_DIR}/${MATH_RUN}"
+# ---- 解析 Stage 1 checkpoint（与 99 / 101 号同一套逻辑，必须选到同一个模型）----
+if [[ -z "${SRC_CKPT:-}" ]]; then
+  if [[ -n "${SRC_LR:-}" ]]; then
+    SRC_RUN="${SRC_RUN:-${SRC_RUN_PREFIX}_lr${SRC_LR}_seed${SEED}}"
+    SRC_CKPT="${SRC_CKPT_DIR}/${SRC_RUN}"
   else
     mapfile -t _CANDS < <(
-      find "${MATH_CKPT_DIR}" -maxdepth 1 -mindepth 1 -type d \
-        -name "part1_math_lr*_seed${SEED}" 2>/dev/null | sort
+      find "${SRC_CKPT_DIR}" -maxdepth 1 -mindepth 1 -type d \
+        -name "${SRC_RUN_PREFIX}_lr*_seed${SEED}" 2>/dev/null | sort
     )
     if (( ${#_CANDS[@]} == 0 )); then
-      echo "在 ${MATH_CKPT_DIR} 下找不到 part1_math_lr*_seed${SEED}"
-      echo "先跑 91 号 MODE=train，或传 MATH_CKPT=/abs/path"
+      echo "在 ${SRC_CKPT_DIR} 下找不到 ${SRC_RUN_PREFIX}_lr*_seed${SEED}"
+      echo "先跑 Stage 1（SOURCE=math -> 91 号 / SOURCE=cs -> 93 号）MODE=train，"
+      echo "或传 SRC_CKPT=/abs/path"
       exit 1
     fi
     if (( ${#_CANDS[@]} > 1 )); then
       echo "命中多个 Stage 1 checkpoint，必须显式选一个（它是基座也是 W0）:"
       for _c in "${_CANDS[@]}"; do echo "  ${_c}"; done
-      echo "传 MATH_LR=<lr> 或 MATH_CKPT=<绝对路径>；**必须与 99 号采 C 时选的那个一致**"
+      echo "传 SRC_LR=<lr> 或 SRC_CKPT=<绝对路径>；"
+      echo "**必须与 Stage 2（99 / 101 号）采 C/F 时选的那个一致**"
       exit 1
     fi
-    MATH_CKPT="${_CANDS[0]}"
-    MATH_RUN="$(basename "${MATH_CKPT}")"
+    SRC_CKPT="${_CANDS[0]}"
+    SRC_RUN="$(basename "${SRC_CKPT}")"
   fi
 fi
-MATH_RUN="${MATH_RUN:-$(basename "${MATH_CKPT}")}"
-[[ -d "${MATH_CKPT}" ]] || { echo "缺 Stage 1 checkpoint（基座）: ${MATH_CKPT}"; exit 1; }
-[[ -f "${MATH_CKPT}/config.json" ]] || { echo "${MATH_CKPT} 不是可加载的模型目录"; exit 1; }
+SRC_RUN="${SRC_RUN:-$(basename "${SRC_CKPT}")}"
+[[ -d "${SRC_CKPT}" ]] || { echo "缺 Stage 1 checkpoint（基座）: ${SRC_CKPT}"; exit 1; }
+[[ -f "${SRC_CKPT}/config.json" ]] || { echo "${SRC_CKPT} 不是可加载的模型目录"; exit 1; }
 
 # ---- run 名 ----
-# λ 进名字，所以换 λ 不会覆盖；ARM 进名字，所以两条臂不会互相覆盖。
+# λ 进名字，所以换 λ 不会覆盖；ARM 进名字，所以各臂不会互相覆盖。
+# SOURCE 不进 run 名而是进 RESULTS_ROOT，与 96 号同一个约定。
 case "${ARM}" in
   vanilla)   RUN="part3_if_vanilla_lr${LR}_seed${SEED}" ;;
   onereplay) RUN="part3_if_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
   ewc)       RUN="part3_if_ewc_lr${LR}_lam${LAMBDA}_seed${SEED}" ;;
-  anchor)    RUN="math_anchor" ;;
+  anchor)    RUN="${ANCHOR_RUN}" ;;
   *) echo "未知 ARM=${ARM}，可选 vanilla / onereplay / ewc / anchor"; exit 1 ;;
 esac
 
@@ -527,19 +785,46 @@ esac
 if [[ "${ARM}" == "ewc" && "${MODE}" != "eval" && "${LAMBDA_WAS_SET}" != "1" ]]; then
   echo "!! ARM=ewc 必须显式传 LAMBDA。"
   echo "   onereplay 的默认值 7.5e-3 是 C 那把尺子上的数，F 是梯度平方，量级完全不同。"
-  echo "   先跑: qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0 ${SELF_PATH}"
+  echo "   先跑: qsub -v MODE=lambda_probe,PROBE_ARM=ewc,PROBE_VANILLA=0,SOURCE=${SOURCE} ${SELF_PATH}"
   echo "   它会读 ${FISHER_PATH} 的 mean(F)，围绕 1/mean(F) 现算 grid 并打印比值表。"
   exit 1
 fi
 CKPT="${CKPT_DIR}/${RUN}"
 
-# ---- 数据池 / 评测集 / C ----
+# ---- 数据池 ----
 if [[ "${ARM}" != "anchor" && "${MODE}" != "eval" ]]; then
   [[ -d "${IF_DATASET}" ]] || {
-    echo "缺 FLAN 池: ${IF_DATASET}"
-    echo "它是 94 号 MODE=data 的产物。本线不重建池（换池就换了数据）。"
+    echo "缺 Conifer 池: ${IF_DATASET}"
+    echo "它是 94 号 qsub -v MODE=data,IF_SOURCE=conifer 的产物。"
+    echo "本线不重建池：换池就换了数据，Part 1 的 Model-IF 分数不再可比。"
     exit 1
   }
+fi
+
+# ---- 旧能力评测集在**训练之前**查 ----
+# 它是本线的主指标，而且不随仓库走（math 那两个 jsonl / LLM-Adapters 的八个 test.json）。
+# 放到 eval 那一步才发现缺，意味着先白烧掉一轮训练。所以这里提前拦；只在这次真的会
+# 评测旧能力时查。
+if [[ "${DO_OLD}" == "1" && ( "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ) ]]; then
+  if [[ "${SOURCE}" == "cs" && ! -d "${CS_EVAL_DIR}" ]]; then
+    echo "!! 缺常识评测数据目录: ${CS_EVAL_DIR}"
+    echo "   它是 SOURCE=cs 时的主指标（旧能力保留）。在有网节点上准备："
+    echo "     git clone --depth 1 https://github.com/AGI-Edgerunners/LLM-Adapters"
+    echo "     cp -r LLM-Adapters/dataset ${CS_EVAL_DIR}"
+    echo "   布局 <dir>/<task>/test.json，八个子目录约 10MB。"
+    echo "   只想训练、评测另开的话传 DO_EVAL=0（或 MODE=train,DO_OLD=0）。"
+    exit 1
+  fi
+  if [[ "${SOURCE}" == "math" && ! -f "${GSM8K_DATA}" && ! -f "${MATH500_DATA}" ]]; then
+    echo "!! 两个数学评测集都不在: ${GSM8K_DATA} / ${MATH500_DATA}"
+    echo "   它们是 SOURCE=math 时的主指标（旧能力保留），91 号读的也是这两个文件。"
+    echo "   只想训练、评测另开的话传 DO_EVAL=0（或 MODE=train,DO_OLD=0）。"
+    exit 1
+  fi
+  if [[ "${DO_IF}" == "1" && ! -f "${IFEVAL_INPUT}" ]]; then
+    echo "注意：找不到 IFEval 输入 ${IFEVAL_INPUT}，新任务侧只会评 FollowBench。"
+    echo "   它本来随仓库自带（third_party/instruction_following_eval/data/），先查路径。"
+  fi
 fi
 
 # ---- 这次到底要用哪个矩阵 ----
@@ -563,36 +848,39 @@ fi
 
 if (( NEEDS_COV )); then
   [[ -f "${COV_PATH}" ]] || {
-    echo "缺 C_math: ${COV_PATH}（先跑 99 号）"
+    echo "缺 C_${SOURCE}: ${COV_PATH}"
+    echo "（SOURCE=math -> 先跑 99 号 / SOURCE=cs -> 先跑 101 号）"
     exit 1
   }
   # C 必须是在**本作业的基座**上采的。metadata 里的 model_name 是 collect_cov 的
-  # --model_name，99 号传的就是 MATH_RUN，所以两边应当逐字相等。
-  # 这条检查挡的是最贵的错误：拿 Base 上采的 C 配 Model-Math 的 W0。
-  python - "${COV_PATH}" "${MATH_RUN}" "${MAXLEN}" <<'PY'
+  # --model_name，99 / 101 号传的就是 Stage 1 的 run 名，所以两边应当逐字相等。
+  # 这条检查挡的是最贵的错误：拿 Base 上采的 C 配 Stage 1 模型的 W0。
+  python - "${COV_PATH}" "${SRC_RUN}" "${MAXLEN}" "${SOURCE}" <<'PY'
 import sys
 
 import torch
 
-cov_path, want_model, new_task_max_len = sys.argv[1], sys.argv[2], int(sys.argv[3])
+cov_path, want_model, new_task_max_len, source = sys.argv[1:5]
+new_task_max_len = int(new_task_max_len)
 payload = torch.load(cov_path, map_location="cpu")
 meta = payload.get("metadata", {})
 covariances = payload["covariances"]
 
 got_model = str(meta.get("model_name", ""))
 cov_max_len = meta.get("max_len")
-print("C_math 的 metadata:")
+print(f"C_{source} 的 metadata:")
 print(f"  model_name       = {got_model}")
 print(f"  pool_rows        = {meta.get('pool_rows')}")
 print(f"  pool_fingerprint = {meta.get('pool_fingerprint')}")
 print(f"  target_modules   = {','.join(meta.get('target_modules', []))}")
 print(f"  层数             = {len(covariances)}")
 # 这两个 max_len **本来就不该相等**，写出来免得后面有人当 bug 修。
-# C 是旧知识（Numina CoT）的隐状态二阶矩，99 号在 4096 下采的；新任务（FLAN 短答案）
-# 在 1536 下训练。罚项只经过 ΔW 与 C 相乘，两边的序列长度不需要一致，需要一致的是
-# **模型**（上面那条检查）。方向和 96 号正好相反（那边是 C@1536 / 新任务@4096）。
-print(f"  max_len          = {cov_max_len}  (采 C 时旧知识池的预算, 应为 4096)")
-print(f"  新任务 max_len   = {new_task_max_len}  (本作业训练的预算, 应为 1536；两者不必相等)")
+# C 是旧知识的隐状态二阶矩，用的是旧任务的预算（math 侧 2048 / cs 侧 512）；新任务
+# Conifer 在 2048 下训练。罚项只经过 ΔW 与 C 相乘，两边的序列长度不需要一致，需要
+# 一致的是**模型**（下面那条检查）。
+expect = 2048 if source == "math" else 512
+print(f"  max_len          = {cov_max_len}  (采 C 时旧知识池的预算, 应为 {expect})")
+print(f"  新任务 max_len   = {new_task_max_len}  (本作业训练的预算；两者不必相等)")
 
 if got_model != want_model:
     raise SystemExit(
@@ -600,7 +888,7 @@ if got_model != want_model:
         "罚项是 tr(ΔW C ΔWᵀ) 且 ΔW = W - W0，W0 就是基座权重，所以 C 必须和基座\n"
         "同一个模型。不一致的话隐状态分布对不上，保护会变弱且无法解释 —— 而且\n"
         "不会报错、loss 曲线也正常。\n"
-        "要么重跑 99 号采对应的 C，要么把 MATH_LR/MATH_CKPT 指到 C 对应的那个 checkpoint。"
+        "要么重跑 Stage 2 采对应的 C，要么把 SRC_LR/SRC_CKPT 指到 C 对应的那个 checkpoint。"
     )
 print("\nC 与基座是同一个模型：ok")
 print(f"C 常驻显存 = {sum(m.numel() for m in covariances.values()) * 4 / 1024 ** 3:.2f} GiB "
@@ -610,19 +898,20 @@ fi
 
 if (( NEEDS_FISHER )); then
   [[ -f "${FISHER_PATH}" ]] || {
-    echo "缺 F_math: ${FISHER_PATH}（先跑 99 号）"
+    echo "缺 F_${SOURCE}: ${FISHER_PATH}"
+    echo "（SOURCE=math -> 先跑 99 号 / SOURCE=cs -> 先跑 101 号）"
     exit 1
   }
   # 和 C 那边同一个理由：F 是 W0 处的曲率，采在别的模型上就不是这个 W0 的曲率。
   # 额外多一条：F 的池指纹必须等于 C 的。EWC 与 onereplay 的整个对照建立在"两者
   # 吃的是同一批旧知识行"之上，指纹不等的话比的就是数据而不是加权矩阵。
-  python - "${FISHER_PATH}" "${MATH_RUN}" "${MAXLEN}" "${COV_PATH}" <<'PY'
+  python - "${FISHER_PATH}" "${SRC_RUN}" "${MAXLEN}" "${COV_PATH}" "${SOURCE}" <<'PY'
 import sys
 from pathlib import Path
 
 import torch
 
-fisher_path, want_model, new_task_max_len, cov_path = sys.argv[1:5]
+fisher_path, want_model, new_task_max_len, cov_path, source = sys.argv[1:6]
 new_task_max_len = int(new_task_max_len)
 payload = torch.load(fisher_path, map_location="cpu")
 meta = payload.get("metadata", {})
@@ -630,7 +919,7 @@ fishers = payload["fishers"]
 
 got_model = str(meta.get("model_name", ""))
 elements = sum(matrix.numel() for matrix in fishers.values())
-print("F_math 的 metadata:")
+print(f"F_{source} 的 metadata:")
 print(f"  model_name       = {got_model}")
 print(f"  estimator        = {meta.get('estimator')}")
 print(f"  num_examples (N) = {meta.get('num_examples')}")
@@ -700,7 +989,7 @@ fi
 
 echo ""
 echo "========================================================================"
-echo "Part 3: Model-Math --FLANv2--> Model-Math-IF   (full finetune)"
+echo "Stage 3: Model-${SOURCE} --Conifer--> Model-${SOURCE}-IF   (full finetune)"
 echo "  MODE / ARM     : ${MODE} / ${ARM}"
 if [[ "${MODE}" == "lambda_probe" ]]; then
 # probe 不看 ARM，它扫的是 PROBE_ARM。这一行免得下面的"保护"栏被读成本次扫的对象。
@@ -709,14 +998,15 @@ fi
 if [[ "${MODE}" == "smoke" ]]; then
 echo "  本次冒烟的臂   : vanilla + ${SMOKE_ARM}"
 fi
-echo "  基座 (= W0)    : ${MATH_CKPT}"
+echo "  旧能力来源     : SOURCE=${SOURCE}  (旧能力 = ${OLD_LABEL})"
+echo "  基座 (= W0)    : ${SRC_CKPT}"
 echo "  新任务池       : ${IF_DATASET}"
 if [[ "${ARM}" == "onereplay" ]]; then
-echo "  保护           : C_math = ${COV_PATH}"
+echo "  保护           : C_${SOURCE} = ${COV_PATH}"
 echo "                   λ=${LAMBDA} reg_impl=${REG_IMPL} once_per_update=${REG_ONCE}"
 echo "                   normalize_by_layers=${NORMALIZE_BY_LAYERS} tf32=${REG_ALLOW_TF32}"
 elif [[ "${ARM}" == "ewc" ]]; then
-echo "  保护           : F_math = ${FISHER_PATH}"
+echo "  保护           : F_${SOURCE} = ${FISHER_PATH}"
 echo "                   λ=${LAMBDA} (EWC 自己的尺子，与 onereplay 的 λ 不可比)"
 echo "                   once_per_update=${REG_ONCE} normalize_by_layers=${NORMALIZE_BY_LAYERS}"
 echo "                   reg_impl 不适用：EWC 只有 autograd 路径"
@@ -727,24 +1017,169 @@ else
 echo "  保护           : 不适用（anchor 只评测 Stage 2 的起点，不训练）"
 fi
 echo "  超参           : epochs=${EPOCHS} lr=${LR} batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
-echo "  评测           : math=${DO_MATH} (gsm8k+math500 旧能力保留, max_new=${MATH_MAX_NEW_TOKENS})"
-echo "                   if=${DO_IF} (ifeval+followbench 新任务, **不评 ifbench**)"
+echo "                   batch 由最吃显存的 ewc 臂决定，三臂必须相同（见配置闸门）"
+echo "  system (新任务): ${SYSTEM_PROMPT:-<空>}"
+echo "                   训练渲染 + ifeval/followbench 都用它，与 94 号对齐"
+echo "  system (旧能力): ${OLD_SYSTEM_PROMPT:-<空>}"
+if [[ "${SOURCE}" == "math" ]]; then
+echo "                   只用于旧能力指标；91 号的值（math500 抽答案靠 \\boxed{}）"
+else
+echo "                   只用于旧能力指标；93 和 94 号用的是同一个值"
+fi
+echo "  评测           : 新任务 if=${DO_IF} (ifeval+followbench, max_new=${MAX_NEW_TOKENS}/${FB_MAX_NEW_TOKENS}"
+echo "                   **不评 ifbench**)"
+echo "                   旧能力 old=${DO_OLD} (${OLD_METRICS_ALL})"
+if [[ "${SOURCE}" == "math" ]]; then
+echo "                   math_max_new=${MATH_MAX_NEW_TOKENS} math_batch=${MATH_BATCH}"
+echo "                   数学分必须配着 hit-cap 读（见 DIAG_LEN）"
+else
+echo "                   tasks=${CS_EVAL_TASKS:-<全部八个>} scoring=${CS_SCORING}"
+echo "                   主口径 acc_logprob; acc_gen 只配 parse_rate 读"
+fi
 echo "  run 名         : ${RUN}"
 echo "  checkpoint     : ${CKPT}"
 echo "  结果树         : ${RESULTS_ROOT}"
 echo "========================================================================"
+# =============================================================================
+# 三臂配置一致性闸门
+#
+# 三臂的产出是性能开销对照，所以 batch / accum / lr / 总更新次数必须逐字相同。这个
+# 检查要在训练**之前**跑：一旦让第二条臂用不同的 batch 跑完，两条臂就都得重跑，而那
+# 是两个 24h 作业。典型的出错方式是先用 vanilla 试到 BATCH=8 能过，再投 ewc 时 OOM
+# 退到 4 —— 那个 8 的 vanilla 当场作废。
+#
+# 比较对象是同一棵结果树下**已经训完**的其他臂的 metrics（epoch 记录里带 batch_size
+# 等字段，见 train.py 的 extra_record）。第一条臂没有参照，直接放行。
+#
+# total_updates 一起比是为了抓 epochs 和数据量的差异：它们不在 epoch 记录里单独出现，
+# 但任一个变了 total_updates 就变。
+#
+# 确实要故意跑不同配置（比如单独做一次 batch 敏感性实验）就传 ALLOW_CONFIG_DRIFT=1，
+# 那样只警告不拦。别为了让作业跑起来而传它 —— 拦住的正是会让你重跑的那件事。
+#
+# DRY_RUN=1 也跑这一步：它属于前置检查，在不碰 GPU 的时候就该看到。
+# =============================================================================
+check_config_consistency () {
+  python - "${METRICS_DIR}" "${RUN}" "${BATCH}" "${ACCUM}" "${LR}" \
+    "${ALLOW_CONFIG_DRIFT}" <<'PY'
+import glob
+import json
+import os
+import sys
+
+metrics_dir, this_run, batch, accum, lr, allow = sys.argv[1:7]
+allow = allow == "1"
+
+# 只比这几个：它们直接决定 per-step 时间和峰值显存，也就是三臂唯一要对齐的东西。
+# lr 在里面是因为它写进 run 名，配置漂了但 run 名没漂会让结果表读错。
+WATCHED = {
+    "batch_size": int(batch),
+    "accumulation_size": int(accum),
+    "lr": float(lr),
+}
+
+
+def last_epoch(path):
+    row = None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                parsed = json.loads(line)
+                if parsed.get("record_type") == "epoch":
+                    row = parsed
+    except (OSError, json.JSONDecodeError):
+        return None
+    return row
+
+
+others = []
+for path in sorted(glob.glob(os.path.join(metrics_dir, "*.jsonl"))):
+    name = os.path.basename(path)[: -len(".jsonl")]
+    # 跳过自己、以及 smoke / probe 那些故意用短配置的短跑。
+    if name == this_run or name.startswith(("smoke_", "probe_")):
+        continue
+    row = last_epoch(path)
+    if row is not None:
+        others.append((name, row))
+
+if not others:
+    print("配置闸门: 这棵树下还没有训完的其他臂，本次配置将成为后续臂的基准。")
+    print(f"  batch_size={batch} accumulation_size={accum} lr={lr}")
+    raise SystemExit(0)
+
+drift = []
+for name, row in others:
+    for key, want in WATCHED.items():
+        got = row.get(key)
+        if got is None:
+            continue
+        if isinstance(want, float):
+            same = abs(float(got) - want) <= 1e-12
+        else:
+            same = int(got) == want
+        if not same:
+            drift.append((name, key, got, want))
+
+# 本次的 total_updates 在训练前还不知道（要等 loader 建好），所以它只能在已有各臂
+# 之间交叉比。它们若彼此不同，"和基准比"这件事就已经没有基准了。
+by_updates = {}
+for name, row in others:
+    value = row.get("total_updates")
+    if value is not None:
+        by_updates.setdefault(value, []).append(name)
+
+print(f"配置闸门: 对照 {len(others)} 条已训完的臂")
+for name, row in others:
+    print(
+        f"  {name:<36} batch={row.get('batch_size')} "
+        f"accum={row.get('accumulation_size')} lr={row.get('lr')} "
+        f"updates={row.get('total_updates')}"
+    )
+print(f"  {'(本次) ' + this_run:<36} batch={batch} accum={accum} lr={lr}")
+
+if not drift and len(by_updates) <= 1:
+    print("  -> 一致，可以训练。")
+    raise SystemExit(0)
+
+print()
+if drift:
+    print("!! 本次配置和已训完的臂不一致：")
+    for name, key, got, want in drift:
+        print(f"   {name}: {key} = {got}，本次要用 {want}")
+if len(by_updates) > 1:
+    print("!! 已训完的各臂之间 total_updates 就已经不一致，本次用什么配置都没有基准：")
+    for value, names in sorted(by_updates.items()):
+        print(f"   total_updates={value:<8} {', '.join(names)}")
+    print("   这通常是 epochs 或 MAX_TRAIN_SAMPLES 中途改过。")
+print()
+if allow:
+    print("ALLOW_CONFIG_DRIFT=1，只警告不拦。这些臂之间的开销数字不可比。")
+    raise SystemExit(0)
+print("三臂的开销对照要求这些值逐字相同。要么改回上面已有的值，要么换一棵结果树")
+print("（传 RESULTS_ROOT=...）把这次实验和已有的分开。确实要故意跑不同配置就传")
+print("ALLOW_CONFIG_DRIFT=1。")
+raise SystemExit(1)
+PY
+}
+
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "DRY_RUN=1：只做前置检查，不训练不评测。"
+  echo ""
+  check_config_consistency || exit 1
+  echo ""
   echo "Job finished at: $(date)"
   exit 0
 fi
 # =============================================================================
 # 共用训练封装
 #
-# 两条臂的唯一差别是最后那三行正则参数，其余逐字相同 —— 这是「只改一个变量」的
-# 工程实现。vanilla 必须传 --measure_replay_when_lambda_zero 0：只传 λ=0 的话
-# build_regularizer 仍会加载 C 并每步求值（默认 measure=1），那测出来的时间和显存
-# 就不是 vanilla 的了（train.py 里有一段专门 warn 这件事）。
+# 三条臂的唯一差别是那几行正则参数，其余逐字相同 —— 这是「只改一个变量」的工程实现。
+# vanilla 必须传 --measure_replay_when_lambda_zero 0：只传 λ=0 的话 build_regularizer
+# 仍会加载 C 并每步求值（默认 measure=1），那测出来的时间和显存就不是 vanilla 的了
+# （train.py 里有一段专门 warn 这件事）。
 #
 #   $1 run  $2 arm  $3 epochs  $4 lambda  $5 save_path  $6 max_steps  $7 save  $8 log_every
 # =============================================================================
@@ -793,7 +1228,7 @@ train_one () {
   mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
   echo "==== train ${run} (arm=${arm} lr=${LR} lam=${lam} max_steps=${max_steps}) ===="
   python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
-    --model_dir "${MATH_CKPT_DIR}" --model_name "${MATH_RUN}" --seed "${SEED}" \
+    --model_dir "${SRC_CKPT_DIR}" --model_name "${SRC_RUN}" --seed "${SEED}" \
     --dataset_path "${IF_DATASET}" \
     --epochs "${epochs}" --lr "${LR}" \
     --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
@@ -802,6 +1237,8 @@ train_one () {
     --eval_batch_size "${BATCH}" \
     --max_train_samples "${MAX_TRAIN_SAMPLES}" \
     --target_modules "${TARGET_MODULES}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     "${reg_args[@]}" \
     --max_steps "${max_steps}" --log_every "${log_every}" \
@@ -815,9 +1252,12 @@ train_one () {
 #   1) 「regularizer covers N layers; no penalty matrix for M layers」
 #      N 必须是 C 的层数（full scope 是 197），**M 必须是 0**。M 非 0 说明 C 的键
 #      和模型的模块名对不上，罚项在偷偷少覆盖几层，而这不会报错。
-#   2) peak memory。文件头给的是加数（C_math 6.58 + W0 3.2 + analytic 约 1.2），
-#      vanilla 基线要靠这里的实测值，94 号没记这个数。
-#   3) 两条臂的 tokens_per_sec 应当基本相同（正则只占约 3% 的计算，见文件头）。
+#   2) peak memory。这是本 mode 最重要的产出，**三臂共用的 BATCH 由它定**。
+#      文件头 BATCH 那处按架构估的是 ewc ~98.9 GiB @ BATCH=2 / ~131 GiB @ BATCH=4，
+#      估算误差 ±15%，所以要提 BATCH 必须先看这里的实测值。
+#      **探显存必须 ARM=ewc**：它走 autograd、所有覆盖层的 fp32 DeltaW 活到 backward
+#      返回，是三臂里最紧的一条。拿 vanilla 探等于没探。
+#   3) 两条臂的 tokens_per_sec 应当基本相同（正则只占约 1% 的计算，见文件头）。
 #      差很多就是显存压力导致的分配器抖动，不是正则本身贵。
 # =============================================================================
 if [[ "${MODE}" == "smoke" ]]; then
@@ -880,6 +1320,11 @@ if arm == "ewc":
     print("EWC 走 autograd：罚项在每个 accumulation 窗口的第一个 micro-batch 上进图，")
     print("backward 之后释放。峰值应当比 onereplay(analytic) 高一些——那条路按层转 fp32，")
     print("这条路整轮持有。高多少看上面的实测，别按估计值排作业。")
+else:
+    print()
+    print("!! 这一轮探的是 onereplay。**BATCH 不能按它定** —— 最紧的是 ewc（只有 autograd")
+    print("   路径，所有覆盖层的 fp32 DeltaW 活到 backward 返回）。定 BATCH 请重跑一次：")
+    print("     qsub -v MODE=smoke,ARM=ewc,LAMBDA=<随便给一个> <本脚本>")
 
 ratio = None
 task = protected.get("train_task_loss")
@@ -899,7 +1344,7 @@ if vanilla.get("tokens_per_sec") and protected.get("tokens_per_sec"):
     speed = protected["tokens_per_sec"] / vanilla["tokens_per_sec"]
     print(f"{arm} / vanilla 吞吐比 = {speed:.3f}")
     if speed < 0.9:
-        print("  -> 慢了 10% 以上。正则本身只占约 3% 计算，先怀疑显存压力。")
+        print("  -> 慢了 10% 以上。正则本身只占约 1% 计算，先怀疑显存压力。")
 PY
   echo ""
   echo "还要回到上面的训练日志里人工确认一行:"
@@ -912,14 +1357,14 @@ fi
 # MODE=lambda_probe：选 λ 的第一步
 #
 # 只回答一个问题：**λ·R 和 task_loss 差几个数量级。** 不回答「哪个 λ 更好」——
-# 那要跑完整训练看 IF 分数和 val_loss。
+# 那要跑完整训练看旧能力分数和 val_loss。
 #
-# 为什么不能照搬历史 λ：约束强度 ∝ λ·trace(C)，但罚项要和任务损失比才有意义，而
-# 本线的新任务是 FLANv2 @ 1536 的短答案（P50 约 18 token）。44 号那个 7.5e-3 是在
-# Commonsense @ 512 上定的，96 号那套是在 Numina @ 4096 上定的，task_loss 的绝对尺度
-# 都和这里不同。
+# 为什么不能照搬历史 λ：约束强度 ∝ λ·trace(C)，但罚项要和任务损失比才有意义，而本线
+# 的新任务是 Conifer @ 2048（答案 p50 = 144 词）。44 号那个 7.5e-3 是在
+# Commonsense @ 512 当新任务时定的，96 号那套是在 Numina @ 2048 上定的，task_loss 的
+# 绝对尺度都和这里不同。两个 SOURCE 也要各标一次：C_math 与 C_cs 采在不同的 W0 上。
 #
-# PROBE_MAX_STEPS 数的是 micro-batch，更新次数要除以 ACCUM/BATCH=64。默认 1280 步
+# PROBE_MAX_STEPS 数的是 micro-batch，更新次数要除以 ACCUM/BATCH=32。默认 640 步
 # = 20 次更新。这对量级判断够了（R 从 0 开始长，前几次更新就到稳定量级），但**不足以
 # 判断谁的 val_loss 更低** —— 别拿这里的 val_loss 排序做决定。
 #
@@ -961,7 +1406,7 @@ total = sum(float(matrix.float().sum()) for matrix in fishers.values())
 elements = sum(matrix.numel() for matrix in fishers.values())
 mean_f = total / max(elements, 1)
 if mean_f <= 0:
-    raise SystemExit("mean(F) <= 0，F 文件不对（全零？先看 99 号的诊断）")
+    raise SystemExit("mean(F) <= 0，F 文件不对（全零？先看 Stage 2 采集脚本的诊断）")
 center = 1.0 / mean_f
 # 1/mean(F) 让 Σ F ΔW² 的量级回到 ΣΔW² 附近，也就是把 EWC 摆到"和 L2 同量级"的
 # 起点上。它只是个有依据的起点，不是答案——落到 1%~10% 区间靠下面那张表。
@@ -990,7 +1435,7 @@ PY
 
   echo ""
   echo "==== λ probe 汇总（${PROBE_MAX_STEPS} micro-batch = $(( PROBE_MAX_STEPS / (ACCUM / BATCH) )) 次更新）===="
-  python - "${METRICS_DIR}" "${LAMBDA_GRID}" "${PROBE_ARM}" <<'PY'
+  python - "${METRICS_DIR}" "${LAMBDA_GRID}" "${PROBE_ARM}" "${OLD_LABEL}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -998,6 +1443,7 @@ from pathlib import Path
 metrics_dir = Path(sys.argv[1])
 grid = sys.argv[2].split()
 arm = sys.argv[3]
+old_label = sys.argv[4]
 
 
 def last_epoch(path: Path):
@@ -1054,8 +1500,8 @@ else:
     print("  * 本次没有一档落在该区间，按比值线性外推调整 grid 再跑一次（λ·R ∝ λ）。")
 print()
 print("**这张表不决定最终 λ。** 20 次更新的 val_loss 没有判别力，别用它排序。定稿要:")
-print("  1) 选出的 λ 跑完整 EPOCHS，和 vanilla 比数学分数（这才是保留能力的证据）")
-print(f"       qsub -v MODE=train,ARM={arm},LAMBDA=<选出的值>,DO_MATH=0 <本脚本>")
+print(f"  1) 选出的 λ 跑完整 EPOCHS，和 vanilla 比 {old_label} 分数（这才是保留能力的证据）")
+print(f"       qsub -v MODE=train,ARM={arm},LAMBDA=<选出的值>,DO_OLD=0 <本脚本>")
 print("  2) 报结果时用 matched plasticity —— 各臂在同一个新任务 val_loss 上比:")
 print("       python -m onereplay.scripts.calibrate_lambda \\")
 print("         --results_root <RESULTS_ROOT> \\")
@@ -1065,7 +1511,7 @@ if arm == "ewc":
     print()
     print("注意：onereplay 与 ewc 各自标定出的 λ 之间**没有可比性**，不要因为一个是")
     print("1e7、一个是 1e-2 就觉得哪条臂更强。可比的是两者在同一个 val_loss 上")
-    print("（matched plasticity）各保住了多少数学分数。")
+    print(f"（matched plasticity）各保住了多少 {old_label} 分数。")
 PY
   exit 0
 fi
@@ -1075,10 +1521,13 @@ fi
 # =============================================================================
 if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
   if [[ "${ARM}" == "anchor" ]]; then
-    echo "ARM=anchor 不训练（它就是 Stage 2 的起点 Model-Math）。用 MODE=eval 评它。"
+    echo "ARM=anchor 不训练（它就是 Stage 2 的起点 Model-${SOURCE}）。用 MODE=eval 评它。"
   elif [[ -d "${CKPT}" && "${FORCE_TRAIN}" != "1" ]]; then
     echo "跳过训练：${CKPT} 已存在（FORCE_TRAIN=1 可强制重训）"
   else
+    # 训练之前拦一次。失败就不开 GPU —— 拦住的是"跑完才发现和别的臂不可比"。
+    check_config_consistency || exit 1
+    echo ""
     train_one "${RUN}" "${ARM}" "${EPOCHS}" "${LAMBDA}" "${CKPT}" 0 1
 
     echo ""
@@ -1145,65 +1594,89 @@ PY
   echo "  --model_dir ${CKPT_DIR} --model_name ${RUN}"
 fi
 # =============================================================================
-# MODE=eval：旧能力保留 (GSM8K + MATH-500) 与新任务 (IFEval + FollowBench)
+# MODE=eval：新任务 (IFEval + FollowBench) 与旧能力保留 (由 SOURCE 决定)
 #
-# 一次 evaluate 调用只加载模型一次，请求的指标共用。DO_MATH / DO_IF 把两半拆到不同
-# 作业，因为加起来装不进一个 24h walltime（数学保留侧 4096 预算 / batch 128 约 0.8h，
-# IF 新任务侧两个数据集 3-4h，再加约 0.5-1h 训练）。
+# 一次 evaluate 调用只加载模型一次，请求的指标共用。DO_IF / DO_OLD 把两半拆到不同
+# 作业，因为加起来装不进一个 24h walltime（新任务侧两个 IF 数据集 3-4h，旧能力侧
+# math 约 0.8h / cs 约 1-1.5h，再加训练）。
 #
 # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
 # is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
 # ARM=anchor 时 --adapter_path 指向 Stage 1 的 checkpoint，评的就是 Stage 2 的起点。
 # =============================================================================
 if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
-  METRICS=""
-  if [[ "${DO_MATH}" == "1" ]]; then
-    if [[ -f "${GSM8K_DATA}" ]]; then
-      METRICS="${METRICS},gsm8k"
-    else
-      echo "跳过 GSM8K：未找到 ${GSM8K_DATA}"
-    fi
-    if [[ -f "${MATH500_DATA}" ]]; then
-      METRICS="${METRICS},math500"
-    else
-      echo "跳过 MATH-500：未找到 ${MATH500_DATA}"
-    fi
-  fi
+  # 两侧分开攒，因为它们要用不同的 --system_prompt（见上面 SYSTEM_PROMPT 那处），而
+  # evaluate.py 一次调用只接受一个。DO_IF=1,DO_OLD=0 这种常用拆法下仍然只有一次调用，
+  # 只有两侧都开时才会加载模型两次。
+  #
+  # SOURCE=cs 时两侧的 system 恰好相同，但这里仍然拆开：三条 Stage 3 线的代码形态要
+  # 一致，而且两侧的 metric 列表本来就要分组（前置文件检查不同）。
+  IF_METRICS=""
+  OLD_METRICS=""
   if [[ "${DO_IF}" == "1" ]]; then
+    # IFEval 要检查输入文件；FollowBench 的数据和判分器完全 vendored，没有可检查的
+    # 前置文件（装缺了会在 evaluate 里报错退出）。
     if [[ -f "${IFEVAL_INPUT}" ]]; then
-      METRICS="${METRICS},ifeval"
+      IF_METRICS="${IF_METRICS},ifeval"
     else
       echo "跳过 IFEval：未找到 ${IFEVAL_INPUT}"
     fi
-    # FollowBench 的数据和判分器完全 vendored，没有可检查的前置文件。
-    METRICS="${METRICS},followbench"
+    IF_METRICS="${IF_METRICS},followbench"
   fi
-  METRICS="${METRICS#,}"
-  [[ -n "${METRICS}" ]] || { echo "没有可用指标（DO_MATH/DO_IF 都关了？），评测退出"; exit 1; }
+  if [[ "${DO_OLD}" == "1" ]]; then
+    # 旧能力指标由 SOURCE 决定（见上面的 case）。math 侧的两个 jsonl 缺了就跳过那一个
+    # 指标；cs 侧的八个 test.json 是主指标，缺了在 Step 0 就已经退出了。
+    for _m in ${OLD_METRICS_ALL//,/ }; do
+      if [[ "${_m}" == "gsm8k" && ! -f "${GSM8K_DATA}" ]]; then
+        echo "跳过 GSM8K：未找到 ${GSM8K_DATA}"
+        continue
+      fi
+      if [[ "${_m}" == "math500" && ! -f "${MATH500_DATA}" ]]; then
+        echo "跳过 MATH-500：未找到 ${MATH500_DATA}"
+        continue
+      fi
+      OLD_METRICS="${OLD_METRICS},${_m}"
+    done
+  fi
+  IF_METRICS="${IF_METRICS#,}"
+  OLD_METRICS="${OLD_METRICS#,}"
+  METRICS="${IF_METRICS}${IF_METRICS:+,}${OLD_METRICS}"
+  METRICS="${METRICS%,}"
+  [[ -n "${METRICS}" ]] || { echo "没有可用指标（DO_IF/DO_OLD 都关了？），评测退出"; exit 1; }
 
   if [[ "${FB_GROUP_LIMIT}" != "0" ]]; then
     echo "!! FB_GROUP_LIMIT=${FB_GROUP_LIMIT}：FollowBench 冒烟模式，产出的 summary 只覆盖每类前"
     echo "   ${FB_GROUP_LIMIT} 组，不是正式结果。"
   fi
-  if [[ "${EVAL_LIMIT}" != "0" && "${METRICS}" == *followbench* ]]; then
-    echo "!! EVAL_LIMIT=${EVAL_LIMIT} 截的是 gsm8k/math500/ifeval；FollowBench 不读全局 --limit，"
-    echo "   要截它请用 FB_GROUP_LIMIT（按阶梯组，不能按行 —— CSL 的分母假设一组完整的 L1..L5）。"
+  if [[ "${EVAL_LIMIT}" != "0" ]]; then
+    echo "!! EVAL_LIMIT=${EVAL_LIMIT} 截的是 ifeval/gsm8k/math500，以及 commonsense_qa"
+    echo "   （后者是**每个 task** 截前 ${EVAL_LIMIT} 行）。截过的分数不是正式结果。"
+    if [[ "${METRICS}" == *followbench* ]]; then
+      echo "   FollowBench 不读全局 --limit，要截它请用 FB_GROUP_LIMIT（按阶梯组，不能按行 ——"
+      echo "   CSL 的分母假设一组完整的 L1..L5）。"
+    fi
+  fi
+  if [[ -n "${CS_EVAL_TASKS}" && "${METRICS}" == *commonsense_qa* ]]; then
+    echo "!! CS_EVAL_TASKS=${CS_EVAL_TASKS}：只评这几个子集。AVERAGE 是**宏平均**，子集不同的两个"
+    echo "   run 之间那一列不可比，正式结果必须八个全跑。"
   fi
 
-  run_eval () {
-    local name="$1" ckpt="$2"
+  # 一次 evaluate 调用 = 一侧的指标 + 那一侧的 system prompt。
+  run_eval_side () {
+    local name="$1" ckpt="$2" side_metrics="$3" side_system="$4"
+    [[ -n "${side_metrics}" ]] || return 0
     local -a ckpt_arg=()
     if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
 
     # 只有请求的指标**全部**已有结果才跳过，否则拆开跑时第二批会被第一批挡掉。
     local pending=0 m
-    for m in ${METRICS//,/ }; do
+    for m in ${side_metrics//,/ }; do
       if [[ ! -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
         pending=1
       fi
     done
     if [[ "${pending}" == "0" && "${FORCE_EVAL}" != "1" ]]; then
-      echo "跳过评测 ${name}：${METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
+      echo "跳过评测 ${name}：${side_metrics} 都已有 summary（FORCE_EVAL=1 强制重评）"
       return 0
     fi
 
@@ -1211,31 +1684,49 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
     if [[ -n "${FB_DATA}" ]]; then fb_data_arg=(--followbench_data "${FB_DATA}"); fi
     if [[ -n "${FB_CATEGORIES}" ]]; then fb_cats_arg=(--followbench_categories "${FB_CATEGORIES}"); fi
 
-    echo "==== eval ${name} (${METRICS}) ===="
+    echo "==== eval ${name} (${side_metrics}) ===="
+    echo "     system: ${side_system:-<空>}"
     python -m onereplay.scripts.evaluate \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
-      --metrics "${METRICS}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+      --metrics "${side_metrics}" --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
       --limit "${EVAL_LIMIT}" \
+      --system_prompt "${side_system}" \
+      --decode_stop_on_im_end "${STOP_ON_IM_END}" \
       --max_new_tokens "${MAX_NEW_TOKENS}" \
       --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
-      --gsm8k_data_path "${GSM8K_DATA}" \
-      --math500_data_path "${MATH500_DATA}" \
-      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
       --ifeval_input "${IFEVAL_INPUT}" \
       --followbench_max_new_tokens "${FB_MAX_NEW_TOKENS}" \
       --followbench_batch_size "${FB_BATCH}" \
       --followbench_group_limit "${FB_GROUP_LIMIT}" \
       "${fb_data_arg[@]}" "${fb_cats_arg[@]}" \
+      --gsm8k_data_path "${GSM8K_DATA}" \
+      --math500_data_path "${MATH500_DATA}" \
+      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+      --cs_eval_dir "${CS_EVAL_DIR}" \
+      --cs_eval_tasks "${CS_EVAL_TASKS}" \
+      --cs_scoring "${CS_SCORING}" \
+      --cs_max_new_tokens "${CS_MAX_NEW_TOKENS}" \
+      --cs_batch_size "${CS_BATCH}" \
+      --cs_score_batch_size "${CS_SCORE_BATCH}" \
       --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+  }
+
+  run_eval () {
+    local name="$1" ckpt="$2"
+    run_eval_side "${name}" "${ckpt}" "${IF_METRICS}" "${SYSTEM_PROMPT}"
+    run_eval_side "${name}" "${ckpt}" "${OLD_METRICS}" "${OLD_SYSTEM_PROMPT}"
   }
 
   case "${ARM}" in
     anchor)
-      # Stage 2 的起点 Model-Math。91 号已经评过它的 GSM8K/MATH-500，但那些结果落在
-      # results_part1_math 的树里；重评一次是为了让 Part 3 的表自成一体，而且 91 号
-      # 根本没评过它的 IFEval/FollowBench（Part 1 的 Math 线不测 IF）。
-      run_eval "math_anchor" "${MATH_CKPT}"
+      # Stage 2 的起点。Stage 1（91 / 93 号）已经评过它的旧能力指标，但那些结果落在
+      # results_part1_* 的树里；重评一次是为了让这张表自成一体，而且 Stage 1 根本没
+      # 评过它的 IFEval/FollowBench（math / cs 线不测 IF）。
+      #
+      # 旧能力那一半的两次分数应当逐字相同（同 checkpoint、同 greedy 解码、同 batch、
+      # 同 system）—— 不同就说明有个口径变了，值得先查清楚再往下读。
+      run_eval "${ANCHOR_RUN}" "${SRC_CKPT}"
       ;;
     *)
       if [[ -d "${CKPT}" ]]; then
@@ -1247,19 +1738,23 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
   esac
 
   # -------------------------------------------------------------------------
-  # 长度/截断诊断：数学分数只有配着 hit-cap 才能读。
-  # hit-cap 接近 0 且 P99 明显低于 cap => 预算够用，accuracy 是能力；hit-cap 还高
-  # => 分数被右删失，而删失率随输出长度变、各臂的输出长度又不同，于是臂间不可比。
+  # 旧能力侧诊断。两个来源查的不是同一件事，所以按 SOURCE 分开。
   # -------------------------------------------------------------------------
-  if [[ "${DIAG_LEN}" == "1" && "${DO_MATH}" == "1" ]]; then
-    if [[ "${ARM}" == "anchor" ]]; then DIAG_NAME="math_anchor"; else DIAG_NAME="${RUN}"; fi
-    DIAG_FILES=()
-    for diag_metric in gsm8k math500; do
-      diag_file="${RESULTS_ROOT}/${diag_metric}/${DIAG_NAME}/responses.jsonl"
-      [[ -f "${diag_file}" ]] && DIAG_FILES+=("${diag_file}")
-    done
-    if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
-      python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "${DIAG_FILES[@]}" <<'PY'
+  if [[ "${DIAG_LEN}" == "1" && "${DO_OLD}" == "1" ]]; then
+    if [[ "${ARM}" == "anchor" ]]; then DIAG_NAME="${ANCHOR_RUN}"; else DIAG_NAME="${RUN}"; fi
+    if [[ "${SOURCE}" == "math" ]]; then
+      # 长度/截断：数学分数只有配着 hit-cap 才能读。
+      # hit-cap 接近 0 且 P99 明显低于 cap => 预算够用，accuracy 是能力；hit-cap 还高
+      # => 分数被右删失，而删失率随输出长度变、各臂的输出长度又不同，于是臂间不可比。
+      # 本线尤其危险：Conifer 把输出推长推杂，protected 臂把权重拉回 Model-Math、倾向
+      # 保住长 CoT，两个方向的偏差都会伪装成能力差异。
+      DIAG_FILES=()
+      for diag_metric in gsm8k math500; do
+        diag_file="${RESULTS_ROOT}/${diag_metric}/${DIAG_NAME}/responses.jsonl"
+        [[ -f "${diag_file}" ]] && DIAG_FILES+=("${diag_file}")
+      done
+      if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
+        python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "${DIAG_FILES[@]}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1295,32 +1790,137 @@ for path in sys.argv[3:]:
         f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
         f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
     )
-print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用；否则把 MATH_MAX_NEW_TOKENS 提到")
-print("提 cap 之前先看是不是重复循环（尾部 distinct-shingle 约 0.1 就是），那种情况加 cap")
-print("没用；确认要提就**所有臂一起重评**，不能只重评一条。")
+print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用。hit-cap 仍高时**先判断是不是重复")
+print("循环**（撞上限那些行的尾部 distinct-shingle 低到约 0.1 就是）—— 那种情况加 cap 没用，")
+print("91 号实测 4096->8192 一分没涨。确认是真写不完再提 cap，且**所有臂一起重评**。")
+print("no-answer 高而 hit-cap 低 => 模型收尾了但没走到 \\boxed{}，那是**格式**丢了而不是")
+print("会不会做。Conifer 把输出推长推杂，vanilla 臂最容易出这一种。")
 PY
+      fi
+    else
+      # 格式/塌缩：分辨「忘了常识」「忘了格式」「塌成猜一个词」三件事。
+      #
+      # math 那边的 hit-cap 诊断在这里没有对应物 —— 主口径 acc_logprob 不解码，没有
+      # 右删失可言。逐 task 打，因为候选集大小和塌缩程度按 task 差很多（boolq 只有
+      # true/false，hellaswag 有四个 ending）：
+      #
+      #   parse_rate 掉 + logprob 没掉  -> 忘的是**格式**不是常识。Conifer 把输出从
+      #                                    7-8 个 token 推到 144 词，extract_label
+      #                                    抽不到那个 label。acc_gen 的下降不是遗忘证据。
+      #   agree（logprob 与 gen 一致率）-> 两个 scorer 在多少行上给出同一个 label。它掉
+      #                                    说明生成路径开始答非所问，而排序路径还知道答案。
+      #   mode share（众数占比）        -> 接近 1 = 预测塌成单一 label，模型在猜不在答。
+      #                                    这种模型的 acc 会停在 random_baseline 附近而
+      #                                    不是 0，不看这一列会把「塌了」读成「还剩一半」。
+      #   hit-cap                       -> 撞 CS_MAX_NEW_TOKENS 的行。答案只要 7-8 个
+      #                                    token，撞上限就是格式漂移的证据。
+      DIAG_FILE="${RESULTS_ROOT}/commonsense_qa/${DIAG_NAME}/responses.jsonl"
+      if [[ -f "${DIAG_FILE}" ]]; then
+        python - "${MODEL_DIR}/${MODEL_NAME}" "${CS_MAX_NEW_TOKENS}" "${DIAG_FILE}" <<'PY'
+import collections
+import json
+import sys
+from pathlib import Path
+
+from transformers import AutoTokenizer
+
+model_path, cap, path = sys.argv[1], int(sys.argv[2]), Path(sys.argv[3])
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+
+def pct(values, q):
+    return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
+
+
+by_task: dict[str, list[dict]] = collections.defaultdict(list)
+with path.open(encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            row = json.loads(line)
+            by_task[str(row.get("task", "?"))].append(row)
+
+print(f"==== commonsense 生成侧诊断 (cap={cap})  {path.parent.name} ====")
+print(
+    f"{'task':<16}{'n':>6}{'parse':>8}{'agree':>8}{'mode':>8}"
+    f"{'mode_lbl':>11}{'hit-cap':>9}{'tokP50':>8}{'tokP90':>8}{'max':>6}"
+)
+for task in sorted(by_task):
+    rows = by_task[task]
+    total = len(rows)
+    # gen 那一路关掉时 responses.jsonl 里没有 response/gen_pred 字段，这几列打 '-'。
+    has_gen = "gen_pred" in rows[0]
+    has_logprob = "logprob_pred" in rows[0]
+
+    if has_gen:
+        lengths = sorted(
+            len(tokenizer(str(row.get("response", "")), add_special_tokens=False)["input_ids"])
+            for row in rows
+        )
+        parsed = sum(1 for row in rows if row.get("gen_pred"))
+        hit_cap = sum(1 for length in lengths if length >= cap - 2)
+        parse_cell = f"{parsed / total:.3f}".rjust(8)
+        cap_cell = f"{hit_cap / total:.1%}".rjust(9)
+        len_cells = f"{pct(lengths, 50):>8}{pct(lengths, 90):>8}{lengths[-1]:>6}"
+    else:
+        parse_cell, cap_cell = "-".rjust(8), "-".rjust(9)
+        len_cells = f"{'-':>8}{'-':>8}{'-':>6}"
+
+    if has_gen and has_logprob:
+        both = [row for row in rows if row.get("gen_pred")]
+        agree = sum(1 for row in both if row["gen_pred"] == row["logprob_pred"])
+        agree_cell = (f"{agree / len(both):.3f}" if both else "-").rjust(8)
+    else:
+        agree_cell = "-".rjust(8)
+
+    # 众数按主口径的预测算（logprob 没跑就退回 gen）。
+    key = "logprob_pred" if has_logprob else ("gen_pred" if has_gen else None)
+    if key:
+        counts = collections.Counter(str(row.get(key, "")) for row in rows)
+        label, count = counts.most_common(1)[0]
+        mode_cell = f"{count / total:.3f}".rjust(8)
+        mode_label = (label or "<empty>")[:10].rjust(11)
+    else:
+        mode_cell, mode_label = "-".rjust(8), "-".rjust(11)
+
+    print(f"{task:<16}{total:>6}{parse_cell}{agree_cell}{mode_cell}{mode_label}{cap_cell}{len_cells}")
+
+print()
+print("怎么读:")
+print("  parse 掉而 summary 里的 acc_logprob 没掉 => 忘的是**格式**不是常识。这正是本线")
+print("    预期会发生的事（Conifer 把输出从 7-8 个 token 推到 144 词），所以主口径是 logprob。")
+print("  mode 接近 1 => 预测塌成单一 label（mode_lbl 那一列就是它）。这种模型的 acc 会停在")
+print("    random_baseline 附近而不是 0，只看 acc 会把「塌了」读成「还剩一半能力」。")
+print("  agree 明显低于 1 => 两个 scorer 分道扬镳，生成路径已经不在答这道题了。")
+print("  hit-cap 非零 => 答案只要 7-8 个 token 却撞上 cap，模型在滔滔不绝。**不要**因此调大")
+print("    CS_MAX_NEW_TOKENS：那是格式漂移的证据，不是预算不够；调了还得所有臂一起重评。")
+PY
+      fi
     fi
   fi
 
   # -------------------------------------------------------------------------
-  # 汇总：一张表，**每个分数右边紧跟它自己的响应词数中位数**。
+  # 汇总：主表 + （SOURCE=cs 时）常识八子集分解 + FollowBench 分级曲线。
   #
-  # 这不是锦上添花，而且方向和 96 号相反。Stage 1 的 Model-Math 答案 P50 约 3900 token，
-  # Stage 2 的 FLAN targets P50 只有 18-19 token —— 输出长度会被往**变短**的方向推两个
-  # 数量级。IFEval/FollowBench 里相当一部分约束本质在量长度（Part 1 第 8c 节），数学
-  # 保留分更是直接受害（走不到 \boxed{} 就读成不会做）。分数和 words 分开看就会把长度
-  # 漂移读成能力变化。
+  # 主表左半 = 旧能力保留、右半 = 新任务学到多少，**每个生成式分数右边紧跟它自己的
+  # 响应词数中位数**。这不是锦上添花：本线的输出长度往变长变杂的方向漂（Conifer 答案
+  # p50 = 144 词、54.7% 带列表），而 IFEval/FollowBench 里相当一部分约束本质在量长度
+  # （Part 1 第 8c 节），数学侧的 \boxed{} 抽取和常识侧的 extract_label 更是直接受害。
+  # 分数和 words 分开看就会把长度漂移读成能力变化。
+  #
+  # SOURCE=cs 的 acc_logprob 是唯一不需要配 words 读的数（闭集排序、不解码）。
   #
   # words 用 len(response.split()) 从各自的 responses.jsonl 现算，与 followbench 的
   # response_shape 同一个定义，所以 fb 那列和它 summary.json 里的 response_words_p50 一致。
   # -------------------------------------------------------------------------
-  python - "${RESULTS_ROOT}" <<'PY' || true
+  python - "${RESULTS_ROOT}" "${SOURCE}" <<'PY' || true
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 root = Path(sys.argv[1])
-METRICS = ("gsm8k", "math500", "ifeval", "followbench")
+source = sys.argv[2]
+OLD = ("gsm8k", "math500") if source == "math" else ("commonsense_qa",)
+METRICS = OLD + ("ifeval", "followbench")
 
 names: set[str] = set()
 for metric in METRICS:
@@ -1333,8 +1933,8 @@ if not names:
 
 
 def sort_key(name: str):
-    # anchor 在最上面（它是 before 那一行），然后 vanilla，然后 onereplay 按 λ 排。
-    rank = 0 if name == "math_anchor" else (1 if "vanilla" in name else 2)
+    # anchor 在最上面（它是 before 那一行），然后 vanilla，然后 protected 臂按 λ 排。
+    rank = 0 if name.endswith("_anchor") else (1 if "vanilla" in name else 2)
     return (rank, name)
 
 
@@ -1372,50 +1972,120 @@ def num(value, width, fmt="{:.0f}"):
 
 
 print()
-print("=" * 108)
-print("Part 3: Model-Math --FLANv2--> Model-Math-IF")
-print("  左半 = 旧能力保留多少(math)   右半 = 新任务学到多少(IF)   words = 该指标自己的响应词数中位数")
-print("=" * 108)
-print(f"{'run':<40}{'GSM8K':>8}{'MATH500':>9}{'IFEval':>8}{'words':>7}{'FB HSR':>8}{'words':>7}")
+print("=" * 116)
+print(f"Stage 3: Model-{source} --Conifer--> Model-{source}-IF")
+print("  左半 = 旧能力保留多少   右半 = 新任务学到多少   words = 该指标自己的响应词数中位数")
+if source == "cs":
+    print("  CS 那四列都是八任务宏平均。logp 是主口径；gen 只能配着 parse 读；rand 是塌缩后的地板。")
+else:
+    print("  数学两列必须配着上面那张 length diagnostic 的 hit-cap / no-answer 读。")
+print("=" * 116)
+if source == "math":
+    print(
+        f"{'run':<40}{'GSM8K':>8}{'words':>7}{'MATH500':>9}{'words':>7}"
+        f"{'IFEval':>8}{'words':>7}{'FB HSR':>8}{'words':>7}"
+    )
+else:
+    print(
+        f"{'run':<40}{'CS logp':>9}{'CS gen':>8}{'parse':>7}{'rand':>7}"
+        f"{'IFEval':>8}{'words':>7}{'FB HSR':>8}{'words':>7}"
+    )
 for name in order:
-    gsm8k = load("gsm8k", name)
-    math500 = load("math500", name)
     ifeval = load("ifeval", name)
     fb = load("followbench", name)
     levels = [fb.get(f"rule_hsr_level_{level}") for level in range(1, 6)] if fb else []
     levels = [value for value in levels if value is not None]
     fb_mean = f"{sum(levels) / len(levels) * 100:.1f}".rjust(8) if levels else "-".rjust(8)
+    if source == "math":
+        gsm8k = load("gsm8k", name)
+        math500 = load("math500", name)
+        old_cells = (
+            pct(gsm8k, "accuracy", 8)
+            + num(words_p50("gsm8k", name), 7)
+            + pct(math500, "accuracy", 9)
+            + num(words_p50("math500", name), 7)
+        )
+    else:
+        cs = load("commonsense_qa", name)
+        old_cells = (
+            pct(cs, "average_acc_logprob", 9)
+            + pct(cs, "average_acc_gen", 8)
+            + pct(cs, "average_parse_rate", 7)
+            + pct(cs, "average_random_baseline", 7)
+        )
     print(
         f"{name:<40}"
-        + pct(gsm8k, "accuracy", 8)
-        + pct(math500, "accuracy", 9)
+        + old_cells
         + pct(ifeval, "strict_prompt_accuracy", 8)
         + num(words_p50("ifeval", name), 7)
         + fb_mean
         + num(words_p50("followbench", name), 7)
     )
 
+# 宏平均会把「某一个子任务塌了」摊平，而遗忘往往不是均匀的 —— 哪个子任务先塌是这条线
+# 能给出的一个额外发现，所以单独列一张。
+if source == "cs":
+    cs_rows = [(name, load("commonsense_qa", name)) for name in order]
+    cs_rows = [(name, payload) for name, payload in cs_rows if payload]
+    if cs_rows:
+        tasks = sorted({task for _, payload in cs_rows for task in payload.get("tasks", [])})
+        print()
+        print("=" * 116)
+        print("常识八子集的 acc_logprob 分解（%，最后一列是宏平均，就是主表的 CS logp）")
+        print("=" * 116)
+        header = "".join(task[:9].rjust(10) for task in tasks)
+        print(f"{'run':<34}{header}{'AVG':>9}")
+        for name, payload in cs_rows:
+            cells = "".join(
+                pct(payload.get("per_task", {}).get(task), "acc_logprob", 10) for task in tasks
+            )
+            print(f"{name:<34}{cells}" + pct(payload, "average_acc_logprob", 9))
+        missing = {
+            name: payload["tasks_missing"]
+            for name, payload in cs_rows
+            if payload.get("tasks_missing")
+        }
+        if missing:
+            print()
+            print(f"!! 有 run 少评了子集: {missing}")
+            print("   AVERAGE 是宏平均，子集不同的两行之间那一列不可比。补齐后重看。")
+
+old_name = "数学分" if source == "math" else "CS logp"
 print()
 print("怎么读:")
-print("  遗忘量  = math_anchor 的数学分 − 该臂的数学分")
-print("  保护效果 = onereplay 的数学分 − vanilla 的数学分")
+print(f"  遗忘量  = {source}_anchor 的 {old_name} − 该臂的 {old_name}")
+print(f"  保护效果 = onereplay 的 {old_name} − vanilla 的 {old_name}")
 print("  代价    = vanilla 的 IF 分 − onereplay 的 IF 分（保护换来的可塑性损失）")
 print("  三个数要一起看：只报第二个而不报第三个，等于用「少学新任务」冒充「保住旧能力」。")
 print()
-print("**数学分数必须配着上面那张 length diagnostic 的 hit-cap 读**，本线尤其如此。")
-print("保留目标是 math 长 CoT，而 FLAN 微调把输出压短：vanilla 可能因为输出塌成短答案、")
-print("走不到 \\boxed{} 而数学分虚低（看着像遗忘），protected 臂把权重拉回 Model-Math、")
-print("倾向保住长 CoT。删失率随输出长度变，hit-cap 不接近 0 时各臂的数学分之间不可比。")
+if source == "math":
+    print("**数学分数必须配着上面那张 length diagnostic 的 hit-cap / no-answer 读。** 保留目标")
+    print("是长 CoT 推理，而 Conifer 把输出推长推杂：vanilla 可能因为格式跑偏、走不到")
+    print("\\boxed{} 而数学分虚低（看着像遗忘），protected 臂把权重拉回 Model-Math、倾向保住")
+    print("数学文体。Part 3 那轮实测过这个陷阱：三条臂 acc_all 差到 0.098/0.144/0.456，但在都")
+    print("吐出 \\boxed 的公共子集上是 0.345/0.318/0.664 —— 差距大半来自格式和截断。")
+else:
+    print("**CS logp 是主口径，而且它是三条线里唯一不受输出长度影响的保留指标**：闭集排序、")
+    print("不解码、不正则匹配，所以遗忘量可以直接读，不像数学分要配着 hit-cap 才有可比性。")
+    print("这是本来源的方法学优势，写结果时值得点明。")
+    print()
+    print("**CS gen 掉了不等于遗忘。** 它测的是「还会不会按训练格式作答」，而 Stage 2 必然把")
+    print("输出从 7-8 个 token 推长推杂（Conifer 答案 p50 = 144 词），所以 gen 和 parse 一起")
+    print("掉是预期行为。只有 logp 掉了才是常识能力掉了。两者分道扬镳时看诊断表的 agree。")
+    print()
+    print("**rand 那一列是地板不是零。** 候选集只有 2-5 个，塌成单一 label 的模型也能拿到这个")
+    print("分数（宏平均约 35%）。CS logp 掉到 rand 附近 = 塌了，不是「还剩三分之一能力」。")
+    print("配着诊断表的 mode 那一列看：接近 1 就是塌缩确认。")
 print()
-print("**IF 分数升降也先看 words 再谈能力。** Stage 1 的 Model-Math 输出 P50 约 3900 token，")
-print("Stage 2 的 FLAN targets P50 只有约 18 token，长度会被往变短方向推两个数量级，而")
-print("IFEval/FollowBench 里不少约束本质在量长度（见 results_log/2026-09-12 第 8c 节）。")
+print("**IF 分数升降先看 words 再谈能力。** 新任务把输出往变长变杂推，而 IFEval/FollowBench")
+print("里不少约束本质在量长度（见 results_log/2026-09-12 第 8c 节）。")
 print()
 print("**FB HSR 不是 FollowBench 全量分数**：只有 rule 那一半（350/820 行、70/164 组），")
 print("style 类覆盖为 0，format 类只覆盖 2/30，example 类还有 2 组是退化的。judge 那")
 print("470 行要在有网的地方过 judge_followbench.py 才能补齐 164 组（见 92 号文件头）。")
 
-# FollowBench 的价值在分级曲线而不是单值：它报的是模型在第几级开始塌。
+# FollowBench 的价值在分级曲线而不是单值：它报的是模型在第几级开始塌。本线里它是
+# **新任务**的曲线，读的是「学会了到第几级」而不是「保住了到第几级」。
 fb_rows = [(name, load("followbench", name)) for name in order]
 fb_rows = [(name, payload) for name, payload in fb_rows if payload]
 if fb_rows:
@@ -1439,14 +2109,19 @@ echo "========================================================================"
 echo "产物:"
 echo "  checkpoint : ${CKPT}"
 echo "  metrics    : ${METRICS_DIR}/${RUN}.jsonl"
-echo "  评测       : ${RESULTS_ROOT}/{gsm8k,math500,ifeval,followbench}/<run>/summary.json"
+echo "  评测       : ${RESULTS_ROOT}/<metric>/<run>/summary.json"
+echo "               metric = ifeval, followbench, ${OLD_METRICS_ALL}"
 echo "  汇总 csv   : ${RESULTS_ROOT}/<metric>_summary.csv"
+if [[ "${SOURCE}" == "cs" ]]; then
+  echo "  逐行输出   : ${RESULTS_ROOT}/commonsense_qa/<run>/responses.jsonl  (诊断表读的就是它)"
+  echo "               commonsense_qa 那份 csv 是**每 run 每 task 一行 + AVERAGE 行**，不是一行一 run"
+fi
 echo ""
 echo "完整的一轮需要这几个 run，缺任何一个结论都不成立:"
-echo "  math_anchor                                     Stage 2 的起点（before）"
+echo "  ${ANCHOR_RUN}                                     Stage 2 的起点（before）"
 echo "  part3_if_vanilla_lr${LR}_seed${SEED}              无保护（遗忘的标尺）"
-echo "  part3_if_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}  C_math 保护"
-echo "  part3_if_ewc_lr${LR}_lam<λ_ewc>_seed${SEED}        F_math 保护（λ 与 onereplay 不可比）"
+echo "  part3_if_onereplay_lr${LR}_lam${LAMBDA}_seed${SEED}  C_${SOURCE} 保护"
+echo "  part3_if_ewc_lr${LR}_lam<λ_ewc>_seed${SEED}        F_${SOURCE} 保护（λ 与 onereplay 不可比）"
 echo ""
 echo "FollowBench 的 judge 那半边（470 行，要在有网的地方跑）:"
 echo "  python -m onereplay.scripts.judge_followbench \\"

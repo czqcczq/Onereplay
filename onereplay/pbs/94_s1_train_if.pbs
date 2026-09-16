@@ -26,19 +26,26 @@
 # base -> Model-IF 的**方向和幅度**，不是绝对值，所以这不影响结论。
 #
 # -----------------------------------------------------------------------------
-# 【Qwen2.5-Math 换模型带来的三个坑，三个都是静默的】
+# 【换模型带来的三个坑，三个都是静默的】
 #
-# 1) **chat template 会自动注入一条数学 system 指令**。没有 system 消息时，
-#    Qwen2.5-Math 的模板补上
+# 下面每条都注明了对当前模型（Qwen3-4B-Base）是否还成立，别按旧印象跳读。
+#
+# 1) **SYSTEM_PROMPT 必须显式传，理由随模型变但结论不变**。
+#    在 Qwen2.5-Math-1.5B 上，模板会在没有 system 消息时补上
 #        "Please reason step by step, and put your final answer within \boxed{}."
 #    而 data/chat.py 的 apply_train_template 和 eval/generation.py 的 render_chat
-#    都只传 user 角色。math 线上这正是论文的 "default chat template + CoT
-#    prompting"（91 号就靠它），在 IF 线上却是污染：每一条 FLAN 训练行和每一条
-#    IFEval/IFBench/FollowBench 评测 prompt 都会被要求输出 \boxed{}。IFEval 里
-#    大量约束是"不要用逗号"、"回答分三段"这类，和 \boxed{} 直接冲突。
-#    所以本线**必须**传 SYSTEM_PROMPT（默认已给一条中性的 Qwen2.5 助手消息），
-#    它同时传给 train.py 和 evaluate.py。两边不一致 = 模型在没训过的 prompt 下
-#    被评测，分数无意义。93 号（commonsense）同理，91 号（math）留空。
+#    都只传 user 角色。那在 math 线上正是论文的 "default chat template + CoT
+#    prompting"（91 号就靠它），在 IF 线上却是污染：每一条训练行和每一条
+#    IFEval/FollowBench 评测 prompt 都会被要求输出 \boxed{}。IFEval 里大量约束是
+#    "不要用逗号"、"回答分三段"这类，和 \boxed{} 直接冲突。
+#
+#    换成 Qwen3-4B-Base 之后模板不注入任何东西，所以上面那个污染在当前模型上已经不
+#    存在了。但 SYSTEM_PROMPT 的默认值**仍然保留**那条中性助手消息，两个原因：已跑
+#    完的 conifer / mix 结果都是在它下面测的，去掉等于换了 prompt、和历史不可比；
+#    而且 base 模型有一条 system 更容易进入助手模式，对 base 臂的评测更公平。
+#    它同时传给 train.py 和 evaluate.py。两边不一致 = 模型在没训过的 prompt 下被
+#    评测，分数无意义。93 号（commonsense）同理；91 号（math）反过来，在 4B 上它必
+#    须**补上** \boxed{} 指令，因为模板不再送。95 号采集必须和这里逐字一致。
 #
 # 2) **eos_token 是 <|endoftext|>，但 chat template 用 <|im_end|> 收尾**。模型
 #    吐出 <|im_end|> 时 generate 不会停，会续写下一轮对话，skip_special_tokens
@@ -351,7 +358,8 @@ cd "${REPO_ROOT}"
 
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 全线模型，理由见 91 号同处。要回 1.5B 就传 MODEL_NAME=Qwen2.5-Math-1.5B。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 
 # ---- 数据源：flan | conifer ----
 # 这条线有两个可用语料，它们教的是互补的两件事，都是实测过的：
@@ -540,11 +548,19 @@ LR="${LR:-5e-5}"
 # 训练开头 train.py 打的那行 `lr schedule: ...` 要和文件头算的更新数对得上。
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
-# 两条 source 同一个 BATCH。Conifer 看着"行更长"所以一度给它 4，但实测的截断表
-# 说全 38.9k 行在 1024 预算下就已经零截断（答案 token P50=183 / P90=310 /
-# max=690），也就是 full_length 顶多 1024 上下，BATCH=8 的实际激活约 8k token，
-# 还低于 FLAN 线 8x2048 的名义上界。给 4 是白扔一倍吞吐。
-BATCH="${BATCH:-8}"
+# 4 而不是 8 是 Qwen3-4B-Base 定的：无梯度检查点、纯 bf16 权重 + Adam（state 跟随
+# param dtype）下每参数 8 字节，4.0B 的静态开销就是 32 GB，8x2048 的峰值约 162 GB、
+# 超 140 GB 的卡，4 约 97 GB。完整拆账见 91 号同处。**ACCUM 不跟着改**，所以
+# accumulation_steps 从 8 变 16、有效 batch 仍是 64，梯度在数学上等价。
+#
+# 三条 source 用同一个值，训练预算才可比。但它们的**实际**序列长度差很远，这条
+# 值得知道：Conifer 的截断表说全 38.9k 行在 1024 预算下就零截断（答案 token
+# P50=183 / P90=310 / max=690），所以单看 conifer 线，BATCH=8 的实际激活只有约
+# 8k token、其实装得下。mix 和 flan 线掺了 FLAN 的 few-shot prompt，长度分布没实
+# 测过，而 padding 是按 batch 内最长算的——只要有少数行接近 2048，那几个 batch
+# 就会 OOM，而且是在训练跑到一半时才炸。为让一条 source 快一倍去冒另两条的风险
+# 不值得，所以统一 4。哪天量过 flan/mix 的 full_length 分布，再单独放开。
+BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-64}"
 # 两条 source 用同一个 2048，训练预算才可比。但**截断的后果方向是相反的**，这
 # 一条必须知道：tokenizer_to_ids 保留序列**末尾**。FLAN 的问题在 prompt 末尾，
@@ -658,7 +674,8 @@ fi
 echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
 echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
 echo "  system 消息    : ${SYSTEM_PROMPT}"
-echo "                   (空 = 用模板默认，Qwen2.5-Math 会注入 \\boxed{} 指令；见文件头)"
+echo "                   (Qwen3 的模板不注入 system，所以空 = 真的没有 system turn；"
+echo "                    95 号采集必须传一样的值，见文件头第 1 条)"
 if [[ "${MODE}" == "lr_sweep" ]]; then
   echo "  sweep          : grid=[${LR_GRID}]  每档 ${SWEEP_MAX_STEPS} micro-batch = $(( SWEEP_MAX_STEPS / (ACCUM / BATCH) )) 次更新 = $(( SWEEP_MAX_STEPS * BATCH )) 行"
 fi

@@ -41,16 +41,20 @@
 # -----------------------------------------------------------------------------
 # 【SYSTEM_PROMPT 必须和 94 号训练时传的一致】
 #
-# 换成 Qwen2.5-Math-1.5B 之后，没有 system turn 时 chat template 会自动注入
-# "Please reason step by step, and put your final answer within \boxed{}."。
-# 94 号因此给 IF 线固定传了一条中性 system 消息。采集这边渲染的是**同一批行**，
-# 用的却是 old_knowledge.py 自己的 --system_prompt（默认空），所以不传的话：
+# 94 号给 IF 线固定传了一条中性 system 消息。采集这边渲染的是**同一批行**，用的却是
+# old_knowledge.py 自己的 --system_prompt（默认空），所以不传就会错开一整个 system 段：
 #
 #     训练时模型看到的  = [system: 中性] + [user: FLAN] + [assistant: gold]
-#     C/F 看到的        = [system: 数学 \boxed 指令] + [user: FLAN] + [assistant: gold]
+#     C/F 看到的        = [user: FLAN] + [assistant: gold]
 #
-# 两者不是同一个文本分布，于是 C 描述的「旧知识激活方向」并不是模型在 Stage 3
-# 起点上真实会看到的方向。不报错、C 照样写得出来、训练照样跑。
+# 两者不是同一个文本分布，于是 C 描述的「旧知识激活方向」并不是模型在 Stage 3 起点上
+# 真实会看到的方向。不报错、C 照样写得出来、训练照样跑。
+#
+# 这个要求和模型无关，但**不一致的具体后果随模型变**，别照旧印象判断：
+#   Qwen2.5-Math-1.5B  不传 -> 模板自动补上 \boxed{} 数学指令，C/F 拿到的是"数学
+#                      system + FLAN 行"这种训练里从没出现过的组合；
+#   Qwen3-4B-Base      不传 -> 模板不注入任何东西，C/F 拿到的是"没有 system"，
+#                      比训练时整整少一段。换模型消掉的是前一种，不是这个要求本身。
 # 默认值与 94 号逐字相同；94 号改了这里必须跟着改。
 #
 # -----------------------------------------------------------------------------
@@ -323,7 +327,9 @@ python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is
 cd "${REPO_ROOT}"
 # ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 全线模型，理由见 91 号同处。必须和 94 号训练时用的模型一致，否则采到的 C/F
+# 描述的不是这个 checkpoint 的激活分布。要回 1.5B 就传 MODEL_NAME=Qwen2.5-Math-1.5B。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 
 # ---- Stage 1（IF 线 / FLAN v2）的产物，本脚本只读 ----
 # 94 号的结果树，按模型分根。C/F 的模型和池子都来自这里。

@@ -66,16 +66,25 @@
 #    取错。所以评测**必须** --decode_stop_on_im_end 1（本脚本已固定传）。
 #    这和 Qwen3-1.7B-Base 是同一个坑，只是 evaluate.py 的默认值是 0。
 #
-# 3) Qwen2.5-Math 的 chat template 在**没有 system 消息**时会自动注入
+# 3) **\boxed{} 那条指令的来源随模型变，现在靠脚本显式传**。Qwen2.5-Math 的 chat
+#    template 在没有 system 消息时会自动注入
 #        "Please reason step by step, and put your final answer within \boxed{}."
-#    这正是论文说的 "default chat template + CoT prompting"。data/chat.py 的
-#    apply_train_template 和 eval/generation.py 的 render_chat 都只传 user 角色，
-#    所以训练和评测拿到的是同一条 system —— 这一点是对齐的，不用改。
+#    那正是论文说的 "default chat template + CoT prompting"，本脚本当年留空就是为了
+#    白拿这一条。**Qwen3-4B-Base 不注入**：它的模板只在 messages[0] 是 system 时才
+#    输出 system 块。而 math500 / amc 的答案提取靠 \boxed{}、Numina 的训练答案又自带
+#    \boxed{}，所以在 4B 上留空会让 base 臂提不出答案而虚低、训练后臂因为从数据里学
+#    会了写 \boxed{} 而正常，凭空夸大训练效果。现在由 SYSTEM_PROMPT_PRESET 按模型补
+#    齐（完整说明见下面 SYSTEM_PROMPT 那处），99 号采集用的是逐字相同的一段逻辑。
+#    不管指令来自模板还是来自这个开关，data/chat.py 的 apply_train_template 和
+#    eval/generation.py 的 render_chat 走的都是同一个值，训练和评测始终对齐。
 #    副作用是 INSTRUCTION_STYLE=eval_aligned 又在 user turn 里写了一遍同样的要求，
 #    指令重复。训练/评测同口径所以不影响可比性，想更贴论文就传 bare。
 #
-# IF 线是 90_part1_if_conifer.pbs。两条线拆开管，因为这条线的 maxlen 是 IF 的 4 倍、
-# batch 只有 1/4，超参和显存预算完全是另一套。不做交叉评测。
+# IF 线是 94_s1_train_if.pbs（90 号已废弃）。两条线拆开管，因为数据准备、评测
+# benchmark 和答案提取是完全两套。超参现在反过来是**对齐**的（MAXLEN 2048 / BATCH 4
+# / ACCUM 64 / 1 epoch / 5e-5 cosine 0.1 warmup），那句"这条线 maxlen 是 IF 的 4 倍、
+# batch 只有 1/4"是 8192-maxlen 时代的话，早就不成立了。对齐是有意的：三条 S1 线
+# 用同一套配方，才好横向比"同样训一个 epoch，不同能力各自涨多少"。不做交叉评测。
 #
 # -----------------------------------------------------------------------------
 # 【为什么是全量微调，而不是 LoRA】
@@ -487,7 +496,12 @@ cd "${REPO_ROOT}"
 
 # ---- 路径 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 09-16 起全线换到 Qwen3-4B-Base：Qwen2.5-Math-1.5B 在 numina 上能涨 math，但同一
+# 套配方训 IF 是负的；4B 两边都能涨，所以三条 S1 线和三个采集脚本统一用它。
+# 要回到 1.5B 就传 MODEL_NAME=Qwen2.5-Math-1.5B，已跑完的结果在
+# results_part1_*_Qwen2.5-Math-1.5B/ 下，不会被这次改动覆盖。
+# 换模型牵动的不止名字，见下面 BATCH 和 SYSTEM_PROMPT_PRESET 两处。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 # 结果树按**模型**分，这是必须的而不是整洁强迫症。旧的 Qwen3-1.7B-Base 那一轮就写在
 # results_part1_numina_math/ 下，run 名是 part1_math_lr5e-5_seed1 —— 和本次的
 # lr/seed 完全相同。两者共用一个根的话，MODE=train 会撞上
@@ -593,11 +607,18 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 # BATCH 必须整除 ACCUM（accumulation_steps = ACCUM // BATCH 是整除），否则"一次更新
 # 64 行"不成立。BATCH=4 x MAXLEN 2048 = 8192 token/micro-batch，和 OpenR1 时代的
 # 1 x 8192 是同一个激活预算，所以那时能跑现在一定能跑。
-# 历史实测：BATCH=8 在 MAXLEN=4096 下 OOM（8 x 4096 = 32768 token/micro-batch）。
-# 现在 MAXLEN 降到 2048，8 x 2048 = 16384 理论上装得下，但没有实测，而且
-# 4 x 2048 已经远在吞吐饱和点之上（见文件头「显存与 batch」），加大换不到速度。
-# 要动就先 MODE=smoke 看峰值。
-BATCH="${BATCH:-8}"
+# 4 而不是 8 是 Qwen3-4B-Base 定的。本脚本没有梯度检查点，权重是纯 bf16
+# （modeling.py 用 dtype=bfloat16 加载，不是 fp32+autocast），优化器是
+# torch.optim.Adam、state 跟随 param dtype，所以每参数 8 字节（权重 2 + 梯度 2 +
+# m,v 各 2）。4.0B 的静态开销因此是 32 GB，1.5B 只有 12 GB。加上 8x2048 的 logits
+# （vocab 151936，cross_entropy 还会 upcast 到 fp32 再留一份反向）约 25 GB、以及约
+# 105 GB 激活，BATCH=8 峰值约 162 GB，超 140 GB 的卡；BATCH=4 约 97 GB。
+# 1.5B 时代的实测：BATCH=8 / MAXLEN=2048 峰值 100 GB（跑得动），
+#                  BATCH=8 / MAXLEN=4096 OOM（32768 token/micro-batch）。
+# **ACCUM 不跟着改**：accumulation_steps 从 8 变 16，有效 batch 仍是 64，梯度在数学
+# 上等价（transformer 里没有跨样本的层），所以降 micro-batch 不等于换训练配置。
+# 要往上调就先 MODE=smoke 看峰值。
+BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-64}"
 # 2048 = 论文 §4.1 的 "maximum input length"。Numina 的答案 P50=351 / P90=778 /
 # max=2666，所以 2048 会截断一小部分行，**不是零截断**。截断是保尾丢头的，提交前
@@ -612,17 +633,20 @@ MAXVAL="${MAXVAL:-200}"
 # 本线没有正则，传什么都不影响结果；与 44 号保持一致便于对照。
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
-# ---- system 消息：本线**刻意留空** ----
-# 空 = 不传 system turn = Qwen2.5-Math 的模板自动注入
+# ---- system 消息：本线要的是那条 \boxed{} 指令，但来源随模型变 ----
+# 在 Qwen2.5-Math-1.5B 上靠**留空**拿到：空 = 不传 system turn = 它的模板自动注入
 #     "Please reason step by step, and put your final answer within \boxed{}."
-# 这正是论文 §4.1 说的 "default chat template + CoT prompting"，是本线要复现的
-# 配方的一部分，所以不要动它（见文件头 Qwen2.5-Math 那节第 3 条）。
+# 那正是论文 §4.1 说的 "default chat template + CoT prompting"，是本线要复现的配方
+# 的一部分。当前模型 Qwen3-4B-Base 的模板不注入，所以同一条指令改由下面的
+# SYSTEM_PROMPT_PRESET 显式补齐，渲染结果等价（见文件头第 3 条）。
+# **所以别再把"留空"当成本线的配置**，那只是 1.5B 下达到目的的手段。
 #
-# 93/94 号（cs / if）相反：同一个注入在那两条线上是污染，它们各自传一条中性的
-# 助手消息。三条线的 system 不同是有意的，不是遗漏。
+# 93/94 号（cs / if）反过来：这条指令在那两条线上是污染，它们各自传一条中性的助手
+# 消息把它顶掉；到了 Qwen3 上已经没有要顶的东西，但那条中性消息保留着（理由见它们
+# 文件头第 1 条）。三条线的 system 不同是有意的，不是遗漏。
 #
-# 已跑完的 Model-Math 就是在空值下训练的，所以改这个等于换了训练 prompt，
-# checkpoint 和评测都要重来。
+# 已跑完的 Qwen2.5-Math Model-Math 是在空值下训练的，所以在那个模型上改这个等于换了
+# 训练 prompt，checkpoint 和评测都要重来。
 #
 # ---- 换模型时的陷阱 ----
 # 上面"留空"依赖的是 Qwen2.5-Math 会自己注入那条指令。**其他模型不会**：

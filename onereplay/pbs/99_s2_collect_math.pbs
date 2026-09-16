@@ -256,7 +256,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME MATH_LINE_ROOT MATH_CKPT_DIR MATH_LR MATH_RUN MATH_CKPT
     TRAIN_POOL RESULTS_ROOT DATASET_CACHE POOL_FILE POOL_ROWS_EXPECT POOL_SAMPLE_SEED
     MODE DRY_RUN FORCE DO_COV DO_FISHER
-    SEED SAMPLE_SEED MAXLEN SCOPE TARGET_MODULES SYSTEM_PROMPT
+    SEED SAMPLE_SEED MAXLEN SCOPE TARGET_MODULES SYSTEM_PROMPT SYSTEM_PROMPT_PRESET
     COV_BATCH COV_ACCUM_DEVICE COV_USE_BF16 COV_PATH
     FISHER_DEVICE FISHER_USE_BF16 FISHER_PATH MAX_SAMPLES LOG_EVERY
     TAG REF_COV REF_LAMBDA_FULL REF_LAMBDA_QV DEBUG_EXAMPLES
@@ -309,7 +309,9 @@ cd "${REPO_ROOT}"
 
 # ---- 原始 Base，只用于 Step 0 打印对照（本脚本**不**在它上面采）----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen2.5-Math-1.5B}"
+# 全线模型，理由见 91 号同处。必须和 91 号训练时用的模型一致，否则采到的 C/F
+# 描述的不是这个 checkpoint 的激活分布。要回 1.5B 就传 MODEL_NAME=Qwen2.5-Math-1.5B。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
 
 # ---- Stage 1（Math 线 / NuminaMath-CoT）的产物，本脚本只读 ----
 # Model-Math 是 91 号用 NuminaMath 100k 训出来的那一个，它就是 Stage 3 的 W0，
@@ -355,12 +357,33 @@ SAMPLE_SEED="${SAMPLE_SEED:-1}"
 # Numina 全序列 P50=479 P90=942 P99=1507 max=2810，2048 下截断的行极少，而 91 号
 # 用的就是 2048 —— 对齐训练侧优先于多留余量。
 MAXLEN="${MAXLEN:-2048}"
-# ---- system 消息：math 线**刻意留空**，必须与 91 号训练时一致 ----
-# 空 = 不传 system turn = Qwen2.5-Math 的模板自动注入
+# ---- system 消息：**必须与 91 号训练时逐字一致** ----
+# C/F 描述的是模型在 Stage 3 起点上会看到的激活分布，所以采集时的渲染和训练时的
+# 渲染必须一样。这里不一致不会报错，只会让保护方向偏掉，静默地削弱 OneReplay/EWC。
+#
+# 在 Qwen2.5-Math-1.5B 上这一条靠"留空"实现：没有 system turn 时它的模板会自动注入
 #     "Please reason step by step, and put your final answer within \boxed{}."
-# 91 号就是在这个渲染下训的（那是它要复现的配方），所以采集这边也必须留空，
-# C/F 才和模型在 Stage 3 起点上真实会看到的文本分布一致。
-# 95 号（IF）和 101 号（CS）相反，它们传一条中性 system 消息把注入顶掉。
+# 91 号刻意留空就是为了复现那个配方，所以采集也留空，两边都拿到注入的版本。
+#
+# 换成 Qwen3-4B-Base 之后留空就错了：Qwen3 的模板只在 messages[0] 是 system 时才输出
+# system 块，不会替你注入任何东西。而 91 号那边已经按模型补齐了那条指令，这边若还
+# 留空，采到的 C/F 就是"无 system turn"下的分布，和训练分布差一整个 system 段。
+# 所以这里用和 91 号**同一套** preset 逻辑，两个脚本必须一起改，别只改一个。
+# 95 号（IF）和 101 号（CS）不需要这个开关：它们的 system 是一条与模型无关的中性
+# 助手消息，换模型不改变渲染。
+SYSTEM_PROMPT_PRESET="${SYSTEM_PROMPT_PRESET:-auto}"
+if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
+  case "${SYSTEM_PROMPT_PRESET}" in
+    none) ;;
+    math) SYSTEM_PROMPT="Please reason step by step, and put your final answer within \\boxed{}." ;;
+    auto)
+      if [[ "${MODEL_NAME}" != *Math* ]]; then
+        SYSTEM_PROMPT="Please reason step by step, and put your final answer within \\boxed{}."
+      fi
+      ;;
+    *) echo "SYSTEM_PROMPT_PRESET 只能是 auto / math / none，得到 '${SYSTEM_PROMPT_PRESET}'" >&2; exit 2 ;;
+  esac
+fi
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 # scope 对 C 和 F 必须相同，否则 EWC 和 onereplay 约束的层集合不同，对照失效。
 SCOPE="${SCOPE:-full}"
@@ -384,6 +407,17 @@ esac
 # COV_BATCH=2 的那段算术是按 8192 写的，不再适用。
 COV_BATCH="${COV_BATCH:-4}"
 # device：把 6.58 GiB 累加器留在 GPU 上，省掉每 batch 每层的回传。
+# 那 6.58 GiB 是 Qwen2.5-Math-1.5B 下的实测值。C 的大小只由架构决定（每个目标层
+# 一个 d_in x d_in 的 fp32 矩阵），换 Qwen3-4B-Base 后 full scope 下大约翻倍：
+# 主导项 down_proj 的 d_in 从 8960 变 9728、层数从 28 变 36，(9728/8960)^2 x 36/28
+# ~= 1.5，而 hidden 从 1536 变 2560 让其余层涨得更多。跑完看 C 文件的实际大小就能
+# 核准，别用这里的数字当定论。
+#
+# 采集本身不吃紧（C 20 GB 上下 + bf16 权重 8 GB + 前向，远在 140 GB 之内），要当心
+# 的是 **Stage 3**：那时显存里同时有 4B 的训练开销（静态 32 GB + 激活 + logits，
+# 见 91 号 BATCH 那段，约 97 GB）、驻留的 C、以及 EWC 的对角 F（4.02B x fp32 ~= 15
+# GiB），加起来约 125 GB，贴着 140 GB 的卡。到时候大概要把 Stage 3 的 BATCH 降到 2、
+# 或者把 C 放 CPU（--cov_accum_device cpu，慢但省 20 GB）。这不影响本脚本。
 COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
 # C 由前向激活累加、hook 里已经 .float() 加宽，所以模型走 bf16 没有精度问题。
 COV_USE_BF16="${COV_USE_BF16:-1}"
