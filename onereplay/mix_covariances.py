@@ -7,6 +7,12 @@ matrix per LoRA target module. This script combines matching module keys:
 
 The resulting file has the same format as a normal covariance file, so training
 can use it directly via --cov_path.
+
+Memory: the inputs are mmapped rather than read, because an all-linear C for
+Qwen3-8B is 33.75 GiB and two of them plus the accumulator would need over
+100 GiB of host RAM. With mmap the only buffer that has to fit is the mix
+itself, one input layer at a time paging in behind it. Falling back to a real
+read keeps this working on filesystems or torch builds where mmap is refused.
 """
 
 from __future__ import annotations
@@ -48,9 +54,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_payload(path: str) -> dict[str, Any]:
-    """Load one covariance payload from disk."""
+    """Map one covariance payload from disk without reading it into RAM."""
 
-    payload = torch.load(path, map_location="cpu")
+    try:
+        payload = torch.load(path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError, ValueError):
+        # mmap needs the zipfile format and a filesystem that supports it.
+        # Anything older or stricter just gets read the slow way.
+        payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict) or "covariances" not in payload:
         raise ValueError(f"Unsupported covariance payload: {path}")
     return payload
@@ -93,9 +104,16 @@ def main() -> None:
         value = None
         count_values = []
         for weight, payload in zip(weights, payloads):
-            covariance = payload["covariances"][key].float()
-            weighted = weight * covariance
-            value = weighted if value is None else value + weighted
+            covariance = payload["covariances"][key]
+            if value is None:
+                # copy=True is load-bearing: without it a float32 input returns
+                # the mmapped tensor itself and mul_ would write into the
+                # read-only mapping of the source file.
+                value = covariance.to(dtype=torch.float32, copy=True).mul_(weight)
+            else:
+                # covariance stays mmapped here -- add_ reads it in place, so no
+                # second full-size buffer is ever live.
+                value.add_(covariance, alpha=weight)
             count_values.append(int(payload.get("counts", {}).get(key, 0)))
         mixed[key] = value
         # Counts no longer define the normalization exactly after mixing. Store

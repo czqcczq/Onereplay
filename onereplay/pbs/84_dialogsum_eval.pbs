@@ -1,0 +1,511 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_ds_eval
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper (PBS + Singularity): 只跑 DialogSum 的生成质量评测，不训练。
+#
+# 【这个脚本解决什么问题】
+#   74/81/82/83 号里 DialogSum 的评测是和 retention 那一堆指标绑在一起的：要
+#   补一次 ROUGE，就得把 DOMAIN、LAMBDA 这些训练侧的变量也填对，脚本还会顺带
+#   把 gsm8k / math500 / humaneval / mbpp / ifeval / ifbench 全评一遍 ——
+#   几个小时的 GPU，只为拿几个摘要分数。
+#
+#   这个脚本只做一件事：给**已经训练好的 adapter** 补 DialogSum 的分数。
+#   不训练、不碰 C、不评任何 retention 指标，一个 adapter 约 10-20 min。
+#
+# 【为什么 val_loss 不够，要单独评这个】
+#   val_loss 是 teacher forcing 下的 token 级交叉熵，它只说"拟合得多紧"。
+#   loss 单调下降，和模型学会了改写对话而不是总结对话，这两件事并不矛盾 ——
+#   前者在每一步都盯着真实前缀，后者的偏差要自由生成几十个 token 才暴露。
+#   ROUGE 与 BERTScore 是对着真参考、在自由生成的结果上打的，而且是绝对数，能
+#   直接和摘要文献的表对齐；val_loss 只能跨自家的臂比。
+#
+#   方向与 retention 那几个指标相反：base 是**地板**不是上限，微调应该把这些
+#   分数推**上去**。一个臂的 ROUGE 停在 base 水平，就是没学会新任务，不管它的
+#   retention 多好看 —— 正则化器总能靠"什么都不学"赢下 retention。
+#
+# 【ROUGE 和 BERTScore 为什么都要】
+#   ROUGE 数的是 n-gram 重叠，换个说法说同一件事就会被判低分；BERTScore 比的是
+#   上下文嵌入，同义改写能认出来，但它对事实错误不敏感（人名换了、数字反了，
+#   嵌入仍然很近）。两个都是 max-over-references（DialogSum 官方 test 每段对话
+#   3 个参考）。ROUGE 是 0-1 的 F 值，BERTScore 未做 baseline rescaling，绝对值
+#   天然在 0.8+，只有跨 run 的 delta 有意义。
+#
+# -----------------------------------------------------------------------------
+# 前置条件
+#   1) ${MODEL_DIR}/${MODEL_NAME}
+#   2) 要评的 adapter 在 ${RESULTS_ROOT}/adapters/ 下
+#   3) DialogSum 官方 test：${DS_TEST_FILE}，由 74 号的 prepare 步骤生成
+#        qsub -v DRY_RUN=0,DO_TRAIN=0,DO_EVAL=0 onereplay/pbs/74_dialogsum_probe.pbs
+#   4) 打分库。**必须在登录节点装**（计算节点离线）：
+#        source ${VENV}/bin/activate
+#        pip install rouge-score bert-score
+#      rouge-score 是纯 Python、不下载任何语料；缺了整个指标没法打，直接退出。
+#   5) BERTScore 的 roberta-large 落在 ${BERTSCORE_MODEL}。计算节点
+#      HF_HUB_OFFLINE=1 拉不动，所以要在**登录节点**先取一次（命令见下面的
+#      warning 输出）。缺了就自动关掉，只影响 BERTScore 这一列。
+#
+# -----------------------------------------------------------------------------
+# !! 默认只扫 ds_ 开头的 adapter
+#   adapters/ 目录里 CS 线（cs_*）和 DialogSum 线（ds_*）是混在一起的。cs_* 那
+#   批没在 DialogSum 上训练过，给它们评 ROUGE 只会得到 base 水平的数，白烧
+#   几小时 GPU。RUN_PREFIX 默认 ds_ 就是这道网；显式传 RUNS 时不过滤。
+#
+# -----------------------------------------------------------------------------
+# 用法:
+#   # 默认：扫 adapters 下所有 ds_* 加 base，跳过已有结果
+#   qsub onereplay/pbs/84_dialogsum_eval.pbs
+#
+#   # 只评指定的几个（空格分隔；显式给名字时不看 RUN_PREFIX）
+#   qsub -v RUNS="ds_vanilla_8b_r16all_lr2e-4_ep2_seed1 ds_onereplay_8b_ifgold_r16all_lam1.5e-2_lr2e-4_seed1_regonce" \
+#     onereplay/pbs/84_dialogsum_eval.pbs
+#
+#   # 评一个不在 adapters/ 下的 adapter，并指定结果目录名
+#   qsub -v RUNS=my_run,ADAPTER=/abs/path/to/adapter,OUT_NAME=my_run \
+#     onereplay/pbs/84_dialogsum_eval.pbs
+#
+#   # 冒烟：只评 base 的前 20 条，确认依赖齐了再投正式的
+#   qsub -v RUNS=base,LIMIT=20 onereplay/pbs/84_dialogsum_eval.pbs
+#
+#   # 已有 summary.json 也强制重评（改过打分口径后必须这样全量重跑）
+#   qsub -v FORCE_EVAL=1 onereplay/pbs/84_dialogsum_eval.pbs
+#
+#   # 1.7B 那批（换模型和结果树）
+#   qsub -v MODEL_NAME=Qwen3-1.7B,RESULTS_ROOT=/scratch/weiliu87/student/czq/Onereplay/results \
+#     onereplay/pbs/84_dialogsum_eval.pbs
+#
+# 预计耗时: 500 段对话 / 256 token 预算，8B 上约 10-20 min 一个模型。
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id>
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（与其它 pbs 脚本保持一致）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/84_dialogsum_eval.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  # -e/--cleanenv 会清掉环境，只有 SINGULARITYENV_/APPTAINERENV_ 前缀的变量能进容器。
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DS_DATASET DS_TEST_FILE
+    SEED RUN RUNS RUN_PREFIX ADAPTER OUT_NAME OUT_SUFFIX LIMIT
+    DS_MAX_NEW_TOKENS DS_BATCH
+    DS_BERTSCORE BERTSCORE_MODEL BERTSCORE_LAYERS BERTSCORE_BATCH
+    WITH_BASE FORCE_EVAL BASELINE_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  # 不加 --nv：Hopper 的 singularity 已经全局绑好 GPU 驱动。
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的评测。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# 离线：模型和数据都在本地盘，禁止任何 HuggingFace 联网调用。
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+DS_DATASET="${DS_DATASET:-${REPO_ROOT}/datasets/dialogsum_sft_hf}"
+DS_TEST_FILE="${DS_TEST_FILE:-${DS_DATASET}_test.jsonl}"
+
+# ---- 评测口径：与 74/81/82/83 号逐字相同，改了所有臂都要重评 ----
+SEED="${SEED:-1}"
+LIMIT="${LIMIT:-0}"                 # >0 时只评前 N 段对话（冒烟用）
+DS_MAX_NEW_TOKENS="${DS_MAX_NEW_TOKENS:-256}"
+DS_BATCH="${DS_BATCH:-32}"
+DS_BERTSCORE="${DS_BERTSCORE:-1}"
+BERTSCORE_MODEL="${BERTSCORE_MODEL:-${MODEL_DIR}/roberta-large}"
+BERTSCORE_LAYERS="${BERTSCORE_LAYERS:-17}"
+BERTSCORE_BATCH="${BERTSCORE_BATCH:-64}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+WITH_BASE="${WITH_BASE:-1}"
+RUN_PREFIX="${RUN_PREFIX:-ds_}"     # 扫目录时的前缀过滤，见文件头
+OUT_SUFFIX="${OUT_SUFFIX:-}"
+# 末尾表里拿谁当分母。默认是 74 号的 vanilla：ROUGE 相对它掉，才说明罚项在拿
+# 新任务换 retention；相对 base 涨只说明"训练确实发生了"。
+BASELINE_RUN="${BASELINE_RUN:-ds_vanilla_8b_r16all_lr2e-4_ep2_seed1}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -f "${DS_TEST_FILE}" ]] || {
+  echo "缺 DialogSum 官方 test: ${DS_TEST_FILE}"
+  echo "74 号的 prepare 步骤会生成它:"
+  echo "  qsub -v DRY_RUN=0,DO_TRAIN=0,DO_EVAL=0 onereplay/pbs/74_dialogsum_probe.pbs"
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 依赖自检：打分库齐不齐、test 文件是不是多参考版。
+#   放在加载模型之前 —— 8B 的加载要几分钟，而打分发生在解码**之后**，
+#   缺库的报错会等到 500 段对话全解码完才出现。
+# ---------------------------------------------------------------------------
+set +x
+echo "==== 依赖自检 ===="
+python - <<'PY'
+import sys
+
+try:
+    from rouge_score import rouge_scorer  # noqa: F401
+except ImportError as error:
+    sys.exit(
+        f"缺 rouge-score: {error}\n"
+        "ROUGE 是这个指标的主分数，缺了没法评。登录节点上装:\n"
+        "  source <REPO_ROOT>/.venv/bin/activate\n"
+        "  pip install rouge-score bert-score"
+    )
+print("rouge-score : ok")
+PY
+echo "rouge 自检通过"
+
+# bert-score 缺席只摘掉 BERTScore 这一列，ROUGE 照评。
+if [[ "${DS_BERTSCORE}" == "1" ]] && ! python -c "import bert_score" >/dev/null 2>&1; then
+  echo "warning: 缺 bert-score，BERTScore 关闭。登录节点上装: pip install bert-score"
+  DS_BERTSCORE=0
+fi
+if [[ "${DS_BERTSCORE}" == "1" && ! -d "${BERTSCORE_MODEL}" ]]; then
+  echo "warning: 缺 ${BERTSCORE_MODEL}，BERTScore 关闭。在**登录节点**取一次:"
+  echo "         python -c \"from transformers import AutoModel, AutoTokenizer; \\"
+  echo "           AutoModel.from_pretrained('roberta-large').save_pretrained('${BERTSCORE_MODEL}'); \\"
+  echo "           AutoTokenizer.from_pretrained('roberta-large').save_pretrained('${BERTSCORE_MODEL}')\""
+  DS_BERTSCORE=0
+fi
+# 拍平的单参考旧版和多参考版长得一样，只有 outputs 字段能区分，而前者打出来的
+# 分数系统性偏低。纯 bash 匹配而不是 head|grep：pipefail 下 grep -q 提前退出会
+# 给 head 一个 SIGPIPE，管道返回码变成 141，判断就反了。
+if [[ "$(head -n 1 "${DS_TEST_FILE}")" != *'"outputs"'* ]]; then
+  echo "warning: ${DS_TEST_FILE} 是拍平的单参考旧版（无 outputs 字段），"
+  echo "         分数会低于论文的 max-over-refs 口径。重建（74 号）:"
+  echo "         qsub -v DRY_RUN=0,FORCE_PREPARE=1,DO_TRAIN=0,DO_EVAL=0 onereplay/pbs/74_dialogsum_probe.pbs"
+fi
+set -x
+
+# ---- 要评的 run ----
+# RUNS 没给就扫 adapters 目录：给所有已有臂补 DialogSum 分数是这个脚本的主用途，
+# 硬编码一张名单每加一个臂就得改一次。
+FILTERED=0
+if [[ -z "${RUNS:-}" ]]; then
+  if [[ -n "${RUN:-}" ]]; then
+    RUNS="${RUN}"
+  else
+    FILTERED=1
+    RUNS=""
+    if [[ -d "${RESULTS_ROOT}/adapters" ]]; then
+      for d in "${RESULTS_ROOT}/adapters"/*/; do
+        [[ -d "${d}" ]] || continue
+        name="$(basename "${d}")"
+        # 前缀过滤：cs_* 没在 DialogSum 上训练过，评它们只是白烧 GPU。
+        [[ -n "${RUN_PREFIX}" && "${name}" != "${RUN_PREFIX}"* ]] && continue
+        RUNS="${RUNS} ${name}"
+      done
+    fi
+    RUNS="${RUNS# }"
+  fi
+fi
+# base 的 adapter 路径是空串：evaluate.py 认这个，直接加载裸模型。
+# 它是这张表的地板：微调应该把分数推到它上面去。
+if [[ "${WITH_BASE}" == "1" && " ${RUNS} " != *" base "* ]]; then
+  RUNS="base ${RUNS}"
+fi
+
+if [[ -z "${RUNS// /}" ]]; then
+  echo "没有可评的 run：${RESULTS_ROOT}/adapters 下没有 ${RUN_PREFIX} 开头的目录，且 WITH_BASE=0"
+  echo "（要评别的前缀就传 RUN_PREFIX=，或直接传 RUNS=\"name1 name2\"）"
+  exit 1
+fi
+
+if [[ "${LIMIT}" != "0" ]]; then
+  echo "!! LIMIT=${LIMIT}：冒烟模式，产出的 summary.json 只覆盖前若干段对话，不是正式结果。"
+fi
+
+resolve_adapter () {
+  local run=$1
+  if [[ "${run}" == "base" ]]; then
+    echo ""
+    return
+  fi
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${ADAPTER:-}" && "${n}" -eq 1 ]]; then
+    echo "${ADAPTER}"
+    return
+  fi
+  echo "${RESULTS_ROOT}/adapters/${run}"
+}
+
+resolve_out_name () {
+  local run=$1
+  local n
+  n="$(echo "${RUNS}" | wc -w)"
+  if [[ -n "${OUT_NAME:-}" && "${n}" -eq 1 ]]; then
+    echo "${OUT_NAME}"
+    return
+  fi
+  echo "${run}${OUT_SUFFIX}"
+}
+
+# ---------------------------------------------------------------------------
+# 前置：谁会跑、谁会跳过、为什么跳过。缺 adapter 只跳过这一行，不整作业退出。
+# ---------------------------------------------------------------------------
+set +x
+echo "========================================================================"
+echo "DialogSum 生成质量（只评这一个指标，不训练）"
+echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  结果树   = ${RESULTS_ROOT}"
+echo "  数据     = ${DS_TEST_FILE}"
+echo "  解码     = 贪心, ${DS_MAX_NEW_TOKENS} token, batch ${DS_BATCH}, seed ${SEED}"
+echo "  打分     = ROUGE-1/2/L (0-1 F 值) + BERTScore:${DS_BERTSCORE}"
+if (( FILTERED == 1 )); then
+  echo "  扫描     = ${RESULTS_ROOT}/adapters/${RUN_PREFIX}*"
+fi
+echo "------------------------------------------------------------------------"
+printf "%-56s %s\n" "run" "状态"
+PENDING=0
+for run in ${RUNS}; do
+  adapter="$(resolve_adapter "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+  if [[ "${run}" != "base" && ! -d "${adapter}" ]]; then
+    printf "%-56s %s\n" "${run}" "!! 缺 adapter: ${adapter}"
+    continue
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/dialogsum/${out_name}/summary.json" ]]; then
+    printf "%-56s %s\n" "${run}" "已有结果，跳过"
+  else
+    printf "%-56s %s\n" "${run}" "待评 -> dialogsum/${out_name}"
+    PENDING=$((PENDING + 1))
+  fi
+done
+echo "------------------------------------------------------------------------"
+echo "待评 ${PENDING} 个，按 ~15 min/个 估计约 $((PENDING * 15 / 60))h$((PENDING * 15 % 60))min"
+echo "========================================================================"
+set -x
+
+# ---------------------------------------------------------------------------
+# 评测
+# ---------------------------------------------------------------------------
+eval_one () {
+  local run=$1
+  local adapter out_name
+  adapter="$(resolve_adapter "${run}")"
+  out_name="$(resolve_out_name "${run}")"
+
+  if [[ "${run}" != "base" && ! -d "${adapter}" ]]; then
+    echo "跳过 ${run}：缺 adapter ${adapter}"
+    return 0
+  fi
+  if [[ "${FORCE_EVAL}" != "1" && -f "${RESULTS_ROOT}/dialogsum/${out_name}/summary.json" ]]; then
+    echo "已有结果，跳过: ${RESULTS_ROOT}/dialogsum/${out_name}/summary.json"
+    return 0
+  fi
+
+  echo "==== eval DialogSum: ${run} -> ${RESULTS_ROOT}/dialogsum/${out_name} ===="
+  # BERTScore 关掉时不传模型路径：evaluate.py 会把空串从 cfg 里滤掉，metric 那边
+  # 读到缺失值报的错比"路径是空串"清楚。
+  local bertscore_flags=(--dialogsum_bertscore "${DS_BERTSCORE}")
+  if [[ "${DS_BERTSCORE}" == "1" ]]; then
+    bertscore_flags+=(
+      --dialogsum_bertscore_model "${BERTSCORE_MODEL}"
+      --dialogsum_bertscore_layers "${BERTSCORE_LAYERS}"
+      --dialogsum_bertscore_batch_size "${BERTSCORE_BATCH}"
+    )
+  fi
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter}" --run_name "${out_name}" \
+    --metrics dialogsum --out_dir "${RESULTS_ROOT}" --seed "${SEED}" \
+    --dialogsum_input "${DS_TEST_FILE}" \
+    --dialogsum_limit "${LIMIT}" \
+    --dialogsum_max_new_tokens "${DS_MAX_NEW_TOKENS}" \
+    --dialogsum_batch_size "${DS_BATCH}" \
+    "${bertscore_flags[@]}"
+}
+
+for run in ${RUNS}; do
+  eval_one "${run}"
+done
+
+# ---------------------------------------------------------------------------
+# 后置：一张表，base 与 vanilla 并排。
+#   方向与 retention 表相反：这里的数越高越好，base 是地板。
+# ---------------------------------------------------------------------------
+set +x
+python - "${RESULTS_ROOT}" "${OUT_SUFFIX}" "${BASELINE_RUN}" ${RUNS} <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+suffix = sys.argv[2]
+baseline = sys.argv[3]
+runs = sys.argv[4:]
+
+
+def load(name):
+    path = root / "dialogsum" / name / "summary.json"
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return None
+
+
+def cell(payload, key, spec="7.4f"):
+    if not payload or payload.get(key) is None:
+        return f"{'--':>{spec.split('.')[0]}}"
+    return f"{payload[key]:>{spec}}"
+
+
+rows = []
+for run in runs:
+    name = f"{run}{suffix}" if suffix else run
+    rows.append((name, load(name)))
+
+baseline_payload = next((p for n, p in rows if n == baseline), None)
+
+print()
+print("=" * 110)
+print("DialogSum 官方 test，max-over-references。**越高越好**，base 是地板不是上限。")
+print("ROUGE 是 0-1 的 F 值；BERTScore 未做 baseline rescaling，绝对值天然在 0.8+。")
+print("=" * 110)
+print(
+    f"{'run':<52}{'R-1':>8}{'R-2':>8}{'R-L':>8}"
+    f"{'BERTScore':>11}{'empty':>8}{'dR-L(pp)':>11}{'dBERT(pp)':>12}"
+)
+print("-" * 110)
+for name, payload in rows:
+    d_rouge = f"{'--':>11}"
+    d_bert = f"{'--':>12}"
+    if payload and baseline_payload and name != baseline:
+        if payload.get("rougeL_f") is not None and baseline_payload.get("rougeL_f") is not None:
+            d_rouge = f"{(payload['rougeL_f'] - baseline_payload['rougeL_f']) * 100:>+11.2f}"
+        if payload.get("bertscore_f1") is not None and baseline_payload.get("bertscore_f1") is not None:
+            d_bert = f"{(payload['bertscore_f1'] - baseline_payload['bertscore_f1']) * 100:>+12.2f}"
+    print(
+        f"{name:<52}"
+        + cell(payload, "rouge1_f", "8.4f")
+        + cell(payload, "rouge2_f", "8.4f")
+        + cell(payload, "rougeL_f", "8.4f")
+        + cell(payload, "bertscore_f1", "11.4f")
+        + (f"{payload['empty_rate']:>8.1%}" if payload else f"{'--':>8}")
+        + d_rouge
+        + d_bert
+    )
+
+print()
+if baseline_payload is None:
+    print(f"note: 分母 {baseline} 还没评过，Δ 两列全是 --。")
+    print("      要么把它加进 RUNS，要么传 BASELINE_RUN=<已评过的 run>。")
+else:
+    print(f"Δ 两列的分母 = {baseline}")
+    print("  R-L 相对它掉 1pp 以上 => λ 选大了：retention 表上的 d_van 里有一部分不是")
+    print("  '保住了旧能力'，而是'没学会新任务'。两张表必须一起报。")
+    print("  BERTScore 的 delta 通常比 ROUGE 小一个量级（分数被压在 0.8-0.9 这个窄带里），")
+    print("  所以它用来确认方向，幅度以 R-L 为准。")
+
+first = next((p for _, p in rows if p), None)
+if first:
+    print()
+    print(f"参考数/对话数  : {first.get('num_references')}/{first.get('num_samples')}")
+    if first.get("num_samples") and first["num_samples"] == first.get("num_references"):
+        print("  !! 两者相等：test JSONL 还是拍平的单参考旧版，分数系统性偏低。")
+    print(f"BERTScore 模型 : {first.get('bertscore_model') or '(未开)'}")
+PY
+
+echo "========================================================================"
+echo "产物:"
+for run in ${RUNS}; do
+  out_name="$(resolve_out_name "${run}")"
+  [[ -f "${RESULTS_ROOT}/dialogsum/${out_name}/summary.json" ]] && \
+    echo "  ${RESULTS_ROOT}/dialogsum/${out_name}/summary.json"
+done
+echo "  ${RESULTS_ROOT}/dialogsum_summary.csv   (所有 run 一行一条)"
+echo "  逐题（每条的 rouge 与 bertscore_f1）: ${RESULTS_ROOT}/dialogsum/<run>/responses.jsonl"
+echo "Job finished at: $(date)"
