@@ -55,7 +55,29 @@ from onereplay.scripts.domain_sft.prepare_finance import (
 # Scale retries: golds are quoted in whatever unit the filing used, while the
 # trace usually boxes the raw figure. "$275 million" vs 275000000 and "11.1%"
 # vs 0.111 are the same answer, and deleting them would gut the pool.
-SCALES = (1.0, 100.0, 0.01, 1e3, 1e-3, 1e6, 1e-6, 1e9, 1e-9)
+SCALES = (1.0, 100.0, 0.01, 1e3, 1e-3, 1e6, 1e-6, 1e9, 1e-9, 1e12, 1e-12)
+
+# Latin script only, as a whitelist. A blacklist cannot work here: the corpus
+# already turned up Italian, German, French, Polish and Urdu, and the original
+# CJK-only check let every one of them through. The ranges are ASCII, Latin-1
+# Supplement and Latin Extended-A/B (accented letters), general punctuation,
+# currency symbols and letterlike symbols.
+NON_LATIN = re.compile(r"[^\x00-\x7F\u00A0-\u024F\u2000-\u206F\u20A0-\u20BF\u2100-\u214F]")
+
+# Function words that English does not share with the languages found here.
+# "in" is out: German and Dutch use it too. "a" is out: it is a preposition in
+# Italian and Portuguese. What is left is dense in any real English sentence
+# and absent from the NER rows.
+ENGLISH_MARKERS = frozenset(
+    """the of and to is was are were be been being has have had this that these those
+    with from for what which who how why when where there their its it not but or as
+    by at an if would should could will can does did do you your we our""".split()
+)
+
+WORD = re.compile(r"[a-z']+")
+# A gold that is a JSON object or dict literal means the row is a structured
+# extraction task -- fill this schema -- not a question with an answer.
+JSON_GOLD = re.compile(r"^\s*[\{\[].*[\}\]]\s*$", re.S)
 SHORT_TEXT_WORDS = 6
 NUMBER = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 MAGNITUDE = (
@@ -69,11 +91,46 @@ MAGNITUDE = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dry-run the ODA-Fin filter rules.")
     parser.add_argument("--fin_json", type=str, default="datasets/raw/ODA-Fin-SFT-318k/train.json")
-    parser.add_argument("--rel_tol", type=float, default=0.01)
+    # 2% rather than 1%: financial golds are rounded quantities, so 0.04348 vs
+    # "4.3" and 0.00203 vs "0.20%" are the same answer reported to fewer digits.
+    # Looser than this starts keeping real errors -- 147 vs 105 must still fail.
+    parser.add_argument("--rel_tol", type=float, default=0.02)
     parser.add_argument("--samples", type=int, default=12, help="samples printed per bucket")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_rows", type=int, default=0, help="0 = whole file")
     return parser.parse_args()
+
+
+def is_english(text: str, min_words: int = 8, min_marker_ratio: float = 0.06) -> bool:
+    """Whitelist English rather than blacklisting everything else.
+
+    Two layers because neither alone suffices. Script rejects non-Latin writing
+    outright. Accent density catches Romance and Slavic languages, which are
+    Latin but sprinkle diacritics far more than English does. Marker density
+    catches the rest -- Italian and German rows here are pure ASCII, so the only
+    thing separating them from English is which function words appear.
+
+    The marker test is skipped below min_words: a short instruction like
+    "Calculate the net present value" can legitimately carry no marker, and
+    deleting those would cost more than the few short foreign rows it saves.
+    Those are caught by the JSON-gold rule instead.
+    """
+
+    if NON_LATIN.search(text):
+        return False
+
+    letters = [char for char in text if char.isalpha()]
+    if letters:
+        accented = sum(1 for char in letters if ord(char) > 127)
+        if accented / len(letters) > 0.02:
+            return False
+
+    words = WORD.findall(text.lower())
+    if len(words) >= min_words:
+        markers = sum(1 for word in words if word in ENGLISH_MARKERS)
+        if markers / len(words) < min_marker_ratio:
+            return False
+    return True
 
 
 def latex_clean(text: str) -> str:
@@ -131,6 +188,13 @@ def as_number(text: str) -> float | None:
         value = float(match.group(0))
     except ValueError:
         return None
+    # "-$518.1": the regex's own -? cannot reach across the currency symbol, so
+    # it matches 518.1 and the sign is silently lost. Accounting parentheses
+    # mean the same thing.
+    if value >= 0 and (
+        re.match(r"^[^\d]*[-\u2212]", cleaned) or (cleaned.startswith("(") and ")" in cleaned)
+    ):
+        value = -value
     for word, factor in MAGNITUDE:
         if word in cleaned:
             value *= factor
@@ -194,6 +258,23 @@ def main() -> None:
             if index < args.samples:
                 pool[index] = item
 
+    # Kept separate from `offer` because these rows never reach a verdict, and
+    # what has to be eyeballed for them is the instruction, not the gold/pred
+    # pair. Both are for confirming the new rules do not over-reach.
+    def offer_lang(source: str, instruction: str) -> None:
+        pool = reservoir["_dropped_language"]
+        if len(pool) < args.samples:
+            pool.append((source, "", "", instruction))
+        elif rng.randrange(log["4b_other_language"] + 1) < args.samples:
+            pool[rng.randrange(args.samples)] = (source, "", "", instruction)
+
+    def offer_json(source: str, gold: str, instruction: str) -> None:
+        pool = reservoir["_dropped_json"]
+        if len(pool) < args.samples:
+            pool.append((source, gold, "", instruction))
+        elif rng.randrange(log["4c_json_gold_extraction"] + 1) < args.samples:
+            pool[rng.randrange(args.samples)] = (source, gold, "", instruction)
+
     raw = 0
     for row in iter_json_records(args.fin_json):
         raw += 1
@@ -218,7 +299,18 @@ def main() -> None:
             continue
 
         if CJK_PATTERN.search(instruction) or CJK_PATTERN.search(output):
-            log["4_non_english"] += 1
+            log["4a_chinese"] += 1
+            continue
+        if not is_english(instruction):
+            log["4b_other_language"] += 1
+            offer_lang(source, instruction)
+            continue
+
+        gold = row.get("answer")
+        gold = "" if gold is None else str(gold).strip()
+        if gold and JSON_GOLD.match(gold):
+            log["4c_json_gold_extraction"] += 1
+            offer_json(source, gold, instruction)
             continue
 
         key = re.sub(r"\s+", " ", instruction.lower()).strip()
@@ -227,8 +319,6 @@ def main() -> None:
             continue
         seen.add(key)
 
-        gold = row.get("answer")
-        gold = "" if gold is None else str(gold).strip()
         pred = extract_boxed(body)
 
         bucket, matched = judge(gold, pred, args.rel_tol)
@@ -246,11 +336,37 @@ def main() -> None:
     print("=" * 78)
     print(f"规则逐条：读入 {raw} 行")
     print("=" * 78)
-    order = ["1_empty_field", "2_broken_structure", "4_non_english", "5_duplicate", "3_wrong_answer", "kept"]
+    order = [
+        "1_empty_field",
+        "2_broken_structure",
+        "4a_chinese",
+        "4b_other_language",
+        "4c_json_gold_extraction",
+        "5_duplicate",
+        "3_wrong_answer",
+        "kept",
+    ]
     for name in order:
         if name in log:
-            print(f"  {name:22} {log[name]:>7}  ({log[name] / max(raw, 1):5.1%})")
-    print(f"\n  长度和源平衡还没算；上一轮里 4096 刷掉 2691 行、源平衡刷掉 61562 行")
+            print(f"  {name:26} {log[name]:>7}  ({log[name] / max(raw, 1):5.1%})")
+    print("\n  长度和源平衡还没算；上一轮里 4096 刷掉 2691 行、源平衡刷掉 61562 行")
+
+    print()
+    print("=" * 78)
+    print("新规则删掉的样本 —— 语言（确认不是英文被误杀）")
+    print("=" * 78)
+    for source, _, _, instruction in reservoir.get("_dropped_language", []):
+        print(f"  [{source}]")
+        print(f"    {instruction[:130]}")
+
+    print()
+    print("=" * 78)
+    print("新规则删掉的样本 —— gold 是 JSON（确认确实是抽取任务）")
+    print("=" * 78)
+    for source, gold, _, instruction in reservoir.get("_dropped_json", []):
+        print(f"  [{source}]")
+        print(f"    Q    : {instruction[:110]}")
+        print(f"    gold : {gold[:100]!r}")
 
     print()
     print("=" * 78)
