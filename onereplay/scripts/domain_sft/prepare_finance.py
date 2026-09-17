@@ -8,15 +8,32 @@ Qwen3-235B-A22B-Thinking and verified. Each row is::
 where ``output`` is ``<think>{CoT}</think><answer>{final}</answer>`` and the
 final segment normally ends in ``\\boxed{...}``. ``input`` is empty throughout.
 
+``answer`` is optional and whole sources omit it
+------------------------------------------------
+Three of the largest constituents -- Agentar-DeepFinance-100K (98694 rows),
+DianJin-R1-Data (36560) and Finance_R1-Distill_Data (2375) -- ship only
+``{id, instruction, input, output, source}``. Not "answer is blank sometimes":
+the key is absent on every row of those sources. Requiring it therefore selects
+on which upstream corpus bothered to denormalize its final answer into a
+separate column, which has nothing to do with whether the row is usable.
+
+That matters more than it sounds: those three are the reasoning-heavy part of
+the aggregate, and dropping them left the pool ~40% sentiment classification.
+So ``answer`` is provenance only -- it is written to ``gold_answer`` for
+traceability and never read by training, which consumes ``instruction`` and
+``response``. When the field is missing, the final ``\\boxed{}`` span is used
+instead, and a row with neither is still kept. Completeness is enforced where it
+actually lives: strip_tags rejects damaged ``<think>``/``<answer>`` structure.
+``--require_answer_field 1`` restores the old behaviour.
+
 Loading
 -------
-The corpus ships as one ``train.json``, and ``answer`` is absent on some rows --
-enough to make the Hub's own viewer fail with ``KeyError: 'answer'`` while
-inferring a schema. ``load_dataset("json", ...)`` walks into the same problem,
-and pinning explicit features would break on the rows where ``answer`` is a
-number rather than a string. So this reads the file with an incremental decoder
-that yields one object at a time and tolerates missing keys, which also keeps a
-multi-gigabyte array from being materialized at once.
+The corpus ships as one ``train.json``. ``load_dataset("json", ...)`` cannot
+infer a schema across it -- the Hub's own viewer fails with ``KeyError:
+'answer'`` -- and pinning explicit features would break on the rows where
+``answer`` is a number rather than a string. So this reads the file with an
+incremental decoder that yields one object at a time and tolerates missing keys,
+which also keeps a multi-gigabyte array from being materialized at once.
 
 Why the tags are stripped
 -------------------------
@@ -38,6 +55,20 @@ sampling stage never sees them and no downstream quota silently reintroduces one
 ``--eval_questions_jsonl`` additionally removes rows matching eval questions at
 the text level, for the case where a benchmark leaked into a differently named
 source.
+
+Off-task sources are excluded outright
+--------------------------------------
+Separate from decontamination, and for a different reason. Roughly 40% of the
+aggregate is single-label work -- headline sentiment, hawkish/dovish, relation
+extraction -- where the target is one token and the distilled CoT is filler.
+All three benchmarks (FinQA, ConvFinQA, TAT-QA) ask for multi-step numeric
+reasoning over financial tables, so those rows spend the budget without moving
+the thing being measured. See DEFAULT_EXCLUDE_SOURCE_PATTERNS.
+
+The pool is therefore deliberately smaller than Math's 100k. Matching example
+counts across domains was never the goal; a Finance model trained on 60k
+reasoning traces is a better instrument than one trained on 100k where 40k are
+tweet labels, and Medical lands near 30k for the same kind of reason.
 
 Source balancing
 ----------------
@@ -85,12 +116,29 @@ DATASET = "OpenDataArena/ODA-Fin-SFT-318k"
 
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 ANSWER_OPEN, ANSWER_CLOSE = "<answer>", "</answer>"
+BOXED_OPEN = re.compile(r"\\boxed\s*\{")
 
 # Substrings matched case-insensitively against the `source` field. FinQA,
 # TAT-QA and ConvFinQA are the chosen Finance benchmarks, so their training
 # splits and anything derived from them must not be trained on. "finqa" also
 # matches "convfinqa", which is intended.
 DEFAULT_EVAL_SOURCE_PATTERNS = ("finqa", "tat-qa", "tatqa", "tat_qa", "convfinqa")
+
+# Single-label tasks: tag a headline as positive/negative, a FOMC line as
+# hawkish/dovish, a sentence pair as a relation type. They are finance text, but
+# the target is one token and the CoT distilled onto them is filler -- nothing
+# here trains multi-step numeric reasoning, which is what all three benchmarks
+# ask for. Nine sources, ~48k rows, 40% of the pre-filter pool. Dropping them is
+# why the pool can be smaller than Math's and still be worth more.
+DEFAULT_EXCLUDE_SOURCE_PATTERNS = (
+    "sentiment",  # financial-tweets-sentiment, fingpt-sentiment-train, twitter-financial-news-sentiment
+    "phrasebank",  # takala/financial_phrasebank
+    "en-fpb",  # TheFinAI/en-fpb, the same corpus relabelled
+    "hawkish",  # gtfintechlab/fomc-hawkish-dovish
+    "financial-classification",  # nickmuchi/financial-classification
+    "finentity",  # yixuantt/FinEntity, span tagging
+    "finred",  # FinGPT/fingpt-finred, relation extraction
+)
 
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
@@ -158,11 +206,30 @@ def parse_args() -> argparse.Namespace:
         "by_source table (count / percentage / average_tokens) from a first run.",
     )
     parser.add_argument(
+        "--exclude_sources",
+        type=str,
+        nargs="*",
+        default=list(DEFAULT_EXCLUDE_SOURCE_PATTERNS),
+        help="Case-insensitive substrings of `source` dropped as off-task. "
+        "Distinct from --eval_source_patterns: that one prevents cheating, this "
+        "one is a statement about what the Finance specialist is for. Pass an "
+        "empty list to keep every source.",
+    )
+    parser.add_argument(
         "--require_boxed",
         type=int,
         default=0,
         help="1 keeps only responses carrying a \\boxed span. Off by default: "
         "long-form financial analysis legitimately ends without one.",
+    )
+    parser.add_argument(
+        "--require_answer_field",
+        type=int,
+        default=0,
+        help="1 drops rows without a top-level `answer`. Off by default because "
+        "three whole sources omit the key -- including the two largest "
+        "reasoning-heavy ones -- so requiring it selects on upstream schema, "
+        "not on data quality. See the module docstring.",
     )
     parser.add_argument("--target_rows", type=int, default=0, help="0 keeps everything the filters allow.")
     parser.add_argument(
@@ -280,6 +347,27 @@ def strip_tags(text: str) -> str:
     return body
 
 
+def extract_boxed(text: str) -> str:
+    """Contents of the last ``\\boxed{...}`` span, or "" if there is none.
+
+    Brace-matched rather than regex-matched: finance answers carry ``\\text{}``
+    and ``\\frac{}{}`` often enough that a non-greedy ``\\{([^}]*)\\}`` would cut
+    at the first inner close brace and return a fragment. The last span wins
+    because a trace that boxes an intermediate result still boxes the final
+    answer last.
+    """
+
+    last = ""
+    for match in BOXED_OPEN.finditer(text):
+        index, depth = match.end(), 1
+        while index < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[index], 0)
+            index += 1
+        if depth == 0:
+            last = text[match.end() : index - 1].strip()
+    return last
+
+
 def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").lower()).strip()
 
@@ -338,6 +426,7 @@ def main() -> None:
     patterns = [pattern.lower() for pattern in args.eval_source_patterns]
     if not patterns:
         print("WARNING: no --eval_source_patterns; benchmark contamination is NOT removed.")
+    excluded = [pattern.lower() for pattern in args.exclude_sources]
 
     log = FilterLog()
     raw_count = 0
@@ -367,20 +456,18 @@ def main() -> None:
         if any(pattern in lowered for pattern in patterns):
             log.bump("dropped_eval_contaminated_source")
             continue
+        if any(pattern in lowered for pattern in excluded):
+            log.bump("dropped_off_task_source")
+            continue
 
         instruction = str(row.get("instruction") or "").strip()
         output = str(row.get("output") or "").strip()
-        answer = row.get("answer")
-        answer = "" if answer is None else str(answer).strip()
 
         if not instruction:
             log.bump("dropped_empty_instruction")
             continue
         if not output:
             log.bump("dropped_empty_output")
-            continue
-        if not answer:
-            log.bump("dropped_empty_answer")
             continue
 
         if eval_questions and normalize(instruction) in eval_questions:
@@ -399,6 +486,17 @@ def main() -> None:
             continue
         if args.require_boxed and "\\boxed" not in body:
             log.bump("dropped_no_boxed")
+            continue
+
+        # Provenance only -- training never reads this. Resolved after strip_tags
+        # so the fallback searches the same text that becomes the response.
+        answer = row.get("answer")
+        answer = "" if answer is None else str(answer).strip()
+        if not answer:
+            answer = extract_boxed(body)
+            log.bump("answer_from_boxed" if answer else "answer_unavailable")
+        if args.require_answer_field and not answer:
+            log.bump("dropped_empty_answer")
             continue
 
         key = normalize(instruction)
@@ -535,10 +633,16 @@ def main() -> None:
         filter_rules={
             "decontamination_order": "eval sources removed before any sampling",
             "eval_source_patterns": list(args.eval_source_patterns),
+            "exclude_sources": list(args.exclude_sources),
             "eval_questions_jsonl": args.eval_questions_jsonl or "(none)",
             "language": args.language,
             "tag_handling": "<think>/<answer> markers stripped, text kept",
-            "required_fields": ["instruction", "output", "answer"],
+            "required_fields": ["instruction", "output"],
+            "answer_field": (
+                "required"
+                if args.require_answer_field
+                else "provenance only; falls back to the last \\boxed span"
+            ),
             "dedup": "normalized-exact on instruction",
             "require_boxed": bool(args.require_boxed),
             "max_source_ratio": args.max_source_ratio,

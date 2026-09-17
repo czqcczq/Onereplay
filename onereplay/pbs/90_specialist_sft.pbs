@@ -252,7 +252,14 @@ DO_EVAL="${DO_EVAL:-1}"
 
 # 见文件头第 3 条：这一条和 prepare_* 的 --system_prompt 必须逐字相同。
 # 文本里有逗号，qsub -v 用逗号分隔变量，所以要覆盖它得改这里而不是 -v。
-SYSTEM_PROMPT="${SYSTEM_PROMPT:-Please reason step by step, and put your final answer within \\boxed{}.}"
+#
+# 不能写成 ${SYSTEM_PROMPT:-...\\boxed{}.}：参数展开找闭合括号时不跟踪嵌套，会在
+# \boxed{} 自己那个 } 上提前收尾，默认值只取到 "...\boxed{"，剩下的 ".}" 作为双引号
+# 内的字面量接在后面，实得 "\boxed{.}"。头一版 math / medical 的池子就是带着这个
+# 错的 system turn 建的。用独立赋值绕开展开，单引号避免反斜杠再被吃一层。
+if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
+  SYSTEM_PROMPT='Please reason step by step, and put your final answer within \boxed{}.'
+fi
 
 # ---- 各领域 prepare 的可调项（只影响数据，不影响训练超参）----
 SAMPLE_ROWS="${SAMPLE_ROWS:-100000}"          # math：目标池大小

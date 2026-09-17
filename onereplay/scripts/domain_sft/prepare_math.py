@@ -5,10 +5,12 @@ script is not a refinement of it -- it is the same corpus re-emitted under the
 rules the three domains now share, which differ from that run in three ways that
 each require the model to be retrained:
 
-  * **No system turn.** The earlier run injected a math-specific system message.
-    Keeping it would mean the Math specialist was prompted differently from the
-    other two, so a later "Math forgot X" result could just as well be "Math was
-    asked differently".
+  * **A system turn shared with the other two domains.** The earlier run injected
+    a math-specific system message. Keeping that one would mean the Math
+    specialist was prompted differently from the other two, so a later "Math
+    forgot X" result could just as well be "Math was asked differently". All
+    three now pass common.DEFAULT_SYSTEM_PROMPT, and it counts against the 4096
+    budget, so --system_prompt here and the training launch must match verbatim.
   * **4096, drop instead of truncate.** The earlier run left length to training,
     where ``tokenizer_to_ids`` truncates *from the left* -- keeping the answer and
     cutting the question's opening. Fewer than 1% of NuminaMath rows are affected
