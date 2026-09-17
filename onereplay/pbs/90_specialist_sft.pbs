@@ -9,13 +9,20 @@
 #PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
 
 # =============================================================================
-# 三个领域 specialist 的 Stage 1：Qwen3-4B-Base -> M_math / M_medical / M_finance
+# 三个领域 specialist 的 Stage 1：Qwen3-4B-Base -> M_math / M_medical / M_code
 #
 #   qsub -v DOMAIN=math    ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
 #   qsub -v DOMAIN=math    ,MODE=train onereplay/pbs/90_specialist_sft.pbs   # 训练+评测
 #   qsub -v DOMAIN=math    ,MODE=eval  onereplay/pbs/90_specialist_sft.pbs   # 只评测
 #   qsub -v DOMAIN=medical ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
+#   qsub -v DOMAIN=code    ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
 #   ...
+#
+# 第三臂原本是 finance（ODA-Fin-SFT-318k），已换成 code。换的原因不是数据脏而是
+# 领域边界：那份语料"金融"标签下混着编程题、语法改写、多语种实体抽取，训练信号和
+# FinQA/ConvFinQA/TAT-QA 要考的东西对不上，再怎么过滤也补不回来。code 没有这个
+# 问题——HumanEval 和 MBPP 要的正是 Magicoder 教的。finance 的 prepare 和 metric
+# 都留着，传 EVAL_DOMAINS="math medical finance" 可以回到旧配置。
 #
 # 1. 为什么是一个脚本而不是三个
 # -----------------------------
@@ -63,15 +70,30 @@
 # 至于为什么不干脆留空：Qwen3-4B-Base 的模板不像 Qwen2.5-Math 那样自动注入
 # \boxed{} 指令，留空的话**没训练过的 base 臂根本不会写 \boxed{}**，评分器找不到答案
 # span 而给近乎 0 分，训练后的模型因为从数据里学会了格式而正常——那个差值是度量误差，
-# 不是学习效果，会把每一个 before/after 都夸大。三个领域的答案都已经归一到 \boxed{}
-# （Medical 的 <answer>X</answer> 在 prepare 阶段改写过），所以同一条指令对三者都成立。
+# 不是学习效果，会把每一个 before/after 都夸大。
+#
+# 3b. 为什么 system prompt 有两条而不是一条
+# ----------------------------------------
+# math 和 medical 的答案都归一到了 \boxed{}（Medical 的 <answer>X</answer> 在
+# prepare 阶段改写过），同一条指令对两者都成立。code 不行：代码答案放不进
+# \boxed{}，code_exec.py 提的是 markdown fence，两套提取器互不相干。给代码题发
+# boxed 指令的结果是所有模型一起提不出答案、pass@1 掉到地板上，而那会被读成
+# "灾难性遗忘"。
+#
+# 所以 SYSTEM_PROMPT_BOXED 和 SYSTEM_PROMPT_CODE 并存，前半句逐字相同，差异只在
+# "最终答案放哪"这一个从句。**训练**用哪条由 DOMAIN 决定，**评测**用哪条由
+# benchmark 决定（见 run_group）——同一个 benchmark 下所有模型必须收到同一条指令，
+# 否则横向不可比。跨域评测时模型会收到训练时没见过的那条，那正是"没学过这个域"的
+# 真实表现，不是度量误差。
+#
+# system prompt 属于数据序列化格式，不在第 1 条要求三域统一的那批训练超参里。
 #
 # 4. 训练完直接接评测，同一个作业，不用再投一次
 # ---------------------------------------------
 # MODE=train 跑完会**在本脚本里**接着评测，没有第二个脚本要投。评测口径因此只有
 # 一份，不会出现"训练脚本里的评测"和"独立评测脚本"各算各的这种漂移。
 #
-# 评的是交叉矩阵：M_<DOMAIN> 在 math / medical / finance 三边全评，base 只评当前
+# 评的是交叉矩阵：M_<DOMAIN> 在 EVAL_DOMAINS（默认 math / medical / code）全评，base 只评当前
 # DOMAIN 这一边。"学会了新领域"和"没忘掉别的领域"是两个问题，只评自己那边只能回答
 # 前一个，而后一个才是这项研究要问的。base 是三条线共用的同一个 checkpoint，让三个
 # DOMAIN 各自重评三边等于把同一组数字算三次，还会往 csv 里塞重复行。
@@ -88,9 +110,16 @@
 # -----------------------------------
 # math 三件沿用这条线一直用的 datasets/math/<name>_test.jsonl：gsm8k 和 math500
 # 早就在集群上了，没有理由为了好看再下一遍或挪位置——挪了反而让旧结果和新结果对不
-# 上账。medical / finance 六件是新加的，走 datasets/bench/<name>/。两套命名不统一
-# 是这个历史的直接结果，不是疏忽。缺哪件，本脚本会在**开跑前**就把路径打出来。
-# 数据用 test_code/download_bench.py 下，它产出的就是下面写的这些路径。
+# 上账。medical / finance 六件是新加的，走 datasets/bench/<name>/。code 两件走
+# 第三套 datasets/code/，因为 HumanEval/MBPP 早就由 download_code_data.py 管着，
+# 那条线还有别的脚本在用。三套命名不统一是历史的直接结果，不是疏忽。缺哪件，本脚本
+# 会在**开跑前**就把路径打出来（只查 EVAL_DOMAINS 里真的会评的那几个域）。
+# math/medical/finance 的数据用 test_code/download_bench.py 下，code 的用
+# onereplay.scripts.download_code_data。
+#
+# MBPP 必须用 test split（500 题）。evaluate.py 的 --dataset_split 默认是
+# validation，那只有 90 题，pass@1 的抽样噪声能盖过真实差异。MBPP_SPLIT 默认已经
+# 是 test，别改。
 #
 # 6. 这一阶段严格禁止的事
 # -----------------------
@@ -126,6 +155,8 @@ MODE="${MODE:-train}"
 NUMINA_PATH="${NUMINA_PATH:-${REPO_ROOT}/datasets/raw/NuminaMath-CoT/data}"
 MEDQA_PATH="${MEDQA_PATH:-${REPO_ROOT}/datasets/raw/MedQA-5options}"
 FIN_JSON="${FIN_JSON:-${REPO_ROOT}/datasets/raw/ODA-Fin-SFT-318k/train.json}"
+# download_magicoder_data.py 的落点，和 code_replay 那条线共用同一份 parquet。
+MAGICODER_PATH="${MAGICODER_PATH:-${REPO_ROOT}/datasets/code_replay/magicoder_oss_instruct_75k.parquet}"
 
 # =============================================================================
 # 外层：裸计算节点，只负责起容器再把自己跑一遍。
@@ -163,8 +194,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     GSM8K_DATA MATH500_DATA MINERVA_DATA
     MEDQA_DATA PUBMEDQA_DATA MEDXPERTQA_DATA
     FINQA_DATA CONVFINQA_DATA TATQA_DATA
-    MATH_BATCH MEDICAL_BATCH FINANCE_BATCH
-    NUMINA_PATH MEDQA_PATH FIN_JSON
+    MATH_BATCH MEDICAL_BATCH FINANCE_BATCH CODE_BATCH CODE_TIMEOUT
+    CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS
+    NUMINA_PATH MEDQA_PATH FIN_JSON MAGICODER_PATH PYTHON_RULE
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY SMOKE_STEPS
@@ -257,8 +289,23 @@ DO_EVAL="${DO_EVAL:-1}"
 # \boxed{} 自己那个 } 上提前收尾，默认值只取到 "...\boxed{"，剩下的 ".}" 作为双引号
 # 内的字面量接在后面，实得 "\boxed{.}"。头一版 math / medical 的池子就是带着这个
 # 错的 system turn 建的。用独立赋值绕开展开，单引号避免反斜杠再被吃一层。
+#
+# 为什么是两条不是一条：代码答案放不进 \boxed{}。code_exec.py 提的是 markdown
+# fence，和 boxed 提取器是互不相干的两套；给代码题发 boxed 指令的结果是答案提
+# 不出来、pass@1 掉到地板上，而那会被误读成"灾难性遗忘"。两条的前半句逐字相同，
+# 差异被压在"最终答案放哪"这一个从句上——这是能做到的最小差异，再小就要牺牲某
+# 一边的正确性。system prompt 属于数据序列化格式，不在必须三域统一的那批训练
+# 超参（optimizer / lr / scheduler / batch / precision / loss mask）里。
+SYSTEM_PROMPT_BOXED='Please reason step by step, and put your final answer within \boxed{}.'
+SYSTEM_PROMPT_CODE='Please reason step by step, and put your final code in a Python code block.'
+
+# 训练用哪条由 DOMAIN 决定；评测用哪条由 **benchmark** 决定，见 run_group。
+# 这里 DOMAIN 可能还是空（校验在后面），落到 boxed 无妨，后面会退出。
 if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
-  SYSTEM_PROMPT='Please reason step by step, and put your final answer within \boxed{}.'
+  case "${DOMAIN}" in
+    code) SYSTEM_PROMPT="${SYSTEM_PROMPT_CODE}" ;;
+    *)    SYSTEM_PROMPT="${SYSTEM_PROMPT_BOXED}" ;;
+  esac
 fi
 
 # ---- 各领域 prepare 的可调项（只影响数据，不影响训练超参）----
@@ -268,7 +315,11 @@ NEAR_DUP_THRESHOLD="${NEAR_DUP_THRESHOLD:-0.8}"
 MAX_SOURCE_RATIO="${MAX_SOURCE_RATIO:-0.15}"  # finance：单一 source 上限
 FIN_LANGUAGE="${FIN_LANGUAGE:-en}"
 EVAL_SOURCE_PATTERNS="${EVAL_SOURCE_PATTERNS:-finqa tat-qa tatqa tat_qa convfinqa}"
-TARGET_ROWS="${TARGET_ROWS:-0}"               # finance：0 = 过滤后剩多少用多少
+TARGET_ROWS="${TARGET_ROWS:-0}"               # finance/code：0 = 过滤后剩多少用多少
+# code：认定 Python 的口径。both = lang 列和 ```python 都要。lang 记的是**种子
+# 片段**的语言，而 OSS-Instruct 可以生成与种子不同的语言，所以单看 lang 会放进
+# 正文是 Go/JS 的行。探针（test_code/probe_code_arm.py）会打出三种口径各剩多少。
+PYTHON_RULE="${PYTHON_RULE:-both}"
 
 # =============================================================================
 # 评测配置
@@ -296,20 +347,36 @@ MEDXPERTQA_DATA="${MEDXPERTQA_DATA:-${BENCH_ROOT}/medxpertqa/test.jsonl}"
 FINQA_DATA="${FINQA_DATA:-${BENCH_ROOT}/finqa/test.jsonl}"
 CONVFINQA_DATA="${CONVFINQA_DATA:-${BENCH_ROOT}/convfinqa/dev_turn.json}"
 TATQA_DATA="${TATQA_DATA:-${BENCH_ROOT}/tatqa/tatqa_dataset_dev.json}"
+# code 走的是另一套目录（download_code_data.py 的产物），不在 bench 下。
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+HUMANEVAL_DATA="${HUMANEVAL_DATA:-${CODE_DATA_DIR}/humaneval_test.parquet}"
+MBPP_DATA="${MBPP_DATA:-${CODE_DATA_DIR}/mbpp_full}"
+# !! 必须是 test（500 题）。evaluate.py 的默认值是 validation，那只有 90 题，
+# pass@1 的抽样噪声能盖过真实差异。
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
 
 MATH_BATCH="${MATH_BATCH:-128}"
 MEDICAL_BATCH="${MEDICAL_BATCH:-64}"
 # 财报 prompt 动辄几千 token，KV cache 吃得比别的组狠，batch 必须压下来。
 FINANCE_BATCH="${FINANCE_BATCH:-32}"
+# 代码只解 512 token，prompt 也短，所以能开大。
+CODE_BATCH="${CODE_BATCH:-64}"
+# 判分在子进程里 exec 生成的代码，卡死的那条会拖住整组。
+CODE_TIMEOUT="${CODE_TIMEOUT:-5.0}"
 
 # =============================================================================
 # DOMAIN 分派：只决定数据在哪、结果写哪、MODE=data 调谁。
 # =============================================================================
 case "${DOMAIN}" in
-  math|medical|finance) ;;
-  "") echo "必须指定 DOMAIN=math|medical|finance" >&2; exit 2 ;;
-  *)  echo "DOMAIN 只能是 math / medical / finance，得到 '${DOMAIN}'" >&2; exit 2 ;;
+  math|medical|code|finance) ;;
+  "") echo "必须指定 DOMAIN=math|medical|code" >&2; exit 2 ;;
+  *)  echo "DOMAIN 只能是 math / medical / code / finance，得到 '${DOMAIN}'" >&2; exit 2 ;;
 esac
+
+# 一个 specialist 要在哪几个领域上评。finance 那一臂因为语料的领域边界不干净
+# （"金融"标签下混着编程题、语法题、医疗记录抽取）被换成了 code，但它的 metric
+# 和 prepare 都留着：传 EVAL_DOMAINS="math medical finance" 就能回到旧配置。
+EVAL_DOMAINS="${EVAL_DOMAINS:-math medical code}"
 case "${MODE}" in
   data|smoke|train|eval) ;;
   *) echo "MODE 只能是 data / smoke / train / eval，得到 '${MODE}'" >&2; exit 2 ;;
@@ -388,6 +455,24 @@ if [[ "${MODE}" == "data" ]]; then
         --medqa_path "${MEDQA_PATH}" \
         --max_traces_per_question "${MAX_TRACES}" \
         --near_dup_threshold "${NEAR_DUP_THRESHOLD}" \
+        "${COMMON_ARGS[@]}"
+      ;;
+    code)
+      [[ -e "${MAGICODER_PATH}" ]] || {
+        echo "找不到 Magicoder: ${MAGICODER_PATH}"
+        echo "  登录节点先跑 python -m onereplay.scripts.download_magicoder_data"
+        exit 1
+      }
+      # HumanEval / MBPP 是这一臂仅有的两个 benchmark，去污染漏一条，报出来的
+      # pass@1 就有一部分是背下来的。prepare_code 默认没给评测集就拒绝建池，
+      # 这里把路径传全，让它真的能查。
+      python -m onereplay.scripts.domain_sft.prepare_code \
+        --magicoder_path "${MAGICODER_PATH}" \
+        --humaneval_data_file "${HUMANEVAL_DATA}" \
+        --mbpp_dataset_path "${MBPP_DATA}" \
+        --mbpp_split "${MBPP_SPLIT}" \
+        --python_rule "${PYTHON_RULE}" \
+        --target_rows "${TARGET_ROWS}" \
         "${COMMON_ARGS[@]}"
       ;;
     finance)
@@ -524,13 +609,20 @@ run_group () {
   fi
   GROUPS_RAN=$((GROUPS_RAN + 1))
 
+  # 评测的 system 由 **benchmark** 决定，不由被评的模型决定。同一个 benchmark
+  # 下所有模型必须收到同一条指令，否则横向不可比；而代码组必须发 code 那条，
+  # 否则 fence 提取器拿不到东西、所有模型一起是 0 分。这意味着跨域评测时模型
+  # 会收到训练时没见过的那条 system —— 那正是"没学过这个域"的真实表现。
+  local group_system="${SYSTEM_PROMPT_BOXED}"
+  [[ "${group}" == "code" ]] && group_system="${SYSTEM_PROMPT_CODE}"
+
   echo
   echo "==== eval ${run_name} / ${group} : ${metrics} ===="
   local args=(
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}"
     --out_dir "${EVAL_ROOT}" --run_name "${run_name}"
     --metrics "${metrics}" --seed "${SEED}"
-    --system_prompt "${SYSTEM_PROMPT}"
+    --system_prompt "${group_system}"
     # 训完的 chat turn 以 '<|im_end|><|endoftext|>' 结尾，而 base tokenizer 的
     # eos 只是 '<|endoftext|>'。不停在 im_end 上，模型会顺着幻觉出下一轮，再被
     # skip_special_tokens 拼进答案里。这条线没有历史结果要兼容，直接开。
@@ -586,13 +678,40 @@ eval_finance () {
     --finance_batch_size "${FINANCE_BATCH}"
 }
 
+eval_code () {
+  local run_name="$1" adapter="$2"
+  require_data code "${HUMANEVAL_DATA}" "${MBPP_DATA}" || return 0
+  # --dataset_split 在 evaluate.py 里只被 MBPP 读，默认 validation 是 90 题的
+  # 那个 split；显式传 test 才是 500 题的正式集合。
+  run_group code "${run_name}" "${adapter}" "humaneval,mbpp" \
+    --humaneval_data_file "${HUMANEVAL_DATA}" \
+    --mbpp_dataset_path "${MBPP_DATA}" \
+    --dataset_split "${MBPP_SPLIT}" \
+    --code_max_new_tokens 512 \
+    --code_batch_size "${CODE_BATCH}" \
+    --timeout "${CODE_TIMEOUT}"
+}
+
 # 某个领域的全部组。
 eval_domain () {
   local domain="$1" run_name="$2" adapter="$3"
   case "${domain}" in
     math)    eval_math_std "${run_name}" "${adapter}"; eval_math_hard "${run_name}" "${adapter}" ;;
     medical) eval_medical  "${run_name}" "${adapter}" ;;
+    code)    eval_code     "${run_name}" "${adapter}" ;;
     finance) eval_finance  "${run_name}" "${adapter}" ;;
+    *) echo "eval_domain: 不认识的领域 '${domain}'，跳过" >&2 ;;
+  esac
+}
+
+# 一个领域要哪几份 benchmark 数据。eval_* 里的 require_data 用的是同一批路径，
+# 两处对不上就会出现"预检说齐了、真跑时跳过"。
+bench_paths_for () {
+  case "$1" in
+    math)    printf '%s\n' "${GSM8K_DATA}" "${MATH500_DATA}" "${MINERVA_DATA}" ;;
+    medical) printf '%s\n' "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" ;;
+    code)    printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" ;;
+    finance) printf '%s\n' "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}" ;;
   esac
 }
 
@@ -602,11 +721,17 @@ eval_domain () {
 # 只警告不中止：训练产出的 checkpoint 本身有价值，不该被"评测数据没同步"拦住。
 preflight_bench () {
   local missing=()
-  local path
-  for path in "${GSM8K_DATA}" "${MATH500_DATA}" "${MINERVA_DATA}" \
-              "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" \
-              "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}"; do
-    [[ -e "${path}" ]] || missing+=("${path}")
+  local path domain
+  # 只查真的会评的那几个域：trained 评 EVAL_DOMAINS，base 评 DOMAIN。拿没配进
+  # EVAL_DOMAINS 的领域（比如换掉的 finance）去报缺失，只会制造假警报。
+  local checked=" "
+  # shellcheck disable=SC2086
+  for domain in ${EVAL_DOMAINS} "${DOMAIN}"; do
+    [[ "${checked}" == *" ${domain} "* ]] && continue
+    checked+="${domain} "
+    while IFS= read -r path; do
+      [[ -n "${path}" && ! -e "${path}" ]] && missing+=("${path}")
+    done < <(bench_paths_for "${domain}")
   done
   if [[ "${#missing[@]}" -gt 0 ]]; then
     echo
@@ -644,8 +769,9 @@ run_cross_eval () {
       return 4
     fi
     echo
-    echo "################ M_${DOMAIN}: 评 math + medical + finance ################"
-    for target in math medical finance; do
+    echo "################ M_${DOMAIN}: 评 ${EVAL_DOMAINS} ################"
+    # shellcheck disable=SC2086
+    for target in ${EVAL_DOMAINS}; do
       eval_domain "${target}" "m_${DOMAIN}" "${CKPT}"
     done
   fi
