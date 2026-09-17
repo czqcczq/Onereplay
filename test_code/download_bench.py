@@ -183,6 +183,28 @@ SPECS: list[Spec] = [
         mode="copy",
         note="164 tasks, pass@1",
     ),
+    # EvalPlus: same tasks, ~80x the test cases. humanevalplus has exactly the
+    # columns the base metric reads, so it is the same file in a different
+    # place. mbppplus is 378 rows (EvalPlus dropped the ambiguous ones) and is
+    # graded on its own `test` column -- see eval/metrics/evalplus.py.
+    Spec(
+        name="humanevalplus",
+        repo_id="evalplus/humanevalplus",
+        allow=["data/test-*"],
+        source="data/test-*.parquet",
+        target="code/humanevalplus_test.parquet",
+        mode="copy",
+        note="164 tasks, extended tests",
+    ),
+    Spec(
+        name="mbppplus",
+        repo_id="evalplus/mbppplus",
+        allow=["data/test-*"],
+        source="data/test-*.parquet",
+        target="code/mbppplus_test.parquet",
+        mode="copy",
+        note="378 tasks (not 500); graded on `test`, not `test_list`",
+    ),
     Spec(
         name="mbpp",
         repo_id="google-research-datasets/mbpp",
