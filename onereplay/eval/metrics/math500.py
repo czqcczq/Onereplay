@@ -11,9 +11,11 @@ answer is the dataset's `answer` field (already extracted) or the boxed span in
 its `solution`. Both are normalized and compared with `is_equiv`.
 
 Three benchmarks share this file because they share the boxed-answer contract:
-MATH-500, AMC, and Minerva Math. They differ only in the data file, the output
-directory, and -- for Minerva -- the equivalence check, since its golds are
-physical quantities like ``4.5e33`` rather than closed-form LaTeX.
+MATH-500, AMC, and Minerva Math. They differ in the data file, the output
+directory, and the equivalence check. Only MATH-500 uses ``is_equiv`` alone:
+AMC's golds are integers written as floats ("142.0") and Minerva's are measured
+quantities ("4.5e33"), so both compare numbers instead -- see the block above
+``to_number``, which records what string equality was costing them.
 
 ``math_num_samples`` > 1 decodes k independent responses per question and
 reports their mean accuracy (average@k). That only measures something when
@@ -211,6 +213,88 @@ def first_existing_key(example: dict, preferred: str, candidates: tuple[str, ...
     raise KeyError(f"None of {candidates} found. Keys: {sorted(example)}")
 
 
+# --- numeric answers --------------------------------------------------------
+# Two of the three sets here need a number, not a string, on both sides:
+#
+#   AMC     the golds arrive as floats from the source parquet, so they land in
+#           the jsonl as "142.0". No model ever writes \boxed{142.0} for an
+#           integer answer, and _strip_string does not touch a trailing ".0" --
+#           so string equality scored **every** AMC answer wrong and the metric
+#           reported a structural 0.000 no matter how the model did. Comparing
+#           numerically is what makes the set scorable at all.
+#   Minerva the golds are measured quantities ("4.5e33", "0.006", "41.8") from
+#           the 272 MIT OpenCourseWare problems, given to a stated precision.
+#           The same number has many correct spellings ("4.5 \times 10^{33}"),
+#           and the last digit is a rounding choice, so it also needs a
+#           tolerance -- see MinervaMathMetric.
+#
+# Either side that is not a number (symbolic answers like
+# "\arcsin{1.3 \sin{\theta_w}}", or an expression the model boxed such as
+# "342+103=445") falls through to is_equiv, which is the conservative direction:
+# it can only refuse credit, never invent it.
+_UNIT_MACROS = re.compile(r"\\(?:text|mathrm|mathbf|operatorname|hbox|mbox)\s*\{[^{}]*\}")
+_SCI_NOTATION = re.compile(r"^([+-]?[\d.]+)\s*(?:\\times|\\cdot|\*|x)\s*10\s*\^\s*\{?([+-]?\d+)\}?$")
+_BARE_POWER = re.compile(r"^([+-]?)10\s*\^\s*\{?([+-]?\d+)\}?$")
+_FRACTION = re.compile(r"^\\d?frac\{([^{}]+)\}\{([^{}]+)\}$")
+
+
+def _clean_numeric(text: str) -> str:
+    """Strip the LaTeX decoration that never carries numeric meaning."""
+
+    cleaned = text.strip()
+    for token in ("\\left", "\\right", "\\!", "\\,", "\\;", "\\:", "\\ ", "$", "~"):
+        cleaned = cleaned.replace(token, "")
+    cleaned = _UNIT_MACROS.sub("", cleaned)
+    cleaned = cleaned.replace("^{\\circ}", "").replace("^\\circ", "")
+    cleaned = cleaned.replace("\\%", "").replace("%", "")
+    cleaned = cleaned.replace(" ", "")
+    # Thousands separators only; "1,2" style tuples are left alone so they fail
+    # to parse and fall through to the string comparison.
+    cleaned = re.sub(r"(?<=\d),(?=\d{3}(\D|$))", "", cleaned)
+    return cleaned.rstrip(".")
+
+
+def to_number(text: str | None) -> float | None:
+    """Best-effort float for a boxed answer; None when it is not a number."""
+
+    if text is None:
+        return None
+    cleaned = _clean_numeric(text)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        pass
+    for pattern, build in (
+        (_SCI_NOTATION, lambda m: float(m.group(1)) * 10.0 ** int(m.group(2))),
+        (_BARE_POWER, lambda m: (-1.0 if m.group(1) == "-" else 1.0) * 10.0 ** int(m.group(2))),
+    ):
+        match = pattern.match(cleaned)
+        if match:
+            try:
+                return build(match)
+            except (ValueError, OverflowError):
+                return None
+    match = _FRACTION.match(cleaned)
+    if not match and cleaned.count("/") == 1:
+        match = re.match(r"^([^/]+)/([^/]+)$", cleaned)
+    if match:
+        top, bottom = to_number(match.group(1)), to_number(match.group(2))
+        if top is not None and bottom not in (None, 0.0):
+            return top / bottom
+    return None
+
+
+def numbers_close(prediction: float, gold: float, rel_tol: float) -> bool:
+    """Relative comparison. A gold of exactly zero has no relative scale, and
+    "within 1% of zero" would accept any small number, so it demands equality."""
+
+    if gold == 0.0:
+        return prediction == 0.0
+    return abs(prediction - gold) <= rel_tol * abs(gold)
+
+
 class MATH500Metric:
     name = "math500"
     # Config keys checked in order for this metric's eval file. Subclasses (AMC,
@@ -355,95 +439,31 @@ class MATH500Metric:
 
 
 class AMCMetric(MATH500Metric):
-    """AMC competition set, scored with the same boxed-answer / is_equiv logic."""
+    """AMC competition set: integer answers, compared as numbers."""
 
     name = "amc"
     data_path_keys = ("amc_data_path", "data_path")
-    # AMC golds are integers, so string equality is the right check; the only
-    # difference from MATH-500 is that this set is hard enough that a single
-    # greedy pass is mostly measuring which side of one problem the coin landed.
+    # Hard enough that a single greedy pass mostly measures which side of one
+    # problem the coin landed on, hence average@k.
     allow_multi_sample = True
 
+    def is_correct(self, prediction: str | None, gold: str, cfg: dict[str, Any]) -> bool:
+        """Exact numeric equality, **not** string equality.
 
-# --- Minerva Math (OCW) numeric equivalence ---------------------------------
-# The golds in math-ai/minervamath are measured quantities -- "4.5e33",
-# "0.006", "41.8" -- because the set is the 272 MIT OpenCourseWare physics and
-# astronomy problems from the Minerva paper, not closed-form MATH answers. Two
-# consequences, both of which make plain is_equiv the wrong scorer here:
-#
-#   1) The same number has many correct spellings. A model that writes
-#      "4.5 \\times 10^{33}" against a gold of "4.5e33" is right, and string
-#      normalization says no. So does "0.0060" against "0.006".
-#   2) The problems ask for a rounded answer ("to two significant figures"),
-#      so the last digit is a formatting choice, not a claim. 4.47e33 and
-#      4.5e33 are the same answer.
-#
-# Hence: parse both sides to a float when possible and compare with a relative
-# tolerance (minerva_rel_tol, default 1%), falling back to is_equiv when either
-# side is not a number -- some answers are symbolic, e.g.
-# "\\arcsin{1.3 \\sin{\\theta_w}}". The strict-string verdict is reported next
-# to it as accuracy_strict_string, so the cost of this choice stays visible.
-_UNIT_MACROS = re.compile(r"\\(?:text|mathrm|mathbf|operatorname|hbox|mbox)\s*\{[^{}]*\}")
-_SCI_NOTATION = re.compile(r"^([+-]?[\d.]+)\s*(?:\\times|\\cdot|\*|x)\s*10\s*\^\s*\{?([+-]?\d+)\}?$")
-_BARE_POWER = re.compile(r"^([+-]?)10\s*\^\s*\{?([+-]?\d+)\}?$")
-_FRACTION = re.compile(r"^\\d?frac\{([^{}]+)\}\{([^{}]+)\}$")
+        The golds come out of the source parquet as floats and are written to the
+        jsonl as "142.0"; models write \\boxed{142}. _strip_string leaves both
+        alone, so is_equiv said no to every single correct answer and this metric
+        reported 0.000 for every run -- see the block above to_number(). No
+        tolerance: these are exact integers, unlike Minerva's measurements.
+        """
 
-
-def _clean_numeric(text: str) -> str:
-    """Strip the LaTeX decoration that never carries numeric meaning."""
-
-    cleaned = text.strip()
-    for token in ("\\left", "\\right", "\\!", "\\,", "\\;", "\\:", "\\ ", "$", "~"):
-        cleaned = cleaned.replace(token, "")
-    cleaned = _UNIT_MACROS.sub("", cleaned)
-    cleaned = cleaned.replace("^{\\circ}", "").replace("^\\circ", "")
-    cleaned = cleaned.replace("\\%", "").replace("%", "")
-    cleaned = cleaned.replace(" ", "")
-    # Thousands separators only; "1,2" style tuples are left alone so they fail
-    # to parse and fall through to the string comparison.
-    cleaned = re.sub(r"(?<=\d),(?=\d{3}(\D|$))", "", cleaned)
-    return cleaned.rstrip(".")
-
-
-def to_number(text: str | None) -> float | None:
-    """Best-effort float for a Minerva answer; None when it is not a number."""
-
-    if text is None:
-        return None
-    cleaned = _clean_numeric(text)
-    if not cleaned:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        pass
-    for pattern, build in (
-        (_SCI_NOTATION, lambda m: float(m.group(1)) * 10.0 ** int(m.group(2))),
-        (_BARE_POWER, lambda m: (-1.0 if m.group(1) == "-" else 1.0) * 10.0 ** int(m.group(2))),
-    ):
-        match = pattern.match(cleaned)
-        if match:
-            try:
-                return build(match)
-            except (ValueError, OverflowError):
-                return None
-    match = _FRACTION.match(cleaned)
-    if not match and cleaned.count("/") == 1:
-        match = re.match(r"^([^/]+)/([^/]+)$", cleaned)
-    if match:
-        top, bottom = to_number(match.group(1)), to_number(match.group(2))
-        if top is not None and bottom not in (None, 0.0):
-            return top / bottom
-    return None
-
-
-def numbers_close(prediction: float, gold: float, rel_tol: float) -> bool:
-    """Relative comparison. A gold of exactly zero has no relative scale, and
-    "within 1% of zero" would accept any small number, so it demands equality."""
-
-    if gold == 0.0:
-        return prediction == 0.0
-    return abs(prediction - gold) <= rel_tol * abs(gold)
+        if prediction is None:
+            return False
+        predicted_number = to_number(prediction)
+        gold_number = to_number(gold)
+        if predicted_number is not None and gold_number is not None:
+            return predicted_number == gold_number
+        return is_equiv(prediction, gold)
 
 
 class MinervaMathMetric(MATH500Metric):

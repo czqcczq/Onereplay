@@ -227,6 +227,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     EVAL_BATCH SAVE MAX_STEPS RUN_TAG RUN VANILLA_RUN
     MATH500_FILE GSM8K_FILE HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT
     IFBENCH_INPUT WITH_IFBENCH
+    DS_TEST_FILE DS_MAX_NEW_TOKENS DS_BATCH WITH_DIALOGSUM
+    DS_BERTSCORE BERTSCORE_MODEL BERTSCORE_LAYERS BERTSCORE_BATCH
     MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS IFBENCH_MAX_NEW_TOKENS
     MATH_BATCH CODE_BATCH IFEVAL_BATCH IFBENCH_BATCH
     TIMEOUT LIMIT DIAG_LEN WITH_BASE WITH_VANILLA EXTRA_MODELS
@@ -426,6 +428,19 @@ MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
 MBPP_SPLIT="${MBPP_SPLIT:-test}"
 IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
 IFBENCH_INPUT="${IFBENCH_INPUT:-}"   # 空 = 用装好的 ifbench 包自带的 IFBench_test.jsonl
+# 新任务（DialogSum 官方 test）。上面全是 retention，方向是"别掉"；这一个方向相反，
+# 是"要涨"。replay 这条臂尤其要看它：混进旧数据会挤掉新任务的有效训练量，
+# val_loss 对这件事不够敏感。74 号定的口径，改了所有臂都要重评。
+DS_TEST_FILE="${DS_TEST_FILE:-${DS_DATASET}_test.jsonl}"
+DS_MAX_NEW_TOKENS="${DS_MAX_NEW_TOKENS:-256}"
+DS_BATCH="${DS_BATCH:-32}"
+# BERTScore 要第二个模型常驻显卡，计算节点 HF_HUB_OFFLINE=1 拉不动，所以下面的
+# 前置检查看到本地没有就自动关掉。层数必须显式给：bert-score 按 hub 名字查默认
+# 层数，我们喂的是路径，查不到会 KeyError。
+DS_BERTSCORE="${DS_BERTSCORE:-1}"
+BERTSCORE_MODEL="${BERTSCORE_MODEL:-${MODEL_DIR}/roberta-large}"
+BERTSCORE_LAYERS="${BERTSCORE_LAYERS:-17}"
+BERTSCORE_BATCH="${BERTSCORE_BATCH:-64}"
 
 # ---- 解码预算与解码 batch：74 号定的口径，所有臂必须逐字相同 ----
 MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
@@ -460,6 +475,21 @@ esac
 WITH_IFBENCH="${WITH_IFBENCH:-1}"
 if [[ "${WITH_IFBENCH}" == "1" ]]; then
   DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
+fi
+# dialogsum 不按域走：它是新任务，三个域的臂都在同一份 DialogSum 上训练，所以
+# 三个域都得知道自己在新任务上退了多少。replay 的代价恰好落在这里 —— 每个 batch
+# 里混进的旧样本挤掉的就是新任务的有效训练量，retention 好看一半是这么来的。
+WITH_DIALOGSUM="${WITH_DIALOGSUM:-1}"
+if [[ "${WITH_DIALOGSUM}" == "1" ]]; then
+  DOMAIN_METRICS="${DOMAIN_METRICS} dialogsum"
+fi
+if [[ "${DS_BERTSCORE}" == "1" && ! -d "${BERTSCORE_MODEL}" ]]; then
+  echo "warning: 缺 ${BERTSCORE_MODEL}，BERTScore 关闭，dialogsum 只打 ROUGE。"
+  echo "         在**登录节点**取一次（计算节点 HF_HUB_OFFLINE=1 拉不动）:"
+  echo "         python -c \"from transformers import AutoModel, AutoTokenizer; \\"
+  echo "           AutoModel.from_pretrained('roberta-large').save_pretrained('${BERTSCORE_MODEL}'); \\"
+  echo "           AutoTokenizer.from_pretrained('roberta-large').save_pretrained('${BERTSCORE_MODEL}')\""
+  DS_BERTSCORE=0
 fi
 
 # LIMIT>0 的产物只覆盖前 N 题，写进正式目录会被"已有 summary.json 就跳过"当成完整结果。
@@ -1174,6 +1204,22 @@ for m in ${DOMAIN_METRICS}; do
     math500)   [[ -f "${MATH500_FILE}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 math500：缺 ${MATH500_FILE}" ;;
     humaneval) [[ -f "${HUMANEVAL_FILE}" ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}" ;;
     mbpp)      [[ -d "${MBPP_DIR}"       ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 mbpp：缺 ${MBPP_DIR}" ;;
+    dialogsum)
+      if [[ -f "${DS_TEST_FILE}" ]]; then
+        AVAIL="${AVAIL} ${m}"
+        # 拍平的单参考旧版打出来的 ROUGE 系统性偏低，而它和多参考版长得一样，
+        # 只有 outputs 字段能区分。不拦，但要说出来，否则跨轮次的数会混。
+        # 纯 bash 匹配而不是 head|grep：pipefail 下 grep -q 提前退出会给 head
+        # 一个 SIGPIPE，管道返回码变成 141，判断就反了。
+        if [[ "$(head -n 1 "${DS_TEST_FILE}")" != *'"outputs"'* ]]; then
+          echo "warning: ${DS_TEST_FILE} 是拍平的单参考旧版（无 outputs 字段），"
+          echo "         ROUGE 会低于论文的 max-over-refs 口径。重建（74 号）:"
+          echo "         qsub -v DRY_RUN=0,FORCE_PREPARE=1,DO_TRAIN=0,DO_EVAL=0 <74 号脚本>"
+        fi
+      else
+        echo "跳过 dialogsum：缺 ${DS_TEST_FILE}（74 号的 prepare 步骤会生成）"
+      fi
+      ;;
     ifbench)
       if ifbench_ready; then
         AVAIL="${AVAIL} ${m}"
@@ -1260,6 +1306,13 @@ for spec in "${SPECS[@]}"; do
     --humaneval_data_file "${HUMANEVAL_FILE}" \
     --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
     --ifeval_input "${IFEVAL_INPUT}" \
+    --dialogsum_input "${DS_TEST_FILE}" \
+    --dialogsum_max_new_tokens "${DS_MAX_NEW_TOKENS}" \
+    --dialogsum_batch_size "${DS_BATCH}" \
+    --dialogsum_bertscore "${DS_BERTSCORE}" \
+    --dialogsum_bertscore_model "${BERTSCORE_MODEL}" \
+    --dialogsum_bertscore_layers "${BERTSCORE_LAYERS}" \
+    --dialogsum_bertscore_batch_size "${BERTSCORE_BATCH}" \
     --ifbench_limit "${LIMIT}" \
     --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
     --ifbench_batch_size "${IFBENCH_BATCH}" \
@@ -1339,6 +1392,7 @@ if [[ "${DIAG_LEN}" == "1" ]]; then
         gsm8k|math500) cap="${MATH_MAX_NEW_TOKENS}" ;;
         humaneval|mbpp) cap="${CODE_MAX_NEW_TOKENS}" ;;
         ifbench) cap="${IFBENCH_MAX_NEW_TOKENS}" ;;
+        dialogsum) cap="${DS_MAX_NEW_TOKENS}" ;;
         *) cap="${IF_MAX_NEW_TOKENS}" ;;
       esac
       DIAG_SPECS+=("${OUT_DIR}/${m}/${name}/responses.jsonl:${cap}")
@@ -1399,6 +1453,9 @@ def cell(value, spec=".4f", width=10):
 print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{'replay':>11}{'d_base(pp)':>12}{'d_van(pp)':>11}")
 print("-" * 66)
 for metric in metric_names:
+    # dialogsum 是新任务，方向相反而且一次给四个数，进这张表只会让符号被读反。
+    if metric == "dialogsum":
+        continue
     base = read_score(metric, "base")
     van = read_score(metric, vanilla_name)
     ours = read_score(metric, run_name)
@@ -1448,6 +1505,46 @@ if ours_m.get("val_loss") and van_m.get("val_loss"):
     else:
         print("  > 0：新任务学得更差了，d_van 里有一部分是'少学了'而不是'保住了'。")
         print("       报结果时必须同时给这两个数，否则就是拿新任务性能换旧能力。")
+
+# val_loss 只说了"拟合得多紧"，没说"生成出来的摘要像不像人写的"。这一节说后者，
+# 而且是绝对数，能和摘要文献对表。方向与上面的主表相反：base 是没学过时的地板，
+# 数字该往上走。replay 的代价正是落在这一栏：每个 batch 混进的旧样本挤掉的就是
+# 新任务的有效训练量，retention 好看有多少是这么换来的，只有这张表说得清。
+if "dialogsum" in metric_names:
+
+    def read_ds(name):
+        path = out_dir / "dialogsum" / name / "summary.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+    print()
+    print("新任务生成质量（DialogSum 官方 test，max-over-refs，越高越好）:")
+    print(f"{'':<14}{'R-1':>10}{'R-2':>10}{'R-L':>12}{'BERTScore':>12}{'empty':>9}")
+    ds = {}
+    for label, name in (("base", "base"), ("vanilla", vanilla_name), ("replay", run_name)):
+        payload = read_ds(name)
+        ds[label] = payload
+        print(
+            f"{label:<14}"
+            + cell(payload.get("rouge1_f"))
+            + cell(payload.get("rouge2_f"))
+            + cell(payload.get("rougeL_f"), ".4f", 12)
+            + cell(payload.get("bertscore_f1"), ".4f", 12)
+            + cell(payload.get("empty_rate"), ".1%", 9)
+        )
+    ours_ds, van_ds = ds["replay"], ds["vanilla"]
+    if ours_ds.get("rougeL_f") is not None and van_ds.get("rougeL_f") is not None:
+        gap = (ours_ds["rougeL_f"] - van_ds["rougeL_f"]) * 100
+        print(f"R-L 相对 vanilla = {gap:+.2f}pp")
+        if gap < -1.0:
+            print("  掉了 1pp 以上：混入比例偏高，新任务被挤掉的训练量已经能测出来。")
+            print("  主表的 d_van 里有一部分不是'保住了旧能力'而是'没学会新任务'，")
+            print("  两张表必须一起报，或者调低 REPLAY_PER_BATCH 再跑一个点。")
+    if not van_ds or not ds["base"]:
+        print("  base/vanilla 是 '-'：74 号那轮还没评 dialogsum。补评不用重训 ——")
+        print("  qsub -v DRY_RUN=0,DO_TRAIN=0,WITH_BASE=1,WITH_VANILLA=1,... 本脚本")
+    if ours_ds.get("num_samples") and ours_ds["num_samples"] == ours_ds.get("num_references"):
+        print("  !! 参考数 = 对话数：test JSONL 还是拍平的单参考旧版，分数系统性偏低。")
+    print("  BERTScore 未做 baseline rescaling，绝对值天然在 0.8+，只有 delta 有意义。")
 print()
 print("这一臂的开销结论（文档 6.3 要的对照）:")
 print("  常驻显存 0（不加载 C），但每步只装 %s 行新任务，墙钟约 vanilla 的 2x，"

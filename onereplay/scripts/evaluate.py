@@ -4,12 +4,17 @@
 
 Available metrics: ifeval, ifbench, followbench, multiif, commonsense,
 commonsense_qa, gsm8k, aime, math500, amc, minervamath, humaneval, mbpp,
-direct_safety. Each metric writes <out_dir>/<metric>/<run_name>/summary.json
-plus an appended row in <out_dir>/<metric>_summary.csv.
+dialogsum, direct_safety. Each metric writes
+<out_dir>/<metric>/<run_name>/summary.json plus an appended row in
+<out_dir>/<metric>_summary.csv.
 
 commonsense and commonsense_qa are not the same measurement: the first is
 held-out SFT loss on the Commonsense170k pool, the second is accuracy on the
 eight LLM-Adapters test sets. Part 1 concludes from the second.
+
+dialogsum is the one metric here that scores a *new* task rather than retention,
+so its numbers are expected to rise above base, not hold. Reading a lambda sweep
+needs both directions: retention alone is trivially won by not learning.
 """
 
 from __future__ import annotations
@@ -117,6 +122,21 @@ def parse_args() -> argparse.Namespace:
     # Smaller than the decoding batch on purpose: the scoring forward pass
     # materializes a [batch, seq, 151936] logit tensor and reuses no KV cache.
     parser.add_argument("--cs_score_batch_size", type=int, default=8)
+
+    # dialogsum: the only new-task metric here, so its scores are meant to rise
+    # relative to base rather than hold. Input is the held-out JSONL from
+    # prepare_dialogsum.py, one row per dialogue with every reference.
+    parser.add_argument("--dialogsum_input", type=str, default="")
+    parser.add_argument("--dialogsum_limit", type=int, default=0)
+    parser.add_argument("--dialogsum_max_new_tokens", type=int, default=256)
+    parser.add_argument("--dialogsum_batch_size", type=int, default=0)
+    # BERTScore needs a second model resident on the card and an offline node
+    # cannot fetch it, so it is opt-in and the path is mandatory once it is on.
+    # Layers must be passed because bert-score looks its default up by hub name.
+    parser.add_argument("--dialogsum_bertscore", type=int, default=0)
+    parser.add_argument("--dialogsum_bertscore_model", type=str, default="")
+    parser.add_argument("--dialogsum_bertscore_layers", type=int, default=17)
+    parser.add_argument("--dialogsum_bertscore_batch_size", type=int, default=64)
 
     # ifeval / ifbench / multiif
     parser.add_argument("--ifeval_input", type=str, default="")

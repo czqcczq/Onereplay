@@ -292,6 +292,11 @@
 #   # 只要标准侧（gsm8k + math500，贪心，快）
 #   qsub -v MODE=eval,DO_IFEVAL=0,DO_FOLLOWBENCH=0,DO_CROSS_MATH=1,DO_HARD_MATH=0 \
 #     onereplay/pbs/94_s1_train_if.pbs
+#   # AMC 已经跑完、只补 Minerva。resume 按指标跳过，不会重解码 AMC。
+#   # 先确认登录节点上有 ${REPO_ROOT}/datasets/math/minervamath_test.jsonl，
+#   # 没有的话作业会打印「跳过 Minerva Math」然后只评 AMC（这就是只出 amc/ 的原因）。
+#   qsub -v MODE=eval,DO_IFEVAL=0,DO_IFBENCH=0,DO_FOLLOWBENCH=0,DO_CROSS_MATH=1 \
+#     onereplay/pbs/94_s1_train_if.pbs
 #
 #   # MODE=lr_sweep 保留但不是必经步骤（三条线统一 5e-5，见上面训练配方一节）
 #
@@ -1210,14 +1215,20 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
     echo "   要截它请用 FB_GROUP_LIMIT（按阶梯组，不能按行）。"
   fi
 
-  # 一侧的指标全部已有 summary 才跳过；否则拆开跑时后一批会被前一批挡掉。
-  side_pending () {
+  # 回显一侧里**还缺 summary 的那几个**指标（空 = 整侧都齐了，可以跳过）。
+  #
+  # 不是"全部齐了才跳过"：往一张已经跑完的表里补一个指标（IFBench、Minerva）是常态，
+  # 而那时重跑 FollowBench 的 820 行或 AMC 的 83×4×4096 纯属白烧。每个指标写自己的
+  # 子目录，所以摘掉已完成的不影响任何结果。要重评已有的数就用 FORCE_EVAL=1。
+  side_todo () {
     local out_root="$1" name="$2" side_metrics="$3" m
-    [[ "${FORCE_EVAL}" == "1" ]] && return 0
+    local -a todo=()
     for m in ${side_metrics//,/ }; do
-      [[ -f "${out_root}/${m}/${name}/summary.json" ]] || return 0
+      if [[ "${FORCE_EVAL}" == "1" || ! -f "${out_root}/${m}/${name}/summary.json" ]]; then
+        todo+=("${m}")
+      fi
     done
-    return 1
+    (IFS=,; echo "${todo[*]}")
   }
 
   run_eval () {
@@ -1226,23 +1237,12 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
     local -a ckpt_arg=()
     if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
 
-    # 已有 summary 的指标逐个摘掉，只跑缺的那些。**不是**"全部齐了才跳过"：往一张已经
-    # 跑完的表里补一个指标（IFBench 就是这么加进来的）是常态，而那时重跑 FollowBench 的
-    # 820 行要 3-4h，纯属白烧。每个指标写自己的子目录，所以摘掉已完成的不影响任何结果。
-    # 要重评已有的数就用 FORCE_EVAL=1。
-    local -a todo=()
-    local m
-    for m in ${METRICS//,/ }; do
-      if [[ "${FORCE_EVAL}" == "1" || ! -f "${RESULTS_ROOT}/${m}/${name}/summary.json" ]]; then
-        todo+=("${m}")
-      fi
-    done
-    if [[ ${#todo[@]} -eq 0 ]]; then
+    local run_metrics
+    run_metrics="$(side_todo "${RESULTS_ROOT}" "${name}" "${METRICS}")"
+    if [[ -z "${run_metrics}" ]]; then
       echo "跳过评测 ${name}：${METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
       return 0
     fi
-    local run_metrics
-    run_metrics="$(IFS=,; echo "${todo[*]}")"
     if [[ "${run_metrics}" != "${METRICS}" ]]; then
       echo "评测 ${name}：${METRICS} 里只有 ${run_metrics} 缺 summary，其余跳过（FORCE_EVAL=1 全部重评）"
     fi
@@ -1283,14 +1283,16 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
     local -a ckpt_arg=()
     if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
 
+    local todo_metrics
     if [[ -n "${CROSS_METRICS}" ]]; then
-      if side_pending "${CROSS_MATH_OUT_DIR}" "${name}" "${CROSS_METRICS}"; then
-        echo "==== eval ${name} (${CROSS_METRICS}) 交叉 math / greedy cap=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} -> ${CROSS_MATH_OUT_DIR} ===="
+      todo_metrics="$(side_todo "${CROSS_MATH_OUT_DIR}" "${name}" "${CROSS_METRICS}")"
+      if [[ -n "${todo_metrics}" ]]; then
+        echo "==== eval ${name} (${todo_metrics}) 交叉 math / greedy cap=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} -> ${CROSS_MATH_OUT_DIR} ===="
         echo "     system: ${MATH_SYSTEM_PROMPT:-<空>}   (91 号的值，改它就没有可比的 before)"
         python -m onereplay.scripts.evaluate \
           --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
           "${ckpt_arg[@]}" --run_name "${name}" \
-          --metrics "${CROSS_METRICS}" --out_dir "${CROSS_MATH_OUT_DIR}" --seed "${SEED}" \
+          --metrics "${todo_metrics}" --out_dir "${CROSS_MATH_OUT_DIR}" --seed "${SEED}" \
           --system_prompt "${MATH_SYSTEM_PROMPT}" \
           --decode_stop_on_im_end "${STOP_ON_IM_END}" \
           --limit "${EVAL_LIMIT}" \
@@ -1306,14 +1308,16 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
 
     # --math_num_samples 只被 amc / minervamath 读取（metrics/math500.py 的
     # allow_multi_sample），math500 / gsm8k 在实现上就忽略它，所以它不会悄悄换掉
-    # 上面那一侧的口径。
+    # 上面那一侧的口径。resume 也是按指标的：AMC 已经有 summary 时只补 Minerva，
+    # 不会把 83×4×4096 再烧一遍。
     if [[ -n "${CROSS_HARD_METRICS}" ]]; then
-      if side_pending "${HARD_MATH_OUT_DIR}" "${name}" "${CROSS_HARD_METRICS}"; then
-        echo "==== eval ${name} (${CROSS_HARD_METRICS}) 交叉 math / sample T=${HARD_MATH_TEMPERATURE} avg@${HARD_MATH_SAMPLES} cap=${HARD_MATH_MAX_NEW_TOKENS} batch=${HARD_MATH_BATCH} -> ${HARD_MATH_OUT_DIR} ===="
+      todo_metrics="$(side_todo "${HARD_MATH_OUT_DIR}" "${name}" "${CROSS_HARD_METRICS}")"
+      if [[ -n "${todo_metrics}" ]]; then
+        echo "==== eval ${name} (${todo_metrics}) 交叉 math / sample T=${HARD_MATH_TEMPERATURE} avg@${HARD_MATH_SAMPLES} cap=${HARD_MATH_MAX_NEW_TOKENS} batch=${HARD_MATH_BATCH} -> ${HARD_MATH_OUT_DIR} ===="
         python -m onereplay.scripts.evaluate \
           --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
           "${ckpt_arg[@]}" --run_name "${name}" \
-          --metrics "${CROSS_HARD_METRICS}" --out_dir "${HARD_MATH_OUT_DIR}" --seed "${SEED}" \
+          --metrics "${todo_metrics}" --out_dir "${HARD_MATH_OUT_DIR}" --seed "${SEED}" \
           --system_prompt "${MATH_SYSTEM_PROMPT}" \
           --decode_stop_on_im_end "${STOP_ON_IM_END}" \
           --limit "${EVAL_LIMIT}" \

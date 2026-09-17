@@ -13,14 +13,18 @@ train.py carves its own validation slice out of it via --val_fraction. That is
 deliberate. Commonsense170k is scored the same way (a random slice of train),
 and held-out loss only means the same thing across the two training sets if
 both validation sets were drawn by the same in-distribution procedure. The
-official validation and test splits are written out as JSONL instead, unused
-for now, waiting for a generation metric that needs a canonical test set.
+official validation and test splits are written out as JSONL instead, and the
+dialogsum metric (ROUGE + BERTScore) scores against those.
 
-One caveat for that future metric: the HuggingFace test split holds 1500 rows
-because the official 500 test dialogues each carry three reference summaries,
-flattened into one row per reference. ROUGE against a single flattened row is
-not the number the DialogSum paper reports -- regroup by `id` and score
-multi-reference.
+The two paths differ in one more way. The training pool is one row per
+reference, but the held-out JSONL is one row per *dialogue*, with every
+reference for it under `outputs`. The official test set gives each of its 500
+dialogues three reference summaries and the DialogSum paper's ROUGE is the max
+over them, while the HuggingFace copy ships that flattened into 1500 rows, one
+per reference. Undoing the flattening here is what lets the metric decode each
+dialogue once and score it multi-reference; left flattened it would decode the
+same dialogue three times and average over references, landing systematically
+below the published numbers.
 
 Length is the reason this script prints a report. DialogSum dialogues average
 131 words, and tokenizer_to_ids truncates from the left, so an over-long row
@@ -40,6 +44,11 @@ from typing import Any
 DEFAULT_INSTRUCTION = "Summarize the following dialogue."
 
 REQUIRED_COLUMNS = ("dialogue", "summary")
+
+# The official test set's column names for its three reference summaries. Only
+# the held-out path accepts them; training on a row with three targets is not a
+# thing this pipeline does.
+MULTI_REFERENCE_COLUMNS = ("summary1", "summary2", "summary3")
 
 # Candidate budgets the truncation table reports on, so --max_len can be chosen
 # from measured truncation rates rather than guessed.
@@ -249,6 +258,66 @@ def to_sft_rows(dataset, instruction: str) -> tuple[list[dict[str, str]], int]:
     return rows, dropped
 
 
+def reference_columns(columns: list[str]) -> list[str]:
+    """Name the columns holding reference summaries, single or multi."""
+
+    if "summary" in columns:
+        return ["summary"]
+    return [name for name in MULTI_REFERENCE_COLUMNS if name in columns]
+
+
+def to_eval_rows(dataset, instruction: str) -> tuple[list[dict[str, Any]], int]:
+    """Group a held-out split into one row per dialogue, carrying every reference.
+
+    Grouping is keyed on the dialogue text, not on `id`. The flattened test ids
+    differ only in a trailing index, but stripping that index off a split that
+    was never flattened would collapse it: validation numbers its rows the same
+    way. Identical dialogue text is what actually marks the same instance, and
+    the false merge it can cause is harmless -- greedy decoding gives an
+    identical prediction for an identical prompt either way.
+
+    `output` stays on the row so anything that reads the SFT schema still works;
+    `outputs` is the list the metric scores against.
+    """
+
+    columns = dataset.column_names
+    names = reference_columns(columns)
+    if "dialogue" not in columns or not names:
+        raise SystemExit(
+            "Held-out split needs a 'dialogue' column plus 'summary' or "
+            f"{list(MULTI_REFERENCE_COLUMNS)}; got {columns}."
+        )
+
+    ids = dataset["id"] if "id" in columns else [""] * len(dataset)
+    grouped: dict[str, dict[str, Any]] = {}
+    dropped = 0
+    for row_id, dialogue, *values in zip(
+        ids, dataset["dialogue"], *(dataset[name] for name in names)
+    ):
+        dialogue_text = (dialogue or "").strip()
+        references = [text for text in ((value or "").strip() for value in values) if text]
+        if not dialogue_text or not references:
+            dropped += 1
+            continue
+        entry = grouped.setdefault(
+            dialogue_text,
+            {
+                "id": row_id or "",
+                "instruction": instruction,
+                "input": dialogue_text,
+                "outputs": [],
+            },
+        )
+        for reference in references:
+            if reference not in entry["outputs"]:
+                entry["outputs"].append(reference)
+
+    rows = list(grouped.values())
+    for row in rows:
+        row["output"] = row["outputs"][0]
+    return rows, dropped
+
+
 def percentile(values: list[int], q: float) -> int:
     """Nearest-rank percentile of an already sorted list."""
 
@@ -366,13 +435,24 @@ def main() -> None:
     for name in ("validation", "test"):
         if name not in splits:
             continue
-        rows, name_dropped = to_sft_rows(splits[name], args.instruction)
+        rows, name_dropped = to_eval_rows(splits[name], args.instruction)
         path = jsonl_dir / f"{out_dir.name}_{name}.jsonl"
         with path.open("w", encoding="utf-8") as file:
             for row in rows:
                 file.write(json.dumps(row, ensure_ascii=False) + "\n")
-        held_out[name] = {"path": str(path), "num_rows": len(rows), "dropped": name_dropped}
-        print(f"wrote {name}: {len(rows)} rows to {path}")
+        counts = [len(row["outputs"]) for row in rows]
+        held_out[name] = {
+            "path": str(path),
+            "num_rows": len(rows),
+            "num_references": sum(counts),
+            "references_per_row_min": min(counts, default=0),
+            "references_per_row_max": max(counts, default=0),
+            "dropped": name_dropped,
+        }
+        print(
+            f"wrote {name}: {len(rows)} dialogues / {sum(counts)} references to {path} "
+            f"(refs per dialogue {min(counts, default=0)}-{max(counts, default=0)})"
+        )
 
     manifest: dict[str, Any] = {
         "source": args.dialogsum_path or args.dialogsum_repo,
@@ -384,7 +464,8 @@ def main() -> None:
         },
         "held_out_jsonl": held_out,
         "note": "train.py splits validation out of this pool with --val_fraction; the "
-        "JSONL splits are untouched and reserved for a generation metric.",
+        "JSONL splits are one row per dialogue with every reference under 'outputs', "
+        "which is what the dialogsum metric scores.",
     }
     if args.tokenizer_path:
         manifest["length"] = length_report(train_rows, args)

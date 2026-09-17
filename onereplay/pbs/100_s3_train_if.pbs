@@ -1957,24 +1957,30 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
     local -a ckpt_arg=()
     if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
 
-    local pending=0 m
+    local -a todo=()
+    local m
     for m in ${HARD_METRICS//,/ }; do
-      if [[ ! -f "${HARD_MATH_OUT_DIR}/${m}/${name}/summary.json" ]]; then
-        pending=1
+      if [[ "${FORCE_EVAL}" == "1" || ! -f "${HARD_MATH_OUT_DIR}/${m}/${name}/summary.json" ]]; then
+        todo+=("${m}")
       fi
     done
-    if [[ "${pending}" == "0" && "${FORCE_EVAL}" != "1" ]]; then
+    if [[ ${#todo[@]} -eq 0 ]]; then
       echo "跳过难 math ${name}：${HARD_METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
       return 0
     fi
+    local run_metrics
+    run_metrics="$(IFS=,; echo "${todo[*]}")"
+    if [[ "${run_metrics}" != "${HARD_METRICS}" ]]; then
+      echo "评测难 math ${name}：${HARD_METRICS} 里只有 ${run_metrics} 缺 summary，其余跳过（FORCE_EVAL=1 全部重评）"
+    fi
 
-    echo "==== eval ${name} (${HARD_METRICS}) sample T=${HARD_MATH_TEMPERATURE} avg@${HARD_MATH_SAMPLES} cap=${HARD_MATH_MAX_NEW_TOKENS} batch=${HARD_MATH_BATCH} ===="
+    echo "==== eval ${name} (${run_metrics}) sample T=${HARD_MATH_TEMPERATURE} avg@${HARD_MATH_SAMPLES} cap=${HARD_MATH_MAX_NEW_TOKENS} batch=${HARD_MATH_BATCH} ===="
     echo "     -> ${HARD_MATH_OUT_DIR}"
     echo "     system: ${OLD_SYSTEM_PROMPT:-<空>}   (和 gsm8k/math500 那一侧同值)"
     python -m onereplay.scripts.evaluate \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
-      --metrics "${HARD_METRICS}" --out_dir "${HARD_MATH_OUT_DIR}" --seed "${SEED}" \
+      --metrics "${run_metrics}" --out_dir "${HARD_MATH_OUT_DIR}" --seed "${SEED}" \
       --limit "${EVAL_LIMIT}" \
       --system_prompt "${OLD_SYSTEM_PROMPT}" \
       --decode_stop_on_im_end "${STOP_ON_IM_END}" \
