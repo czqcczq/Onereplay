@@ -410,8 +410,49 @@ def example_to_prompt_text(example: dict[str, Any], tokenizer, args: argparse.Na
         )
 
 
+def common_prefix_length(left: list[int], right: list[int]) -> int:
+    """Length of the shared head of two token id lists.
+
+    The assistant mask is derived by rendering the row twice, once with the
+    answer and once without, and masking the shared prefix. Comparing token ids
+    rather than trusting len(prompt_ids) matters because a chat template may
+    inject tokens into the generation prompt that the full render does not have
+    in the same place (Qwen3's thinking block is the usual culprit). A literal
+    prefix comparison degrades gracefully in that case instead of masking the
+    wrong span.
+
+    Both estimators mask with this function, so "assistant token" means the same
+    span for C as it does for F.
+    """
+
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
 def build_collate_fn(tokenizer, args: argparse.Namespace):
-    """Create a DataLoader collator that tokenizes text and pads each batch."""
+    """Create a DataLoader collator that tokenizes text and pads each batch.
+
+    --cov_supervision decides which of the returned masks the covariance hook
+    later accumulates over, and the two answer different questions:
+
+      assistant_only  C is restricted to the answer span, matching the tokens F
+                      and the SFT/replay losses are already supervised on.
+      all_tokens      C = E[x x^T] over every non-padding token. The average
+                      then mixes system, prompt and answer positions in whatever
+                      ratio the corpus happens to have, so a short-answer corpus
+                      like FLAN yields a mostly-prompt covariance and a long-CoT
+                      corpus yields a mostly-answer one.
+
+    The assistant path needs the prompt boundary, so it renders each row twice
+    and masks the shared token prefix. Masking happens before truncation for the
+    same reason it does in the Fisher collator: the prompt is only a prefix of
+    the *untruncated* sequence, and a left cut shifts the answer forward.
+    Slicing both arrays together reproduces the tokenizer's own truncation, so
+    input_ids stay identical to what the all_tokens path forwards.
+    """
 
     # Truncation drops the assistant turn by default (transformers truncates on
     # the right), while training keeps it (`full_input_ids[-max_length:]` in
@@ -422,8 +463,9 @@ def build_collate_fn(tokenizer, args: argparse.Namespace):
     truncation_side = getattr(args, "truncation_side", "")
     if truncation_side:
         tokenizer.truncation_side = truncation_side
+    add_special_tokens = args.use_chat_template != 1
 
-    def collate_fn(examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def collate_all_tokens(examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         texts = [example_to_model_text(example, tokenizer, args) for example in examples]
         tokenized = tokenizer(
             texts,
@@ -433,8 +475,54 @@ def build_collate_fn(tokenizer, args: argparse.Namespace):
             return_tensors="pt",
             # Chat templates already include model-specific special tokens.
             # Plain-text ablations still use normal tokenizer special tokens.
-            add_special_tokens=args.use_chat_template != 1,
+            add_special_tokens=add_special_tokens,
         )
         return tokenized
 
-    return collate_fn
+    def collate_assistant_only(examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        id_rows: list[list[int]] = []
+        mask_rows: list[list[int]] = []
+        mismatches = 0
+        for example in examples:
+            full_ids = tokenizer(
+                example_to_model_text(example, tokenizer, args),
+                add_special_tokens=add_special_tokens,
+            )["input_ids"]
+            prompt_ids = tokenizer(
+                example_to_prompt_text(example, tokenizer, args),
+                add_special_tokens=add_special_tokens,
+            )["input_ids"]
+
+            prefix = common_prefix_length(full_ids, prompt_ids)
+            mismatches += int(prefix != len(prompt_ids))
+            supervision = [0] * prefix + [1] * (len(full_ids) - prefix)
+
+            if len(full_ids) > args.max_len:
+                keep = slice(0, args.max_len)
+                if getattr(tokenizer, "truncation_side", "right") == "left":
+                    keep = slice(-args.max_len, None)
+                full_ids = full_ids[keep]
+                supervision = supervision[keep]
+
+            id_rows.append(full_ids)
+            mask_rows.append(supervision)
+
+        # tokenizer.pad rather than a hand-rolled fill, so the pad id and the
+        # padding side stay whatever the tokenizer says they are.
+        batch = tokenizer.pad({"input_ids": id_rows}, padding=True, return_tensors="pt")
+        width = batch["input_ids"].shape[1]
+        pad_left = getattr(tokenizer, "padding_side", "right") == "left"
+        padded_masks = [
+            ([0] * (width - len(row)) + row) if pad_left else (row + [0] * (width - len(row)))
+            for row in mask_rows
+        ]
+        batch["supervision_mask"] = torch.tensor(padded_masks, dtype=torch.long)
+        batch["prompt_prefix_mismatches"] = torch.tensor(mismatches, dtype=torch.long)
+        return batch
+
+    # collect_cov defaults to assistant_only; this fallback deliberately does
+    # not. Args that predate the flag also predate the prompt-side rendering the
+    # assistant path needs, so they get the collator they were written against.
+    if getattr(args, "cov_supervision", "all_tokens") == "assistant_only":
+        return collate_assistant_only
+    return collate_all_tokens

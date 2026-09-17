@@ -80,7 +80,7 @@ def make_covariance_hook(
     module_name: str,
     cov_sums: dict[str, torch.Tensor],
     counts: dict[str, int],
-    attention_holder: dict[str, torch.Tensor | None],
+    token_mask_holder: dict[str, torch.Tensor | None],
     cov_normalization: str,
     cov_norm_eps: float,
     accum_on_device: bool = False,
@@ -89,6 +89,13 @@ def make_covariance_hook(
 
     The hook sees the input hidden states of a Linear layer before W or LoRA is
     applied. This is exactly the x in DeltaW x.
+
+    token_mask_holder["token_mask"] selects which positions of the batch enter
+    the sum, and it is the single place the estimator's scope is decided. The
+    caller puts the attention mask there to average over every non-padding
+    token, or an assistant-only mask to restrict C to the answer span. The hook
+    itself does not know which: it only drops the positions the mask zeroes, and
+    counts what is left.
 
     With cov_normalization="none", the collected matrix is E[x x^T].
 
@@ -122,10 +129,16 @@ def make_covariance_hook(
             batch, seq_len, hidden_dim = hidden_states.shape
             flat_x = hidden_states.reshape(batch * seq_len, hidden_dim)
             flat_y = base_outputs.reshape(batch * seq_len, base_outputs.shape[-1])
-            attention_mask = attention_holder.get("attention_mask")
+            # "attention_mask" is this slot's pre-assistant_only name, still read
+            # as a fallback: a caller that fills the old key and gets ignored
+            # fails silently rather than loudly, because the shape guard below
+            # would just leave flat_mask None and let padding into C.
+            token_mask = token_mask_holder.get("token_mask")
+            if token_mask is None:
+                token_mask = token_mask_holder.get("attention_mask")
             flat_mask = None
-            if attention_mask is not None and attention_mask.shape[:2] == (batch, seq_len):
-                flat_mask = attention_mask.reshape(batch * seq_len).bool().to(flat_x.device)
+            if token_mask is not None and token_mask.shape[:2] == (batch, seq_len):
+                flat_mask = token_mask.reshape(batch * seq_len).bool().to(flat_x.device)
 
         if flat_mask is not None:
             flat_x = flat_x[flat_mask]
@@ -157,7 +170,7 @@ def make_covariance_hook(
 def register_covariance_hooks(
     model,
     target_module_names: list[str],
-    attention_holder: dict[str, torch.Tensor | None],
+    token_mask_holder: dict[str, torch.Tensor | None],
     args: argparse.Namespace,
 ):
     """Attach hooks to every target Linear layer and return hook handles."""
@@ -174,7 +187,7 @@ def register_covariance_hooks(
             module_name,
             cov_sums,
             counts,
-            attention_holder,
+            token_mask_holder,
             args.cov_normalization,
             args.cov_norm_eps,
             accum_on_device=accum_on_device,

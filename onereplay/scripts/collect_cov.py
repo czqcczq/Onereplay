@@ -5,7 +5,31 @@ estimate one matrix per LoRA target layer:
 
     C_l = E_x[x x^T]
 
-where x is the input hidden state of that layer for one non-padding token.
+where x is the input hidden state of that layer for one token of the corpus.
+
+--cov_supervision decides which tokens those are:
+
+  assistant_only  (default) only the answer span, the same tokens
+                  collect_fisher supervises and the same ones the SFT and replay
+                  losses are computed on. This is what "the old task's responses
+                  are protected" requires: all four arms then constrain the same
+                  positions, and the comparison isolates the weighting matrix.
+  all_tokens      every non-padding position, so system, prompt and answer all
+                  enter the average in whatever ratio the corpus happens to
+                  have. FLAN's one-line targets make this mostly a covariance of
+                  prompts; a long-CoT corpus makes it mostly one of answers. This
+                  was the only behaviour before the flag existed, so every C
+                  collected up to that point is an all_tokens one.
+
+The two are different estimators, not a tuning knob: they have different traces,
+so a lambda calibrated against one does not carry over to the other.
+
+The masked span is the answer tokens themselves. The Fisher's loss is shifted by
+one (position t scores token t+1), so F's gradient also leans on the last prompt
+position while C does not, and C covers the final answer token while F does not.
+That is a two-token boundary difference, kept on purpose: C is a statement about
+which representations must not drift, not about which logits are scored, and a
+mid-stack x feeds every later position through attention anyway.
 
 With --cov_normalization base_output_norm the script instead estimates
 
@@ -94,6 +118,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="1 includes FLAN targets as assistant messages when collecting C",
+    )
+    parser.add_argument(
+        "--cov_supervision",
+        type=str,
+        choices=["all_tokens", "assistant_only"],
+        default="assistant_only",
+        help=(
+            "Which token positions enter C. assistant_only (default) restricts C "
+            "to the answer span, matching what collect_fisher and the SFT/replay "
+            "losses are computed on, and needs --include_target_in_chat 1. "
+            "all_tokens averages over every non-padding token instead, mixing "
+            "prompt and answer in whatever ratio the corpus has; it is what every "
+            "C collected before this flag existed used. The two have different "
+            "traces, so a lambda calibrated on one does not transfer."
+        ),
     )
     parser.add_argument(
         "--system_prompt",
@@ -255,6 +294,12 @@ def parse_args() -> argparse.Namespace:
 def collect_covariances(args: argparse.Namespace) -> None:
     """Run the full collection stage and write normalized C matrices to disk."""
 
+    if args.cov_supervision == "assistant_only" and args.include_target_in_chat != 1:
+        raise ValueError(
+            "--cov_supervision assistant_only needs --include_target_in_chat 1: with no "
+            "assistant turn every position would be masked out and C would come out zero"
+        )
+
     set_seed(args.seed)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -308,14 +353,15 @@ def collect_covariances(args: argparse.Namespace) -> None:
         collate_fn=build_collate_fn(tokenizer, args),
     )
 
-    attention_holder: dict[str, torch.Tensor | None] = {"attention_mask": None}
+    token_mask_holder: dict[str, torch.Tensor | None] = {"token_mask": None}
     cov_sums, counts, handles = register_covariance_hooks(
         model,
         target_module_names,
-        attention_holder,
+        token_mask_holder,
         args,
     )
 
+    assistant_only = args.cov_supervision == "assistant_only"
     if args.cov_normalization == "base_output_norm":
         print(
             "Stage 1: forwarding old-knowledge data and accumulating "
@@ -323,10 +369,30 @@ def collect_covariances(args: argparse.Namespace) -> None:
         )
     else:
         print("Stage 1: forwarding old-knowledge data and accumulating X^T X")
+    print(f"Stage 1: supervision = {args.cov_supervision}")
+
+    total_tokens = 0
+    supervised_tokens = 0
+    zero_supervision_rows = 0
+    prompt_mismatches = 0
     with torch.no_grad():
         for step, batch in enumerate(dataloader, start=1):
             batch = {key: value.to(device) for key, value in batch.items()}
-            attention_holder["attention_mask"] = batch.get("attention_mask")
+            attention_mask = batch.get("attention_mask")
+            if attention_mask is not None:
+                total_tokens += int(attention_mask.sum())
+            # The model still reads the whole sequence either way: the answer is
+            # conditioned on its prompt, so the prompt has to be forwarded even
+            # when it is excluded from C. Only the hook's mask narrows.
+            if assistant_only:
+                supervision_mask = batch["supervision_mask"]
+                per_row = supervision_mask.sum(dim=1)
+                supervised_tokens += int(per_row.sum())
+                zero_supervision_rows += int((per_row == 0).sum())
+                prompt_mismatches += int(batch["prompt_prefix_mismatches"])
+                token_mask_holder["token_mask"] = supervision_mask
+            else:
+                token_mask_holder["token_mask"] = attention_mask
             model_inputs = {
                 key: value
                 for key, value in batch.items()
@@ -338,6 +404,33 @@ def collect_covariances(args: argparse.Namespace) -> None:
 
     for handle in handles:
         handle.remove()
+
+    if not assistant_only:
+        supervised_tokens = total_tokens
+    print(
+        f"Stage 1: C rests on {supervised_tokens} tokens, "
+        f"{supervised_tokens / max(total_tokens, 1):.1%} of the {total_tokens} "
+        "non-padding tokens in the pool"
+    )
+    if assistant_only:
+        if zero_supervision_rows:
+            # Same failure the Fisher run reports: a right-side cut removes the
+            # answer, and the row is then forwarded while contributing nothing.
+            print(
+                f"  warning: {zero_supervision_rows} rows contributed no token. Either "
+                "truncation ate the answer (--truncation_side should be left) or the "
+                "row had an empty target"
+            )
+        if prompt_mismatches:
+            print(
+                f"  warning: {prompt_mismatches} rows where the prompt render was not a "
+                "clean token prefix of the full render; their masks fall back to the "
+                "shared prefix"
+            )
+        print(
+            "  trace(C) is now on a different scale than an all_tokens run: re-sweep "
+            "lambda instead of reusing the old grid"
+        )
 
     # pop instead of iterating: with --cov_accum_device device the sums are the
     # single largest allocation of the run, and normalizing them into a second
@@ -366,6 +459,11 @@ def collect_covariances(args: argparse.Namespace) -> None:
         "target_column": args.target_column,
         "use_chat_template": args.use_chat_template,
         "include_target_in_chat": args.include_target_in_chat,
+        "cov_supervision": args.cov_supervision,
+        "supervised_tokens": supervised_tokens,
+        "total_tokens": total_tokens,
+        "zero_supervision_rows": zero_supervision_rows,
+        "prompt_prefix_mismatches": prompt_mismatches,
         "system_prompt": args.system_prompt,
         "require_target": args.require_target,
         "require_target_column": args.require_target_column,

@@ -43,7 +43,11 @@ import numpy as np
 import torch
 from torch import nn
 
-from onereplay.data.old_knowledge import example_to_model_text, example_to_prompt_text
+from onereplay.data.old_knowledge import (
+    common_prefix_length,
+    example_to_model_text,
+    example_to_prompt_text,
+)
 
 
 def load_fisher_file(path: str) -> dict[str, torch.Tensor]:
@@ -133,25 +137,6 @@ def select_target_weights(
         weight.requires_grad_(True)
         target_weights[module_name] = weight
     return target_weights
-
-
-def common_prefix_length(left: list[int], right: list[int]) -> int:
-    """Length of the shared head of two token id lists.
-
-    The assistant mask is derived by rendering the row twice, once with the
-    answer and once without, and masking the shared prefix. Comparing token ids
-    rather than trusting len(prompt_ids) matters because a chat template may
-    inject tokens into the generation prompt that the full render does not have
-    in the same place (Qwen3's thinking block is the usual culprit). A literal
-    prefix comparison degrades gracefully in that case instead of masking the
-    wrong span.
-    """
-
-    limit = min(len(left), len(right))
-    index = 0
-    while index < limit and left[index] == right[index]:
-        index += 1
-    return index
 
 
 def build_supervised_collate_fn(tokenizer, args: argparse.Namespace):

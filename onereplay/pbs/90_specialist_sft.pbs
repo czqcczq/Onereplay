@@ -1,0 +1,469 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N spec_sft
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
+
+# =============================================================================
+# 三个领域 specialist 的 Stage 1：Qwen3-4B-Base -> M_math / M_medical / M_finance
+#
+#   qsub -v DOMAIN=math    ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
+#   qsub -v DOMAIN=math    ,MODE=train onereplay/pbs/90_specialist_sft.pbs
+#   qsub -v DOMAIN=medical ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
+#   ...
+#
+# 1. 为什么是一个脚本而不是三个
+# -----------------------------
+# 三个 specialist 存在的意义是之后拿来比较（Math->Medical 会不会忘掉 Math），
+# 而比较成立的前提是**除了数据以外什么都没变**。三份脚本意味着三份可以各自漂移的
+# 超参：某次只在 medical 那份上调了 BATCH，半年后没人记得，于是"finance 比 medical
+# 差"里混进了一个 batch size 差。
+#
+# 所以超参在这里**只有一份**，DOMAIN 只切换三样东西：数据集路径、结果目录、以及
+# MODE=data 时调用哪个 prepare 脚本。下面 pick_domain 之后的所有训练参数对三个领域
+# 逐字相同，这是脚本结构保证的，不是靠人记得。
+#
+# 2. 相对旧 Math 线改了什么
+# -------------------------
+# 旧的 91_s1_train_math.pbs（已随 IF/CS 线一起删除，要查就翻 git 历史）是这条线的
+# reference，下面的 LR / scheduler / warmup /
+# ACCUM / VAL_FRAC / TARGET_MODULES / SYSTEM_PROMPT 全部逐字照抄。只有三处不同，
+# 每一处都是**三个领域一起变**，所以领域之间仍然是同口径：
+#
+#   MAXLEN  2048 -> 4096
+#     旧线把长度交给训练时截断，而 tokenizer_to_ids 是 full_ids[-max_length:]，
+#     **保尾丢头**——被砍掉的是题干开头，留下的是答案。对 Numina 影响很小（p99≈1462），
+#     但 MedQA 的 R1 轨迹和 ODA-Fin 的 235B 蒸馏 CoT 在 2048 下会被大量砍掉，而且砍掉的
+#     不是随机样本，是**所有长推理样本**，剩下的全是简单题。现在长度在数据侧解决：
+#     prepare_* 把超过 4096 的整行丢掉，所以训练时永远不会触发截断那条路径。
+#
+#   BATCH   4 -> 2       （ACCUM 保持 64）
+#     纯粹是 4096 序列的显存代价。**有效 batch 没变**：trainer 里
+#     accum_steps = accumulation_size // batch_size，旧线是 64//4 = 16 步 x 4 行 = 64 行/update，
+#     这里是 64//2 = 32 步 x 2 行 = 64 行/update。优化器看到的东西逐字相同，只是慢一倍。
+#     **如果还 OOM，改 BATCH 就够了，不要动 ACCUM**；且三个领域必须用同一个值，
+#     所以改了就三个都重跑。
+#
+#   SEED    1 -> 42
+#     和 prepare_* 的采样 seed 对齐，全线一个数。Math 因此要重训，这是已知的。
+#
+# 3. SYSTEM_PROMPT 必须和数据准备时逐字一致
+# -----------------------------------------
+# 这不是风格问题，是**长度正确性**问题。system turn 会贡献 token，而 4096 那条线是在
+# prepare_* 里按"含 system 的完整序列"算出来的。训练时传一个不同的 system（哪怕只差
+# 一个标点），每行长度都会平移，prepare 保证的"没有一行会被截断"就不再成立，而且不会
+# 报错。所以这里的默认值 = common.DEFAULT_SYSTEM_PROMPT = 旧线 SYSTEM_PROMPT_PRESET=auto
+# 展开出来的那一条，三处必须同时改或都不改。
+#
+# 至于为什么不干脆留空：Qwen3-4B-Base 的模板不像 Qwen2.5-Math 那样自动注入
+# \boxed{} 指令，留空的话**没训练过的 base 臂根本不会写 \boxed{}**，评分器找不到答案
+# span 而给近乎 0 分，训练后的模型因为从数据里学会了格式而正常——那个差值是度量误差，
+# 不是学习效果，会把每一个 before/after 都夸大。三个领域的答案都已经归一到 \boxed{}
+# （Medical 的 <answer>X</answer> 在 prepare 阶段改写过），所以同一条指令对三者都成立。
+#
+# 4. 训练完直接接评测，同一个作业，不用再投一次
+# ---------------------------------------------
+# MODE=train 跑完会继续调用 91_cross_eval.pbs。评测逻辑本身仍然只有 91 号那一份：
+# 这里已经在容器内，所以是设 ONEREPLAY_IN_CONTAINER=1 直接 bash 它，跳过它起容器
+# 的那一半。两条路径共用同一套口径，改 91 号就等于同时改了这里，不会出现"训练脚本
+# 里的评测"和"独立评测脚本"各算各的。
+#
+# 评的是交叉矩阵：M_<DOMAIN> 在 math / medical / finance 三边全评，base 只评当前
+# DOMAIN 这一边。"学会了新领域"和"没忘掉别的领域"是两个问题，只评自己那边只能回答
+# 前一个，而后一个才是这项研究要问的。base 是三条线共用的同一个 checkpoint，让三个
+# DOMAIN 各自重评三边等于把同一组数字算三次，还会往 csv 里塞重复行。
+#
+# walltime 必须够训练 + 评测两段。不够也不会丢东西：checkpoint 在就跳过训练，评测
+# 组只要有 summary.json 就跳过，原样重投会从断点接着跑。DO_EVAL=0 则只训不评。
+#
+# 5. 这一阶段严格禁止的事
+# -----------------------
+# 三个模型必须各自从**同一个** Qwen3-4B-Base 独立训练：不 warm-start（不许
+# M_math -> Medical）、不 replay、不掺通用数据、不做 teacher 生成、不做 RL。
+# 下面的 --replay_lambda 0 和 --replay_dataset_path 缺省是写死的，不要加回来。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/90_specialist_sft.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_spec_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_spec_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# ---- 只有这三样跟着 DOMAIN 变 ----
+DOMAIN="${DOMAIN:-}"
+MODE="${MODE:-train}"
+
+# ---- 原始语料（离线，必须在登录节点先下好）----
+# 计算节点上 HF_HUB_OFFLINE=1，prepare_* 走不了 Hub，所以这三条都得是本地路径。
+NUMINA_PATH="${NUMINA_PATH:-${REPO_ROOT}/datasets/raw/NuminaMath-CoT/data}"
+MEDQA_PATH="${MEDQA_PATH:-${REPO_ROOT}/datasets/raw/MedQA-5options}"
+FIN_JSON="${FIN_JSON:-${REPO_ROOT}/datasets/raw/ODA-Fin-SFT-318k/train.json}"
+
+# =============================================================================
+# 外层：裸计算节点，只负责起容器再把自己跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]]    || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_spec_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR
+    DOMAIN MODE DRY_RUN SEED DO_EVAL
+    BENCH_ROOT EVAL_ROOT LIMIT WHICH FORCE
+    GSM8K_DATA MATH500_DATA MINERVA_DATA
+    MEDQA_DATA PUBMEDQA_DATA MEDXPERTQA_DATA
+    FINQA_DATA CONVFINQA_DATA TATQA_DATA
+    MATH_BATCH MEDICAL_BATCH FINANCE_BATCH
+    NUMINA_PATH MEDQA_PATH FIN_JSON
+    DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
+    EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
+    TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY SMOKE_STEPS
+    SAMPLE_ROWS MAX_TRACES NEAR_DUP_THRESHOLD MAX_SOURCE_RATIO FIN_LANGUAGE
+    EVAL_SOURCE_PATTERNS TARGET_ROWS
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# ---- 模型 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+# 三个 specialist 必须从**完全相同**的这一个 checkpoint 起步。
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
+
+# ---- 数据产物布局 ----
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
+STATS_DIR="${STATS_DIR:-${DATA_ROOT}/stats}"
+
+# =============================================================================
+# 训练超参：**这一段对三个领域逐字相同**，来自已删除的 91_s1_train_math.pbs。
+# 想调任何一个，就是三个领域一起重跑，否则它们不再可比。
+# =============================================================================
+EPOCHS="${EPOCHS:-1}"
+LR="${LR:-5e-5}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+# 见文件头第 2 条：BATCH 是显存参数，ACCUM 才是"每次更新多少行"。
+# accum_steps = ACCUM / BATCH = 32，effective batch = ACCUM = 64 行/update，和旧线一致。
+BATCH="${BATCH:-2}"
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-4096}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-200}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+SEED="${SEED:-42}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+LOG_EVERY="${LOG_EVERY:-500}"
+SMOKE_STEPS="${SMOKE_STEPS:-70}"
+DRY_RUN="${DRY_RUN:-0}"
+# MODE=train 跑完直接接交叉评测。DO_EVAL=0 只训不评（补评再投 91 号）。
+DO_EVAL="${DO_EVAL:-1}"
+
+# 见文件头第 3 条：这一条和 prepare_* 的 --system_prompt 必须逐字相同。
+# 文本里有逗号，qsub -v 用逗号分隔变量，所以要覆盖它得改这里而不是 -v。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-Please reason step by step, and put your final answer within \\boxed{}.}"
+
+# ---- 各领域 prepare 的可调项（只影响数据，不影响训练超参）----
+SAMPLE_ROWS="${SAMPLE_ROWS:-100000}"          # math：目标池大小
+MAX_TRACES="${MAX_TRACES:-4}"                 # medical：每题最多几条正确轨迹
+NEAR_DUP_THRESHOLD="${NEAR_DUP_THRESHOLD:-0.8}"
+MAX_SOURCE_RATIO="${MAX_SOURCE_RATIO:-0.15}"  # finance：单一 source 上限
+FIN_LANGUAGE="${FIN_LANGUAGE:-en}"
+EVAL_SOURCE_PATTERNS="${EVAL_SOURCE_PATTERNS:-finqa tat-qa tatqa tat_qa convfinqa}"
+TARGET_ROWS="${TARGET_ROWS:-0}"               # finance：0 = 过滤后剩多少用多少
+
+# =============================================================================
+# DOMAIN 分派：只决定数据在哪、结果写哪、MODE=data 调谁。
+# =============================================================================
+case "${DOMAIN}" in
+  math|medical|finance) ;;
+  "") echo "必须指定 DOMAIN=math|medical|finance" >&2; exit 2 ;;
+  *)  echo "DOMAIN 只能是 math / medical / finance，得到 '${DOMAIN}'" >&2; exit 2 ;;
+esac
+
+DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/${DOMAIN}_train}"
+OUT_JSONL="${PROCESSED_DIR}/${DOMAIN}_train.jsonl"
+OUT_STATS="${STATS_DIR}/${DOMAIN}_stats.json"
+
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_specialist_${DOMAIN}_${MODEL_NAME}}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+RUN="specialist_${DOMAIN}_lr${LR}_seed${SEED}"
+CKPT="${CKPT_DIR}/${RUN}"
+mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${PROCESSED_DIR}" "${STATS_DIR}"
+
+echo "================================================================"
+echo " DOMAIN      : ${DOMAIN}"
+echo " MODE        : ${MODE}"
+echo " model       : ${MODEL_DIR}/${MODEL_NAME}"
+echo " dataset     : ${DATASET_DIR}"
+echo " run         : ${RUN}"
+echo " maxlen      : ${MAXLEN}   batch ${BATCH} x accum $((ACCUM / BATCH)) = ${ACCUM} 行/update"
+echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
+echo " system      : ${SYSTEM_PROMPT}"
+echo "================================================================"
+
+# =============================================================================
+# MODE=data：原始语料 -> data/processed/{domain}_train{.jsonl,/}
+#
+# 三个 prepare 脚本都会打印一张 budget_scan 表（1024/2048/3072/4096/6144/8192 各档
+# 会保留多少行、多少 assistant token）。**定 MAXLEN 之前先读它**，尤其是 medical 和
+# finance——如果 4096 在某个领域丢掉的行远多于预期，那是该领域数据本身的信息，不是
+# 参数填错了。
+# =============================================================================
+if [[ "${MODE}" == "data" ]]; then
+  if [[ -f "${DATASET_DIR}/dataset_dict.json" ]]; then
+    echo "拒绝 MODE=data：${DATASET_DIR} 已经是一个 save_to_disk 池。"
+    echo "  prepare_* 会整目录覆盖，而已经用它训过的 checkpoint 会就此失去可追溯的数据。"
+    echo "  真要重建就先把旧目录挪走，或者指定 DATASET_DIR=<新路径>。"
+    exit 3
+  fi
+
+  COMMON_ARGS=(
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
+    --system_prompt "${SYSTEM_PROMPT}"
+    --max_tokens "${MAXLEN}"
+    --seed "${SEED}"
+    --out_jsonl "${OUT_JSONL}"
+    --out_stats "${OUT_STATS}"
+    --out_dir "${DATASET_DIR}"
+  )
+
+  case "${DOMAIN}" in
+    math)
+      [[ -d "${NUMINA_PATH}" ]] || { echo "找不到 NuminaMath: ${NUMINA_PATH}"; exit 1; }
+      python -m onereplay.scripts.domain_sft.prepare_math \
+        --numina_path "${NUMINA_PATH}" \
+        --sample_rows "${SAMPLE_ROWS}" \
+        --require_boxed 1 \
+        "${COMMON_ARGS[@]}"
+      ;;
+    medical)
+      [[ -e "${MEDQA_PATH}" ]] || { echo "找不到 MedQA: ${MEDQA_PATH}"; exit 1; }
+      python -m onereplay.scripts.domain_sft.prepare_medical \
+        --medqa_path "${MEDQA_PATH}" \
+        --max_traces_per_question "${MAX_TRACES}" \
+        --near_dup_threshold "${NEAR_DUP_THRESHOLD}" \
+        "${COMMON_ARGS[@]}"
+      ;;
+    finance)
+      [[ -f "${FIN_JSON}" ]] || { echo "找不到 ODA-Fin train.json: ${FIN_JSON}"; exit 1; }
+      # shellcheck disable=SC2086
+      python -m onereplay.scripts.domain_sft.prepare_finance \
+        --fin_json "${FIN_JSON}" \
+        --language "${FIN_LANGUAGE}" \
+        --eval_source_patterns ${EVAL_SOURCE_PATTERNS} \
+        --max_source_ratio "${MAX_SOURCE_RATIO}" \
+        --target_rows "${TARGET_ROWS}" \
+        "${COMMON_ARGS[@]}"
+      ;;
+  esac
+
+  echo
+  echo "==== ${DOMAIN} 数据就绪 ===="
+  echo "  训练用 : ${DATASET_DIR}"
+  echo "  可审计 : ${OUT_JSONL}"
+  echo "  统计   : ${OUT_STATS}"
+  echo "三个领域都跑完后，比一下各自的 total_assistant_tokens：那才是 SFT loss 真正"
+  echo "作用到的量。差距超过 1.5~2x 的话，再考虑补一个 matched-token 的对照。"
+  exit 0
+fi
+
+# =============================================================================
+# 训练
+# =============================================================================
+train_one () {
+  local run="$1" save_path="$2" max_steps="${3:-0}" do_save="${4:-1}"
+  local log_every="${5:-${LOG_EVERY}}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo "==== train ${run} (lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} maxlen=${MAXLEN} batch=${BATCH} accum=${ACCUM} max_steps=${max_steps}) ===="
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --dataset_path "${DATASET_DIR}" \
+    --epochs "${EPOCHS}" --lr "${LR}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${BATCH}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --replay_lambda 0 --measure_replay_when_lambda_zero 0 \
+    --max_steps "${max_steps}" --log_every "${log_every}" \
+    --save "${do_save}" --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl"
+}
+
+if [[ ! -d "${DATASET_DIR}" ]]; then
+  echo "数据集不存在: ${DATASET_DIR}"
+  echo "先跑: qsub -v DOMAIN=${DOMAIN},MODE=data onereplay/pbs/90_specialist_sft.pbs"
+  exit 1
+fi
+
+# 数据是用哪条 system prompt 量出来的，就必须用哪条训练——不然 4096 的保证失效。
+STATS_SYSTEM="$(python - "${OUT_STATS}" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        print(json.load(fh)["metadata"]["system_prompt"], end="")
+except Exception:
+    print("", end="")
+PY
+)"
+if [[ -n "${STATS_SYSTEM}" && "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
+  echo "拒绝训练：SYSTEM_PROMPT 和数据准备时用的不一致。"
+  echo "  数据 (${OUT_STATS}): ${STATS_SYSTEM}"
+  echo "  本次训练          : ${SYSTEM_PROMPT}"
+  echo "  system turn 会贡献 token，长度是按含它的完整序列量的；不一致就会有行超过"
+  echo "  ${MAXLEN} 而被静默左截断（保尾丢头），prepare 的 drop-not-truncate 保证作废。"
+  exit 4
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：只打印配置，不训练。"
+  exit 0
+fi
+
+# 训练完直接在**同一个作业**里接着评测，不用再投一次。
+#
+# 复用的是 91 号本身，不是把它的内容抄一份过来：这里已经在容器里，所以设
+# ONEREPLAY_IN_CONTAINER=1 让 91 号跳过起容器那一半，直接走它的内层。评测口径
+# 因此只有一份，改 91 号就等于同时改了这条路径。
+run_cross_eval () {
+  local eval_script="${REPO_ROOT}/onereplay/pbs/91_cross_eval.pbs"
+  if [[ ! -f "${eval_script}" ]]; then
+    echo "找不到评测脚本: ${eval_script}" >&2
+    return 1
+  fi
+
+  echo
+  echo "================================================================"
+  echo " 训练结束，接着跑交叉评测（M_${DOMAIN} 评三边 + base 评 ${DOMAIN}）"
+  echo "================================================================"
+  ONEREPLAY_IN_CONTAINER=1 \
+  REPO_ROOT="${REPO_ROOT}" VENV="${VENV}" CACHE_ROOT="${CACHE_ROOT}" \
+  JOB_TMPDIR="${JOB_TMPDIR}" \
+  MODEL_DIR="${MODEL_DIR}" MODEL_NAME="${MODEL_NAME}" \
+  DOMAIN="${DOMAIN}" CKPT="${CKPT}" SEED="${SEED}" LR="${LR}" \
+  SYSTEM_PROMPT="${SYSTEM_PROMPT}" \
+    bash "${eval_script}"
+}
+
+case "${MODE}" in
+  smoke)
+    # 几十步，用来确认 4096 x BATCH 放得下、loss 会降。不保存。
+    train_one "${RUN}_smoke" "" "${SMOKE_STEPS}" 0 8
+    ;;
+  train)
+    # checkpoint 已经在就跳过训练，但**不退出**——后面的评测还要跑。撞了
+    # walltime 之后原样重投，就会跳过训练、跳过已完成的评测组，从断点接着跑。
+    if [[ -d "${CKPT}" ]]; then
+      echo "已存在 checkpoint，跳过训练: ${CKPT}"
+      echo "  要重训就先挪走它，或换一个 SEED / RESULTS_ROOT。"
+    else
+      train_one "${RUN}" "${CKPT}" 0 1
+      echo
+      echo "==== ${DOMAIN} specialist 训练完成 ===="
+      echo "  checkpoint : ${CKPT}"
+      echo "  metrics    : ${METRICS_DIR}/${RUN}.jsonl"
+    fi
+
+    if [[ "${DO_EVAL}" != "1" ]]; then
+      echo
+      echo "DO_EVAL=0：不评测。要补评就投 qsub -v DOMAIN=${DOMAIN} onereplay/pbs/91_cross_eval.pbs"
+      exit 0
+    fi
+    if ! run_cross_eval; then
+      echo
+      echo "评测失败，但训练本身是好的：${CKPT}" >&2
+      echo "  单独重投评测: qsub -v DOMAIN=${DOMAIN} onereplay/pbs/91_cross_eval.pbs" >&2
+      exit 5
+    fi
+    ;;
+  *)
+    echo "MODE 只能是 data / smoke / train，得到 '${MODE}'" >&2
+    exit 2
+    ;;
+esac

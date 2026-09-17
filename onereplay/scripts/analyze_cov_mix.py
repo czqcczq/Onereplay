@@ -91,8 +91,17 @@ import torch  # noqa: E402
 from onereplay.scripts.compare_cov_scale import load_lora_deltas  # noqa: E402
 
 # A mismatch here means the two files describe different objects and no weight
-# repairs that; the comparison has to be abandoned, not reweighted.
-BLOCKING_KEYS = ("model_name", "target_modules", "cov_normalization", "cov_norm_eps")
+# repairs that; the comparison has to be abandoned, not reweighted. cov_supervision
+# belongs here rather than below: an all_tokens C and an assistant_only C are
+# second moments of different token populations, so mixing them averages a
+# prompt-weighted matrix with an answer-only one.
+BLOCKING_KEYS = (
+    "model_name",
+    "target_modules",
+    "cov_normalization",
+    "cov_norm_eps",
+    "cov_supervision",
+)
 
 # A mismatch here keeps the files comparable but changes which tokens entered the
 # average, so it changes what the mix is equalizing rather than whether it can.
