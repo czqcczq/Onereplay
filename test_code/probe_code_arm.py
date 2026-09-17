@@ -12,11 +12,22 @@ Two stages, in the order that can change the plan:
    judging code has to be written, and that is worth knowing before promising
    four benchmarks instead of two.
 
-2. Magicoder sizing. Three questions the plan rests on: how many rows are really
-   Python, how many survive decontamination against HumanEval/MBPP, and how many
-   survive 4096. The `lang` column is NOT the answer to the first one -- it
-   records the language of the SEED snippet, and OSS-Instruct is documented to
-   emit a different language than its seed. So all three readings are reported.
+2. Magicoder sizing. How many rows survive decontamination against
+   HumanEval/MBPP, how many survive 4096, and what the Python / non-Python mix
+   looks like on the way out.
+
+   The whole corpus is measured, not the Python part. The benchmarks are Python,
+   which makes filtering to Python look obvious, and the paper's ablation
+   (Table 5) says it costs accuracy: HumanEval+ pass@1 is 47.6 for Python-only
+   (43K) against 55.5 for the full 75K, and non-Python data *alone* gets 44.5
+   from a 34.1 base. So the language readings are printed for reference and the
+   pipeline runs on everything.
+
+   Where Python does need identifying -- the mix report -- it is the ```python
+   fence, not the `lang` column. `lang` records the language of the SEED
+   snippet, and the paper explicitly declines to classify by it "because LLMs
+   performing OSS-Instruct may produce code in a different programming language
+   than the seed".
 
 Nothing is written except the raw downloads; this only measures.
 """
@@ -180,13 +191,14 @@ def stage_magicoder(args: argparse.Namespace) -> None:
     print(f"  取列: problem={problem_key!r} solution={solution_key!r}")
 
     print()
-    print("---- Python 的三种口径（lang 记的是种子片段的语言，不是生成内容的）")
-    by_lang, by_fence, by_both = [], [], []
+    print("---- 语言口径（lang 记的是种子片段的语言，不是生成内容的）")
+    by_lang, by_fence, by_both, nonempty = [], [], [], []
     for index, row in enumerate(rows):
         problem = str(row.get(problem_key, "") or "").strip()
         solution = str(row.get(solution_key, "") or "").strip()
         if not problem or not solution:
             continue
+        nonempty.append(index)
         lang_ok = str(row.get("lang", "")).strip().lower() == "python"
         fence_ok = "```python" in solution.lower()
         if lang_ok:
@@ -196,12 +208,18 @@ def stage_magicoder(args: argparse.Namespace) -> None:
         if lang_ok and fence_ok:
             by_both.append(index)
     total = max(len(rows), 1)
-    print(f"  lang == python        {len(by_lang):>6}  ({len(by_lang)/total:5.1%})")
-    print(f"  含 ```python          {len(by_fence):>6}  ({len(by_fence)/total:5.1%})")
-    print(f"  两者交集（现用口径）  {len(by_both):>6}  ({len(by_both)/total:5.1%})")
-    print(f"  只满足一边            {len(set(by_lang) ^ set(by_fence)):>6}")
+    print(f"  lang == python           {len(by_lang):>6}  ({len(by_lang)/total:5.1%})")
+    print(f"  含 ```python（论文口径） {len(by_fence):>6}  ({len(by_fence)/total:5.1%})")
+    print(f"  两者交集                 {len(by_both):>6}  ({len(by_both)/total:5.1%})")
+    print(f"  只满足一边               {len(set(by_lang) ^ set(by_fence)):>6}")
+    print(f"  全部非空行（现用口径）   {len(nonempty):>6}  ({len(nonempty)/total:5.1%})")
+    print()
+    print("  用全量，不是只用 Python —— 论文 Table 5（CodeLlama-Python-7B，HumanEval+ pass@1）:")
+    print("    不微调 34.1 / 只用 Python(43K) 47.6 / 只用非 Python(32K) 44.5 / 全量(75K) 55.5")
+    print("  非 Python 那一半对 Python 是净贡献，不是稀释。")
 
-    kept = by_both
+    kept = nonempty
+    is_python = set(by_fence)
 
     print()
     print("---- 去重（题面归一后完全相同）")
@@ -278,6 +296,25 @@ def stage_magicoder(args: argparse.Namespace) -> None:
         violations = sum(1 for item in survivors if not item.prompt_is_prefix)
         if violations:
             print(f"  !! prompt 不是 full 的前缀: {violations} 行，label mask 会错位")
+
+        # 存活行里 Python / 非 Python 各占多少 —— 论文是 ~57% Python，差太多说明
+        # 某一侧被前面的过滤打得更狠。
+        py_tokens = non_py_tokens = py_rows = 0
+        for row_index, item in zip(clean, measured):
+            if item.total_tokens > args.max_tokens:
+                continue
+            if row_index in is_python:
+                py_rows += 1
+                py_tokens += item.response_tokens
+            else:
+                non_py_tokens += item.response_tokens
+        print(
+            f"  其中 Python {py_rows} 行 / {py_tokens:,} assistant token"
+            f"（{py_rows / max(len(survivors), 1):.1%} 的行，"
+            f"{py_tokens / max(py_tokens + non_py_tokens, 1):.1%} 的 token）"
+        )
+        print(f"  非 Python {len(survivors) - py_rows} 行 / {non_py_tokens:,} assistant token")
+        print("  论文 OSS-Instruct 75K 约 57% 是 Python；偏离太多说明某一侧被过滤打得更狠")
 
     print()
     print("---- 对照：另外两臂")
