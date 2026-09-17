@@ -12,7 +12,8 @@
 # 三个领域 specialist 的 Stage 1：Qwen3-4B-Base -> M_math / M_medical / M_finance
 #
 #   qsub -v DOMAIN=math    ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
-#   qsub -v DOMAIN=math    ,MODE=train onereplay/pbs/90_specialist_sft.pbs
+#   qsub -v DOMAIN=math    ,MODE=train onereplay/pbs/90_specialist_sft.pbs   # 训练+评测
+#   qsub -v DOMAIN=math    ,MODE=eval  onereplay/pbs/90_specialist_sft.pbs   # 只评测
 #   qsub -v DOMAIN=medical ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
 #   ...
 #
@@ -67,10 +68,8 @@
 #
 # 4. 训练完直接接评测，同一个作业，不用再投一次
 # ---------------------------------------------
-# MODE=train 跑完会继续调用 91_cross_eval.pbs。评测逻辑本身仍然只有 91 号那一份：
-# 这里已经在容器内，所以是设 ONEREPLAY_IN_CONTAINER=1 直接 bash 它，跳过它起容器
-# 的那一半。两条路径共用同一套口径，改 91 号就等于同时改了这里，不会出现"训练脚本
-# 里的评测"和"独立评测脚本"各算各的。
+# MODE=train 跑完会**在本脚本里**接着评测，没有第二个脚本要投。评测口径因此只有
+# 一份，不会出现"训练脚本里的评测"和"独立评测脚本"各算各的这种漂移。
 #
 # 评的是交叉矩阵：M_<DOMAIN> 在 math / medical / finance 三边全评，base 只评当前
 # DOMAIN 这一边。"学会了新领域"和"没忘掉别的领域"是两个问题，只评自己那边只能回答
@@ -80,7 +79,20 @@
 # walltime 必须够训练 + 评测两段。不够也不会丢东西：checkpoint 在就跳过训练，评测
 # 组只要有 summary.json 就跳过，原样重投会从断点接着跑。DO_EVAL=0 则只训不评。
 #
-# 5. 这一阶段严格禁止的事
+# 只想评不想训的场合用 MODE=eval，配 WHICH 选评谁：
+#   qsub -v DOMAIN=math,MODE=eval,WHICH=base   ...   # 只看 base 的分数
+#   qsub -v DOMAIN=math,MODE=eval              ...   # 训练早跑完了，补评/续评
+#   qsub -v DOMAIN=math,MODE=eval,FORCE=1      ...   # 改了 metric，推翻重算
+#
+# 5. benchmark 放在哪，为什么两套命名
+# -----------------------------------
+# math 三件沿用这条线一直用的 datasets/math/<name>_test.jsonl：gsm8k 和 math500
+# 早就在集群上了，没有理由为了好看再下一遍或挪位置——挪了反而让旧结果和新结果对不
+# 上账。medical / finance 六件是新加的，走 datasets/bench/<name>/。两套命名不统一
+# 是这个历史的直接结果，不是疏忽。缺哪件，本脚本会在**开跑前**就把路径打出来。
+# 数据用 test_code/download_bench.py 下，它产出的就是下面写的这些路径。
+#
+# 6. 这一阶段严格禁止的事
 # -----------------------
 # 三个模型必须各自从**同一个** Qwen3-4B-Base 独立训练：不 warm-start（不许
 # M_math -> Medical）、不 replay、不掺通用数据、不做 teacher 生成、不做 RL。
@@ -235,7 +247,7 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
 LOG_EVERY="${LOG_EVERY:-500}"
 SMOKE_STEPS="${SMOKE_STEPS:-70}"
 DRY_RUN="${DRY_RUN:-0}"
-# MODE=train 跑完直接接交叉评测。DO_EVAL=0 只训不评（补评再投 91 号）。
+# MODE=train 跑完直接接交叉评测。DO_EVAL=0 只训不评（之后用 MODE=eval 补）。
 DO_EVAL="${DO_EVAL:-1}"
 
 # 见文件头第 3 条：这一条和 prepare_* 的 --system_prompt 必须逐字相同。
@@ -252,12 +264,52 @@ EVAL_SOURCE_PATTERNS="${EVAL_SOURCE_PATTERNS:-finqa tat-qa tatqa tat_qa convfinq
 TARGET_ROWS="${TARGET_ROWS:-0}"               # finance：0 = 过滤后剩多少用多少
 
 # =============================================================================
+# 评测配置
+# =============================================================================
+# base | trained | both。MODE=train 之后固定走 both（base 那半有结果就自动跳过）。
+WHICH="${WHICH:-both}"
+# 1 = 已有 summary.json 也重算。改了 metric 实现时才用。
+FORCE="${FORCE:-0}"
+LIMIT="${LIMIT:-0}"                           # >0 只评前 N 题，冒烟用
+
+# 评测结果**跨 DOMAIN 共用一个根**：每个 <metric>_summary.csv 才能把 base 和三个
+# specialist 攒成一张表。分开放就得手工拼。
+EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_specialist_eval}"
+
+# ---- benchmark 数据（离线，登录节点先下好）----
+# 见文件头第 5 条：math 沿用旧布局，medical/finance 走新的 bench 目录。
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+BENCH_ROOT="${BENCH_ROOT:-${REPO_ROOT}/datasets/bench}"
+GSM8K_DATA="${GSM8K_DATA:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+MATH500_DATA="${MATH500_DATA:-${MATH_DATA_DIR}/math500_test.jsonl}"
+MINERVA_DATA="${MINERVA_DATA:-${MATH_DATA_DIR}/minervamath_test.jsonl}"
+MEDQA_DATA="${MEDQA_DATA:-${BENCH_ROOT}/medqa/test.jsonl}"
+PUBMEDQA_DATA="${PUBMEDQA_DATA:-${BENCH_ROOT}/pubmedqa/test.jsonl}"
+MEDXPERTQA_DATA="${MEDXPERTQA_DATA:-${BENCH_ROOT}/medxpertqa/test.jsonl}"
+FINQA_DATA="${FINQA_DATA:-${BENCH_ROOT}/finqa/test.jsonl}"
+CONVFINQA_DATA="${CONVFINQA_DATA:-${BENCH_ROOT}/convfinqa/dev_turn.json}"
+TATQA_DATA="${TATQA_DATA:-${BENCH_ROOT}/tatqa/tatqa_dataset_dev.json}"
+
+MATH_BATCH="${MATH_BATCH:-128}"
+MEDICAL_BATCH="${MEDICAL_BATCH:-64}"
+# 财报 prompt 动辄几千 token，KV cache 吃得比别的组狠，batch 必须压下来。
+FINANCE_BATCH="${FINANCE_BATCH:-32}"
+
+# =============================================================================
 # DOMAIN 分派：只决定数据在哪、结果写哪、MODE=data 调谁。
 # =============================================================================
 case "${DOMAIN}" in
   math|medical|finance) ;;
   "") echo "必须指定 DOMAIN=math|medical|finance" >&2; exit 2 ;;
   *)  echo "DOMAIN 只能是 math / medical / finance，得到 '${DOMAIN}'" >&2; exit 2 ;;
+esac
+case "${MODE}" in
+  data|smoke|train|eval) ;;
+  *) echo "MODE 只能是 data / smoke / train / eval，得到 '${MODE}'" >&2; exit 2 ;;
+esac
+case "${WHICH}" in
+  base|trained|both) ;;
+  *) echo "WHICH 只能是 base / trained / both，得到 '${WHICH}'" >&2; exit 2 ;;
 esac
 
 DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/${DOMAIN}_train}"
@@ -280,6 +332,12 @@ echo " run         : ${RUN}"
 echo " maxlen      : ${MAXLEN}   batch ${BATCH} x accum $((ACCUM / BATCH)) = ${ACCUM} 行/update"
 echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
 echo " system      : ${SYSTEM_PROMPT}"
+if [[ "${MODE}" == "train" || "${MODE}" == "eval" ]]; then
+echo " eval        : WHICH=${WHICH} DO_EVAL=${DO_EVAL} FORCE=${FORCE} LIMIT=${LIMIT}"
+echo " eval root   : ${EVAL_ROOT}"
+echo " math bench  : ${MATH_DATA_DIR}"
+echo " 其他 bench  : ${BENCH_ROOT}"
+fi
 echo "================================================================"
 
 # =============================================================================
@@ -376,14 +434,17 @@ train_one () {
     --metrics_path "${METRICS_DIR}/${run}.jsonl"
 }
 
-if [[ ! -d "${DATASET_DIR}" ]]; then
-  echo "数据集不存在: ${DATASET_DIR}"
-  echo "先跑: qsub -v DOMAIN=${DOMAIN},MODE=data onereplay/pbs/90_specialist_sft.pbs"
-  exit 1
-fi
+# 下面两项是**训练**的前置条件，MODE=eval 不该受它们约束：评测只需要
+# checkpoint 和 benchmark，训练数据集早就可以不在了（甚至本来就在别的机器上）。
+if [[ "${MODE}" != "eval" ]]; then
+  if [[ ! -d "${DATASET_DIR}" ]]; then
+    echo "数据集不存在: ${DATASET_DIR}"
+    echo "先跑: qsub -v DOMAIN=${DOMAIN},MODE=data onereplay/pbs/90_specialist_sft.pbs"
+    exit 1
+  fi
 
-# 数据是用哪条 system prompt 量出来的，就必须用哪条训练——不然 4096 的保证失效。
-STATS_SYSTEM="$(python - "${OUT_STATS}" <<'PY'
+  # 数据是用哪条 system prompt 量出来的，就必须用哪条训练——不然 4096 的保证失效。
+  STATS_SYSTEM="$(python - "${OUT_STATS}" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
@@ -392,13 +453,14 @@ except Exception:
     print("", end="")
 PY
 )"
-if [[ -n "${STATS_SYSTEM}" && "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
-  echo "拒绝训练：SYSTEM_PROMPT 和数据准备时用的不一致。"
-  echo "  数据 (${OUT_STATS}): ${STATS_SYSTEM}"
-  echo "  本次训练          : ${SYSTEM_PROMPT}"
-  echo "  system turn 会贡献 token，长度是按含它的完整序列量的；不一致就会有行超过"
-  echo "  ${MAXLEN} 而被静默左截断（保尾丢头），prepare 的 drop-not-truncate 保证作废。"
-  exit 4
+  if [[ -n "${STATS_SYSTEM}" && "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
+    echo "拒绝训练：SYSTEM_PROMPT 和数据准备时用的不一致。"
+    echo "  数据 (${OUT_STATS}): ${STATS_SYSTEM}"
+    echo "  本次训练          : ${SYSTEM_PROMPT}"
+    echo "  system turn 会贡献 token，长度是按含它的完整序列量的；不一致就会有行超过"
+    echo "  ${MAXLEN} 而被静默左截断（保尾丢头），prepare 的 drop-not-truncate 保证作废。"
+    exit 4
+  fi
 fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -406,29 +468,196 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
-# 训练完直接在**同一个作业**里接着评测，不用再投一次。
+# =============================================================================
+# 评测：交叉矩阵。M_<DOMAIN> 评三边，base 只评当前 DOMAIN 这一边。
+# =============================================================================
+# 跑了多少组、跳过多少组。两种跳过必须分开记：
+#   DONE   已经有结果 -> 正常，补评时几乎全是这种
+#   NODATA 数据没下载 -> 不正常，矩阵会缺一块，结束时要让作业失败
+# 不分开的话，一次"什么都没评"的运行会安静地以 0 退出，看起来和评完了一样。
+GROUPS_RAN=0
+GROUPS_DONE=0
+GROUPS_NODATA=0
+
+# 缺哪个 benchmark 就报哪个，不要等跑到一半才炸。
+require_data () {
+  local group="$1"; shift
+  local missing=0
+  for path in "$@"; do
+    if [[ ! -e "${path}" ]]; then
+      echo "  [${group}] 缺少数据: ${path}" >&2
+      missing=1
+    fi
+  done
+  if [[ "${missing}" == "1" ]]; then
+    echo "  [${group}] 数据不全，整组跳过；补齐后重投会自动补上。" >&2
+    GROUPS_NODATA=$((GROUPS_NODATA + 1))
+  fi
+  return "${missing}"
+}
+
+# 该组的每个 metric 是否都已经有 summary.json。
+group_done () {
+  local run_name="$1"; shift
+  for metric in "$@"; do
+    [[ -f "${EVAL_ROOT}/${metric}/${run_name}/summary.json" ]] || return 1
+  done
+  return 0
+}
+
+# run_group <组名> <run_name> <adapter_path 或空> <metrics 逗号串> <额外参数...>
+run_group () {
+  local group="$1" run_name="$2" adapter="$3" metrics="$4"; shift 4
+  local metric_list=(${metrics//,/ })
+
+  if [[ "${FORCE}" != "1" ]] && group_done "${run_name}" "${metric_list[@]}"; then
+    echo "==== skip ${run_name} / ${group}：${EVAL_ROOT} 下已有全部 summary.json ===="
+    GROUPS_DONE=$((GROUPS_DONE + 1))
+    return 0
+  fi
+  GROUPS_RAN=$((GROUPS_RAN + 1))
+
+  echo
+  echo "==== eval ${run_name} / ${group} : ${metrics} ===="
+  local args=(
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}"
+    --out_dir "${EVAL_ROOT}" --run_name "${run_name}"
+    --metrics "${metrics}" --seed "${SEED}"
+    --system_prompt "${SYSTEM_PROMPT}"
+    # 训完的 chat turn 以 '<|im_end|><|endoftext|>' 结尾，而 base tokenizer 的
+    # eos 只是 '<|endoftext|>'。不停在 im_end 上，模型会顺着幻觉出下一轮，再被
+    # skip_special_tokens 拼进答案里。这条线没有历史结果要兼容，直接开。
+    --decode_stop_on_im_end 1
+    --limit "${LIMIT}"
+  )
+  [[ -n "${adapter}" ]] && args+=(--adapter_path "${adapter}")
+  python -m onereplay.scripts.evaluate "${args[@]}" "$@"
+}
+
+# ---- 四个解码组 ----
+eval_math_std () {
+  local run_name="$1" adapter="$2"
+  require_data math_std "${GSM8K_DATA}" "${MATH500_DATA}" || return 0
+  run_group math_std "${run_name}" "${adapter}" "gsm8k,math500" \
+    --gsm8k_data_path "${GSM8K_DATA}" \
+    --math500_data_path "${MATH500_DATA}" \
+    --math_max_new_tokens 2048 \
+    --math_batch_size "${MATH_BATCH}"
+}
+
+eval_math_hard () {
+  local run_name="$1" adapter="$2"
+  require_data math_hard "${MINERVA_DATA}" || return 0
+  # MinervaMath 难且方差大，贪心一遍基本在量"某一道题的硬币落在哪面"，所以 avg@4。
+  # 采样必须配 --decode_do_sample 1，否则 4 个样本是同一条贪心输出的四份拷贝。
+  run_group math_hard "${run_name}" "${adapter}" "minervamath" \
+    --minervamath_data_path "${MINERVA_DATA}" \
+    --math_max_new_tokens 4096 \
+    --math_batch_size 64 \
+    --decode_do_sample 1 --decode_temperature 1.0 --math_num_samples 4
+}
+
+eval_medical () {
+  local run_name="$1" adapter="$2"
+  require_data medical "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" || return 0
+  run_group medical "${run_name}" "${adapter}" "medqa,pubmedqa,medxpertqa" \
+    --medqa_data_path "${MEDQA_DATA}" \
+    --pubmedqa_data_path "${PUBMEDQA_DATA}" \
+    --medxpertqa_data_path "${MEDXPERTQA_DATA}" \
+    --medical_max_new_tokens 2048 \
+    --medical_batch_size "${MEDICAL_BATCH}"
+}
+
+eval_finance () {
+  local run_name="$1" adapter="$2"
+  require_data finance "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}" || return 0
+  run_group finance "${run_name}" "${adapter}" "finqa,convfinqa,tatqa" \
+    --finqa_data_path "${FINQA_DATA}" \
+    --convfinqa_data_path "${CONVFINQA_DATA}" \
+    --tatqa_data_path "${TATQA_DATA}" \
+    --finance_max_new_tokens 2048 \
+    --finance_batch_size "${FINANCE_BATCH}"
+}
+
+# 某个领域的全部组。
+eval_domain () {
+  local domain="$1" run_name="$2" adapter="$3"
+  case "${domain}" in
+    math)    eval_math_std "${run_name}" "${adapter}"; eval_math_hard "${run_name}" "${adapter}" ;;
+    medical) eval_medical  "${run_name}" "${adapter}" ;;
+    finance) eval_finance  "${run_name}" "${adapter}" ;;
+  esac
+}
+
+# 训练要跑几个小时，评测紧接在后面。benchmark 缺不缺现在就知道了，没有理由等
+# require_data 在几小时后才发现——那时补完数据还得重投一次作业。
 #
-# 复用的是 91 号本身，不是把它的内容抄一份过来：这里已经在容器里，所以设
-# ONEREPLAY_IN_CONTAINER=1 让 91 号跳过起容器那一半，直接走它的内层。评测口径
-# 因此只有一份，改 91 号就等于同时改了这条路径。
+# 只警告不中止：训练产出的 checkpoint 本身有价值，不该被"评测数据没同步"拦住。
+preflight_bench () {
+  local missing=()
+  local path
+  for path in "${GSM8K_DATA}" "${MATH500_DATA}" "${MINERVA_DATA}" \
+              "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" \
+              "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}"; do
+    [[ -e "${path}" ]] || missing+=("${path}")
+  done
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo
+    echo "!! 训练后要评的 benchmark 缺 ${#missing[@]} 个：" >&2
+    printf '     %s\n' "${missing[@]}" >&2
+    echo "   训练照常开始，但评测会跳过对应的组、最后以 rc=6 结束。" >&2
+    echo "   现在补上比训练跑完再补省一次作业：python test_code/download_bench.py" >&2
+    echo
+  fi
+}
+
 run_cross_eval () {
-  local eval_script="${REPO_ROOT}/onereplay/pbs/91_cross_eval.pbs"
-  if [[ ! -f "${eval_script}" ]]; then
-    echo "找不到评测脚本: ${eval_script}" >&2
-    return 1
+  echo
+  echo "================================================================"
+  echo " 交叉评测：M_${DOMAIN} 评三边 + base 评 ${DOMAIN}"
+  echo " eval root : ${EVAL_ROOT}"
+  echo " WHICH     : ${WHICH}   FORCE=${FORCE}   LIMIT=${LIMIT}"
+  echo "================================================================"
+  mkdir -p "${EVAL_ROOT}"
+
+  # ---- base：只评当前 DOMAIN 这一边 ----
+  if [[ "${WHICH}" == "base" || "${WHICH}" == "both" ]]; then
+    echo
+    echo "################ base: 只评 ${DOMAIN} ################"
+    eval_domain "${DOMAIN}" "base" ""
+  fi
+
+  # ---- trained：三边全评 ----
+  if [[ "${WHICH}" == "trained" || "${WHICH}" == "both" ]]; then
+    if [[ ! -d "${CKPT}" ]]; then
+      echo
+      echo "找不到 checkpoint: ${CKPT}" >&2
+      echo "  先跑 qsub -v DOMAIN=${DOMAIN},MODE=train onereplay/pbs/90_specialist_sft.pbs" >&2
+      echo "  或者用 WHICH=base 只评 base。" >&2
+      return 4
+    fi
+    echo
+    echo "################ M_${DOMAIN}: 评 math + medical + finance ################"
+    for target in math medical finance; do
+      eval_domain "${target}" "m_${DOMAIN}" "${CKPT}"
+    done
   fi
 
   echo
-  echo "================================================================"
-  echo " 训练结束，接着跑交叉评测（M_${DOMAIN} 评三边 + base 评 ${DOMAIN}）"
-  echo "================================================================"
-  ONEREPLAY_IN_CONTAINER=1 \
-  REPO_ROOT="${REPO_ROOT}" VENV="${VENV}" CACHE_ROOT="${CACHE_ROOT}" \
-  JOB_TMPDIR="${JOB_TMPDIR}" \
-  MODEL_DIR="${MODEL_DIR}" MODEL_NAME="${MODEL_NAME}" \
-  DOMAIN="${DOMAIN}" CKPT="${CKPT}" SEED="${SEED}" LR="${LR}" \
-  SYSTEM_PROMPT="${SYSTEM_PROMPT}" \
-    bash "${eval_script}"
+  echo "==== 交叉评测结束: DOMAIN=${DOMAIN} WHICH=${WHICH} ===="
+  echo "  本次执行 ${GROUPS_RAN} 组，已有结果跳过 ${GROUPS_DONE} 组，缺数据跳过 ${GROUPS_NODATA} 组。"
+  echo "  汇总 csv: ${EVAL_ROOT}/<metric>_summary.csv"
+  echo "  三个 DOMAIN 都跑完后，每个 csv 里会有 base 和三个 m_* 的行。"
+
+  if [[ "${GROUPS_NODATA}" -gt 0 ]]; then
+    echo
+    echo "有 ${GROUPS_NODATA} 组因为缺数据没评，这次的交叉矩阵是不完整的。" >&2
+    echo "  按上面 stderr 里的路径把 benchmark 补齐，然后投" >&2
+    echo "  qsub -v DOMAIN=${DOMAIN},MODE=eval onereplay/pbs/90_specialist_sft.pbs，" >&2
+    echo "  已经评完的组会自动跳过，只补缺的那几组。" >&2
+    return 6
+  fi
+  return 0
 }
 
 case "${MODE}" in
@@ -437,6 +666,7 @@ case "${MODE}" in
     train_one "${RUN}_smoke" "" "${SMOKE_STEPS}" 0 8
     ;;
   train)
+    if [[ "${DO_EVAL}" == "1" ]]; then preflight_bench; fi
     # checkpoint 已经在就跳过训练，但**不退出**——后面的评测还要跑。撞了
     # walltime 之后原样重投，就会跳过训练、跳过已完成的评测组，从断点接着跑。
     if [[ -d "${CKPT}" ]]; then
@@ -452,18 +682,25 @@ case "${MODE}" in
 
     if [[ "${DO_EVAL}" != "1" ]]; then
       echo
-      echo "DO_EVAL=0：不评测。要补评就投 qsub -v DOMAIN=${DOMAIN} onereplay/pbs/91_cross_eval.pbs"
+      echo "DO_EVAL=0：不评测。要补评就投"
+      echo "  qsub -v DOMAIN=${DOMAIN},MODE=eval onereplay/pbs/90_specialist_sft.pbs"
       exit 0
     fi
-    if ! run_cross_eval; then
+    # 评测的退出码直接透出来（4=没 checkpoint，6=缺 benchmark），但要说清楚训练
+    # 那一半是好的：不然看到非 0 会以为整个作业白跑了，跑去重训。
+    eval_rc=0
+    run_cross_eval || eval_rc=$?
+    if [[ "${eval_rc}" != "0" ]]; then
       echo
-      echo "评测失败，但训练本身是好的：${CKPT}" >&2
-      echo "  单独重投评测: qsub -v DOMAIN=${DOMAIN} onereplay/pbs/91_cross_eval.pbs" >&2
-      exit 5
+      echo "评测没跑完（rc=${eval_rc}），但训练本身是好的：${CKPT}" >&2
+      echo "  补评: qsub -v DOMAIN=${DOMAIN},MODE=eval onereplay/pbs/90_specialist_sft.pbs" >&2
+      exit "${eval_rc}"
     fi
     ;;
-  *)
-    echo "MODE 只能是 data / smoke / train，得到 '${MODE}'" >&2
-    exit 2
+  eval)
+    # 只评不训。checkpoint 在不在由 run_cross_eval 判断：WHICH=base 时本来就不需要。
+    eval_rc=0
+    run_cross_eval || eval_rc=$?
+    exit "${eval_rc}"
     ;;
 esac
