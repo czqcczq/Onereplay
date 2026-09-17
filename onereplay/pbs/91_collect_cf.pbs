@@ -221,9 +221,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 cd "${REPO_ROOT}"
 
 case "${DOMAIN}" in
-  math|medical|finance) ;;
+  math|medical|code|finance) ;;
   *)
-    echo "必须指定 DOMAIN=math|medical|finance，当前 '${DOMAIN}'"
+    echo "必须指定 DOMAIN=math|medical|code，当前 '${DOMAIN}'"
     echo "  例: qsub -v DOMAIN=math,WHAT=cov onereplay/pbs/91_collect_cf.pbs"
     exit 2
     ;;
@@ -247,8 +247,16 @@ TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,
 
 # 见 90 号文件头：不能写成 ${SYSTEM_PROMPT:-...\boxed{}.}，参数展开会在 \boxed{}
 # 自己那个 } 上提前收尾，实得 "\boxed{.}"。用独立赋值绕开，单引号防反斜杠再被吃一层。
+#
+# 两条、按 DOMAIN 选，和 90 号训练侧同一套规则：code 那一臂是用 code 那条训的，
+# stats 里记的也是它，拿 boxed 来采会直接被下面 Step 0 的守卫挡掉（exit 4）。
+SYSTEM_PROMPT_BOXED='Please reason step by step, and put your final answer within \boxed{}.'
+SYSTEM_PROMPT_CODE='Please reason step by step, and put your final code in a Python code block.'
 if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
-  SYSTEM_PROMPT='Please reason step by step, and put your final answer within \boxed{}.'
+  case "${DOMAIN}" in
+    code) SYSTEM_PROMPT="${SYSTEM_PROMPT_CODE}" ;;
+    *)    SYSTEM_PROMPT="${SYSTEM_PROMPT_BOXED}" ;;
+  esac
 fi
 
 # ---- 采哪个 checkpoint ----

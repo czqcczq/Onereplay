@@ -168,6 +168,34 @@ SPECS: list[Spec] = [
         mode="copy",
         note="dev split; the official test split has no public answers",
     ),
+    # --- code ---------------------------------------------------------------
+    # These two land under datasets/code/ rather than datasets/bench/, because
+    # download_code_data.py has been putting them there since well before this
+    # line existed and other scripts still read that path. Kept here anyway so
+    # one command fetches everything the specialist runs evaluate against.
+    Spec(
+        name="humaneval",
+        repo_id="openai/openai_humaneval",
+        allow=["openai_humaneval/test-*"],
+        source="openai_humaneval/test-*.parquet",
+        # Copied, not converted: HumanEvalMetric reads it back as parquet.
+        target="code/humaneval_test.parquet",
+        mode="copy",
+        note="164 tasks, pass@1",
+    ),
+    Spec(
+        name="mbpp",
+        repo_id="google-research-datasets/mbpp",
+        # The whole `full` config: MBPPMetric calls load_from_disk(...)[split],
+        # so the split names have to survive, and 90_specialist_sft.pbs asks for
+        # `test` (500 tasks). The default split in evaluate.py is validation,
+        # which is 90 tasks -- too few to read a pass@1 difference off.
+        allow=["full/*"],
+        source="full/*.parquet",
+        target="code/mbpp_full",
+        mode="save_to_disk",
+        note="974 tasks across splits; the line evaluates test (500)",
+    ),
 ]
 
 
@@ -250,6 +278,36 @@ def jsonish_to_jsonl(path: Path, target: Path) -> int:
     return to_jsonl(payload, target)
 
 
+def parquet_to_disk(paths: list[Path], target: Path) -> str:
+    """Rebuild a DatasetDict on disk, keeping the split names.
+
+    MBPPMetric calls ``load_from_disk(path)[split]``, so a bare parquet file
+    will not do -- the split names have to survive the trip, and they only exist
+    in the file names (``full/test-00000-of-00001.parquet``).
+    """
+
+    import pandas as pd
+    from datasets import Dataset, DatasetDict
+
+    by_split: dict[str, list[Path]] = {}
+    for path in sorted(paths):
+        by_split.setdefault(path.stem.split("-")[0], []).append(path)
+
+    bundle = DatasetDict(
+        {
+            split: Dataset.from_pandas(
+                pd.concat([pd.read_parquet(item) for item in files], ignore_index=True)
+            )
+            for split, files in sorted(by_split.items())
+        }
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    bundle.save_to_disk(str(target))
+    return ", ".join(f"{name}={len(rows)}" for name, rows in sorted(bundle.items()))
+
+
 def fetch_url(spec: Spec, dest: Path, target: Path) -> tuple[bool, str]:
     import urllib.request
 
@@ -269,6 +327,9 @@ def fetch_url(spec: Spec, dest: Path, target: Path) -> tuple[bool, str]:
 def fetch(spec: Spec, dest: Path, force: bool) -> tuple[bool, str]:
     target = dest / spec.target
     if target.exists() and not force:
+        if target.is_dir():
+            files = sum(1 for path in target.rglob("*") if path.is_file())
+            return True, f"已存在，跳过 (目录，{files} 个文件) -- --force 可重下"
         size = target.stat().st_size / 1e6
         return True, f"已存在，跳过 ({size:.1f} MB) -- --force 可重下"
 
@@ -301,6 +362,12 @@ def fetch(spec: Spec, dest: Path, force: bool) -> tuple[bool, str]:
         shutil.copyfile(matches[0], target)
         size = target.stat().st_size / 1e6
         return True, f"{matches[0].name} -> {spec.target} ({size:.1f} MB)"
+
+    if spec.mode == "save_to_disk":
+        parquet = [path for path in matches if path.suffix.lower() == ".parquet"]
+        if not parquet:
+            return False, f"没有 parquet 匹配 {spec.source!r}，实际: {[p.name for p in matches]}"
+        return True, f"{parquet_to_disk(parquet, target)} -> {spec.target}"
 
     parquet = [path for path in matches if path.suffix.lower() == ".parquet"]
     if parquet or spec.mode == "parquet":
