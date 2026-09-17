@@ -43,16 +43,21 @@ def build_prompt(function_prompt: str) -> str:
 
 
 class HumanEvalMetric:
+    # Both names are class attributes so HumanEval+ can be this metric pointed
+    # at a different file: evalplus/humanevalplus ships the same five columns,
+    # only with a much larger `test`. See metrics/evalplus.py.
     name = "humaneval"
+    data_key = "humaneval_data_file"
+    default_timeout = 5.0
 
     def run(self, model, tokenizer, device, cfg: dict[str, Any]) -> dict[str, Any]:
         output_dir = Path(cfg["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
-        data_file = cfg.get("humaneval_data_file", "")
+        data_file = cfg.get(self.data_key, "")
         cache_dir = cfg.get("cache_dir", "")
         limit = int(cfg.get("limit", 0))
         max_new_tokens = int(cfg.get("code_max_new_tokens", cfg.get("max_new_tokens", 384)))
-        timeout = float(cfg.get("timeout", 5.0))
+        timeout = float(cfg.get("timeout", 0) or self.default_timeout)
         run_name = cfg.get("run_name", "base")
 
         rows = load_humaneval(data_file, cache_dir, limit)
@@ -67,7 +72,7 @@ class HumanEvalMetric:
             max_new_tokens,
             resolve_batch_size(cfg, "code_batch_size"),
             strip=False,
-            log_label="humaneval",
+            log_label=self.name,
         )
 
         passed = 0
@@ -95,7 +100,7 @@ class HumanEvalMetric:
                     + "\n"
                 )
                 if idx % 25 == 0:
-                    print(f"humaneval tested {idx}/{len(rows)}", flush=True)
+                    print(f"{self.name} tested {idx}/{len(rows)}", flush=True)
 
         summary = {
             "run_name": run_name,
@@ -108,7 +113,7 @@ class HumanEvalMetric:
         (output_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        summary_csv = Path(cfg.get("output_root", output_dir.parent)) / "humaneval_summary.csv"
+        summary_csv = Path(cfg.get("output_root", output_dir.parent)) / f"{self.name}_summary.csv"
         exists = summary_csv.exists()
         with summary_csv.open("a", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=list(summary.keys()))

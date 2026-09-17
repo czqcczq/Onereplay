@@ -51,15 +51,32 @@ def build_mbpp_prompt(example: dict[str, Any]) -> str:
 
 class MBPPMetric:
     name = "mbpp"
+    default_timeout = 5.0
+
+    def load_rows(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        """Overridden by MBPP+, which ships a parquet instead of a split dir."""
+
+        return load_mbpp(cfg)
+
+    def select_tests(self, example: dict[str, Any]) -> list[str]:
+        """The assertions this example is graded on.
+
+        MBPP+ overrides this: it keeps the original three assertions in
+        `test_list` and puts its own much larger set in `test`, so reading
+        `test_list` there would grade the plus set with the base set's tests.
+        """
+
+        tests = example.get("test_list") or example.get("tests") or []
+        return [tests] if isinstance(tests, str) else list(tests)
 
     def run(self, model, tokenizer, device, cfg: dict[str, Any]) -> dict[str, Any]:
         output_dir = Path(cfg["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         max_new_tokens = int(cfg.get("code_max_new_tokens", cfg.get("max_new_tokens", 512)))
-        timeout = float(cfg.get("timeout", 5.0))
+        timeout = float(cfg.get("timeout", 0) or self.default_timeout)
         run_name = cfg.get("run_name", "base")
 
-        rows = load_mbpp(cfg)
+        rows = self.load_rows(cfg)
         raws = batched_generate(
             model,
             tokenizer,
@@ -67,7 +84,7 @@ class MBPPMetric:
             device,
             max_new_tokens,
             resolve_batch_size(cfg, "code_batch_size"),
-            log_label="mbpp",
+            log_label=self.name,
         )
 
         passed = 0
@@ -75,10 +92,9 @@ class MBPPMetric:
         with response_path.open("w", encoding="utf-8") as file:
             for idx, (example, raw) in enumerate(zip(rows, raws), start=1):
                 completion = cleanup_program_completion(raw)
-                tests = example.get("test_list") or example.get("tests") or []
-                if isinstance(tests, str):
-                    tests = [tests]
-                ok, error = evaluate_assert_program(completion, list(tests), timeout)
+                ok, error = evaluate_assert_program(
+                    completion, self.select_tests(example), timeout
+                )
                 passed += int(ok)
                 file.write(
                     json.dumps(
@@ -94,7 +110,7 @@ class MBPPMetric:
                     + "\n"
                 )
                 if idx % 50 == 0:
-                    print(f"mbpp tested {idx}/{len(rows)}", flush=True)
+                    print(f"{self.name} tested {idx}/{len(rows)}", flush=True)
 
         summary = {
             "run_name": run_name,
@@ -107,7 +123,7 @@ class MBPPMetric:
         (output_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        summary_csv = Path(cfg.get("output_root", output_dir.parent)) / "mbpp_summary.csv"
+        summary_csv = Path(cfg.get("output_root", output_dir.parent)) / f"{self.name}_summary.csv"
         exists = summary_csv.exists()
         with summary_csv.open("a", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=list(summary.keys()))

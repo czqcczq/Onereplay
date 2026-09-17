@@ -209,11 +209,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--finance_rel_tol", type=float, default=0.01)
     parser.add_argument("--humaneval_data_file", type=str, default="")
     parser.add_argument("--mbpp_dataset_path", type=str, default="")
+    # EvalPlus. Both are parquet files: humanevalplus has the same columns as
+    # the base set, mbppplus is graded on its own `test` column instead of the
+    # original `test_list`. See eval/metrics/evalplus.py.
+    parser.add_argument("--humanevalplus_data_file", type=str, default="")
+    parser.add_argument("--mbppplus_data_file", type=str, default="")
     parser.add_argument("--dataset_name", type=str, default="google-research-datasets/mbpp")
     parser.add_argument("--dataset_config", type=str, default="full")
     parser.add_argument("--dataset_split", type=str, default="validation")
     parser.add_argument("--cache_dir", type=str, default="")
-    parser.add_argument("--timeout", type=float, default=5.0)
+    # 0 = 让每个 metric 用自己的默认值。base 的两个仍是 5 秒；EvalPlus 的两个是
+    # 30 秒，因为它们跑的断言多出约 80 倍，而超时会被记成失败——限得太短等于把
+    # 正确答案变成所有臂共同的扣分。显式传值仍然覆盖一切。
+    parser.add_argument("--timeout", type=float, default=0.0)
     return parser.parse_args()
 
 

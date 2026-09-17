@@ -196,6 +196,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     FINQA_DATA CONVFINQA_DATA TATQA_DATA
     MATH_BATCH MEDICAL_BATCH FINANCE_BATCH CODE_BATCH CODE_TIMEOUT
     CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS
+    HUMANEVALPLUS_DATA MBPPPLUS_DATA
     NUMINA_PATH MEDQA_PATH FIN_JSON MAGICODER_PATH PYTHON_RULE
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
@@ -351,6 +352,11 @@ TATQA_DATA="${TATQA_DATA:-${BENCH_ROOT}/tatqa/tatqa_dataset_dev.json}"
 CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
 HUMANEVAL_DATA="${HUMANEVAL_DATA:-${CODE_DATA_DIR}/humaneval_test.parquet}"
 MBPP_DATA="${MBPP_DATA:-${CODE_DATA_DIR}/mbpp_full}"
+# EvalPlus：同样的题、约 80 倍的测试用例。基础版那 9 条/3 条测试少到能让错解通过，
+# 加号版就是冲这个去的。注意 MBPP+ 只有 378 题（EvalPlus 删掉了题意含糊和参考解
+# 本身就错的），题目集和 MBPP 的 500 题不同，两个分数并列看、不能当 before/after。
+HUMANEVALPLUS_DATA="${HUMANEVALPLUS_DATA:-${CODE_DATA_DIR}/humanevalplus_test.parquet}"
+MBPPPLUS_DATA="${MBPPPLUS_DATA:-${CODE_DATA_DIR}/mbppplus_test.parquet}"
 # !! 必须是 test（500 题）。evaluate.py 的默认值是 validation，那只有 90 题，
 # pass@1 的抽样噪声能盖过真实差异。
 MBPP_SPLIT="${MBPP_SPLIT:-test}"
@@ -362,7 +368,10 @@ FINANCE_BATCH="${FINANCE_BATCH:-32}"
 # 代码只解 512 token，prompt 也短，所以能开大。
 CODE_BATCH="${CODE_BATCH:-64}"
 # 判分在子进程里 exec 生成的代码，卡死的那条会拖住整组。
-CODE_TIMEOUT="${CODE_TIMEOUT:-5.0}"
+# 0 = 各 metric 用自己的默认值：基础版 5 秒，EvalPlus 30 秒。加号版每题跑的断言
+# 多约 80 倍，5 秒会把正确答案判成超时，而超时记作失败——那是所有臂共同的扣分，
+# 看上去就像大家都变差了。要统一覆盖就在这里给个非 0 值。
+CODE_TIMEOUT="${CODE_TIMEOUT:-0}"
 
 # =============================================================================
 # DOMAIN 分派：只决定数据在哪、结果写哪、MODE=data 调谁。
@@ -680,13 +689,20 @@ eval_finance () {
 
 eval_code () {
   local run_name="$1" adapter="$2"
-  require_data code "${HUMANEVAL_DATA}" "${MBPP_DATA}" || return 0
+  require_data code "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
+                    "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" || return 0
   # --dataset_split 在 evaluate.py 里只被 MBPP 读，默认 validation 是 90 题的
   # 那个 split；显式传 test 才是 500 题的正式集合。
-  run_group code "${run_name}" "${adapter}" "humaneval,mbpp" \
+  #
+  # 四个 metric 一组解码一次：prompt 在基础版和加号版之间是一样的，分开成两组
+  # 等于把同一批生成跑两遍。CODE_TIMEOUT 留空的话，基础版用 5 秒、加号版用 30
+  # 秒（metric 各自的默认值）——加号版跑的断言多约 80 倍，超时会被记成失败。
+  run_group code "${run_name}" "${adapter}" "humaneval,mbpp,humanevalplus,mbppplus" \
     --humaneval_data_file "${HUMANEVAL_DATA}" \
     --mbpp_dataset_path "${MBPP_DATA}" \
     --dataset_split "${MBPP_SPLIT}" \
+    --humanevalplus_data_file "${HUMANEVALPLUS_DATA}" \
+    --mbppplus_data_file "${MBPPPLUS_DATA}" \
     --code_max_new_tokens 512 \
     --code_batch_size "${CODE_BATCH}" \
     --timeout "${CODE_TIMEOUT}"
@@ -710,7 +726,8 @@ bench_paths_for () {
   case "$1" in
     math)    printf '%s\n' "${GSM8K_DATA}" "${MATH500_DATA}" "${MINERVA_DATA}" ;;
     medical) printf '%s\n' "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" ;;
-    code)    printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" ;;
+    code)    printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
+                           "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" ;;
     finance) printf '%s\n' "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}" ;;
   esac
 }
