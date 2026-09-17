@@ -9,6 +9,16 @@ retention numbers meaningless.
 The predicted answer is the last \\boxed{...} in the model response; the gold
 answer is the dataset's `answer` field (already extracted) or the boxed span in
 its `solution`. Both are normalized and compared with `is_equiv`.
+
+Three benchmarks share this file because they share the boxed-answer contract:
+MATH-500, AMC, and Minerva Math. They differ only in the data file, the output
+directory, and -- for Minerva -- the equivalence check, since its golds are
+physical quantities like ``4.5e33`` rather than closed-form LaTeX.
+
+``math_num_samples`` > 1 decodes k independent responses per question and
+reports their mean accuracy (average@k). That only measures something when
+decoding is stochastic: with the default greedy policy the k samples are
+identical and average@k is a slower way to get accuracy@1.
 """
 
 from __future__ import annotations
@@ -203,10 +213,22 @@ def first_existing_key(example: dict, preferred: str, candidates: tuple[str, ...
 
 class MATH500Metric:
     name = "math500"
-    # Config keys checked in order for this metric's eval file. Subclasses (AMC)
-    # point at their own path so several boxed-answer sets can run in one job
-    # without clobbering each other's output_dir / summary csv.
+    # Config keys checked in order for this metric's eval file. Subclasses (AMC,
+    # Minerva) point at their own path so several boxed-answer sets can run in
+    # one job without clobbering each other's output_dir / summary csv.
     data_path_keys = ("math500_data_path", "data_path")
+    # Minerva turns this on: its scoring is numeric-tolerant, so the strict
+    # string verdict is worth carrying alongside as a floor.
+    report_strict_string = False
+    # Opt-in, and off here on purpose. MATH-500 is reported as greedy@1 across
+    # every existing table, so it must ignore math_num_samples even when the two
+    # hard sets in the same job are decoding four samples each.
+    allow_multi_sample = False
+
+    def is_correct(self, prediction: str | None, gold: str, cfg: dict[str, Any]) -> bool:
+        """Answer equivalence. Overridden where string equality is too strict."""
+
+        return is_equiv(prediction, gold)
 
     def run(self, model, tokenizer, device, cfg: dict[str, Any]) -> dict[str, Any]:
         output_dir = Path(cfg["output_dir"])
@@ -218,6 +240,14 @@ class MATH500Metric:
                 break
         limit = int(cfg.get("limit", 0))
         max_new_tokens = int(cfg.get("math_max_new_tokens", cfg.get("max_new_tokens", 1024)))
+        requested_samples = max(1, int(cfg.get("math_num_samples", 1) or 1))
+        num_samples = requested_samples if self.allow_multi_sample else 1
+        if requested_samples != num_samples:
+            print(
+                f"[{self.name}] math_num_samples={requested_samples} ignored: this "
+                "benchmark is reported as a single greedy pass",
+                flush=True,
+            )
         run_name = cfg.get("run_name", "base")
         question_field = cfg.get("question_field", "")
         answer_field = cfg.get("answer_field", "")
@@ -238,10 +268,14 @@ class MATH500Metric:
             if limit > 0 and len(examples) >= limit:
                 break
 
+        # Sample-major order: response index s * n + i is sample s of question i.
+        # Repeating the prompt list is enough because generate() draws for each
+        # row independently, and batched_generate returns in input order.
+        prompts = [build_prompt(example["question"]) for example in examples]
         responses = batched_generate(
             model,
             tokenizer,
-            [build_prompt(example["question"]) for example in examples],
+            prompts * num_samples,
             device,
             max_new_tokens,
             resolve_batch_size(cfg, "math_batch_size"),
@@ -249,29 +283,36 @@ class MATH500Metric:
         )
 
         correct = 0
-        scored = 0
+        strict_correct = 0
+        per_sample_correct = [0] * num_samples
+        solved_at_least_once = [False] * len(examples)
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
-            for example, response in zip(examples, responses):
+            for flat_index, response in enumerate(responses):
+                sample_index, index = divmod(flat_index, len(examples))
+                example = examples[index]
                 gold = example["answer"]
                 pred = extract_answer(response)
-                is_correct = is_equiv(pred, gold)
-                correct += int(is_correct)
-                scored += 1
-                file.write(
-                    json.dumps(
-                        {
-                            "question": example["question"],
-                            "gold": gold,
-                            "prediction": pred,
-                            "correct": is_correct,
-                            "response": response,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+                is_hit = self.is_correct(pred, gold, cfg)
+                correct += int(is_hit)
+                per_sample_correct[sample_index] += int(is_hit)
+                solved_at_least_once[index] = solved_at_least_once[index] or is_hit
+                row = {
+                    "question": example["question"],
+                    "gold": gold,
+                    "prediction": pred,
+                    "correct": is_hit,
+                    "response": response,
+                }
+                if num_samples > 1:
+                    row["sample_index"] = sample_index
+                if self.report_strict_string:
+                    strict_hit = is_equiv(pred, gold)
+                    strict_correct += int(strict_hit)
+                    row["correct_strict_string"] = strict_hit
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+        scored = len(responses)
         summary = {
             "run_name": run_name,
             "adapter_path": cfg.get("adapter_path", ""),
@@ -279,9 +320,27 @@ class MATH500Metric:
             "num_examples": len(examples),
             "num_scored": scored,
             "correct": correct,
+            # With k samples this is average@k: correct answers over all k*n
+            # decoded responses, i.e. the mean of the k per-sample accuracies.
             "accuracy": correct / max(scored, 1),
             "output_dir": str(output_dir),
         }
+        # Keys are added only where they mean something. <metric>_summary.csv is
+        # appended to with a header taken from these keys, so a run that emits
+        # extra columns into a file written by an earlier run would misalign it.
+        if self.report_strict_string:
+            summary["accuracy_strict_string"] = strict_correct / max(scored, 1)
+        if num_samples > 1:
+            summary["num_samples"] = num_samples
+            summary["accuracy_per_sample"] = "|".join(
+                f"{hits / max(len(examples), 1):.4f}" for hits in per_sample_correct
+            )
+            # Not the reported number, but it separates "the model cannot do this
+            # problem" from "it can, unreliably" -- which is the whole reason a
+            # hard set is decoded k times instead of once.
+            summary["pass_at_k"] = sum(solved_at_least_once) / max(len(examples), 1)
+            summary["temperature"] = cfg.get("decode_temperature", 0.0)
+            summary["max_new_tokens"] = max_new_tokens
         (output_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -300,3 +359,111 @@ class AMCMetric(MATH500Metric):
 
     name = "amc"
     data_path_keys = ("amc_data_path", "data_path")
+    # AMC golds are integers, so string equality is the right check; the only
+    # difference from MATH-500 is that this set is hard enough that a single
+    # greedy pass is mostly measuring which side of one problem the coin landed.
+    allow_multi_sample = True
+
+
+# --- Minerva Math (OCW) numeric equivalence ---------------------------------
+# The golds in math-ai/minervamath are measured quantities -- "4.5e33",
+# "0.006", "41.8" -- because the set is the 272 MIT OpenCourseWare physics and
+# astronomy problems from the Minerva paper, not closed-form MATH answers. Two
+# consequences, both of which make plain is_equiv the wrong scorer here:
+#
+#   1) The same number has many correct spellings. A model that writes
+#      "4.5 \\times 10^{33}" against a gold of "4.5e33" is right, and string
+#      normalization says no. So does "0.0060" against "0.006".
+#   2) The problems ask for a rounded answer ("to two significant figures"),
+#      so the last digit is a formatting choice, not a claim. 4.47e33 and
+#      4.5e33 are the same answer.
+#
+# Hence: parse both sides to a float when possible and compare with a relative
+# tolerance (minerva_rel_tol, default 1%), falling back to is_equiv when either
+# side is not a number -- some answers are symbolic, e.g.
+# "\\arcsin{1.3 \\sin{\\theta_w}}". The strict-string verdict is reported next
+# to it as accuracy_strict_string, so the cost of this choice stays visible.
+_UNIT_MACROS = re.compile(r"\\(?:text|mathrm|mathbf|operatorname|hbox|mbox)\s*\{[^{}]*\}")
+_SCI_NOTATION = re.compile(r"^([+-]?[\d.]+)\s*(?:\\times|\\cdot|\*|x)\s*10\s*\^\s*\{?([+-]?\d+)\}?$")
+_BARE_POWER = re.compile(r"^([+-]?)10\s*\^\s*\{?([+-]?\d+)\}?$")
+_FRACTION = re.compile(r"^\\d?frac\{([^{}]+)\}\{([^{}]+)\}$")
+
+
+def _clean_numeric(text: str) -> str:
+    """Strip the LaTeX decoration that never carries numeric meaning."""
+
+    cleaned = text.strip()
+    for token in ("\\left", "\\right", "\\!", "\\,", "\\;", "\\:", "\\ ", "$", "~"):
+        cleaned = cleaned.replace(token, "")
+    cleaned = _UNIT_MACROS.sub("", cleaned)
+    cleaned = cleaned.replace("^{\\circ}", "").replace("^\\circ", "")
+    cleaned = cleaned.replace("\\%", "").replace("%", "")
+    cleaned = cleaned.replace(" ", "")
+    # Thousands separators only; "1,2" style tuples are left alone so they fail
+    # to parse and fall through to the string comparison.
+    cleaned = re.sub(r"(?<=\d),(?=\d{3}(\D|$))", "", cleaned)
+    return cleaned.rstrip(".")
+
+
+def to_number(text: str | None) -> float | None:
+    """Best-effort float for a Minerva answer; None when it is not a number."""
+
+    if text is None:
+        return None
+    cleaned = _clean_numeric(text)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        pass
+    for pattern, build in (
+        (_SCI_NOTATION, lambda m: float(m.group(1)) * 10.0 ** int(m.group(2))),
+        (_BARE_POWER, lambda m: (-1.0 if m.group(1) == "-" else 1.0) * 10.0 ** int(m.group(2))),
+    ):
+        match = pattern.match(cleaned)
+        if match:
+            try:
+                return build(match)
+            except (ValueError, OverflowError):
+                return None
+    match = _FRACTION.match(cleaned)
+    if not match and cleaned.count("/") == 1:
+        match = re.match(r"^([^/]+)/([^/]+)$", cleaned)
+    if match:
+        top, bottom = to_number(match.group(1)), to_number(match.group(2))
+        if top is not None and bottom not in (None, 0.0):
+            return top / bottom
+    return None
+
+
+def numbers_close(prediction: float, gold: float, rel_tol: float) -> bool:
+    """Relative comparison. A gold of exactly zero has no relative scale, and
+    "within 1% of zero" would accept any small number, so it demands equality."""
+
+    if gold == 0.0:
+        return prediction == 0.0
+    return abs(prediction - gold) <= rel_tol * abs(gold)
+
+
+class MinervaMathMetric(MATH500Metric):
+    """Minerva Math (math-ai/minervamath): 272 OCW problems, numeric answers.
+
+    Same prompt and boxed-answer extraction as MATH-500 -- so the model sees the
+    same contract across all three sets -- with numeric-tolerant scoring on top.
+    """
+
+    name = "minervamath"
+    data_path_keys = ("minervamath_data_path", "data_path")
+    allow_multi_sample = True
+    report_strict_string = True
+
+    def is_correct(self, prediction: str | None, gold: str, cfg: dict[str, Any]) -> bool:
+        if prediction is None:
+            return False
+        rel_tol = float(cfg.get("minerva_rel_tol", 0.01) or 0.01)
+        predicted_number = to_number(prediction)
+        gold_number = to_number(gold)
+        if predicted_number is not None and gold_number is not None:
+            return numbers_close(predicted_number, gold_number, rel_tol)
+        return is_equiv(prediction, gold)

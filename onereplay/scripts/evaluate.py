@@ -3,9 +3,9 @@
     python -m onereplay.scripts.evaluate --metrics ifeval,multiif,commonsense ...
 
 Available metrics: ifeval, ifbench, followbench, multiif, commonsense,
-commonsense_qa, gsm8k, aime, math500, amc, humaneval, mbpp, direct_safety. Each
-metric writes <out_dir>/<metric>/<run_name>/summary.json plus an appended row in
-<out_dir>/<metric>_summary.csv.
+commonsense_qa, gsm8k, aime, math500, amc, minervamath, humaneval, mbpp,
+direct_safety. Each metric writes <out_dir>/<metric>/<run_name>/summary.json
+plus an appended row in <out_dir>/<metric>_summary.csv.
 
 commonsense and commonsense_qa are not the same measurement: the first is
 held-out SFT loss on the Commonsense170k pool, the second is accuracy on the
@@ -151,7 +151,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gsm8k_data_path", type=str, default="")
     parser.add_argument("--math500_data_path", type=str, default="")
     parser.add_argument("--amc_data_path", type=str, default="")
+    parser.add_argument("--minervamath_data_path", type=str, default="")
     parser.add_argument("--aime_data_path", type=str, default="")
+    # Decode k responses per question and report their mean accuracy
+    # (average@k). Only amc and minervamath honor it: MATH-500 and GSM8K are
+    # reported as greedy@1 everywhere, so they ignore it by construction.
+    # Meaningless without --decode_do_sample 1, since k greedy passes are k
+    # copies of the same response.
+    parser.add_argument("--math_num_samples", type=int, default=1)
+    # Minerva golds are measured quantities given to a stated precision, so its
+    # scorer compares numbers with this relative tolerance and only falls back
+    # to string equality for symbolic answers. See the metric's comments.
+    parser.add_argument("--minerva_rel_tol", type=float, default=0.01)
     parser.add_argument("--question_field", type=str, default="")
     parser.add_argument("--answer_field", type=str, default="")
     parser.add_argument("--humaneval_data_file", type=str, default="")

@@ -68,6 +68,7 @@ def get_metric(name: str) -> Metric:
         "direct_safety": "onereplay.eval.metrics.direct_safety:DirectSafetyMetric",
         "math500": "onereplay.eval.metrics.math500:MATH500Metric",
         "amc": "onereplay.eval.metrics.math500:AMCMetric",
+        "minervamath": "onereplay.eval.metrics.math500:MinervaMathMetric",
     }
     if name not in registry:
         raise ValueError(f"Unknown metric {name!r}. Choose from: {sorted(registry)}")

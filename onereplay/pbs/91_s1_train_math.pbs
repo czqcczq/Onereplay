@@ -10,16 +10,43 @@
 #
 # =============================================================================
 # Part 1 / Math 线: Qwen2.5-Math-1.5B --NuminaMath-CoT--> Model-Math
-#                   评 MATH-500 + AMC + GSM8K
+#                   评 MATH-500 + GSM8K（贪心）+ AMC + Minerva（采样 avg@4）
+#                   外加交叉评测 IFEval + IFBench + FollowBench（DO_CROSS_IF=1）
 #
 #     Base ---- NuminaMath-CoT ----> Model-Math
-#     评测: MATH-500, AMC, GSM8K     对照: base
+#     评测: MATH-500, GSM8K, AMC, Minerva Math     对照: base
+#     交叉: IFEval, FollowBench                    对照: 94 号的 base 那一行
 #
 # capability forgetting 实验的 sanity check 之一。只回答一个问题：
 #
 #     NuminaMath 能不能把 mathematical reasoning 教起来？
 #
 # 必须先确认能，Part 2 里测到的 Math 下降才叫遗忘。
+#
+# -----------------------------------------------------------------------------
+# 【交叉评测：为什么这条线要评 IF，而且必须评】
+#
+# S3 的结果里出现了一件本来不该出现的事：先训 IF 再训 math，IF 几乎没有掉。这有两种
+# 完全不同的解释，而它们对整篇论文的含义相反：
+#
+#   A) math 训练真的不伤 IF —— 那是「遗忘」这个现象在这一对能力上不成立。
+#   B) 两个能力本来就正相关，S1 训 IF 时 math 也涨了、S1 训 math 时 IF 也涨了 ——
+#      那 S3 看到的"没有遗忘"是被这条正相关抵掉的，不是真的没掉。
+#
+# 分辨 A 和 B 只需要一件事：**在 S1 就把两个方向都测了**。所以本脚本（math 线）加评
+# IF，94 号（IF 线）加评 math。两条线的 base 是同一个权重，而 base 的 IF 分在 94 号
+# 已经测过、base 的 math 分在本脚本已经测过，所以**交叉评测只跑 trained 那一行**，
+# 把两个脚本的结果并起来就是完整的 2x2 表。重复评 base 是纯浪费。
+#
+#   完整的 2x2（行 = 模型，列 = 能力）：
+#                   math (本脚本)        IF (94 号)
+#     base          本脚本 base          94 号 base
+#     Model-Math    本脚本 trained       本脚本 trained + DO_CROSS_IF=1   <- 新增
+#     Model-IF      94 号 DO_CROSS_MATH=1                 94 号 trained
+#
+# 交叉那一侧的**预算和 system 必须和该能力的主场脚本逐字相同**，否则减出来的差里混进
+# 了口径差。所以本脚本的 IF 侧照抄 94 号：中性 system 消息、max_new=1024、
+# FB 六类全跑 @1024、stop_on_im_end=1。同理 94 号的 math 侧照抄本脚本。
 #
 # -----------------------------------------------------------------------------
 # 【为什么换成 Qwen2.5-Math-1.5B，以及配方对标哪篇论文】
@@ -178,12 +205,45 @@
 #   math500/amc.build_prompt : "Reason step by step, then give the final answer as \boxed{...}"
 #   gsm8k.build_prompt       : "Reason briefly, then end your answer with '#### ' + 最终数字"
 #
-# eval_aligned 对齐的是前者。于是这三个指标读出来的含义不同：
+# eval_aligned 对齐的是前者。于是这几个指标读出来的含义不同：
 #   MATH-500 = 同分布的能力上限（训练/评测同一套指令和答案格式）
 #   AMC      = 同口径但更难（竞赛题，指令格式和训练一致，只是题目分布更难）
+#   Minerva  = 同口径、更难、而且换了**题材**（OCW 物理/天文的量纲计算）
 #   GSM8K    = 跨格式泛化（模型要在没见过的 '####' 指令下仍然做对）
 #
-# 所以 AMC 低于 MATH-500 是难度，不是格式问题；GSM8K 低则要先排除格式。
+# 所以 AMC / Minerva 低于 MATH-500 是难度，不是格式问题；GSM8K 低则要先排除格式。
+#
+# -----------------------------------------------------------------------------
+# 【难题集（AMC + Minerva Math）：为什么它们**必须**换一套解码配置】
+#
+# 这两个集合和 MATH-500/GSM8K 分开跑，用 cap=4096 / temperature=1.0 / average@4，
+# 产物落在单独的 ${RESULTS_ROOT}/eval_hard_* 目录。三个偏离各有各的理由：
+#
+#   1) **average@4 而不是 greedy@1**。AMC 只有 83 题、Minerva 272 题，而这两个集合上
+#      的准确率低（个位数到二十几个百分点）。83 题 x 一次贪心解码，1 题 = 1.2 个百分
+#      点，而 1.5B 那轮 base 和 trained 的差距本来就只有几个百分点 —— 那张表里读到的
+#      多半是「哪几道题的硬币朝哪面落」。avg@4 把方差降到约一半，且这正是 DFT/ICLR2026
+#      Table 1 的口径（它报 temperature 1.0 的 Average@16），绝对值因此可以对表。
+#   2) **temperature=1.0**。avg@4 在贪心下毫无意义：4 次解码逐位相同，只是把时间花掉
+#      四遍。所以采样是 avg@k 的前提，不是独立的旋钮。代价是**结果不再可逐位复现**，
+#      只在 seed 固定时统计上稳定 —— 报这两个数字时要连 accuracy_per_sample 一起看
+#      （summary.json 里有四次各自的分数，散得很开就说明 4 次还不够）。
+#   3) **cap=4096 而不是 2048**。竞赛题和 OCW 题的推理链比 MATH-500 长，而在 2048 下
+#      被截断的行会因为写不到 \boxed{} 而记 0 分 —— 那是「预算不够」被读成「不会做」。
+#      4096 在 Qwen3-4B-Base 的 32768 窗口内（这一点和 Qwen2.5-Math-1.5B 的 4096 硬
+#      上限不同：在 1.5B 上 prompt+4096 已经出界，所以那个模型上这套配置只能用 2048，
+#      要跑就显式传 HARD_MATH_MAX_NEW_TOKENS=2048 并在读数时记住这个差别）。
+#
+# 三件事的共同后果：**这两列和 MATH-500/GSM8K 那两列不可比，也不能和任何 greedy@1 的
+# 旧 AMC 数字放进同一张表**。AMC 以前是跟着 MATH-500 在 eval_cap2048/ 下贪心测的，那
+# 些数字还在原地、没有被覆盖，但它们量的是另一回事。想复现旧口径就传 DO_HARD_MATH=0
+# 并把 amc 加回标准侧（GREEDY_AMC=1）。
+#
+# Minerva 的打分是**数值容差**而不是字符串相等，这是它的 gold 形态逼出来的
+# （"4.5e33" / "0.006" / "41.8"，还有 "to two significant figures" 这种题面要求）。
+# 细节写在 onereplay/eval/metrics/math500.py 的 MinervaMathMetric 上方；summary.json
+# 里同时报 accuracy（容差，主指标）和 accuracy_strict_string（严格字符串），两者的
+# 差就是这个选择的代价，别只报前者。
 #
 # GSM8K 的打分不会因此假阴性：predicted_answer 在响应里找不到 '####' 时，会退回
 # 取全文最后一个数字，而 \boxed{18} 结尾的响应最后一个数字正是 18。GSM8K 的 gold
@@ -354,9 +414,28 @@
 #                指向已有池时 check_out_dir 会放行并覆盖掉它。
 #                旁边的 numina_math_100k_manifest.json 是核 MAXLEN 的依据，见上面
 #                「MAXLEN=2048」那一节。正式训练**不要**走 MODE=data。
-#   3) 评测集    ${REPO_ROOT}/datasets/math/{gsm8k,math500,amc}_test.jsonl
+#   3) 评测集    ${REPO_ROOT}/datasets/math/{gsm8k,math500,amc,minervamath}_test.jsonl
 #                （和 32/33/45 号同一目录，不是 datasets/math_eval/）
-#                三个文件都已存在。缺哪个就自动跳过那个指标，不会中断作业。
+#                前三个都已存在。缺哪个就自动跳过那个指标，不会中断作业。
+#                **minervamath_test.jsonl 是本次新增的，要先在登录节点拉一次**：
+#                  python -m onereplay.scripts.download_math_data \
+#                    --out_dir ${REPO_ROOT}/datasets/math \
+#                    --with_math_train 0 --with_math500 0 --with_amc 0 \
+#                    --with_aime 0 --with_gsm8k 0 --with_minervamath 1
+#                它读 math-ai/minervamath 的 test 切分（272 题，OCW 物理/天文），
+#                写成 {problem, answer}。已有的四个文件一个都不会动。
+#                离线只有 parquet 时走 prepare_math_data.py --minervamath <路径>。
+#   3b) 交叉评测（DO_CROSS_IF=1）要的 IFEval 输入随仓库自带，FollowBench 完全
+#                vendored 在 onereplay/third_party/followbench/，都不需要额外下载。
+#                **IFBench 例外，两样前置都只能在登录节点做**（它在交叉侧默认开）：
+#                  source ${REPO_ROOT}/.venv/bin/activate
+#                  pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"
+#                  python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng
+#                commit 钉死是因为 checker 函数就是这个指标本身。语料落在
+#                ${VENV}/nltk_data，NLTK_DATA 默认指那里并导进容器 —— 容器里的 nltk
+#                只翻 site-packages，而它的 nltk.download() 在离线节点不报错也不下载。
+#                缺任一样，本作业会跳过 ifbench 并打印这两条命令，其余指标照常评。
+#                完整说明见 73 号文件头。
 #   4) mkdir -p ${REPO_ROOT}/logs   （即上面 #PBS -o 指的目录，不存在的话作业没日志）
 #
 # 【用法】按顺序。数据池已备好，所以不再需要第 0 步。
@@ -369,11 +448,26 @@
 #   #    1 epoch 约 1.0-1.9 h，所以可以带评测一起跑；想拆开就加 DO_EVAL=0。
 #   qsub -v MODE=train onereplay/pbs/91_s1_train_math.pbs
 #
-#   # 3) 评测单独跑（或上一步带 DO_EVAL=0 之后补）。默认 cap=2048 / batch=128，
-#   #    两个 run x 三个指标。产物写到 ${RESULTS_ROOT}/eval_cap2048/，按 cap 分目录
-#   #    所以不会和 OpenR1 时代 4096/8192 的数字混进一张表。
+#   # 3) 评测单独跑（或上一步带 DO_EVAL=0 之后补）。一次 MODE=eval 现在有三侧：
+#   #      标准 math  gsm8k + math500，贪心 cap=2048 batch=128 -> eval_cap2048/
+#   #      难 math    amc + minervamath，采样 T=1.0 cap=4096 avg@4 -> eval_hard_*/
+#   #      交叉 IF    ifeval + ifbench + followbench（整侧默认关，见下面第 3c 步）
+#   #    产物按 cap / 解码配置分目录，所以不会和 OpenR1 时代 4096/8192 的数字、也不会
+#   #    和旧的 greedy AMC 混进一张表。
 #   #    **LR 必须和训练时一致**（默认都是 5e-5），否则会去找不存在的 checkpoint 目录。
 #   qsub -v MODE=eval onereplay/pbs/91_s1_train_math.pbs
+#
+#   # 3a) 只补难题集那一侧（AMC + Minerva，base 和 trained 各 355 题 x 4 次采样）
+#   qsub -v MODE=eval,DO_MATH=0 onereplay/pbs/91_s1_train_math.pbs
+#
+#   # 3b) 只跑标准侧，跳过难题集（复现本次改动之前的行为）
+#   qsub -v MODE=eval,DO_HARD_MATH=0 onereplay/pbs/91_s1_train_math.pbs
+#
+#   # 3c) **交叉评测：Model-Math 的 IF 能力**（这是"IF 和 math 是否正相关"那个问题的
+#   #     一半，另一半在 94 号）。只评 trained：base 的 IF 分在 94 号已经有了。
+#   #     已经训完的模型现在只要补这一条作业，训练不用重跑。
+#   qsub -v MODE=eval,DO_MATH=0,DO_HARD_MATH=0,DO_CROSS_IF=1 \
+#     onereplay/pbs/91_s1_train_math.pbs
 #
 #   # 想先便宜地把整条链路跑通，用子集（几分钟）
 #   qsub -v MODE=train,MAX_TRAIN_SAMPLES=6000,EPOCHS=1 onereplay/pbs/91_s1_train_math.pbs
@@ -401,11 +495,15 @@ IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_1
 
 JOBTAG="${PBS_JOBID:-local$$}"
 SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+# 交叉 IF 侧的 IFBench 要四份 NLTK 语料。venv 里 nltk.downloader 会落到
+# sys.prefix/nltk_data（与 70/73/81/94 号同一处），必须导进容器：容器里的 nltk 只翻
+# site-packages（空的），而它自己的 nltk.download() 在离线计算节点不报错也不下载。
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
 if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
-  JOB_TMPDIR="/local_ssd/${SCRATCH_USER}/tmp_p1math_${JOBTAG}"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_p1math_${JOBTAG}}"
   EXTRA_BIND="-B /local_ssd:/local_ssd"
 else
-  JOB_TMPDIR="/scratch/${SCRATCH_USER}/cache/tmp_p1math_${JOBTAG}"
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_p1math_${JOBTAG}}"
   EXTRA_BIND=""
 fi
 
@@ -446,8 +544,14 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     LR_GRID SWEEP_MAX_STEPS SMOKE_STEPS MAX_TRAIN_SAMPLES LOG_EVERY SWEEP_LOG_EVERY
     THINK_HANDLING INSTRUCTION_STYLE REQUIRE_BOXED SYSTEM_PROMPT SYSTEM_PROMPT_PRESET
     REPLAY_ROWS REPLAY_POOL REPLAY_SAMPLE_SEED
-    GSM8K_DATA MATH500_DATA AMC_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
+    GSM8K_DATA MATH500_DATA AMC_DATA MINERVA_DATA MATH_MAX_NEW_TOKENS EVAL_OUT_DIR
     EVAL_LIMIT EVAL_BATCH MATH_BATCH RUNS_TO_EVAL DIAG_LEN STOP_ON_IM_END
+    DO_MATH GREEDY_AMC
+    DO_HARD_MATH HARD_MATH_MAX_NEW_TOKENS HARD_MATH_TEMPERATURE HARD_MATH_SAMPLES
+    HARD_MATH_BATCH HARD_MATH_OUT_DIR MINERVA_REL_TOL
+    DO_CROSS_IF CROSS_IF_OUT_DIR IF_SYSTEM_PROMPT IFEVAL_INPUT MAX_NEW_TOKENS
+    DO_IFBENCH IFBENCH_INPUT IFBENCH_MAX_NEW_TOKENS NLTK_DATA
+    FB_DATA FB_CATEGORIES FB_MAX_NEW_TOKENS FB_BATCH FB_GROUP_LIMIT
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -487,6 +591,8 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+# 交叉 IF 侧的 IFBench checker 要读它。不导出的话容器里的 nltk 只翻 site-packages。
+export NLTK_DATA="${NLTK_DATA}"
 
 echo "Python          : $(which python)"
 python --version
@@ -701,10 +807,15 @@ SWEEP_LOG_EVERY="${SWEEP_LOG_EVERY:-64}"
 GSM8K_DATA="${GSM8K_DATA:-${REPO_ROOT}/datasets/math/gsm8k_test.jsonl}"
 MATH500_DATA="${MATH500_DATA:-${REPO_ROOT}/datasets/math/math500_test.jsonl}"
 # AMC 走 math500.py 的 AMCMetric（继承 MATH500Metric，共用 build_prompt 和 is_equiv，
-# 只换数据文件和输出目录），所以加上它零成本。注意这个文件来自
+# 只换数据文件和输出目录）。注意这个文件来自
 # AI-MO/aimo-validation-amc，是 AMC12 2022+2023 共 83 题，**不是论文 AMC23 的 40 题**，
 # 所以绝对值不能直接对 Table 1，只能读 base -> Model-Math 的方向。
+# **它现在属于难题集那一侧**（采样 avg@4，见文件头），不在下面的标准 METRICS 里。
 AMC_DATA="${AMC_DATA:-${REPO_ROOT}/datasets/math/amc_test.jsonl}"
+# Minerva Math = math-ai/minervamath 的 test 切分，272 题 OCW 物理/天文。gold 是带量纲
+# 的测量值（"4.5e33"、"0.006"），所以 MinervaMathMetric 用数值容差打分而不是字符串
+# 相等；容差和它的代价见文件头「难题集」一节。文件由 download_math_data.py 产出。
+MINERVA_DATA="${MINERVA_DATA:-${REPO_ROOT}/datasets/math/minervamath_test.jsonl}"
 # Qwen2.5-Math 的 eos_token 是 <|endoftext|>，而 chat template 的 assistant turn 以
 # <|im_end|> 收尾。不开这个，模型吐出 <|im_end|> 后 generate 不停，会续写下一轮对话，
 # skip_special_tokens 再把那段拼到答案后面 —— \boxed{} 之后多出数字，math500 取错
@@ -769,6 +880,70 @@ MATH_BATCH="${MATH_BATCH:-128}"
 EVAL_OUT_DIR="${EVAL_OUT_DIR:-${RESULTS_ROOT}/eval_cap${MATH_MAX_NEW_TOKENS}}"
 DIAG_LEN="${DIAG_LEN:-1}"
 
+# ---- 三侧评测的开关 ----
+# 标准侧：gsm8k + math500，贪心 cap=2048。这是历史上所有 math 数字的口径。
+DO_MATH="${DO_MATH:-1}"
+# 1 把 AMC 也放回标准侧（贪心 cap=2048），用来复现本次改动之前的旧口径。默认 0：
+# AMC 现在归难题集那一侧。**两侧都开时它会被评两遍**，落在两个不同目录里，别混读。
+GREEDY_AMC="${GREEDY_AMC:-0}"
+
+# ---- 难题集侧：AMC + Minerva Math，采样 + average@k ----
+# 为什么必须是另一次 evaluate 调用而不是多加两个指标：解码策略在 evaluate.py 里是
+# **整个 run 共享**的（configure_decoding 一次设定，见 eval/generation.py 开头那段
+# "a comparison that mixes greedy and sampled arms is meaningless"）。要让 math500
+# 保持贪心、AMC/Minerva 采样，就只能分两次调用。代价是模型加载两遍。
+DO_HARD_MATH="${DO_HARD_MATH:-1}"
+# 4096：竞赛题/OCW 题的推理链比 MATH-500 长，2048 下写不到 \boxed{} 的行会被记 0 分。
+# Qwen3-4B-Base 的窗口是 32768，所以这个预算安全；**Qwen2.5-Math-1.5B 的硬上限是
+# 4096**，在那个模型上 prompt+4096 已经出界，要跑就传 2048 并在读数时记住这个差别。
+HARD_MATH_MAX_NEW_TOKENS="${HARD_MATH_MAX_NEW_TOKENS:-4096}"
+# 1.0 = DFT/ICLR2026 Table 1 的口径。它同时是 avg@k 的**前提**：贪心下 4 次采样逐位
+# 相同，avg@4 只是把同一个数算四遍。改成 0 会让下面的 avg@4 退化成 greedy@1。
+HARD_MATH_TEMPERATURE="${HARD_MATH_TEMPERATURE:-1.0}"
+# average@4：83 + 272 题在低准确率区间上，单次贪心的抖动和 base->trained 的真实差距
+# 同量级。4 次把标准误降到约一半。summary.json 里会带 accuracy_per_sample（四次各自
+# 的分数）和 pass_at_k，**报结果时至少要看一眼前者散得有多开**。
+HARD_MATH_SAMPLES="${HARD_MATH_SAMPLES:-4}"
+# 64 而不是 MATH_BATCH 的 128：cap 翻倍、每题又要解 4 遍，KV 是标准侧的 2 倍。
+# Qwen3-4B-Base 每 token KV = 36 层 x 2 x 8 KV head x 128 x 2 B = 144 KiB，
+# prompt+4096 约 4300 token = 0.59 GiB/序列 -> 64 行约 38 GiB，128 行约 76 GiB。
+# 38 GiB 在 140 GiB 卡上很宽裕；批数 = ceil(83x4/64) + ceil(272x4/64) = 6 + 17 = 23。
+# 采样解码不吐 EOS 的比例比贪心高，所以几乎每批都会跑满 cap，墙钟正比于批数。
+HARD_MATH_BATCH="${HARD_MATH_BATCH:-64}"
+# Minerva 的数值容差。1% 是按题面"to two/three significant figures"定的：gold 本身只
+# 给到两三位有效数字，要求逐位相等等于在惩罚舍入方式。放到 0 就退回严格字符串比较
+# （那时 accuracy 会等于 accuracy_strict_string）。
+MINERVA_REL_TOL="${MINERVA_REL_TOL:-0.01}"
+# 解码配置进目录名，所以它和标准侧、和任何旧的 greedy AMC 数字物理隔离 —— 这三组数
+# 混进一张表就是错的，而目录名是唯一不会忘记的注释。
+HARD_MATH_OUT_DIR="${HARD_MATH_OUT_DIR:-${RESULTS_ROOT}/eval_hard_t${HARD_MATH_TEMPERATURE}_avg${HARD_MATH_SAMPLES}_cap${HARD_MATH_MAX_NEW_TOKENS}}"
+
+# ---- 交叉侧：Model-Math 的 IF 能力（默认关）----
+# 回答"IF 和 math 是不是正相关"的一半，另一半是 94 号的 DO_CROSS_MATH。理由和读法见
+# 文件头「交叉评测」一节。**只评 trained**：base 的 IF 分在 94 号已经测过，重复评是
+# 纯浪费，而且两边 base 是同一个权重、同一套 IF 配置，可以直接并表。
+DO_CROSS_IF="${DO_CROSS_IF:-0}"
+# 下面这些值**逐字照抄 94 号**。差一个，减出来的"IF 变化量"里就混进了口径差而不是能力差。
+IF_SYSTEM_PROMPT="${IF_SYSTEM_PROMPT:-You are a helpful assistant.}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+# IFBench：300 条 out-of-domain 可验证约束，09-17 起进 IF 的报告口径（三条线同口径）。
+# 空 IFBENCH_INPUT = 用 ifbench 包自带的 IFBench_test.jsonl。
+# 它的前置要在**登录节点**装（pip 装 git 版 ifbench + 四份 NLTK 语料）；缺了会被
+# 下面的 ifbench_ready 探到并只摘掉这一个指标。
+DO_IFBENCH="${DO_IFBENCH:-1}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-1024}"
+FB_DATA="${FB_DATA:-}"
+FB_CATEGORIES="${FB_CATEGORIES:-}"
+FB_MAX_NEW_TOKENS="${FB_MAX_NEW_TOKENS:-1024}"
+# 不回落到 EVAL_BATCH：example 类把 few-shot 示例内联进 instruction，prompt P90=2516 /
+# max=5019 token，KV 不是一个量级。
+FB_BATCH="${FB_BATCH:-16}"
+# FollowBench 不读全局 --limit（metric 只认 group_limit），冒烟要用这个，且按**组**截。
+FB_GROUP_LIMIT="${FB_GROUP_LIMIT:-0}"
+CROSS_IF_OUT_DIR="${CROSS_IF_OUT_DIR:-${RESULTS_ROOT}/eval_cross_if}"
+
 # run 名**刻意保持** part1_math_lr<LR>_seed<SEED> 这个形状：99/100 号发现 Stage 1
 # checkpoint 的三条路径里有两条依赖它（MATH_LR 拼名、以及 glob
 # "part1_math_lr*_seed${SEED}"）。把 MODEL_NAME 塞进 run 名会让那两条同时失效，
@@ -794,9 +969,18 @@ echo "                   (Numina 无 <think> 标签，strip_tags 是空操作；
 echo "  超参           : epochs=${EPOCHS} lr=${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO}"
 echo "                   batch=${BATCH} accum=${ACCUM} maxlen=${MAXLEN}"
 echo "                   (对标 DFT/ICLR2026 Table 1 的 Qwen2.5-Math-1.5B w/SFT 行)"
-echo "  评测           : math500, amc, gsm8k   (对照 base)"
-echo "                   max_new_tokens=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} stop_on_im_end=${STOP_ON_IM_END}"
-echo "  eval out       : ${EVAL_OUT_DIR}   (FORCE_EVAL=${FORCE_EVAL})"
+echo "  标准 math      : gsm8k, math500 (do=${DO_MATH}, greedy_amc=${GREEDY_AMC})   (对照 base)"
+echo "                   greedy max_new=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} stop_on_im_end=${STOP_ON_IM_END}"
+echo "                   -> ${EVAL_OUT_DIR}"
+echo "  难 math        : amc, minervamath (do=${DO_HARD_MATH})   (对照 base)"
+echo "                   sample T=${HARD_MATH_TEMPERATURE} avg@${HARD_MATH_SAMPLES} cap=${HARD_MATH_MAX_NEW_TOKENS} batch=${HARD_MATH_BATCH}"
+echo "                   -> ${HARD_MATH_OUT_DIR}"
+echo "                   (和标准侧不可比：换了 cap、换了解码、换了统计量)"
+echo "  交叉 IF        : ifeval, ifbench(do=${DO_IFBENCH}), followbench (do=${DO_CROSS_IF})   只评 trained"
+echo "                   greedy max_new=${MAX_NEW_TOKENS}/${IFBENCH_MAX_NEW_TOKENS}/${FB_MAX_NEW_TOKENS} (94 号的值)"
+echo "                   base 的 IF 分在 94 号，两边口径逐字相同，直接并表"
+echo "                   -> ${CROSS_IF_OUT_DIR}"
+echo "  eval out root  : ${RESULTS_ROOT}   (FORCE_EVAL=${FORCE_EVAL})"
 echo "  checkpoint     : ${CKPT}"
 echo "========================================================================"
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -960,53 +1144,226 @@ if [[ "${MODE}" == "train" && "${DO_TRAIN}" == "1" ]]; then
 fi
 
 # =============================================================================
-# MODE=eval：base 与 Model-Math 各测 GSM8K + MATH-500
+# MODE=eval：三侧，每侧一次 evaluate 调用
 #
-# 一次 evaluate 调用只加载模型一次，两个指标共用。
+#   标准 math   gsm8k + math500                贪心 cap=2048        -> EVAL_OUT_DIR
+#   难 math     amc + minervamath              采样 T=1.0 avg@4 4096 -> HARD_MATH_OUT_DIR
+#   交叉 IF     ifeval + ifbench + followbench 贪心 cap=1024        -> CROSS_IF_OUT_DIR
+#
+# **为什么是三次调用而不是一次八个指标**：解码策略和 system prompt 在 evaluate.py 里
+# 都是整个 run 共享的（configure_decoding / configure_system_prompt 各调一次）。难侧
+# 要采样、标准侧要贪心；math 侧要 \boxed{} 指令、IF 侧要中性助手消息。混在一次调用里
+# 只能得到其中一种，另一侧的分数就和它自己的基线不可比了。代价是模型加载三遍。
+#
+# 每一侧独立判断"是否已有结果"，所以拆到不同作业里补跑不会被别侧的产物挡掉。
+#
 # 全量 checkpoint 直接传 --adapter_path：runner 的 load_eval_model 先用
 # is_lora_adapter_dir 判断，没有 adapter_config.json 就把该目录当完整模型加载。
 # =============================================================================
+
+# IFBench 的前置不是一个文件，是装好的 ifbench 包加四份 NLTK 语料，而它们缺席时的
+# 失败发生在**打分阶段** —— 300 条已经解码完，GPU 白烧。所以解码前先探一次，探不过
+# 就只把 ifbench 摘掉，其余指标照常评（与 70 / 81 / 94 号同一套探测）。
+ifbench_ready () {
+  python - <<'PY' >/dev/null 2>&1
+from ifbench import instructions_registry
+from onereplay.eval.metrics.ifbench import check_nltk_data
+
+# 83 = 25 个 patch 过的经典 checker + 58 个新的；数目对不上说明装到了别的版本。
+assert len(instructions_registry.INSTRUCTION_DICT) >= 83
+check_nltk_data()
+PY
+}
+
+ifbench_hint () {
+  echo "跳过 IFBench：依赖没就绪。在**登录节点**补齐后重投（MODE=eval 即可，训练不用重跑）:"
+  echo "  source ${VENV}/bin/activate"
+  echo '  pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"'
+  echo "  python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng"
+  echo "  当前 NLTK_DATA=${NLTK_DATA}（venv 里 nltk.downloader 默认就落这里）"
+  echo "  详细说明见 onereplay/pbs/73_ifbench_eval.pbs 文件头"
+}
+
 if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]]; then
   METRICS=""
-  if [[ -f "${GSM8K_DATA}" ]]; then
-    METRICS="${METRICS},gsm8k"
-  else
-    echo "跳过 GSM8K：未找到 ${GSM8K_DATA}（prepare_math_data.py 产出）"
-  fi
-  if [[ -f "${MATH500_DATA}" ]]; then
-    METRICS="${METRICS},math500"
-  else
-    echo "跳过 MATH-500：未找到 ${MATH500_DATA}"
-  fi
-  if [[ -f "${AMC_DATA}" ]]; then
-    METRICS="${METRICS},amc"
-  else
-    echo "跳过 AMC：未找到 ${AMC_DATA}"
+  if [[ "${DO_MATH}" == "1" ]]; then
+    if [[ -f "${GSM8K_DATA}" ]]; then
+      METRICS="${METRICS},gsm8k"
+    else
+      echo "跳过 GSM8K：未找到 ${GSM8K_DATA}（prepare_math_data.py 产出）"
+    fi
+    if [[ -f "${MATH500_DATA}" ]]; then
+      METRICS="${METRICS},math500"
+    else
+      echo "跳过 MATH-500：未找到 ${MATH500_DATA}"
+    fi
+    # 旧口径的贪心 AMC，默认不跑（它归难题集那一侧了）。
+    if [[ "${GREEDY_AMC}" == "1" ]]; then
+      if [[ -f "${AMC_DATA}" ]]; then
+        METRICS="${METRICS},amc"
+        echo "!! GREEDY_AMC=1：AMC 会在标准侧再评一遍（贪心 cap=${MATH_MAX_NEW_TOKENS}）。"
+        echo "   它和难题集里的 AMC 是两个口径的两个数字，落在两个目录，别混进一张表。"
+      else
+        echo "跳过 AMC：未找到 ${AMC_DATA}"
+      fi
+    fi
   fi
   METRICS="${METRICS#,}"
-  [[ -n "${METRICS}" ]] || { echo "没有可用指标，评测退出"; exit 1; }
+
+  # 难题集侧的指标列表。
+  HARD_METRICS=""
+  if [[ "${DO_HARD_MATH}" == "1" ]]; then
+    if [[ -f "${AMC_DATA}" ]]; then
+      HARD_METRICS="${HARD_METRICS},amc"
+    else
+      echo "跳过 AMC：未找到 ${AMC_DATA}"
+    fi
+    if [[ -f "${MINERVA_DATA}" ]]; then
+      HARD_METRICS="${HARD_METRICS},minervamath"
+    else
+      echo "跳过 Minerva Math：未找到 ${MINERVA_DATA}"
+      echo "  它要先在**登录节点**拉一次（计算节点无外网）："
+      echo "    python -m onereplay.scripts.download_math_data \\"
+      echo "      --out_dir $(dirname "${MINERVA_DATA}") \\"
+      echo "      --with_math_train 0 --with_math500 0 --with_amc 0 \\"
+      echo "      --with_aime 0 --with_gsm8k 0 --with_minervamath 1"
+    fi
+  fi
+  HARD_METRICS="${HARD_METRICS#,}"
+
+  # 交叉侧（IF）。IFEval 缺输入就只跳过它；FollowBench 完全 vendored，没有可查的前置
+  # 文件；IFBench 的前置是装好的包 + NLTK 语料，探不过就只摘掉它（见 ifbench_ready）。
+  CROSS_METRICS=""
+  if [[ "${DO_CROSS_IF}" == "1" ]]; then
+    if [[ -f "${IFEVAL_INPUT}" ]]; then
+      CROSS_METRICS="${CROSS_METRICS},ifeval"
+    else
+      echo "跳过 IFEval：未找到 ${IFEVAL_INPUT}"
+    fi
+    if [[ "${DO_IFBENCH}" == "1" ]]; then
+      if ifbench_ready; then
+        CROSS_METRICS="${CROSS_METRICS},ifbench"
+      else
+        ifbench_hint
+      fi
+    fi
+    CROSS_METRICS="${CROSS_METRICS},followbench"
+  fi
+  CROSS_METRICS="${CROSS_METRICS#,}"
+
+  if [[ -z "${METRICS}${HARD_METRICS}${CROSS_METRICS}" ]]; then
+    echo "没有可用指标（DO_MATH/DO_HARD_MATH/DO_CROSS_IF 都关了？），评测退出"
+    exit 1
+  fi
+
+  # 回显一侧里**还缺 summary 的那几个**指标（空 = 整侧都齐了，可以跳过）。
+  #
+  # 不是"全部齐了才跳过"：往一张已经跑完的表里补一个指标（IFBench 就是这么加进交叉侧
+  # 的）是常态，而那时重跑 FollowBench 的 820 行要 3-4h，纯属白烧。每个指标写自己的
+  # 子目录，所以摘掉已完成的不影响任何结果。要重评已有的数就用 FORCE_EVAL=1。
+  side_todo () {
+    local out_root="$1" name="$2" side_metrics="$3" m
+    local -a todo=()
+    for m in ${side_metrics//,/ }; do
+      if [[ "${FORCE_EVAL}" == "1" || ! -f "${out_root}/${m}/${name}/summary.json" ]]; then
+        todo+=("${m}")
+      fi
+    done
+    (IFS=,; echo "${todo[*]}")
+  }
 
   run_eval () {
     local name="$1" ckpt="$2"
     local -a ckpt_arg=()
     if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
+    local todo_metrics
 
-    if [[ -f "${EVAL_OUT_DIR}/math500/${name}/summary.json" && "${FORCE_EVAL}" != "1" ]]; then
-      echo "跳过评测 ${name}：已有 ${EVAL_OUT_DIR}/math500/${name}/summary.json（FORCE_EVAL=1 强制重评）"
+    if [[ -n "${METRICS}" ]]; then
+      todo_metrics="$(side_todo "${EVAL_OUT_DIR}" "${name}" "${METRICS}")"
+      if [[ -n "${todo_metrics}" ]]; then
+        echo "==== eval ${name} (${todo_metrics}) greedy cap=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} -> ${EVAL_OUT_DIR} ===="
+        python -m onereplay.scripts.evaluate \
+          --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+          "${ckpt_arg[@]}" --run_name "${name}" \
+          --metrics "${todo_metrics}" --out_dir "${EVAL_OUT_DIR}" --seed "${SEED}" \
+          --system_prompt "${SYSTEM_PROMPT}" \
+          --limit "${EVAL_LIMIT}" \
+          --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
+          --gsm8k_data_path "${GSM8K_DATA}" \
+          --math500_data_path "${MATH500_DATA}" \
+          --amc_data_path "${AMC_DATA}" \
+          --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+          --decode_stop_on_im_end "${STOP_ON_IM_END}" \
+          --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+      else
+        echo "跳过标准 math ${name}：${METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
+      fi
+    fi
+
+    # 难题集侧。--decode_do_sample 1 + --decode_temperature 是 avg@k 的前提；
+    # --math_num_samples 只被 amc / minervamath 读取，math500 和 gsm8k 在实现上
+    # 就忽略它（metrics/math500.py 的 allow_multi_sample），所以即使有人把
+    # math500 加进 HARD_METRICS 也不会悄悄换掉它的口径。
+    if [[ -n "${HARD_METRICS}" ]]; then
+      todo_metrics="$(side_todo "${HARD_MATH_OUT_DIR}" "${name}" "${HARD_METRICS}")"
+      if [[ -n "${todo_metrics}" ]]; then
+        echo "==== eval ${name} (${todo_metrics}) sample T=${HARD_MATH_TEMPERATURE} avg@${HARD_MATH_SAMPLES} cap=${HARD_MATH_MAX_NEW_TOKENS} batch=${HARD_MATH_BATCH} -> ${HARD_MATH_OUT_DIR} ===="
+        python -m onereplay.scripts.evaluate \
+          --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+          "${ckpt_arg[@]}" --run_name "${name}" \
+          --metrics "${todo_metrics}" --out_dir "${HARD_MATH_OUT_DIR}" --seed "${SEED}" \
+          --system_prompt "${SYSTEM_PROMPT}" \
+          --limit "${EVAL_LIMIT}" \
+          --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${HARD_MATH_BATCH}" \
+          --amc_data_path "${AMC_DATA}" \
+          --minervamath_data_path "${MINERVA_DATA}" \
+          --math_max_new_tokens "${HARD_MATH_MAX_NEW_TOKENS}" \
+          --math_num_samples "${HARD_MATH_SAMPLES}" \
+          --minerva_rel_tol "${MINERVA_REL_TOL}" \
+          --decode_do_sample 1 \
+          --decode_temperature "${HARD_MATH_TEMPERATURE}" \
+          --decode_stop_on_im_end "${STOP_ON_IM_END}" \
+          --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
+      else
+        echo "跳过难 math ${name}：${HARD_METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
+      fi
+    fi
+  }
+
+  # 交叉侧单独一个函数：它只对 trained 那一行调用（base 的 IF 分在 94 号），而且用的是
+  # IF 的 system prompt 和 IF 的生成预算。
+  run_cross_if_eval () {
+    local name="$1" ckpt="$2"
+    [[ -n "${CROSS_METRICS}" ]] || return 0
+    local -a ckpt_arg=()
+    if [[ -n "${ckpt}" ]]; then ckpt_arg=(--adapter_path "${ckpt}"); fi
+    local todo_metrics
+    todo_metrics="$(side_todo "${CROSS_IF_OUT_DIR}" "${name}" "${CROSS_METRICS}")"
+    if [[ -z "${todo_metrics}" ]]; then
+      echo "跳过交叉 IF ${name}：${CROSS_METRICS} 都已有 summary（FORCE_EVAL=1 强制重评）"
       return 0
     fi
-    echo "==== eval ${name} (${METRICS}) cap=${MATH_MAX_NEW_TOKENS} batch=${MATH_BATCH} -> ${EVAL_OUT_DIR} ===="
+    local -a fb_data_arg=() fb_cats_arg=() ifbench_arg=()
+    if [[ -n "${FB_DATA}" ]]; then fb_data_arg=(--followbench_data "${FB_DATA}"); fi
+    if [[ -n "${FB_CATEGORIES}" ]]; then fb_cats_arg=(--followbench_categories "${FB_CATEGORIES}"); fi
+    # 空 IFBENCH_INPUT 走包自带的 300 条，别把空串传给 --ifbench_input。
+    if [[ -n "${IFBENCH_INPUT}" ]]; then ifbench_arg=(--ifbench_input "${IFBENCH_INPUT}"); fi
+    echo "==== eval ${name} (${todo_metrics}) 交叉 IF 侧 -> ${CROSS_IF_OUT_DIR} ===="
+    echo "     system: ${IF_SYSTEM_PROMPT}   (94 号的值，改它就没有可比的 before)"
     python -m onereplay.scripts.evaluate \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       "${ckpt_arg[@]}" --run_name "${name}" \
-      --metrics "${METRICS}" --out_dir "${EVAL_OUT_DIR}" --seed "${SEED}" \
-      --system_prompt "${SYSTEM_PROMPT}" \
+      --metrics "${todo_metrics}" --out_dir "${CROSS_IF_OUT_DIR}" --seed "${SEED}" \
+      --system_prompt "${IF_SYSTEM_PROMPT}" \
       --limit "${EVAL_LIMIT}" \
-      --eval_batch_size "${EVAL_BATCH}" --math_batch_size "${MATH_BATCH}" \
-      --gsm8k_data_path "${GSM8K_DATA}" \
-      --math500_data_path "${MATH500_DATA}" \
-      --amc_data_path "${AMC_DATA}" \
-      --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+      --max_new_tokens "${MAX_NEW_TOKENS}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --ifeval_input "${IFEVAL_INPUT}" \
+      --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
+      --followbench_max_new_tokens "${FB_MAX_NEW_TOKENS}" \
+      --followbench_batch_size "${FB_BATCH}" \
+      --followbench_group_limit "${FB_GROUP_LIMIT}" \
+      "${ifbench_arg[@]}" "${fb_data_arg[@]}" "${fb_cats_arg[@]}" \
       --decode_stop_on_im_end "${STOP_ON_IM_END}" \
       --map_cache_dir "${RESULTS_ROOT}/map_cache/eval_seed${SEED}"
   }
@@ -1017,6 +1374,8 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       trained)
         if [[ -d "${CKPT}" ]]; then
           run_eval "${RUN}" "${CKPT}"
+          # 交叉 IF 只在这里调：base 的 IF 分归 94 号。
+          run_cross_if_eval "${RUN}" "${CKPT}"
         else
           echo "跳过 ${RUN}：checkpoint 不存在（${CKPT}）"
           echo "MODE=eval 的 LR/SEED 必须和训练时一致（默认都是 lr=5e-5 seed=1），"
@@ -1027,10 +1386,16 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
       *) echo "未知 run: ${which}" ;;
     esac
   done
+  if [[ "${DO_CROSS_IF}" == "1" && " ${RUNS_TO_EVAL} " != *" trained "* ]]; then
+    echo "!! DO_CROSS_IF=1 但 RUNS_TO_EVAL=${RUNS_TO_EVAL} 里没有 trained，交叉侧什么都没跑。"
+    echo "   交叉评测按设计只评 trained（base 的 IF 分在 94 号）。"
+  fi
 
   # 长度/截断诊断：hit-cap 接近 0 且 P99 明显低于 cap 才算预算够用。
+  # 两侧的 cap 不同，所以分两次调用；难侧的 n 是题数 x HARD_MATH_SAMPLES。
   if [[ "${DIAG_LEN}" == "1" ]]; then
     DIAG_FILES=()
+    HARD_DIAG_FILES=()
     for which in ${RUNS_TO_EVAL}; do
       case "${which}" in
         base) name="base" ;;
@@ -1041,7 +1406,14 @@ if [[ "${MODE}" == "eval" || ( "${MODE}" == "train" && "${DO_EVAL}" == "1" ) ]];
         f="${EVAL_OUT_DIR}/${metric}/${name}/responses.jsonl"
         [[ -f "${f}" ]] && DIAG_FILES+=("${f}")
       done
+      for metric in amc minervamath; do
+        f="${HARD_MATH_OUT_DIR}/${metric}/${name}/responses.jsonl"
+        [[ -f "${f}" ]] && HARD_DIAG_FILES+=("${f}")
+      done
     done
+    if [[ ${#HARD_DIAG_FILES[@]} -gt 0 ]]; then
+      DIAG_FILES+=("--cap${HARD_MATH_MAX_NEW_TOKENS}" "${HARD_DIAG_FILES[@]}")
+    fi
     if [[ ${#DIAG_FILES[@]} -gt 0 ]]; then
       python - "${MODEL_DIR}/${MODEL_NAME}" "${MATH_MAX_NEW_TOKENS}" "${DIAG_FILES[@]}" <<'PY'
 import json
@@ -1058,54 +1430,216 @@ def pct(values, q):
     return values[min(len(values) - 1, int(round(q / 100 * (len(values) - 1))))]
 
 
-print(f"==== response length / truncation diagnostic (cap={cap}) ====")
-for path in sys.argv[3:]:
-    file = Path(path)
-    if not file.is_file():
-        continue
-    rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
-    if not rows:
-        continue
-    lengths = sorted(
-        len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
-        for row in rows
-    )
-    missing = sum(row.get("prediction") in (None, "") for row in rows)
-    hit_cap = sum(length >= cap - 8 for length in lengths)
-    label = f"{file.parent.parent.name}/{file.parent.name}"
-    print(
-        f"{label:>40}: n={len(rows)} "
-        f"no-answer={missing} ({missing / len(rows):.1%}) "
-        f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
-        f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
-    )
+# argv 里的 "--cap<N>" 是分隔符：它之后的文件用另一个 cap 判 hit-cap。难题集那一侧的
+# 预算是 4096 而标准侧是 2048，用同一个数去判会把整整一侧的截断率算错。
+def groups(argv):
+    cap_now, batch = cap, []
+    for item in argv:
+        if item.startswith("--cap"):
+            if batch:
+                yield cap_now, batch
+            cap_now, batch = int(item[len("--cap") :]), []
+        else:
+            batch.append(item)
+    if batch:
+        yield cap_now, batch
+
+
+for group_cap, paths in groups(sys.argv[3:]):
+    print(f"==== response length / truncation diagnostic (cap={group_cap}) ====")
+    for path in paths:
+        file = Path(path)
+        if not file.is_file():
+            continue
+        rows = [json.loads(line) for line in file.open(encoding="utf-8") if line.strip()]
+        if not rows:
+            continue
+        lengths = sorted(
+            len(tokenizer(row.get("response", ""), add_special_tokens=False)["input_ids"])
+            for row in rows
+        )
+        missing = sum(row.get("prediction") in (None, "") for row in rows)
+        hit_cap = sum(length >= group_cap - 8 for length in lengths)
+        label = f"{file.parent.parent.name}/{file.parent.name}"
+        # 采样 avg@k 的文件里 n = 题数 x k，每个采样都是独立一行。
+        print(
+            f"{label:>40}: n={len(rows)} "
+            f"no-answer={missing} ({missing / len(rows):.1%}) "
+            f"hit-cap={hit_cap} ({hit_cap / len(rows):.1%}) "
+            f"P50={pct(lengths, 50)} P90={pct(lengths, 90)} P99={pct(lengths, 99)} max={lengths[-1]}"
+        )
 print("hit-cap 接近 0 且 P99 明显低于 cap => 预算够用。hit-cap 仍高时**先看是不是重复循环**")
 print("（撞上限那些行的尾部 distinct-shingle 低到约 0.1 就是），那种情况加 cap 没用；")
-print("确认是真的写不完再把 MATH_MAX_NEW_TOKENS 提上去并**所有 run 一起重评**。")
+print("确认是真的写不完再把 cap 提上去并**所有 run 一起重评**。")
+print("难题集那一侧是采样解码，hit-cap 天然比贪心高（采样更容易走进不收尾的分支）；")
+print("它和标准侧的 hit-cap 不能直接比大小。")
 PY
     fi
   fi
+
+  # ---------------------------------------------------------------------------
+  # 汇总：三侧各一张表。**刻意不合成一张**：三侧的解码配置不同，同一行里并排的数字
+  # 会被当成可以相减的量，而它们不是。
+  # ---------------------------------------------------------------------------
+  python - "${EVAL_OUT_DIR}" "${HARD_MATH_OUT_DIR}" "${CROSS_IF_OUT_DIR}" <<'PY' || true
+import json
+import sys
+from pathlib import Path
+
+standard_root, hard_root, cross_root = (Path(p) for p in sys.argv[1:4])
+
+
+def runs_in(root: Path, metrics: tuple[str, ...]) -> list[str]:
+    names: set[str] = set()
+    for metric in metrics:
+        directory = root / metric
+        if directory.is_dir():
+            names.update(path.name for path in directory.iterdir() if path.is_dir())
+    return sorted(names, key=lambda name: (name != "base", name))
+
+
+def load(root: Path, metric: str, name: str):
+    path = root / metric / name / "summary.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def pct(payload, key, width):
+    if payload is None or payload.get(key) is None:
+        return "-".rjust(width)
+    return f"{payload[key] * 100:.1f}".rjust(width)
+
+
+def words_p50(root: Path, metric: str, name: str):
+    path = root / metric / name / "responses.jsonl"
+    if not path.is_file():
+        return None
+    counts = sorted(
+        len(str(json.loads(line).get("response", "")).split())
+        for line in path.open(encoding="utf-8")
+        if line.strip()
+    )
+    return counts[len(counts) // 2] if counts else None
+
+
+standard = runs_in(standard_root, ("gsm8k", "math500", "amc"))
+if standard:
+    print()
+    print("=" * 78)
+    print("标准 math（贪心 greedy@1）accuracy %")
+    print("=" * 78)
+    print(f"{'run':<40}{'GSM8K':>9}{'MATH500':>9}{'AMC':>9}")
+    for name in standard:
+        print(
+            f"{name:<40}"
+            + pct(load(standard_root, "gsm8k", name), "accuracy", 9)
+            + pct(load(standard_root, "math500", name), "accuracy", 9)
+            + pct(load(standard_root, "amc", name), "accuracy", 9)
+        )
+    print("AMC 这一列只有在 GREEDY_AMC=1 时才有值；它和下面那张表里的 AMC 不是一个口径。")
+
+hard = runs_in(hard_root, ("amc", "minervamath"))
+if hard:
+    print()
+    print("=" * 96)
+    print("难 math（采样 average@k）accuracy %，pass@k 是至少答对一次的题目占比")
+    print("=" * 96)
+    header = f"{'run':<40}{'AMC':>8}{'pass@k':>9}{'Minerva':>9}{'strict':>8}{'pass@k':>9}"
+    print(header)
+    for name in hard:
+        amc = load(hard_root, "amc", name)
+        minerva = load(hard_root, "minervamath", name)
+        print(
+            f"{name:<40}"
+            + pct(amc, "accuracy", 8)
+            + pct(amc, "pass_at_k", 9)
+            + pct(minerva, "accuracy", 9)
+            + pct(minerva, "accuracy_strict_string", 8)
+            + pct(minerva, "pass_at_k", 9)
+        )
+    for name in hard:
+        for metric in ("amc", "minervamath"):
+            payload = load(hard_root, metric, name)
+            if payload and payload.get("accuracy_per_sample"):
+                print(
+                    f"  {metric:<12}{name:<40} 四次各自: "
+                    f"{payload['accuracy_per_sample']}  (k={payload.get('num_samples')}, "
+                    f"T={payload.get('temperature')})"
+                )
+    print()
+    print("怎么读这张表:")
+    print("  * accuracy 就是 average@k（k 次解码的平均正确率），不是 pass@k。两列一起看：")
+    print("    accuracy 低而 pass@k 高 = 模型会做但不稳定，那是采样方差不是能力缺失。")
+    print("  * 「四次各自」散得很开（比如 8% / 20% / 12% / 19%）说明 k=4 还不够，")
+    print("    这时 base 与 trained 的差要比这个散布大才能当结论。")
+    print("  * Minerva 的 strict 列是严格字符串打分，accuracy 与它的差就是数值容差")
+    print("    （MINERVA_REL_TOL）带来的那部分。差得很大时先去 responses.jsonl 抽几条看。")
+    print("  * 这两列**不能**和上面标准侧的数字放进同一张表：cap、解码、统计量全不同。")
+
+cross = runs_in(cross_root, ("ifeval", "ifbench", "followbench"))
+if cross:
+    print()
+    print("=" * 104)
+    print("交叉 IF（Model-Math 的指令跟随）prompt-level strict %，words = 响应词数中位数")
+    print("=" * 104)
+    print(f"{'run':<40}{'IFEval':>9}{'words':>8}{'IFBench':>9}{'words':>8}{'FB HSR':>9}{'words':>8}")
+    for name in cross:
+        ifeval = load(cross_root, "ifeval", name)
+        ifbench = load(cross_root, "ifbench", name)
+        fb = load(cross_root, "followbench", name)
+        levels = [fb.get(f"rule_hsr_level_{level}") for level in range(1, 6)] if fb else []
+        levels = [value for value in levels if value is not None]
+        fb_mean = f"{sum(levels) / len(levels) * 100:.1f}".rjust(9) if levels else "-".rjust(9)
+        words_if = words_p50(cross_root, "ifeval", name)
+        words_ifb = words_p50(cross_root, "ifbench", name)
+        words_fb = words_p50(cross_root, "followbench", name)
+        print(
+            f"{name:<40}"
+            + pct(ifeval, "strict_prompt_accuracy", 9)
+            + ("-" if words_if is None else str(words_if)).rjust(8)
+            + pct(ifbench, "strict_prompt_accuracy", 9)
+            + ("-" if words_ifb is None else str(words_ifb)).rjust(8)
+            + fb_mean
+            + ("-" if words_fb is None else str(words_fb)).rjust(8)
+        )
+    print()
+    if not any(load(cross_root, "ifbench", name) for name in cross):
+        print("IFBench 两列空 = 依赖没就绪被跳过了，日志里搜「跳过 IFBench」拿补齐命令。")
+    print("这里**没有 base 那一行，也不该有**：base 的 IF 分在 94 号的 results_part1_*/")
+    print("ifeval|ifbench|followbench/base/ 下，两边的 system、max_new_tokens、")
+    print("stop_on_im_end 逐字相同（也是同一个 base 权重），所以直接并表。")
+    print("差值 = math 训练对 IF 的净影响。")
+    print("分数升降先看 words：Numina 的答案 P50=351 token，会把输出往长的方向推，而")
+    print("IFEval/FollowBench 里不少约束本质在量长度（results_log/2026-09-12 第 8c 节）。")
+PY
 fi
 
 echo "========================================================================"
 echo "产物:"
 echo "  Math 池      : ${MATH_DATASET}"
 echo "  checkpoint   : ${CKPT}"
-echo "  评测         : ${EVAL_OUT_DIR}/{gsm8k,math500,amc}/<run>/summary.json"
-echo "  汇总 csv     : ${EVAL_OUT_DIR}/{gsm8k,math500,amc}_summary.csv"
+echo "  标准 math    : ${EVAL_OUT_DIR}/{gsm8k,math500}/<run>/summary.json"
+echo "  难 math      : ${HARD_MATH_OUT_DIR}/{amc,minervamath}/<run>/summary.json"
+echo "  交叉 IF      : ${CROSS_IF_OUT_DIR}/{ifeval,ifbench,followbench}/${RUN}/summary.json"
+echo "  汇总 csv     : 各自目录下的 <metric>_summary.csv"
 echo "  Qwen3 旧结果 : ${REPO_ROOT}/results_part1_numina_math/  （另一个模型，未触碰）"
 echo ""
 echo "接 Part 3（99/100 号）时记得带："
 echo "  MATH_LINE_ROOT=${RESULTS_ROOT}"
 echo ""
-echo "怎么读结论: Model-Math 的 MATH-500/AMC/GSM8K 明显高于 base => NuminaMath 确实"
-echo "            教会了数学推理，这条线的 sanity check 通过。"
-echo "            MATH-500 是同分布上限（训练 prompt 与它一致），AMC 同口径但更难，"
+echo "怎么读结论: Model-Math 的 MATH-500/GSM8K/AMC/Minerva 明显高于 base => NuminaMath"
+echo "            确实教会了数学推理，这条线的 sanity check 通过。"
+echo "            MATH-500 是同分布上限（训练 prompt 与它一致），AMC / Minerva 同口径但"
+echo "            更难（Minerva 还换了题材：OCW 物理/天文的量纲计算），"
 echo "            GSM8K 是跨格式泛化（要求 '####'，训练时没见过），后者偏低是正常的。"
 echo "            外部参照是 DFT/ICLR2026 Table 1：Qwen2.5-Math-1.5B 的 MATH-500"
-echo "            31.66 -> w/SFT 43.76。**但那是 temperature 1.0 的 Average@16，"
-echo "            我们这里是 greedy@1，绝对值通常偏高，只能比方向和幅度。**"
-echo "            AMC 的文件是 AMC12 2022+2023 83 题，不是论文的 AMC23 40 题。"
+echo "            31.66 -> w/SFT 43.76。**那是 temperature 1.0 的 Average@16**，所以"
+echo "            MATH-500 这一列（greedy@1）只能比方向和幅度；AMC/Minerva 那一侧的"
+echo "            avg@4 口径更接近它，但 AMC 的文件是 AMC12 2022+2023 83 题，不是论文的"
+echo "            AMC23 40 题，绝对值仍不能直接对表。"
 echo "            先看作业末尾的 length diagnostic：hit-cap 还高就不是能力不行，是预算"
-echo "            仍不够。这批数字必须和 4096/8192 那两次分开读，不能混进同一张表。"
+echo "            仍不够。三侧的数字分三张表读，不能混进同一张。"
+echo ""
+echo "交叉评测（DO_CROSS_IF=1）回答的是另一个问题：math 训练顺带改变了多少 IF 能力。"
+echo "它的另一半在 94 号（DO_CROSS_MATH=1，量 IF 训练顺带改变了多少 math）。两个脚本"
+echo "各跑一条 trained 就凑齐 2x2 表，base 那两格分别在两个脚本已有的结果里。"
 echo "Job finished at: $(date)"

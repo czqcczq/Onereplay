@@ -146,9 +146,14 @@
 #    数学能力」。而本线的新任务恰好就是在把输出压短。评测末尾的 length diagnostic
 #    就是为这件事准备的。
 #
-# 3) **不评 IFBench**（与 96/100/102 号一致）：Part 1 第 8c 节结论是 IFBench 三个家族
-#    测长篇散文的涌现统计量、对输出长度极度敏感，而本线恰好是长度剧烈变化的一条线，
-#    那 161 条对遗忘研究是纯噪声源。
+# 3) **不评 IFBench**：Part 1 第 8c 节结论是 IFBench 三个家族测长篇散文的涌现统计量、
+#    对输出长度极度敏感，而本线恰好是长度剧烈变化的一条线，那 161 条对遗忘研究是纯
+#    噪声源。
+#    **注意本条已与 91/94/96/100 号不一致**：那四条线（math 与 IF 的 S1/S3）09-17 起
+#    把 IFBench 加进了 IF 的报告口径，为的是四张表能并排读同一套指标。cs 这两条线
+#    （本脚本和 102 号）当时被明确排在后面，所以维持原口径。要跟上就照 96 号那处
+#    OLD_METRICS_ALL 加 ifbench，另外还要搬 NLTK_DATA 的导出和 ifbench_ready 探测
+#    （依赖缺席时的失败发生在打分阶段，300 条已经解码完）。
 #
 # 4) **FollowBench 只有 rule 那一半**（350/820 行、70/164 组，style 类覆盖为 0）。
 #    不要写成「FollowBench = xx%」。judge 那 470 行落到 judge_inputs.jsonl，要在有网
@@ -426,7 +431,8 @@ case "${SOURCE}" in
       *) echo "未知 IF_SOURCE_TAG=${IF_SOURCE_TAG}，可选 flanv2/conifer/ifmix"; exit 2 ;;
     esac
     SRC_POOL_FILE="${SRC_POOL_FILE:-${SRC_LINE_ROOT}/datasets/${SRC_POOL_BASE}_replay.jsonl}"
-    # 旧能力：**不评 ifbench**，与 94/96 号一致，理由见文件头第 3 条纪律
+    # 旧能力：**不评 ifbench**，理由见文件头第 3 条纪律。注意 94/96 号已经改成评它了，
+    # 所以这条线的 IF 列和那两张表不是同一套口径，别混着读。
     OLD_METRICS_ALL="ifeval,followbench"
     OLD_LABEL="IF"
     ;;

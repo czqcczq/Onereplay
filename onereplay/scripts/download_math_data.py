@@ -8,7 +8,8 @@ file names / columns the slurm scripts expect, into --out_dir:
         self-distillation corpus for C_math. `targets` is a placeholder gold that
         generate_replay_targets.py overwrites with the base model's own answer.
   math500_test.jsonl : HuggingFaceH4/MATH-500 -> {problem, answer, solution}   (math500 metric)
-  amc_test.jsonl     : AI-MO/aimo-validation-amc -> {problem, answer}          (math500 metric)
+  amc_test.jsonl     : AI-MO/aimo-validation-amc -> {problem, answer}          (amc metric)
+  minervamath_test.jsonl : math-ai/minervamath -> {problem, answer}            (minervamath metric)
   aime_test.jsonl    : AIME 2024 + 2025 merged -> {problem, answer}            (aime metric)
   gsm8k_test.jsonl   : GSM8K test -> {question, answer}                        (gsm8k metric, optional)
 
@@ -49,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--math500_split", type=str, default="test")
     parser.add_argument("--amc_repo", type=str, default="AI-MO/aimo-validation-amc")
     parser.add_argument("--amc_split", type=str, default="train")
+    parser.add_argument("--minervamath_repo", type=str, default="math-ai/minervamath")
+    parser.add_argument("--minervamath_split", type=str, default="test")
     parser.add_argument(
         "--aime_repos",
         type=str,
@@ -62,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with_math_train", type=int, default=1)
     parser.add_argument("--with_math500", type=int, default=1)
     parser.add_argument("--with_amc", type=int, default=1)
+    parser.add_argument("--with_minervamath", type=int, default=1)
     parser.add_argument("--with_aime", type=int, default=1)
     parser.add_argument("--with_gsm8k", type=int, default=1)
     return parser.parse_args()
@@ -140,6 +144,24 @@ def build_amc(args, out_dir, cache_dir) -> None:
     write_jsonl(rows, out_dir / "amc_test.jsonl")
 
 
+def build_minervamath(args, out_dir, cache_dir) -> None:
+    """Minerva Math (OCW, 272 problems) -> {problem, answer}.
+
+    Columns are `question` / `answer`; the answers are measured quantities, not
+    closed-form LaTeX, which is why the metric compares them numerically.
+    """
+
+    print(f"[minervamath] {args.minervamath_repo}[{args.minervamath_split}]")
+    dataset = load_split(args.minervamath_repo, args.minervamath_split, None, cache_dir)
+    rows = []
+    for record in dataset:
+        problem = pick(record, PROBLEM_KEYS)
+        answer = pick(record, ANSWER_KEYS)
+        if problem and answer:
+            rows.append({"problem": problem, "answer": answer})
+    write_jsonl(rows, out_dir / "minervamath_test.jsonl")
+
+
 def build_aime(args, out_dir, cache_dir) -> None:
     """AIME (several repos) -> merged {problem, answer}."""
 
@@ -183,6 +205,7 @@ def main() -> None:
         ("math_train", args.with_math_train, build_math_train),
         ("math500", args.with_math500, build_math500),
         ("amc", args.with_amc, build_amc),
+        ("minervamath", args.with_minervamath, build_minervamath),
         ("aime", args.with_aime, build_aime),
         ("gsm8k", args.with_gsm8k, build_gsm8k),
     ]

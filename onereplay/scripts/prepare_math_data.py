@@ -8,6 +8,7 @@ directory, or a comma-separated list, in parquet / jsonl / json:
   --math_train  MATH-lighteval train split   -> math_train_inputs_targets.jsonl
   --math500     HuggingFaceH4/MATH-500        -> math500_test.jsonl
   --amc         AI-MO/aimo-validation-amc     -> amc_test.jsonl
+  --minervamath math-ai/minervamath test      -> minervamath_test.jsonl
   --aime        AIME 2024 (+2025, comma-sep)  -> aime_test.jsonl  (merged)
   --gsm8k       GSM8K test                    -> gsm8k_test.jsonl
 
@@ -15,10 +16,11 @@ Outputs (in --out_dir):
   math_train_inputs_targets.jsonl : {inputs=problem, targets=solution}
       `targets` is only a placeholder gold; generate_replay_targets.py overwrites
       it with the base model's own answer during self-distillation.
-  math500_test.jsonl : {problem, answer, solution}  (math500 metric)
-  amc_test.jsonl     : {problem, answer}            (math500 metric)
-  aime_test.jsonl    : {problem, answer}            (aime metric, integer answers)
-  gsm8k_test.jsonl   : {question, answer}           (gsm8k metric)
+  math500_test.jsonl     : {problem, answer, solution}  (math500 metric)
+  amc_test.jsonl         : {problem, answer}            (amc metric)
+  minervamath_test.jsonl : {problem, answer}            (minervamath metric)
+  aime_test.jsonl        : {problem, answer}            (aime metric, integers)
+  gsm8k_test.jsonl       : {question, answer}           (gsm8k metric)
 
 Field names are auto-detected across common casings, so mirror datasets with
 slightly different columns still work.
@@ -49,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--math_train", type=str, default="")
     parser.add_argument("--math500", type=str, default="")
     parser.add_argument("--amc", type=str, default="")
+    parser.add_argument("--minervamath", type=str, default="")
     parser.add_argument("--aime", type=str, default="")
     parser.add_argument("--gsm8k", type=str, default="")
     return parser.parse_args()
@@ -163,6 +166,24 @@ def build_amc(spec: str, out_dir: Path) -> None:
     write_jsonl(rows, out_dir / "amc_test.jsonl")
 
 
+def build_minervamath(spec: str, out_dir: Path) -> None:
+    """Minerva Math (OCW) -> {problem, answer}.
+
+    The source columns are `question` and `answer`, and the answers are measured
+    quantities ("4.5e33", "0.006") rather than closed-form LaTeX, so nothing is
+    extracted from a solution field here -- there is none. The metric's numeric
+    comparison is what makes these golds scorable; see metrics/math500.py.
+    """
+
+    rows = []
+    for record in read_records(spec):
+        problem = pick(record, PROBLEM_KEYS)
+        answer = pick(record, ANSWER_KEYS)
+        if problem and answer:
+            rows.append({"problem": problem, "answer": answer})
+    write_jsonl(rows, out_dir / "minervamath_test.jsonl")
+
+
 def build_aime(spec: str, out_dir: Path) -> None:
     """AIME (possibly several files) -> merged {problem, answer}."""
 
@@ -198,6 +219,7 @@ def main() -> None:
         (args.math_train, build_math_train),
         (args.math500, build_math500),
         (args.amc, build_amc),
+        (args.minervamath, build_minervamath),
         (args.aime, build_aime),
         (args.gsm8k, build_gsm8k),
     ]
@@ -207,7 +229,10 @@ def main() -> None:
             builder(spec, out_dir)
             ran = True
     if not ran:
-        raise SystemExit("nothing to do: pass at least one of --math_train/--math500/--amc/--aime/--gsm8k")
+        raise SystemExit(
+            "nothing to do: pass at least one of "
+            "--math_train/--math500/--amc/--minervamath/--aime/--gsm8k"
+        )
     print("done.")
 
 
