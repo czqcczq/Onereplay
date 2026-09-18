@@ -106,6 +106,11 @@
 #   qsub -v DOMAIN=math,MODE=eval              ...   # 训练早跑完了，补评/续评
 #   qsub -v DOMAIN=math,MODE=eval,FORCE=1      ...   # 改了 metric，推翻重算
 #
+# 评测太慢想砍掉某一组用 SKIP_GROUPS（比 EVAL_DOMAINS 细一档，按解码组而不是按域）：
+#   qsub -v DOMAIN=code,MODE=train,SKIP_GROUPS=math_hard ...
+# math_hard（minervamath）是最值得砍的一组：4096 上限配 avg@4，而**不会做的模型
+# 反而最慢**——答不出来就不收尾，四遍都顶到上限。见 SKIP_GROUPS 那里的完整说明。
+#
 # 5. benchmark 放在哪，为什么两套命名
 # -----------------------------------
 # math 三件沿用这条线一直用的 datasets/math/<name>_test.jsonl：gsm8k 和 math500
@@ -195,9 +200,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MEDQA_DATA PUBMEDQA_DATA MEDXPERTQA_DATA
     FINQA_DATA CONVFINQA_DATA TATQA_DATA
     MATH_BATCH MEDICAL_BATCH FINANCE_BATCH CODE_BATCH CODE_TIMEOUT
-    CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS
+    CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS SKIP_GROUPS
     HUMANEVALPLUS_DATA MBPPPLUS_DATA
-    NUMINA_PATH MEDQA_PATH FIN_JSON MAGICODER_PATH PYTHON_RULE
+    NUMINA_PATH MEDQA_PATH FIN_JSON MAGICODER_PATH LANG_FILTER
+    DECONTAM_NGRAM DECONTAM_MIN_HITS
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY SMOKE_STEPS
@@ -317,10 +323,22 @@ MAX_SOURCE_RATIO="${MAX_SOURCE_RATIO:-0.15}"  # finance：单一 source 上限
 FIN_LANGUAGE="${FIN_LANGUAGE:-en}"
 EVAL_SOURCE_PATTERNS="${EVAL_SOURCE_PATTERNS:-finqa tat-qa tatqa tat_qa convfinqa}"
 TARGET_ROWS="${TARGET_ROWS:-0}"               # finance/code：0 = 过滤后剩多少用多少
-# code：认定 Python 的口径。both = lang 列和 ```python 都要。lang 记的是**种子
-# 片段**的语言，而 OSS-Instruct 可以生成与种子不同的语言，所以单看 lang 会放进
-# 正文是 Go/JS 的行。探针（test_code/probe_code_arm.py）会打出三种口径各剩多少。
-PYTHON_RULE="${PYTHON_RULE:-both}"
+# code：要哪些语言。默认 all —— benchmark 全是 Python，但 OSS-Instruct 论文的
+# 消融（Table 5，CodeLlama-Python-7B）说只留 Python 反而更差：
+#
+#   不微调 34.1 / 只用 Python(43K) 47.6 / 只用非 Python(32K) 44.5 / 全量(75K) 55.5
+#           ——都是 HumanEval+ pass@1
+#
+# 非 Python 那一半不是稀释，是净贡献：光用它训练就能把 Python 从 34.1 提到 44.5。
+# 顺带池子翻倍，token 量和另外两臂的差距也小一截。
+# python / python_strict 可以退回只要 Python；注意论文是按 ```python 分类的，
+# **不**按 lang 列，因为 OSS-Instruct 可以生成与种子不同的语言。
+LANG_FILTER="${LANG_FILTER:-all}"
+# code 去污染：13 词窗口、至少撞 2 个窗口才算抄。用 8 词/撞 1 个的老口径会刷掉
+# 8% 的语料，其中 86% 栽在两句 GPT 写编程题的口头禅上（"your task is to
+# implement a function that" 之类，取自 HumanEval 的 docstring）。
+DECONTAM_NGRAM="${DECONTAM_NGRAM:-13}"
+DECONTAM_MIN_HITS="${DECONTAM_MIN_HITS:-2}"
 
 # =============================================================================
 # 评测配置
@@ -386,6 +404,22 @@ esac
 # （"金融"标签下混着编程题、语法题、医疗记录抽取）被换成了 code，但它的 metric
 # 和 prepare 都留着：传 EVAL_DOMAINS="math medical finance" 就能回到旧配置。
 EVAL_DOMAINS="${EVAL_DOMAINS:-math medical code}"
+
+# 按**解码组**关掉评测，比 EVAL_DOMAINS 细一档：math 一个域下有 math_std
+# （gsm8k+math500，贪心 2048）和 math_hard（minervamath，4096 配 avg@4）两组，
+# 想只去掉后者就得在这一层。可用组名：math_std math_hard medical code finance。
+#
+# math_hard 是明显的候选。它的成本不是难度带来的而是**不会做**带来的：模型答不出
+# 来就不收尾，一路顶到 4096 上限，再乘 4 个采样，跨域评一次能吃掉几个小时，而
+# 非数学模型在上面基本贴着 0。
+#
+#   qsub -v DOMAIN=code,MODE=train,SKIP_GROUPS=math_hard ...
+#
+# 代价要说清楚：math_hard 一关，M_code / M_medical 在 MinervaMath 上就没有数字，
+# 而 M_math 有，"忘了多少"这一栏在这个 benchmark 上就空着。gsm8k 和 math500 仍然
+# 覆盖着同一个问题，所以主线结论不受影响；真要补，事后 MODE=eval 不带这个开关
+# 单独补跑即可，已有的组会自动跳过。
+SKIP_GROUPS="${SKIP_GROUPS:-}"
 case "${MODE}" in
   data|smoke|train|eval) ;;
   *) echo "MODE 只能是 data / smoke / train / eval，得到 '${MODE}'" >&2; exit 2 ;;
@@ -480,7 +514,9 @@ if [[ "${MODE}" == "data" ]]; then
         --humaneval_data_file "${HUMANEVAL_DATA}" \
         --mbpp_dataset_path "${MBPP_DATA}" \
         --mbpp_split "${MBPP_SPLIT}" \
-        --python_rule "${PYTHON_RULE}" \
+        --lang_filter "${LANG_FILTER}" \
+        --decontam_ngram "${DECONTAM_NGRAM}" \
+        --decontam_min_hits "${DECONTAM_MIN_HITS}" \
         --target_rows "${TARGET_ROWS}" \
         "${COMMON_ARGS[@]}"
       ;;
@@ -579,6 +615,13 @@ fi
 GROUPS_RAN=0
 GROUPS_DONE=0
 GROUPS_NODATA=0
+GROUPS_SKIPPED=0
+
+# 该组是否被 SKIP_GROUPS 关掉了。组名见下面 eval_* 的第一个参数：
+# math_std / math_hard / medical / code / finance。
+group_skipped () {
+  [[ " ${SKIP_GROUPS} " == *" $1 "* ]]
+}
 
 # 缺哪个 benchmark 就报哪个，不要等跑到一半才炸。
 require_data () {
@@ -610,6 +653,13 @@ group_done () {
 run_group () {
   local group="$1" run_name="$2" adapter="$3" metrics="$4"; shift 4
   local metric_list=(${metrics//,/ })
+
+  # 在 group_done 之前判：被关掉的组连"已有结果"都不必查，日志里也就只出现一行。
+  if group_skipped "${group}"; then
+    echo "==== skip ${run_name} / ${group}：在 SKIP_GROUPS 里 ===="
+    GROUPS_SKIPPED=$((GROUPS_SKIPPED + 1))
+    return 0
+  fi
 
   if [[ "${FORCE}" != "1" ]] && group_done "${run_name}" "${metric_list[@]}"; then
     echo "==== skip ${run_name} / ${group}：${EVAL_ROOT} 下已有全部 summary.json ===="
@@ -724,7 +774,10 @@ eval_domain () {
 # 两处对不上就会出现"预检说齐了、真跑时跳过"。
 bench_paths_for () {
   case "$1" in
-    math)    printf '%s\n' "${GSM8K_DATA}" "${MATH500_DATA}" "${MINERVA_DATA}" ;;
+    # 只要求真的会跑的那几份：关掉了某组还报它的数据缺失就是假警报。
+    math)    group_skipped math_std  || printf '%s\n' "${GSM8K_DATA}" "${MATH500_DATA}"
+             group_skipped math_hard || printf '%s\n' "${MINERVA_DATA}"
+             ;;
     medical) printf '%s\n' "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" ;;
     code)    printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
                            "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" ;;
@@ -795,7 +848,8 @@ run_cross_eval () {
 
   echo
   echo "==== 交叉评测结束: DOMAIN=${DOMAIN} WHICH=${WHICH} ===="
-  echo "  本次执行 ${GROUPS_RAN} 组，已有结果跳过 ${GROUPS_DONE} 组，缺数据跳过 ${GROUPS_NODATA} 组。"
+  echo "  本次执行 ${GROUPS_RAN} 组，已有结果跳过 ${GROUPS_DONE} 组，缺数据跳过 ${GROUPS_NODATA} 组，SKIP_GROUPS 关掉 ${GROUPS_SKIPPED} 组。"
+  [[ -n "${SKIP_GROUPS}" ]] && echo "  SKIP_GROUPS='${SKIP_GROUPS}' —— 这几组没有数字，不是跑出来是 0。"
   echo "  汇总 csv: ${EVAL_ROOT}/<metric>_summary.csv"
   echo "  三个 DOMAIN 都跑完后，每个 csv 里会有 base 和三个 m_* 的行。"
 

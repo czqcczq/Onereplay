@@ -50,6 +50,15 @@ class HumanEvalMetric:
     data_key = "humaneval_data_file"
     default_timeout = 5.0
 
+    def select_test(self, example: dict[str, Any]) -> str:
+        """The test source to execute for one task.
+
+        A hook rather than a direct field read because HumanEval+ has to repair
+        one row before running it; see metrics/evalplus.py.
+        """
+
+        return str(example["test"])
+
     def run(self, model, tokenizer, device, cfg: dict[str, Any]) -> dict[str, Any]:
         output_dir = Path(cfg["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -82,7 +91,7 @@ class HumanEvalMetric:
                 completion = cleanup_body_completion(raw)
                 program = assemble_entry_point_program(example["prompt"], completion)
                 ok, error = evaluate_entry_point_program(
-                    program, example["entry_point"], example["test"], timeout
+                    program, example["entry_point"], self.select_test(example), timeout
                 )
                 passed += int(ok)
                 file.write(

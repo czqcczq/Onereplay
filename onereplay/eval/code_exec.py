@@ -21,24 +21,16 @@ import re
 import textwrap
 from typing import Any
 
-# Execution already happens in a subprocess with a timeout, so this list only
-# needs to cover reaching outside that subprocess: the filesystem, other
-# processes, and the network. `sys`, `pathlib` and `pickle` used to be here too
-# and rejected ordinary solutions that merely imported them.
-DANGEROUS_PATTERNS = (
-    "import os",
-    "from os",
-    "import subprocess",
-    "from subprocess",
-    "open(",
-    "exec(",
-    "eval(",
-    "__import__",
-    "socket",
-    "requests",
-    "urllib",
-    "shutil",
+# Execution already happens in a subprocess with a timeout, so these only need
+# to cover reaching outside that subprocess: the filesystem, other processes,
+# and the network. `sys`, `pathlib` and `pickle` used to be here too and
+# rejected ordinary solutions that merely imported them.
+BLOCKED_MODULES = frozenset(
+    {"os", "subprocess", "socket", "shutil", "requests", "urllib"}
 )
+# Bare calls only. A method call like `archive.open(...)` is an attribute, not
+# a name, and is left alone.
+BLOCKED_CALLS = frozenset({"open", "__import__"})
 
 _FENCE = "```"
 _INDENT = "    "
@@ -60,10 +52,49 @@ _PROGRAM_KEEP = (
 
 
 def has_dangerous_code(code: str) -> bool:
-    """Reject completions that try to access files, processes, or network."""
+    """Reject programs that try to reach files, processes, or the network.
 
-    lowered = code.lower()
-    return any(pattern in lowered for pattern in DANGEROUS_PATTERNS)
+    Matched on the AST, and `eval`/`exec` are deliberately absent. Both of those
+    come from the same finding: the previous substring version scored
+    HumanEval/160's *own reference solution* as a security violation. That task
+    asks for an arithmetic expression to be assembled and evaluated, and
+    ``return eval(exp)`` is the intended answer -- so every model that solved it
+    correctly was handed a zero, silently, on every run.
+
+    `eval` and `exec` do not belong on this list by its own stated standard
+    anyway: they are not exits, they run whatever they are given, and a literal
+    ``__import__('os')`` inside an eval'd string is still caught by the rules
+    below. What actually contains a runaway program is the subprocess and the
+    timeout; this check is a guard against a model wandering into `os.system`,
+    not a sandbox against an adversary who is trying to hide.
+
+    Using the AST also stops the scan from reading comments, docstrings and
+    string literals -- which mattered more than it sounds, because the program
+    being scanned is the HumanEval prompt plus the completion, so any task whose
+    docstring merely mentioned one of these names was unanswerable.
+
+    Code that does not parse is allowed through: it cannot run, and the executor
+    reporting the real SyntaxError is more useful than a spurious "blocked".
+    """
+
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in BLOCKED_MODULES for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            # `from os.path import join` -> root is still os. A relative import
+            # has module None and no root to check.
+            if (node.module or "").split(".")[0] in BLOCKED_MODULES:
+                return True
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_CALLS:
+                return True
+    return False
 
 
 def _compiles(source: str) -> bool:
