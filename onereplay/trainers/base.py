@@ -215,6 +215,41 @@ class BaseTrainer:
         self._append_jsonl(record)
         return probe_sec
 
+    def evaluate_before_train(
+        self, val_loader, extra_record: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Score the validation split before the first optimizer step.
+
+        The epoch records carry val_loss but nothing to compare it against, so
+        a finished run cannot say how far it moved -- only where it ended up.
+        This is the same loader, the same batch mean and the same no-penalty
+        path evaluate_loss uses at the end of every epoch, so the two subtract.
+
+        record_type is "baseline" rather than an epoch 0 row because every
+        reader downstream filters on record_type == "epoch" to build loss
+        curves; a row with no train_task_loss would land in the middle of them.
+        """
+
+        start = time.time()
+        val_loss = self.evaluate_loss(val_loader)
+        eval_sec = time.time() - start
+        record = {
+            "record_type": "baseline",
+            "epoch": 0,
+            "global_step": 0,
+            "val_loss": val_loss,
+            "eval_sec": eval_sec,
+        }
+        if extra_record:
+            record.update(extra_record)
+        print(
+            f"baseline val_loss={val_loss:.6f} (untrained starting model, {eval_sec:.1f}s) "
+            "-- every epoch's val_loss is relative to this",
+            flush=True,
+        )
+        self._append_jsonl(record)
+        return record
+
     def train_one_epoch(self, train_loader, epoch: int = 0) -> tuple[float, float]:
         """Train one epoch; return mean task_loss and mean replay_reg."""
 
@@ -364,6 +399,7 @@ class BaseTrainer:
         extra_record: dict[str, Any] | None = None,
         save_path: str = "",
         tokenizer=None,
+        eval_before_train: int = 0,
     ) -> list[dict[str, Any]]:
         """Run epochs, optionally evaluate and save the final adapter."""
 
@@ -373,6 +409,8 @@ class BaseTrainer:
         # answers, so it is near zero and every later value reads directly as
         # "how far the model has drifted from W0".
         self.run_probes(epoch=0)
+        if eval_before_train and val_loader is not None:
+            records.append(self.evaluate_before_train(val_loader, extra_record))
         for epoch in range(epochs):
             start_time = time.time()
             train_loss, replay_reg = self.train_one_epoch(train_loader, epoch=epoch + 1)

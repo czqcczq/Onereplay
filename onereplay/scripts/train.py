@@ -131,6 +131,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_every", type=int, default=500)
     parser.add_argument("--max_steps", type=int, default=0)
     parser.add_argument(
+        "--eval_before_train",
+        type=int,
+        default=0,
+        help=(
+            "1 scores the validation split once on the untouched starting model "
+            "and logs it as record_type=baseline, epoch 0. It is the only "
+            "reference that makes the epoch-1 val_loss readable: without it a "
+            "number like 0.62 says nothing about whether the run learned "
+            "anything. Same loader, same batch size, no regularizer, so the two "
+            "are directly subtractable. Costs one pass over --max_val_samples "
+            "rows. Default 0 keeps every metrics file written before this flag "
+            "existed byte-identical."
+        ),
+    )
+    parser.add_argument(
         "--profile",
         type=int,
         default=0,
@@ -789,6 +804,7 @@ def main() -> None:
         train_loader,
         epochs=args.epochs,
         val_loader=valid_loader,
+        eval_before_train=args.eval_before_train,
         extra_record={
             "paradigm": args.paradigm,
             "seed": args.seed,
@@ -848,6 +864,7 @@ def main() -> None:
             "probe_every_updates": args.probe_every_updates,
             "max_train_samples": args.max_train_samples,
             "max_val_samples": args.max_val_samples,
+            "eval_before_train": args.eval_before_train,
             # A loss curve only means something next to the schedule that
             # produced it, and "lr: 5e-5" alone no longer identifies a run now
             # that the same peak can be constant or cosine-decayed.

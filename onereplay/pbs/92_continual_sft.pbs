@@ -192,6 +192,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT REPLAY_SYSTEM MAX_TRAIN_SAMPLES LOG_EVERY
+    EVAL_BEFORE_TRAIN
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -285,6 +286,17 @@ LOG_EVERY="${LOG_EVERY:-500}"
 DRY_RUN="${DRY_RUN:-0}"
 DO_EVAL="${DO_EVAL:-1}"
 
+# 训练前先在新域 val 上评一次起点模型。注意这里的"起点"是 M_${SRC_DOMAIN}，不是
+# Qwen3-4B-Base —— 也正因为如此它比 90 号那个更有用：它就是 M_src 在**没学过的**
+# 新域上的 loss，epoch 记录里的 val_loss 减掉它就是这一轮 continual 真正学到的量。
+#
+# 四条臂共享同一个 W_ref、同一份新域数据、同一个 eval_batch_size，所以四条臂的
+# baseline 应当**逐字相同**（同 seed 下 val 切分也一样）。对不上就说明有东西漂了，
+# 这比事后从分数里猜要早得多。val 一直是纯新任务的，replay 臂也不例外。
+#
+# record_type=baseline / epoch=0，下游按 record_type=="epoch" 过滤，不会混进曲线。
+EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-1}"
+
 # ---- 正则项的口径，和 70/72 号一致 ----
 NORM_BY_LAYERS="${NORM_BY_LAYERS:-1}"
 REG_ONCE="${REG_ONCE:-1}"
@@ -364,7 +376,24 @@ EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_specialist_eval}"
 FORCE="${FORCE:-0}"
 LIMIT="${LIMIT:-0}"
 EVAL_DOMAINS="${EVAL_DOMAINS:-math medical code}"
+# 和 90 号同一个开关、同一套组名：math_std math_hard medical code finance，
+# 外加别名 math（= math_std + math_hard）。分隔符空格或冒号 —— 冒号是给 qsub -v
+# 准备的，空格在那里要整体加引号才活得下来，而忘了引号是静默失败。
 SKIP_GROUPS="${SKIP_GROUPS:-}"
+_skip_normalized=""
+for _group in ${SKIP_GROUPS//:/ }; do
+  case "${_group}" in
+    math)                                  _skip_normalized+=" math_std math_hard" ;;
+    math_std|math_hard|medical|code|finance) _skip_normalized+=" ${_group}" ;;
+    *)
+      echo "SKIP_GROUPS 里有不认识的组名 '${_group}'。" >&2
+      echo "  可用：math_std math_hard medical code finance，以及别名 math（= math_std + math_hard）。" >&2
+      echo "  拼错的话什么都不会匹配，那一组会照常评几个小时而日志里毫无提示，所以这里直接拒绝。" >&2
+      exit 2
+      ;;
+  esac
+done
+SKIP_GROUPS="${_skip_normalized# }"
 
 MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
 BENCH_ROOT="${BENCH_ROOT:-${REPO_ROOT}/datasets/bench}"
@@ -547,6 +576,7 @@ else
 echo "               每次更新 ${NEW_PER_UPDATE} 行新任务（基准 ${ACCUM}）"
 fi
 echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
+echo " 起点 val    : EVAL_BEFORE_TRAIN=${EVAL_BEFORE_TRAIN}（1 = 训练前先测 M_${SRC_DOMAIN} 在 ${NEW_DOMAIN} val 上的 loss，${MAXVAL} 行）"
 echo " system      : ${SYSTEM_PROMPT}"
 [[ "${ARM}" == "replay" ]] && echo " replay sys  : ${REPLAY_SYSTEM}"
 echo " 结果        : ${RESULTS_ROOT}"
@@ -793,6 +823,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "    --model_dir ${SRC_CKPT_DIR} --model_name ${SRC_CKPT_NAME}"
     echo "    --dataset_path ${DATASET_DIR}"
     echo "    --batch_size ${BATCH} --accumulation_size ${ARM_ACCUM}"
+    echo "    --eval_before_train ${EVAL_BEFORE_TRAIN}"
     # arm_train_args 一行一个 token，成对打印才读得出 flag 和值的对应关系。
     _pair=()
     while IFS= read -r _item; do
@@ -832,6 +863,7 @@ train_one () {
     --max_len "${MAXLEN}" \
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
     --eval_batch_size "${BATCH}" \
+    --eval_before_train "${EVAL_BEFORE_TRAIN}" \
     --max_train_samples "${MAX_TRAIN_SAMPLES}" \
     --target_modules "${TARGET_MODULES}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
@@ -847,6 +879,9 @@ train_one () {
 # ===========================================================================
 require_data () {
   local group="$1"; shift
+  # 关掉的组不需要它的数据；不加这句的话"跳过 math + 没同步 math 数据"会被记成
+  # NODATA 而让作业以 rc=6 收场。bench_paths_for 已经是这个口径，两处必须一致。
+  group_skipped "${group}" && return 0
   local missing=0
   for path in "$@"; do
     if [[ ! -e "${path}" ]]; then

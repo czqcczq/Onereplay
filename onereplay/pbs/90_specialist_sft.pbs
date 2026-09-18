@@ -209,6 +209,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY SMOKE_STEPS
+    EVAL_BEFORE_TRAIN
     SAMPLE_ROWS MAX_TRACES MEDICAL_MAX_TOKENS NEAR_DUP_THRESHOLD MAX_SOURCE_RATIO FIN_LANGUAGE
     EVAL_SOURCE_PATTERNS TARGET_ROWS
   )
@@ -290,6 +291,17 @@ SMOKE_STEPS="${SMOKE_STEPS:-70}"
 DRY_RUN="${DRY_RUN:-0}"
 # MODE=train 跑完直接接交叉评测。DO_EVAL=0 只训不评（之后用 MODE=eval 补）。
 DO_EVAL="${DO_EVAL:-1}"
+
+# 训练前先在 val 上评一次 base（Qwen3-4B-Base，一步都还没走）。epoch 记录里的
+# val_loss 单看是读不出来的：0.62 到底是学会了还是本来就这么低，只有和起点比才
+# 知道。同一个 loader、同一个 eval_batch_size、同样不带罚项，所以两个数直接相减
+# 就是这一轮 SFT 在自己的 held-out 上降了多少。
+#
+# 它落在 metrics jsonl 里，record_type=baseline / epoch=0，而下游读曲线的脚本
+# 一律按 record_type=="epoch" 过滤，所以不会混进任何已有的汇总。
+#
+# 代价是 MAXVAL（默认 200）行的一次前向，几十秒的量级。EVAL_BEFORE_TRAIN=0 关掉。
+EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-1}"
 
 # 见文件头第 3 条：这一条和 prepare_* 的 --system_prompt 必须逐字相同。
 # 文本里有逗号，qsub -v 用逗号分隔变量，所以要覆盖它得改这里而不是 -v。
@@ -423,11 +435,41 @@ EVAL_DOMAINS="${EVAL_DOMAINS:-math medical code}"
 #
 #   qsub -v DOMAIN=code,MODE=train,SKIP_GROUPS=math_hard ...
 #
+# 整个 math 域都不想评就传 SKIP_GROUPS=math，它是 math_std + math_hard 的别名。
+# 之所以要这个别名：写全的话是 "math_std math_hard"，中间那个空格在 qsub -v 里
+# 得靠整体加引号才活得下来，而忘了引号的后果是**静默的**——PBS 只认到 math_std，
+# math_hard 照跑几个小时。冒号也当分隔符用，同样是为了绕开 -v：
+#
+#   qsub -v DOMAIN=code,MODE=train,SKIP_GROUPS=math ...
+#   qsub -v DOMAIN=code,MODE=train,SKIP_GROUPS=math_hard:medical ...
+#
+# 这和 EVAL_DOMAINS 的区别值得记一下：EVAL_DOMAINS 只管 trained 那半，base 永远
+# 评 DOMAIN 那一边；SKIP_GROUPS 在解码组这一层，两半都管。所以"这次一个 math
+# 数字都不要"只有 SKIP_GROUPS 能保证。
+#
 # 代价要说清楚：math_hard 一关，M_code / M_medical 在 MinervaMath 上就没有数字，
 # 而 M_math 有，"忘了多少"这一栏在这个 benchmark 上就空着。gsm8k 和 math500 仍然
 # 覆盖着同一个问题，所以主线结论不受影响；真要补，事后 MODE=eval 不带这个开关
 # 单独补跑即可，已有的组会自动跳过。
 SKIP_GROUPS="${SKIP_GROUPS:-}"
+
+# 归一化 + 校验。拼错的组名（maths / math_easy / Code）原样留着的话什么也不会
+# 匹配，于是那一组照常评几个小时，而日志里没有任何一行提到它被忽略了 —— 这种
+# 失败只有在账单上才看得见，所以这里直接拒绝开跑。
+_skip_normalized=""
+for _group in ${SKIP_GROUPS//:/ }; do
+  case "${_group}" in
+    math)                                  _skip_normalized+=" math_std math_hard" ;;
+    math_std|math_hard|medical|code|finance) _skip_normalized+=" ${_group}" ;;
+    *)
+      echo "SKIP_GROUPS 里有不认识的组名 '${_group}'。" >&2
+      echo "  可用：math_std math_hard medical code finance，以及别名 math（= math_std + math_hard）。" >&2
+      echo "  分隔符用空格或冒号。注意组名不是域名：math 是别名，medical/code 两层同名。" >&2
+      exit 2
+      ;;
+  esac
+done
+SKIP_GROUPS="${_skip_normalized# }"
 case "${MODE}" in
   data|smoke|train|eval) ;;
   *) echo "MODE 只能是 data / smoke / train / eval，得到 '${MODE}'" >&2; exit 2 ;;
@@ -459,6 +501,7 @@ if [[ "${DOMAIN}" == "medical" ]]; then
 echo " medical data: max_tokens=${MEDICAL_MAX_TOKENS}  max_traces=${MAX_TRACES}"
 fi
 echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
+echo " base val    : EVAL_BEFORE_TRAIN=${EVAL_BEFORE_TRAIN}（1 = 训练前先在 ${MAXVAL} 行 val 上测一次 base）"
 echo " system      : ${SYSTEM_PROMPT}"
 if [[ "${MODE}" == "train" || "${MODE}" == "eval" ]]; then
 echo " eval        : WHICH=${WHICH} DO_EVAL=${DO_EVAL} FORCE=${FORCE} LIMIT=${LIMIT}"
@@ -575,6 +618,7 @@ train_one () {
     --max_len "${MAXLEN}" \
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
     --eval_batch_size "${BATCH}" \
+    --eval_before_train "${EVAL_BEFORE_TRAIN}" \
     --max_train_samples "${MAX_TRAIN_SAMPLES}" \
     --target_modules "${TARGET_MODULES}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
@@ -639,6 +683,10 @@ group_skipped () {
 # 缺哪个 benchmark 就报哪个，不要等跑到一半才炸。
 require_data () {
   local group="$1"; shift
+  # 关掉的组不需要它的数据。这一句不加的话，"跳过 math + 没同步 math 数据"会被
+  # 记成 NODATA，作业最后以 rc=6 收场 —— 明明是按要求跳过的，看上去却像评测残缺。
+  # preflight_bench 那边（bench_paths_for）已经是这个口径，两处必须一致。
+  group_skipped "${group}" && return 0
   local missing=0
   for path in "$@"; do
     if [[ ! -e "${path}" ]]; then

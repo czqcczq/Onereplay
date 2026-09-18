@@ -568,6 +568,8 @@ ACCUM_STEPS=$(( ACCUM / BATCH ))
 NEW_PER_UPDATE=$(( ACCUM_STEPS * NEW_PER_BATCH ))
 
 # ---- run 名：域与混合比都编进去 ----
+# 71/81/82 号都是这个默认值，三个脚本的 run 名要能并排比较，这里不能不一样。
+RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
 # DOMAIN_TAG 单域时逐字等于旧值（ifgold / mathgold / codegold），否则 74 号以来
 # 所有已有结果的目录名都会对不上。mix 把参与的域和行份额都编进去，所以
 # 0.5/0.5 与 0.25/0.75 是两个独立的实验，不会互相覆盖。
