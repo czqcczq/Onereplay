@@ -236,7 +236,12 @@ esac
 # ---- 模型 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/specialist}"
+# 必须和 90 号那一行**逐字相同**，否则 SRC=specialist 找不到 checkpoint。曾经
+# 这里写的是 ${REPO_ROOT}/results/specialist，而 90 号按领域和模型名分目录，于是
+# 90 号存到 results_specialist_medical_Qwen3-4B-Base/checkpoints/，91 号去
+# results/specialist/checkpoints/ 找，报"找不到采集对象"。
+# 改这一行就要同时改 90 号，test_code/check_cf_pbs_flags.py 会比对两边。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_specialist_${DOMAIN}_${MODEL_NAME}}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
 # ---- 训练侧口径：必须和 90 号逐字相同，见文件头 ----
