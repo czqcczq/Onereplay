@@ -364,6 +364,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--replay_system_prompt",
+        type=str,
+        default="",
+        help=(
+            "System turn for replay rows only; empty inherits --system_prompt. "
+            "Continual training needs it: the new task and the replay corpus "
+            "were serialized under different system turns during their own SFT "
+            "stages (code asks for a Python code block, math and medical ask "
+            "for \\boxed{}), and chat_policy holds one turn per process. "
+            "Without this the replay rows arrive under the new task's turn and "
+            "stop being byte-identical to the rows the model actually learned, "
+            "which costs this arm the one property that makes it a rehearsal. "
+            "It also shifts every replay row's length, so set --replay_max_len "
+            "from the same measurement."
+        ),
+    )
+    parser.add_argument(
         "--replay_mix_files",
         type=str,
         default="",
@@ -817,6 +834,12 @@ def main() -> None:
             # task, so the effective one has to be recorded rather than inferred
             # from max_len.
             "replay_max_len": replay_max_len(args) if args.replay_per_batch > 0 else 0,
+            # Whether the rehearsal rows arrived in the form the model was
+            # taught them in. Empty means they inherited the new task's turn,
+            # which is right for a single-corpus run and wrong for a continual
+            # one -- and the two are indistinguishable after the fact without
+            # this field.
+            "replay_system_prompt": args.replay_system_prompt,
             "replay_mix_files": args.replay_mix_files,
             "replay_mix_weights": (
                 ",".join(f"{weight:.4f}" for _, _, weight in replay_mix) if replay_mix else ""

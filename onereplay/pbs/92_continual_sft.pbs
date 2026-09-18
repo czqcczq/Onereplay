@@ -1,0 +1,1055 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N cont_sft
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# 第三阶段：持续后训练。M_<SRC_DOMAIN> 学 <NEW_DOMAIN>，四条臂。
+#
+#   qsub -v ARM=vanilla   onereplay/pbs/92_continual_sft.pbs
+#   qsub -v ARM=replay    onereplay/pbs/92_continual_sft.pbs
+#   qsub -v ARM=onereplay,LAMBDA=1.5e-3 onereplay/pbs/92_continual_sft.pbs
+#   qsub -v ARM=ewc,LAMBDA=2e-4         onereplay/pbs/92_continual_sft.pbs
+#
+# 默认 SRC_DOMAIN=medical NEW_DOMAIN=code，即 M_medical 学 code、保护 medical。
+# 换方向就传这两个变量，任意组合都行（math/medical/code）。
+#
+# 90 号产出 M_*（第一步），91 号在其上采出 C 和 F（第二步），本脚本是第三步。
+#
+# 1. 四条臂各是什么
+# -----------------
+#   vanilla    什么都不做，直接在新域上接着训。遗忘的**分母**：另外三臂救回多少
+#              只有和它比才有意义。
+#   onereplay  罚 tr(ΔW C ΔWᵀ)，C 来自 91 号。本方法。
+#   ewc        罚 Σ F_ij ΔW_ij²，F 来自 91 号。对照：同一批旧知识、同一个
+#              W_ref，只换加权矩阵。
+#   replay     不罚 ΔW，改为每个 micro-batch 掺一半旧域真实数据。对照：同一批
+#              旧知识，换成"重新训一遍"而不是"压成矩阵"。
+#
+# 四臂共享的东西必须逐字相同，否则比较里会混进第二个变量：W_ref（= 90 号那个
+# checkpoint）、新域数据、LR / scheduler / warmup / MAXLEN / TARGET_MODULES /
+# SEED、以及**每次更新的新任务行数**（见第 3 条）。
+#
+# 2. λ 不给默认值
+# ---------------
+# onereplay 和 ewc 的 λ 尺度**完全不通用**：前者罚 tr(ΔW C ΔWᵀ)，后者
+# Σ F_ij ΔW_ij²，量纲和量级都不是一回事，一个域上调好的值搬到另一个域也不成立。
+# 所以这里不给默认值，不传就退出。起点去读 91 号 Step 3 的输出，它按实测的
+# mean tr(C)/d 和 mean(F) 各给了一个 1/x：
+#
+#   -> OneReplay λ 从 1/x = ... 附近起步，围绕它扫 0.5x / 1x / 2x
+#   -> EWC λ 从 1/mean = ... 附近起步，按十倍展开
+#
+# 要一次投多个：LAMBDAS=7.5e-4:1.5e-3:3e-3。**串行**，每个值都是一次完整的
+# 训练+评测，walltime 按个数乘。第一轮建议先单值。
+#
+# 3. !! replay 臂的 ACCUM 必须翻倍，否则它学的新任务比别人少一半
+# --------------------------------------------------------------
+# --replay_per_batch 是**批级**混合：replay 行从 --batch_size 里切出来，不是加
+# 在外面（train.py: new_per_batch = batch_size - replay_per_batch）。所以
+# BATCH=2 配 replay_per_batch=1 之后，每个 micro-batch 只剩 1 行新任务，
+# 每次更新的新任务行数从 64 掉到 32。
+#
+# 于是 ACCUM 必须从 64 提到 128。脚本自动算，不用手填：
+#
+#   ACCUM_arm = ACCUM * BATCH / (BATCH - REPLAY_PER_BATCH) = 64 * 2 / 1 = 128
+#
+# 这样四臂的"每次更新 64 行新任务"逐字相同，优化器看到的新任务数据量一致。
+# 代价是 micro-batch 数翻倍（每步只学 1 行新任务），**replay 臂的训练墙钟约为
+# 其他臂的两倍**。24 小时可能不够，两个办法：
+#   DO_EVAL=0 先只训练，跑完再 MODE=eval 补评测；
+#   或者确认队列允许后调高 #PBS walltime。
+#
+# 为什么不用数据级混合（--replay_ratio 0.5）：它做不到。replay.py 会要求池里有
+# 0.5 x |新任务| 行，code 池 69k 行就要 35k 行 replay，而池子按第 4 条只有
+# 10k 行，直接抛 ValueError。批级混合循环复用池子，任何比例都能到。
+#
+# 4. !! replay 的池子必须**就是**产出 C/F 的那 10k 行
+# ---------------------------------------------------
+# 三条非 vanilla 臂的前提是"同一批旧知识的不同用法"。replay 要是从全池
+# （medical 37k 行）采，它见到的旧知识就比 C/F 多三倍，那 replay 赢了也说不清
+# 是方法好还是数据多。
+#
+# 所以这里传的 --replay_pool_size / --replay_sample_seed 与 91 号的
+# --max_samples / --sample_seed 逐字相同（10000 / 42）。两边的采样实现也确认过
+# 是同一套：old_knowledge.limit_dataset 和 replay.build_replay_dataset 都是
+# shuffle(seed) 再 select(range(n))。
+#
+# 唯一的顺序差异：collect_cov 先滤掉空 target 再 shuffle，replay 先 shuffle 再
+# 滤。池里**没有**空行时两者等价，Step 0 会查这件事并在有空行时报警。
+#
+# 5. !! replay 行发的是旧域那条 system，不是新域那条
+# --------------------------------------------------
+# chat_policy 的 system turn 是**进程级**的一份，新任务和 replay 共用。而两个
+# 域是在不同 system 下各自 SFT 的：code 那条要求 markdown 代码块，math/medical
+# 那条要求 \boxed{}。不管它的话，medical 的复习行会被发 code 那条 system，于是
+# 它和阶段一真正训练过的那一行不再逐字相同 —— 而"逐字相同"正是 replay 作为
+# rehearsal 的全部意义，medical 评测发的也是 boxed 那条。
+#
+# 所以 train.py 新增了 --replay_system_prompt（默认空 = 继承，既有调用行为不
+# 变），本脚本按 SRC_DOMAIN 传旧域那条。这只影响 replay 臂：另外三臂没有
+# replay 行。
+#
+# 6. 评测：和 90 号共用同一个 EVAL_ROOT
+# -------------------------------------
+# 这是有意的。<metric>_summary.csv 里于是同时有 base、m_medical（阶段一）和
+# 四条 cont_* 臂，"M_medical 在 MedQA 上多少分 -> continual 后掉到多少 -> 各臂
+# 救回多少"在一张表里就能读，不用手工拼。分开放就得拼表，而拼表是会拼错的。
+#
+# 三个域全评，理由和 90 号一样：新域回答"学会了吗"，旧域回答"忘了吗"，第三个
+# 域是从没学过的对照。base 这里**不评** —— 90 号已经评过，同一个 checkpoint
+# 重复评只会往 csv 里塞重复行。
+#
+# 评测慢就砍组，和 90 号同一个开关：
+#   qsub -v ARM=vanilla,SKIP_GROUPS=math_hard onereplay/pbs/92_continual_sft.pbs
+# math_hard（MinervaMath）是首选：4096 上限配 avg@4，而**不会做的模型反而最
+# 慢**，答不出来就一路顶到上限再乘 4 个采样。
+#
+# 7. 投递前要有
+# -------------
+#   1) 90 号 MODE=train 的 M_<SRC_DOMAIN> checkpoint
+#   2) 90 号 MODE=data 的 <NEW_DOMAIN> 数据集（save_to_disk）
+#   3) ARM=onereplay 要 91 号的 C；ARM=ewc 要 F；ARM=replay 要旧域的 jsonl
+#   4) 三个域的 benchmark（Step 0 会预检并打印缺哪个）
+#
+# 先看计划：qsub -v ARM=onereplay,LAMBDA=1.5e-3,DRY_RUN=1 onereplay/pbs/92_...
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/92_continual_sft.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_cont_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_cont_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# ---- 这四样决定这次跑什么 ----
+SRC_DOMAIN="${SRC_DOMAIN:-medical}"   # 起点 specialist，也是被保护的域
+NEW_DOMAIN="${NEW_DOMAIN:-code}"      # 新学的域
+ARM="${ARM:-}"                        # vanilla | onereplay | ewc | replay
+MODE="${MODE:-train}"                 # train | eval
+
+# =============================================================================
+# 外层：裸计算节点，只负责起容器再把自己跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]]    || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_cont_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR
+    SRC_DOMAIN NEW_DOMAIN ARM MODE DRY_RUN SEED DO_EVAL
+    LAMBDA LAMBDAS
+    SRC_RESULTS_ROOT SRC_CKPT_DIR SRC_CKPT_NAME
+    POOL_SAMPLES SAMPLE_SEED COV_PATH FISHER_PATH
+    REPLAY_JSONL REPLAY_PER_BATCH REPLAY_MAX_LEN
+    NORM_BY_LAYERS REG_ONCE REG_IMPL MEASURE_ZERO
+    BENCH_ROOT EVAL_ROOT LIMIT FORCE WHICH_EVAL
+    GSM8K_DATA MATH500_DATA MINERVA_DATA
+    MEDQA_DATA PUBMEDQA_DATA MEDXPERTQA_DATA
+    FINQA_DATA CONVFINQA_DATA TATQA_DATA
+    MATH_BATCH MEDICAL_BATCH FINANCE_BATCH CODE_BATCH CODE_TIMEOUT
+    CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS SKIP_GROUPS
+    HUMANEVALPLUS_DATA MBPPPLUS_DATA
+    DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
+    EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
+    TARGET_MODULES SYSTEM_PROMPT REPLAY_SYSTEM MAX_TRAIN_SAMPLES LOG_EVERY
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # 不能用 exec：会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# ---- 参数校验 ----
+for _d in "${SRC_DOMAIN}" "${NEW_DOMAIN}"; do
+  case "${_d}" in
+    math|medical|code|finance) ;;
+    *) echo "域名只能是 math / medical / code / finance，得到 '${_d}'" >&2; exit 2 ;;
+  esac
+done
+if [[ "${SRC_DOMAIN}" == "${NEW_DOMAIN}" ]]; then
+  echo "SRC_DOMAIN 和 NEW_DOMAIN 相同（都是 ${SRC_DOMAIN}），那不是 continual 而是再训一遍。" >&2
+  exit 2
+fi
+case "${ARM}" in
+  vanilla|onereplay|ewc|replay) ;;
+  "") echo "必须指定 ARM=vanilla|onereplay|ewc|replay" >&2; exit 2 ;;
+  *)  echo "ARM 只能是 vanilla / onereplay / ewc / replay，得到 '${ARM}'" >&2; exit 2 ;;
+esac
+case "${MODE}" in
+  train|eval) ;;
+  *) echo "MODE 只能是 train / eval，得到 '${MODE}'（数据由 90 号 MODE=data 准备）" >&2; exit 2 ;;
+esac
+
+# ---- 模型 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
+
+# =============================================================================
+# 训练超参：**全部照抄 90 号**，四条臂之间也逐字相同。
+# 想调任何一个，就是四条臂一起重跑，否则它们不再可比。
+# =============================================================================
+EPOCHS="${EPOCHS:-1}"
+LR="${LR:-5e-5}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+BATCH="${BATCH:-2}"
+# 基准值。replay 臂会按第 3 条自动提高，另外三臂用这个原值。
+ACCUM="${ACCUM:-64}"
+MAXLEN="${MAXLEN:-4096}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-200}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+SEED="${SEED:-42}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+LOG_EVERY="${LOG_EVERY:-500}"
+DRY_RUN="${DRY_RUN:-0}"
+DO_EVAL="${DO_EVAL:-1}"
+
+# ---- 正则项的口径，和 70/72 号一致 ----
+NORM_BY_LAYERS="${NORM_BY_LAYERS:-1}"
+REG_ONCE="${REG_ONCE:-1}"
+REG_IMPL="${REG_IMPL:-analytic}"
+# vanilla / replay 臂必须是 0：留 1 的话矩阵仍会被加载并每步求值，白付
+# regularizer 的时间，而报出来的墙钟会被拿去和 onereplay 比。
+MEASURE_ZERO="${MEASURE_ZERO:-0}"
+
+# 见 90 号文件头：不能写成 ${SYSTEM_PROMPT:-...\boxed{}.}，参数展开会在 \boxed{}
+# 自己那个 } 上提前收尾，实得 "\boxed{.}"。用独立赋值绕开，单引号防反斜杠再被吃一层。
+SYSTEM_PROMPT_BOXED='Please reason step by step, and put your final answer within \boxed{}.'
+SYSTEM_PROMPT_CODE='Please reason step by step, and put your final code in a Python code block.'
+
+system_for_domain () {
+  case "$1" in
+    code) printf '%s' "${SYSTEM_PROMPT_CODE}" ;;
+    *)    printf '%s' "${SYSTEM_PROMPT_BOXED}" ;;
+  esac
+}
+
+# 新任务（= 进程级那条）按 NEW_DOMAIN 选；replay 行按 SRC_DOMAIN 选，见第 5 条。
+if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
+  SYSTEM_PROMPT="$(system_for_domain "${NEW_DOMAIN}")"
+fi
+if [[ -z "${REPLAY_SYSTEM:-}" ]]; then
+  REPLAY_SYSTEM="$(system_for_domain "${SRC_DOMAIN}")"
+fi
+
+# =============================================================================
+# 路径：起点、C/F、replay 池、新域数据。
+# 前三个的推导必须和 90/91 号逐字相同，test_code/check_continual_paths.sh 会比对。
+# =============================================================================
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
+STATS_DIR="${STATS_DIR:-${DATA_ROOT}/stats}"
+
+# 新域的训练数据（90 号 MODE=data 的产物）
+DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/${NEW_DOMAIN}_train}"
+NEW_STATS="${STATS_DIR}/${NEW_DOMAIN}_stats.json"
+
+# 起点 specialist = 90 号的 checkpoint，也是 91 号采 C/F 的那个对象，
+# 也是 regularizer 的 W_ref。三者必须是同一个目录。
+SRC_RESULTS_ROOT="${SRC_RESULTS_ROOT:-${REPO_ROOT}/results_specialist_${SRC_DOMAIN}_${MODEL_NAME}}"
+SRC_CKPT_DIR="${SRC_CKPT_DIR:-${SRC_RESULTS_ROOT}/checkpoints}"
+SRC_CKPT_NAME="${SRC_CKPT_NAME:-specialist_${SRC_DOMAIN}_lr${LR}_seed${SEED}}"
+
+# C/F 与 replay 池：同一个 10k 子集，见第 4 条。
+POOL_SAMPLES="${POOL_SAMPLES:-10000}"
+SAMPLE_SEED="${SAMPLE_SEED:-42}"
+if [[ "${POOL_SAMPLES}" -eq 0 ]]; then
+  POOL_TAG="full"
+elif (( POOL_SAMPLES % 1000 == 0 )); then
+  POOL_TAG="$((POOL_SAMPLES / 1000))k"
+else
+  POOL_TAG="${POOL_SAMPLES}"
+fi
+COV_PATH="${COV_PATH:-${SRC_RESULTS_ROOT}/cov/cov_${SRC_DOMAIN}_m${SRC_DOMAIN}_${POOL_TAG}.pt}"
+FISHER_PATH="${FISHER_PATH:-${SRC_RESULTS_ROOT}/fisher/fisher_${SRC_DOMAIN}_m${SRC_DOMAIN}_${POOL_TAG}.pt}"
+REPLAY_JSONL="${REPLAY_JSONL:-${PROCESSED_DIR}/${SRC_DOMAIN}_train.jsonl}"
+SRC_STATS="${STATS_DIR}/${SRC_DOMAIN}_stats.json"
+
+# replay 行的长度预算。旧域的数据本来就是在 MAXLEN 下过滤出来的，而 C/F 也是在
+# MAXLEN 下采的，所以这里跟着 MAXLEN；给小了 replay 见到的旧知识会比罚项编码的
+# 更少（截断保尾丢头，题干会被砍掉，问答复习退化成裸续写）。
+REPLAY_MAX_LEN="${REPLAY_MAX_LEN:-${MAXLEN}}"
+REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-1}"
+
+# 本阶段的产物根，按"方向"分目录，四条臂共享（run 名里带臂名，不会撞）。
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_continual_${SRC_DOMAIN}2${NEW_DOMAIN}_${MODEL_NAME}}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+
+# =============================================================================
+# 评测配置。EVAL_ROOT 和 90 号共用，见第 6 条。
+# =============================================================================
+EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_specialist_eval}"
+FORCE="${FORCE:-0}"
+LIMIT="${LIMIT:-0}"
+EVAL_DOMAINS="${EVAL_DOMAINS:-math medical code}"
+SKIP_GROUPS="${SKIP_GROUPS:-}"
+
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+BENCH_ROOT="${BENCH_ROOT:-${REPO_ROOT}/datasets/bench}"
+GSM8K_DATA="${GSM8K_DATA:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+MATH500_DATA="${MATH500_DATA:-${MATH_DATA_DIR}/math500_test.jsonl}"
+MINERVA_DATA="${MINERVA_DATA:-${MATH_DATA_DIR}/minervamath_test.jsonl}"
+MEDQA_DATA="${MEDQA_DATA:-${BENCH_ROOT}/medqa/test.jsonl}"
+PUBMEDQA_DATA="${PUBMEDQA_DATA:-${BENCH_ROOT}/pubmedqa/test.jsonl}"
+MEDXPERTQA_DATA="${MEDXPERTQA_DATA:-${BENCH_ROOT}/medxpertqa/test.jsonl}"
+FINQA_DATA="${FINQA_DATA:-${BENCH_ROOT}/finqa/test.jsonl}"
+CONVFINQA_DATA="${CONVFINQA_DATA:-${BENCH_ROOT}/convfinqa/dev_turn.json}"
+TATQA_DATA="${TATQA_DATA:-${BENCH_ROOT}/tatqa/tatqa_dataset_dev.json}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+HUMANEVAL_DATA="${HUMANEVAL_DATA:-${CODE_DATA_DIR}/humaneval_test.parquet}"
+MBPP_DATA="${MBPP_DATA:-${CODE_DATA_DIR}/mbpp_full}"
+HUMANEVALPLUS_DATA="${HUMANEVALPLUS_DATA:-${CODE_DATA_DIR}/humanevalplus_test.parquet}"
+MBPPPLUS_DATA="${MBPPPLUS_DATA:-${CODE_DATA_DIR}/mbppplus_test.parquet}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+
+MATH_BATCH="${MATH_BATCH:-128}"
+MEDICAL_BATCH="${MEDICAL_BATCH:-64}"
+FINANCE_BATCH="${FINANCE_BATCH:-32}"
+CODE_BATCH="${CODE_BATCH:-64}"
+CODE_TIMEOUT="${CODE_TIMEOUT:-0}"
+
+# =============================================================================
+# 臂 -> 训练参数。这个函数是四条臂**唯一**的差异来源。
+# =============================================================================
+# 本臂实际用的 ACCUM 与 replay 行数，见第 3 条。
+ARM_ACCUM="${ACCUM}"
+ARM_REPLAY_PER_BATCH=0
+if [[ "${ARM}" == "replay" ]]; then
+  ARM_REPLAY_PER_BATCH="${REPLAY_PER_BATCH}"
+  NEW_PER_BATCH=$((BATCH - ARM_REPLAY_PER_BATCH))
+  if (( NEW_PER_BATCH <= 0 )); then
+    echo "REPLAY_PER_BATCH=${ARM_REPLAY_PER_BATCH} 在 BATCH=${BATCH} 下不留新任务行。" >&2
+    exit 2
+  fi
+  # 目标：accum_steps x new_per_batch == ACCUM（基准的每次更新行数）
+  ARM_ACCUM=$((ACCUM * BATCH / NEW_PER_BATCH))
+  if (( ARM_ACCUM * NEW_PER_BATCH / BATCH != ACCUM )); then
+    echo "!! ACCUM=${ACCUM} BATCH=${BATCH} REPLAY_PER_BATCH=${ARM_REPLAY_PER_BATCH} 除不尽，" >&2
+    echo "   每次更新的新任务行数凑不回 ${ACCUM}，四臂不再可比。换一组能整除的值。" >&2
+    exit 2
+  fi
+fi
+ACCUM_STEPS=$((ARM_ACCUM / BATCH))
+if [[ "${ARM}" == "replay" ]]; then
+  NEW_PER_UPDATE=$((ACCUM_STEPS * (BATCH - ARM_REPLAY_PER_BATCH)))
+else
+  NEW_PER_UPDATE=$((ACCUM_STEPS * BATCH))
+fi
+
+# λ：onereplay / ewc 必须显式给，见第 2 条。
+LAMBDA="${LAMBDA:-}"
+LAMBDAS="${LAMBDAS:-}"
+if [[ "${ARM}" == "onereplay" || "${ARM}" == "ewc" ]]; then
+  if [[ -z "${LAMBDA}" && -z "${LAMBDAS}" ]]; then
+    echo "ARM=${ARM} 必须给 λ：LAMBDA=<值> 或 LAMBDAS=<a:b:c>" >&2
+    echo "  起点去读 91 号 Step 3 的输出（它按实测的 mean tr(C)/d 和 mean(F) 各给了一个 1/x）：" >&2
+    if [[ "${ARM}" == "onereplay" ]]; then
+      echo "    -> OneReplay λ 从 1/... 附近起步，围绕它扫 0.5x / 1x / 2x" >&2
+    else
+      echo "    -> EWC λ 从 1/mean = ... 附近起步，按十倍展开" >&2
+    fi
+    echo "  两条臂的尺度不通用，不能互相搬。" >&2
+    exit 2
+  fi
+else
+  if [[ -n "${LAMBDA}" || -n "${LAMBDAS}" ]]; then
+    echo "!! ARM=${ARM} 不吃 λ（它不加罚项），传进来的 LAMBDA/LAMBDAS 会被忽略。"
+  fi
+  LAMBDA=""
+  LAMBDAS=""
+fi
+
+# 要跑的 λ 列表。非罚项臂是一个空元素，表示"跑一次，不带 λ"。
+if [[ -n "${LAMBDAS}" ]]; then
+  IFS=':' read -r -a LAMBDA_LIST <<< "${LAMBDAS}"
+elif [[ -n "${LAMBDA}" ]]; then
+  LAMBDA_LIST=("${LAMBDA}")
+else
+  LAMBDA_LIST=("")
+fi
+for _lam in "${LAMBDA_LIST[@]}"; do
+  [[ -z "${_lam}" ]] && continue
+  if ! python -c "import sys; sys.exit(0 if float('${_lam}') > 0 else 1)" 2>/dev/null; then
+    echo "λ='${_lam}' 不是正数。λ=0 就是 vanilla，那是 ARM=vanilla 的事。" >&2
+    exit 2
+  fi
+done
+
+# run 名：EVAL_ROOT 是和 90 号共用的，所以这里必须自带足够的标识，
+# 否则 csv 里两条臂会挤在同一行上。
+run_name_for () {
+  local lam="$1"
+  local name="cont_${SRC_DOMAIN}2${NEW_DOMAIN}_${ARM}"
+  [[ -n "${lam}" ]] && name="${name}_lam${lam}"
+  printf '%s' "${name}_lr${LR}_seed${SEED}"
+}
+
+# 四条臂的差异**全部**集中在这个函数里 —— 它上面的超参对四条臂逐字相同，
+# 下面的 train_one 对四条臂逐字相同。要判断两条臂到底差在哪，只看这里。
+# 定义放在 DRY_RUN 之前，这样 DRY_RUN=1 能把真实参数打出来核对。
+arm_train_args () {
+  local lam="$1"
+  case "${ARM}" in
+    vanilla)
+      # --cov_path 清空是为了 metrics：train.py 把它记成 penalty_path，而它的
+      # argparse 默认值是一条早就不存在的旧路径，留着会让事后审计以为这条臂
+      # 加了罚项。
+      printf '%s\n' \
+        --replay_lambda 0 \
+        --measure_replay_when_lambda_zero "${MEASURE_ZERO}" \
+        --cov_path ""
+      ;;
+    onereplay)
+      printf '%s\n' \
+        --regularizer onereplay \
+        --cov_path "${COV_PATH}" \
+        --replay_lambda "${lam}" \
+        --identity_cov 0 \
+        --normalize_replay_by_layers "${NORM_BY_LAYERS}" \
+        --reg_once_per_update "${REG_ONCE}" \
+        --reg_impl "${REG_IMPL}"
+      ;;
+    ewc)
+      # build_regularizer 在 ewc 下只读 fisher_path，但 cov_path 仍会进 metrics，
+      # 所以同样清空，免得事后分不清这条臂的罚项来自哪个矩阵。
+      printf '%s\n' \
+        --regularizer ewc \
+        --fisher_path "${FISHER_PATH}" \
+        --cov_path "" \
+        --replay_lambda "${lam}" \
+        --identity_cov 0 \
+        --normalize_replay_by_layers "${NORM_BY_LAYERS}" \
+        --reg_once_per_update "${REG_ONCE}"
+      ;;
+    replay)
+      # 不加罚项，改为批级混合。池子、seed、system 见文件头第 4、5 条。
+      printf '%s\n' \
+        --replay_lambda 0 \
+        --measure_replay_when_lambda_zero "${MEASURE_ZERO}" \
+        --cov_path "" \
+        --replay_per_batch "${ARM_REPLAY_PER_BATCH}" \
+        --replay_data_files "${REPLAY_JSONL}" \
+        --replay_split train \
+        --replay_input_column question \
+        --replay_target_column response \
+        --replay_pool_size "${POOL_SAMPLES}" \
+        --replay_sample_seed "${SAMPLE_SEED}" \
+        --replay_max_len "${REPLAY_MAX_LEN}" \
+        --replay_system_prompt "${REPLAY_SYSTEM}" \
+        --replay_cache_dir "${RESULTS_ROOT}/replay_cache"
+      ;;
+  esac
+}
+
+mkdir -p "${METRICS_DIR}" "${CKPT_DIR}"
+
+echo "================================================================"
+echo " 第三阶段 continual : M_${SRC_DOMAIN} --[${NEW_DOMAIN}]--> ?"
+echo " ARM         : ${ARM}"
+echo " MODE        : ${MODE}"
+echo " 起点 W_ref  : ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}"
+echo " 新域数据    : ${DATASET_DIR}"
+echo " 保护的域    : ${SRC_DOMAIN}"
+case "${ARM}" in
+  onereplay) echo " C           : ${COV_PATH}" ;;
+  ewc)       echo " F           : ${FISHER_PATH}" ;;
+  replay)    echo " replay 池   : ${REPLAY_JSONL}"
+             echo "               子集 ${POOL_SAMPLES} 行 / seed ${SAMPLE_SEED} / maxlen ${REPLAY_MAX_LEN}" ;;
+esac
+echo " λ           : ${LAMBDA_LIST[*]:-（本臂不用）}"
+echo " batch       : ${BATCH} x accum ${ACCUM_STEPS} = ${ARM_ACCUM} 行/update"
+if [[ "${ARM}" == "replay" ]]; then
+echo "               其中 ${ARM_REPLAY_PER_BATCH}/${BATCH} 是 replay，"
+echo "               每次更新 ${NEW_PER_UPDATE} 行新任务（基准 ${ACCUM}，ACCUM 已从 ${ACCUM} 提到 ${ARM_ACCUM}）"
+else
+echo "               每次更新 ${NEW_PER_UPDATE} 行新任务（基准 ${ACCUM}）"
+fi
+echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
+echo " system      : ${SYSTEM_PROMPT}"
+[[ "${ARM}" == "replay" ]] && echo " replay sys  : ${REPLAY_SYSTEM}"
+echo " 结果        : ${RESULTS_ROOT}"
+echo " eval root   : ${EVAL_ROOT}   （与 90 号共用）"
+echo " eval domains: ${EVAL_DOMAINS}"
+[[ -n "${SKIP_GROUPS}" ]] && echo " skip groups : ${SKIP_GROUPS}"
+echo "================================================================"
+
+# ===========================================================================
+# Step 0: 前置检查
+# ===========================================================================
+echo
+echo "==== Step 0: 前置检查 ===="
+
+[[ -d "${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" ]] || {
+  echo "找不到起点 checkpoint: ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" >&2
+  echo "  它是 90 号的产物，先跑：" >&2
+  echo "    qsub -v DOMAIN=${SRC_DOMAIN},MODE=train onereplay/pbs/90_specialist_sft.pbs" >&2
+  exit 1
+}
+echo "起点 checkpoint 在: ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}"
+
+if [[ "${MODE}" != "eval" ]]; then
+  [[ -d "${DATASET_DIR}" ]] || {
+    echo "找不到新域数据集: ${DATASET_DIR}" >&2
+    echo "  先跑 qsub -v DOMAIN=${NEW_DOMAIN},MODE=data onereplay/pbs/90_specialist_sft.pbs" >&2
+    exit 1
+  }
+
+  # 新任务的 system 必须和它被量长度时那条一致，否则 4096 的"没有一行被截断"失效。
+  # 和 90 号训练前那道守卫同源。
+  STATS_SYSTEM="$(NEW_STATS="${NEW_STATS}" python - <<'PY'
+import json, os
+path = os.environ["NEW_STATS"]
+if os.path.isfile(path):
+    with open(path, encoding="utf-8") as fh:
+        print(json.load(fh).get("metadata", {}).get("system_prompt", ""), end="")
+else:
+    print("", end="")
+PY
+)"
+  if [[ -n "${STATS_SYSTEM}" && "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
+    echo "拒绝训练：新任务的 SYSTEM_PROMPT 和它准备数据时用的不一致。" >&2
+    echo "  数据 (${NEW_STATS}): ${STATS_SYSTEM}" >&2
+    echo "  本次训练            : ${SYSTEM_PROMPT}" >&2
+    echo "  system turn 会贡献 token，长度是按含它的完整序列量的；不一致就会有行超过" >&2
+    echo "  ${MAXLEN} 而被静默左截断（保尾丢头），prepare 的 drop-not-truncate 保证作废。" >&2
+    exit 4
+  fi
+  echo "新任务 system 与 ${NEW_STATS} 一致"
+fi
+
+# ---- 罚项臂：矩阵必须在，而且要和这次的 W_ref 同源 ----
+if [[ "${ARM}" == "onereplay" ]]; then
+  [[ -f "${COV_PATH}" ]] || {
+    echo "找不到 C: ${COV_PATH}" >&2
+    echo "  它是 91 号的产物，先跑：" >&2
+    echo "    qsub -v DOMAIN=${SRC_DOMAIN},WHAT=cov,DRY_RUN=0 onereplay/pbs/91_collect_cf.pbs" >&2
+    exit 1
+  }
+fi
+if [[ "${ARM}" == "ewc" ]]; then
+  [[ -f "${FISHER_PATH}" ]] || {
+    echo "找不到 F: ${FISHER_PATH}" >&2
+    echo "  它是 91 号的产物，先跑：" >&2
+    echo "    qsub -v DOMAIN=${SRC_DOMAIN},WHAT=fisher,DRY_RUN=0 onereplay/pbs/91_collect_cf.pbs" >&2
+    exit 1
+  }
+fi
+
+if [[ "${ARM}" == "onereplay" || "${ARM}" == "ewc" ]]; then
+  # 矩阵的元数据要和这次训练对表。层覆盖不足是最危险的一种：regularizer 对找不到
+  # 矩阵的层是**静默跳过**的，训练照跑、loss 照降，方法被削掉一大半而不报错。
+  ARM="${ARM}" COV_PATH="${COV_PATH}" FISHER_PATH="${FISHER_PATH}" \
+  SRC_CKPT="${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" TARGET_MODULES="${TARGET_MODULES}" \
+  MAXLEN="${MAXLEN}" SYSTEM_PROMPT="${SYSTEM_PROMPT}" \
+  REPLAY_SYSTEM="${REPLAY_SYSTEM}" POOL_SAMPLES="${POOL_SAMPLES}" \
+  python - <<'PY'
+import json, os, sys
+
+import torch
+
+path = os.environ["COV_PATH"] if os.environ["ARM"] == "onereplay" else os.environ["FISHER_PATH"]
+with open(os.path.join(os.environ["SRC_CKPT"], "config.json"), encoding="utf-8") as fh:
+    layers = json.load(fh)["num_hidden_layers"]
+targets = [m.strip() for m in os.environ["TARGET_MODULES"].split(",") if m.strip()]
+expect = sum(1 if m == "lm_head" else layers for m in targets)
+
+try:
+    payload = torch.load(path, map_location="cpu", mmap=True)
+except (TypeError, RuntimeError):
+    payload = torch.load(path, map_location="cpu")
+matrices = payload.get("fishers") or payload["covariances"]
+meta = payload.get("metadata", {})
+
+print(f"  矩阵      : {path}")
+print(f"  层覆盖    : {len(matrices)} / 期望 {expect}")
+print(f"  采集口径  : max_len={meta.get('max_len')} pool_rows={meta.get('pool_rows')}")
+print(f"  pool 指纹 : {meta.get('pool_fingerprint')}")
+
+failures = []
+if len(matrices) != expect:
+    failures.append(
+        f"层覆盖 {len(matrices)} != 期望 {expect}。regularizer 对缺矩阵的层是静默跳过的，"
+        "方法会被削掉一部分而不报错。"
+    )
+if meta.get("max_len") and int(meta["max_len"]) != int(os.environ["MAXLEN"]):
+    failures.append(
+        f"矩阵采集用 max_len={meta['max_len']}，本次训练 MAXLEN={os.environ['MAXLEN']}。"
+        "罚项覆盖的序列长度和训练的不一致。"
+    )
+# C/F 是在旧域语料上采的，所以它记的 system 应该是**旧域**那条，而不是新任务那条。
+recorded = (meta.get("system_prompt") or "").strip()
+if recorded and recorded != os.environ["REPLAY_SYSTEM"].strip():
+    failures.append(
+        f"矩阵采集时的 system 是 {recorded!r}，但 {os.environ['SRC_CKPT']} 那个域"
+        f"应该是 {os.environ['REPLAY_SYSTEM']!r}。激活跟着 system 变，"
+        "罚项保护的就不是阶段一那个模型的行为。"
+    )
+rows = meta.get("pool_rows")
+want_rows = int(os.environ["POOL_SAMPLES"])
+if rows and want_rows and int(rows) != want_rows:
+    print(
+        f"  !! 矩阵是在 {rows} 行上采的，本脚本按 {want_rows} 行推导路径。"
+        " replay 臂会用后者，两条臂的旧知识就不同源了。"
+    )
+
+if failures:
+    print()
+    print("!! 矩阵自检未通过：")
+    for item in failures:
+        print(f"   - {item}")
+    sys.exit(1)
+print("  矩阵自检通过")
+PY
+fi
+
+# ---- replay 臂：池子必须存在、够大，而且和 C/F 是同一个子集 ----
+if [[ "${ARM}" == "replay" ]]; then
+  [[ -f "${REPLAY_JSONL}" ]] || {
+    echo "找不到 replay 池: ${REPLAY_JSONL}" >&2
+    echo "  它是 90 号 MODE=data 的产物（可审计的那份 jsonl）。" >&2
+    exit 1
+  }
+  # 见第 4 条：collect_cov 先滤空 target 再 shuffle，replay 先 shuffle 再滤。
+  # 池里没有空行时两者等价，这里就查这件事 —— 有空行的话两个 10k 子集会错位，
+  # "同一批旧知识"这个前提就没了。
+  REPLAY_JSONL="${REPLAY_JSONL}" POOL_SAMPLES="${POOL_SAMPLES}" python - <<'PY'
+import json, os, sys
+
+path = os.environ["REPLAY_JSONL"]
+want = int(os.environ["POOL_SAMPLES"])
+rows = blank_q = blank_r = 0
+with open(path, encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        rows += 1
+        if not str(row.get("question") or "").strip():
+            blank_q += 1
+        if not str(row.get("response") or "").strip():
+            blank_r += 1
+
+print(f"  replay 池 : {path}")
+print(f"              {rows} 行，空 question {blank_q}，空 response {blank_r}")
+
+failures = []
+if want > 0 and rows < want:
+    failures.append(
+        f"池里只有 {rows} 行，少于 POOL_SAMPLES={want}。replay 会静默地用全部 {rows} 行，"
+        f"而 C/F 是在 {want} 行上采的，两条臂不再同源。"
+    )
+if blank_q or blank_r:
+    failures.append(
+        f"池里有空行（question {blank_q} / response {blank_r}）。collect_cov 先滤空再"
+        "shuffle，replay 先 shuffle 再滤，有空行时两个 10k 子集会错位。"
+    )
+if failures:
+    print()
+    print("!! replay 池自检未通过：")
+    for item in failures:
+        print(f"   - {item}")
+    sys.exit(1)
+print(f"  池自检通过：无空行，所以 replay 的 {want} 行子集与 C/F 的逐行相同")
+PY
+fi
+
+# ---- benchmark 预检：训练要跑几小时，缺数据现在就该知道 ----
+GROUPS_RAN=0
+GROUPS_DONE=0
+GROUPS_NODATA=0
+GROUPS_SKIPPED=0
+
+group_skipped () {
+  [[ " ${SKIP_GROUPS} " == *" $1 "* ]]
+}
+
+bench_paths_for () {
+  case "$1" in
+    math)    group_skipped math_std  || printf '%s\n' "${GSM8K_DATA}" "${MATH500_DATA}"
+             group_skipped math_hard || printf '%s\n' "${MINERVA_DATA}"
+             ;;
+    medical) printf '%s\n' "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" ;;
+    code)    printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
+                           "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" ;;
+    finance) printf '%s\n' "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}" ;;
+  esac
+}
+
+preflight_bench () {
+  local missing=() path domain
+  # shellcheck disable=SC2086
+  for domain in ${EVAL_DOMAINS}; do
+    while IFS= read -r path; do
+      [[ -n "${path}" && ! -e "${path}" ]] && missing+=("${path}")
+    done < <(bench_paths_for "${domain}")
+  done
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo
+    echo "!! 训练后要评的 benchmark 缺 ${#missing[@]} 个：" >&2
+    printf '     %s\n' "${missing[@]}" >&2
+    echo "   训练照常开始，但评测会跳过对应的组、最后以 rc=6 结束。" >&2
+    echo "   现在补上比训练跑完再补省一次作业：python test_code/download_bench.py" >&2
+  fi
+}
+
+if [[ "${DO_EVAL}" == "1" ]]; then preflight_bench; fi
+
+if [[ "${ARM}" == "replay" ]]; then
+  echo
+  echo "!! replay 臂的 micro-batch 数约为其他臂的两倍（每步只学"
+  echo "   $((BATCH - ARM_REPLAY_PER_BATCH))/${BATCH} 行新任务），训练墙钟也约两倍。"
+  echo "   24 小时不够的话：DO_EVAL=0 先只训练，再 MODE=eval 补评测。"
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划，不训练不评测。"
+  for _lam in "${LAMBDA_LIST[@]}"; do
+    echo
+    echo "  run: $(run_name_for "${_lam}")"
+    echo "  train.py 会收到（四条臂只在这一段上不同）："
+    echo "    --model_dir ${SRC_CKPT_DIR} --model_name ${SRC_CKPT_NAME}"
+    echo "    --dataset_path ${DATASET_DIR}"
+    echo "    --batch_size ${BATCH} --accumulation_size ${ARM_ACCUM}"
+    # arm_train_args 一行一个 token，成对打印才读得出 flag 和值的对应关系。
+    _pair=()
+    while IFS= read -r _item; do
+      _pair+=("${_item}")
+      if (( ${#_pair[@]} == 2 )); then
+        printf '    %s %s\n' "${_pair[0]}" "${_pair[1]:-\'\'}"
+        _pair=()
+      fi
+    done < <(arm_train_args "${_lam}")
+    if (( ${#_pair[@]} > 0 )); then
+      printf '    %s <缺值！奇数个 token，某个 flag 没配值>\n' "${_pair[0]}"
+    fi
+  done
+  exit 0
+fi
+
+train_one () {
+  local run="$1" lam="$2"
+  local save_path="${CKPT_DIR}/${run}"
+
+  mkdir -p "${RESULTS_ROOT}/map_cache/${run}"
+  echo
+  echo "==== train ${run} ===="
+  echo "  臂 ${ARM}  λ=${lam:-（不用）}  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ARM_ACCUM}"
+  echo "  W_ref ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}"
+
+  local arm_args=()
+  while IFS= read -r item; do arm_args+=("${item}"); done < <(arm_train_args "${lam}")
+
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${SRC_CKPT_DIR}" --model_name "${SRC_CKPT_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --dataset_path "${DATASET_DIR}" \
+    --epochs "${EPOCHS}" --lr "${LR}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
+    --batch_size "${BATCH}" --accumulation_size "${ARM_ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${BATCH}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
+    --log_every "${LOG_EVERY}" \
+    "${arm_args[@]}" \
+    --save 1 --save_path "${save_path}" \
+    --metrics_path "${METRICS_DIR}/${run}.jsonl"
+}
+
+# ===========================================================================
+# 评测：三个域全评，run_name 自带臂名和 λ。逐字照搬 90 号的解码组，
+# 否则阶段一和阶段三的分数不可比 —— 而这两者相减就是"忘了多少"。
+# ===========================================================================
+require_data () {
+  local group="$1"; shift
+  local missing=0
+  for path in "$@"; do
+    if [[ ! -e "${path}" ]]; then
+      echo "  [${group}] 缺少数据: ${path}" >&2
+      missing=1
+    fi
+  done
+  if [[ "${missing}" == "1" ]]; then
+    echo "  [${group}] 数据不全，整组跳过；补齐后重投会自动补上。" >&2
+    GROUPS_NODATA=$((GROUPS_NODATA + 1))
+  fi
+  return "${missing}"
+}
+
+group_done () {
+  local run_name="$1"; shift
+  for metric in "$@"; do
+    [[ -f "${EVAL_ROOT}/${metric}/${run_name}/summary.json" ]] || return 1
+  done
+  return 0
+}
+
+run_group () {
+  local group="$1" run_name="$2" adapter="$3" metrics="$4"; shift 4
+  local metric_list=(${metrics//,/ })
+
+  if group_skipped "${group}"; then
+    echo "==== skip ${run_name} / ${group}：在 SKIP_GROUPS 里 ===="
+    GROUPS_SKIPPED=$((GROUPS_SKIPPED + 1))
+    return 0
+  fi
+  if [[ "${FORCE}" != "1" ]] && group_done "${run_name}" "${metric_list[@]}"; then
+    echo "==== skip ${run_name} / ${group}：${EVAL_ROOT} 下已有全部 summary.json ===="
+    GROUPS_DONE=$((GROUPS_DONE + 1))
+    return 0
+  fi
+  GROUPS_RAN=$((GROUPS_RAN + 1))
+
+  # 评测的 system 由 **benchmark** 决定，不由被评的模型决定 —— 和 90 号同一套
+  # 规则。同一个 benchmark 下所有模型必须收到同一条指令，否则横向不可比。
+  local group_system="${SYSTEM_PROMPT_BOXED}"
+  [[ "${group}" == "code" ]] && group_system="${SYSTEM_PROMPT_CODE}"
+
+  echo
+  echo "==== eval ${run_name} / ${group} : ${metrics} ===="
+  local args=(
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}"
+    --out_dir "${EVAL_ROOT}" --run_name "${run_name}"
+    --metrics "${metrics}" --seed "${SEED}"
+    --system_prompt "${group_system}"
+    --decode_stop_on_im_end 1
+    --limit "${LIMIT}"
+  )
+  [[ -n "${adapter}" ]] && args+=(--adapter_path "${adapter}")
+  python -m onereplay.scripts.evaluate "${args[@]}" "$@"
+}
+
+eval_math_std () {
+  local run_name="$1" adapter="$2"
+  require_data math_std "${GSM8K_DATA}" "${MATH500_DATA}" || return 0
+  run_group math_std "${run_name}" "${adapter}" "gsm8k,math500" \
+    --gsm8k_data_path "${GSM8K_DATA}" \
+    --math500_data_path "${MATH500_DATA}" \
+    --math_max_new_tokens 2048 \
+    --math_batch_size "${MATH_BATCH}"
+}
+
+eval_math_hard () {
+  local run_name="$1" adapter="$2"
+  require_data math_hard "${MINERVA_DATA}" || return 0
+  run_group math_hard "${run_name}" "${adapter}" "minervamath" \
+    --minervamath_data_path "${MINERVA_DATA}" \
+    --math_max_new_tokens 4096 \
+    --math_batch_size 64 \
+    --decode_do_sample 1 --decode_temperature 1.0 --math_num_samples 4
+}
+
+eval_medical () {
+  local run_name="$1" adapter="$2"
+  require_data medical "${MEDQA_DATA}" "${PUBMEDQA_DATA}" "${MEDXPERTQA_DATA}" || return 0
+  run_group medical "${run_name}" "${adapter}" "medqa,pubmedqa,medxpertqa" \
+    --medqa_data_path "${MEDQA_DATA}" \
+    --pubmedqa_data_path "${PUBMEDQA_DATA}" \
+    --medxpertqa_data_path "${MEDXPERTQA_DATA}" \
+    --medical_max_new_tokens 2048 \
+    --medical_batch_size "${MEDICAL_BATCH}"
+}
+
+eval_finance () {
+  local run_name="$1" adapter="$2"
+  require_data finance "${FINQA_DATA}" "${CONVFINQA_DATA}" "${TATQA_DATA}" || return 0
+  run_group finance "${run_name}" "${adapter}" "finqa,convfinqa,tatqa" \
+    --finqa_data_path "${FINQA_DATA}" \
+    --convfinqa_data_path "${CONVFINQA_DATA}" \
+    --tatqa_data_path "${TATQA_DATA}" \
+    --finance_max_new_tokens 2048 \
+    --finance_batch_size "${FINANCE_BATCH}"
+}
+
+eval_code () {
+  local run_name="$1" adapter="$2"
+  require_data code "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
+                    "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" || return 0
+  run_group code "${run_name}" "${adapter}" "humaneval,mbpp,humanevalplus,mbppplus" \
+    --humaneval_data_file "${HUMANEVAL_DATA}" \
+    --mbpp_dataset_path "${MBPP_DATA}" \
+    --dataset_split "${MBPP_SPLIT}" \
+    --humanevalplus_data_file "${HUMANEVALPLUS_DATA}" \
+    --mbppplus_data_file "${MBPPPLUS_DATA}" \
+    --code_max_new_tokens 512 \
+    --code_batch_size "${CODE_BATCH}" \
+    --timeout "${CODE_TIMEOUT}"
+}
+
+eval_domain () {
+  local domain="$1" run_name="$2" adapter="$3"
+  case "${domain}" in
+    math)    eval_math_std "${run_name}" "${adapter}"; eval_math_hard "${run_name}" "${adapter}" ;;
+    medical) eval_medical  "${run_name}" "${adapter}" ;;
+    code)    eval_code     "${run_name}" "${adapter}" ;;
+    finance) eval_finance  "${run_name}" "${adapter}" ;;
+    *) echo "eval_domain: 不认识的领域 '${domain}'，跳过" >&2 ;;
+  esac
+}
+
+eval_one () {
+  local run="$1"
+  local ckpt="${CKPT_DIR}/${run}"
+  if [[ ! -d "${ckpt}" ]]; then
+    echo "找不到 checkpoint: ${ckpt}" >&2
+    echo "  先跑 MODE=train，或检查 ARM / LAMBDA 是否和训练时一致。" >&2
+    return 4
+  fi
+  echo
+  echo "################ ${run}: 评 ${EVAL_DOMAINS} ################"
+  # shellcheck disable=SC2086
+  for target in ${EVAL_DOMAINS}; do
+    eval_domain "${target}" "${run}" "${ckpt}"
+  done
+  return 0
+}
+
+# ===========================================================================
+# 主流程
+# ===========================================================================
+overall_rc=0
+for lam in "${LAMBDA_LIST[@]}"; do
+  RUN="$(run_name_for "${lam}")"
+
+  if [[ "${MODE}" == "train" ]]; then
+    if [[ -d "${CKPT_DIR}/${RUN}" ]]; then
+      echo
+      echo "已存在 checkpoint，跳过训练: ${CKPT_DIR}/${RUN}"
+      echo "  要重训就先挪走它，或换一个 SEED。"
+    else
+      train_one "${RUN}" "${lam}"
+      echo
+      echo "==== 训练完成: ${RUN} ===="
+      echo "  checkpoint : ${CKPT_DIR}/${RUN}"
+      echo "  metrics    : ${METRICS_DIR}/${RUN}.jsonl"
+    fi
+    if [[ "${DO_EVAL}" != "1" ]]; then
+      echo "DO_EVAL=0：不评测。补评："
+      echo "  qsub -v SRC_DOMAIN=${SRC_DOMAIN},NEW_DOMAIN=${NEW_DOMAIN},ARM=${ARM}${lam:+,LAMBDA=${lam}},MODE=eval onereplay/pbs/92_continual_sft.pbs"
+      continue
+    fi
+  fi
+
+  mkdir -p "${EVAL_ROOT}"
+  eval_one "${RUN}" || overall_rc=$?
+done
+
+echo
+echo "================================================================"
+echo "==== 结束: ${SRC_DOMAIN} -> ${NEW_DOMAIN}  ARM=${ARM} ===="
+echo "  本次执行 ${GROUPS_RAN} 组评测，已有结果跳过 ${GROUPS_DONE} 组，"
+echo "  缺数据跳过 ${GROUPS_NODATA} 组，SKIP_GROUPS 关掉 ${GROUPS_SKIPPED} 组。"
+[[ -n "${SKIP_GROUPS}" ]] && echo "  SKIP_GROUPS='${SKIP_GROUPS}' —— 这几组没有数字，不是跑出来是 0。"
+echo "  汇总 csv: ${EVAL_ROOT}/<metric>_summary.csv"
+echo
+echo "  那张表里现在应该有（以 medqa 为例）："
+echo "    base                                    <- 90 号，没学过任何域"
+echo "    m_${SRC_DOMAIN}                              <- 阶段一，保留的上界"
+echo "    cont_${SRC_DOMAIN}2${NEW_DOMAIN}_vanilla_...        <- 遗忘的分母"
+echo "    cont_${SRC_DOMAIN}2${NEW_DOMAIN}_{onereplay,ewc,replay}_..."
+echo "  读法：${NEW_DOMAIN} 那几个 metric 回答「学会了吗」，${SRC_DOMAIN} 回答「忘了吗」，"
+echo "  第三个域是从没学过的对照。每条臂的收益 = 它 - vanilla，遗忘量 = 它 - m_${SRC_DOMAIN}。"
+echo
+echo "  四条臂还差哪几条就投哪几条："
+for _arm in vanilla onereplay ewc replay; do
+  [[ "${_arm}" == "${ARM}" ]] && continue
+  if [[ "${_arm}" == "onereplay" || "${_arm}" == "ewc" ]]; then
+    echo "    qsub -v SRC_DOMAIN=${SRC_DOMAIN},NEW_DOMAIN=${NEW_DOMAIN},ARM=${_arm},LAMBDA=<读 91 号 Step 3> onereplay/pbs/92_continual_sft.pbs"
+  else
+    echo "    qsub -v SRC_DOMAIN=${SRC_DOMAIN},NEW_DOMAIN=${NEW_DOMAIN},ARM=${_arm} onereplay/pbs/92_continual_sft.pbs"
+  fi
+done
+echo "================================================================"
+
+if [[ "${GROUPS_NODATA}" -gt 0 ]]; then
+  echo
+  echo "有 ${GROUPS_NODATA} 组因为缺数据没评，这次的矩阵是不完整的。" >&2
+  echo "  补齐 benchmark 后投 MODE=eval，已评完的组会自动跳过。" >&2
+  exit 6
+fi
+exit "${overall_rc}"

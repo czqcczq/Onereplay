@@ -349,6 +349,13 @@ WHICH="${WHICH:-both}"
 FORCE="${FORCE:-0}"
 LIMIT="${LIMIT:-0}"                           # >0 只评前 N 题，冒烟用
 
+# medical 的解码预算。必须 >= 训练池的 MAXLEN，因为那是 prompt+response 的总长，
+# 蒸馏进来的长 CoT 响应本身就能接近它。2048 时 m_medical 在 medqa 上有 41% 的回答
+# 顶到上限，没抽到答案的 416 题**全部**是截断（无一例格式不服从），accuracy 被压到
+# 54.99% 而抽到答案的那 857 题里对了 81.68%。base 答得短、不受影响，所以这个预算
+# 会给每一个"训练后退化"的 delta 掺进一份纯伪影。
+MEDICAL_MAX_NEW="${MEDICAL_MAX_NEW:-4096}"
+
 # 评测结果**跨 DOMAIN 共用一个根**：每个 <metric>_summary.csv 才能把 base 和三个
 # specialist 攒成一张表。分开放就得手工拼。
 EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_specialist_eval}"

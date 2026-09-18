@@ -66,6 +66,26 @@ def replay_max_len(args: argparse.Namespace) -> int:
     return value if value > 0 else args.max_len
 
 
+def replay_system_prompt(args: argparse.Namespace) -> str | None:
+    """The system turn replay rows render with, or None for the run-wide one.
+
+    Continual training is the only caller that needs this. The new task and the
+    replay corpus come from two different SFT stages, and those stages did not
+    share a system turn: a code corpus is taught under "put your final code in
+    a Python code block" while a medical one is taught under "put your final
+    answer within \\boxed{}". chat_policy holds one turn per process, so
+    without an override the replay rows inherit the new task's, and a rehearsal
+    row stops being byte-identical to the row the model actually learned --
+    which is the one property replay is supposed to have.
+
+    Empty means "inherit", not "no system turn". Distinguishing those would buy
+    a configuration nothing needs and cost every existing caller its default.
+    """
+
+    value = str(getattr(args, "replay_system_prompt", "") or "").strip()
+    return value or None
+
+
 def replay_target_flavor(args: argparse.Namespace) -> str:
     """Name the answers replay is about to train on, for the run log.
 
@@ -223,7 +243,10 @@ def build_replay_dataset(
     max_len = replay_max_len(args)
     if max_len != args.max_len:
         print(f"{tag}: tokenizing at max_len={max_len} (new task stays at {args.max_len})")
-    tokenize = build_sft_tokenize_fn(tokenizer, max_len)
+    system = replay_system_prompt(args)
+    if system is not None:
+        print(f"{tag}: rendering with its own system turn {system!r}")
+    tokenize = build_sft_tokenize_fn(tokenizer, max_len, system_prompt=system)
     map_cache_dir = getattr(args, "map_cache_dir", "")
     if map_cache_dir:
         cache_dir = Path(map_cache_dir)

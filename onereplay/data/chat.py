@@ -10,23 +10,46 @@ ensure_project_root()
 from process_dataset.process_glue_myself import build_loader, tokenizer_to_ids  # noqa: E402
 
 
-def apply_train_template(tokenizer, instruction: str, input_text: str, output_text: str) -> tuple[str, str]:
+def apply_train_template(
+    tokenizer,
+    instruction: str,
+    input_text: str,
+    output_text: str,
+    system_prompt: str | None = None,
+) -> tuple[str, str]:
     """Return full training text and prompt-only text for label masking.
 
     full_text contains both user and assistant messages.
     prompt_text ends at the assistant generation point and excludes the answer.
     tokenizer_to_ids then masks prompt_text tokens with -100.
+
+    system_prompt=None takes the run-wide turn from chat_policy, which is what
+    every caller wants when one corpus is in play. Continual training is the
+    exception: the new task and the replay corpus were serialized under
+    different system turns during their own SFT stages, and a replay row is
+    only a rehearsal if it arrives in the form the model was taught it in. Pass
+    the string explicitly there; "" means no system turn at all, which is
+    distinct from None.
     """
 
     user_content = instruction.strip()
     if input_text and input_text.strip():
         user_content = f"{user_content}\n\nInput:\n{input_text.strip()}"
 
-    full_messages = with_system([
-        {"role": "user", "content": user_content},
-        {"role": "assistant", "content": output_text.strip()},
-    ])
-    prompt_messages = with_system([{"role": "user", "content": user_content}])
+    user_turn = {"role": "user", "content": user_content}
+    assistant_turn = {"role": "assistant", "content": output_text.strip()}
+
+    if system_prompt is None:
+        full_messages = with_system([user_turn, assistant_turn])
+        prompt_messages = with_system([user_turn])
+    else:
+        prefix = (
+            [{"role": "system", "content": system_prompt.strip()}]
+            if system_prompt.strip()
+            else []
+        )
+        full_messages = [*prefix, user_turn, assistant_turn]
+        prompt_messages = [*prefix, user_turn]
 
     full_text = tokenizer.apply_chat_template(
         full_messages,
@@ -52,11 +75,13 @@ def apply_train_template(tokenizer, instruction: str, input_text: str, output_te
     return full_text, prompt_text
 
 
-def build_sft_tokenize_fn(tokenizer, max_len: int):
+def build_sft_tokenize_fn(tokenizer, max_len: int, system_prompt: str | None = None):
     """Return a datasets.map function for {instruction, input, output} rows.
 
     Commonsense170k and the replay corpus both go through this, so replayed
     old-knowledge samples are masked and truncated exactly like new-task ones.
+    system_prompt overrides the run-wide turn for this corpus only; see
+    apply_train_template.
     """
 
     def add_tokenized_fields(example):
@@ -65,6 +90,7 @@ def build_sft_tokenize_fn(tokenizer, max_len: int):
             example["instruction"],
             example.get("input", ""),
             example["output"],
+            system_prompt=system_prompt,
         )
         tokenized = tokenizer_to_ids(
             tokenizer=tokenizer,

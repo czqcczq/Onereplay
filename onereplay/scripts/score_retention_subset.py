@@ -272,10 +272,10 @@ def main() -> None:
     parser.add_argument("--results_root", required=True)
     parser.add_argument(
         "--metrics",
-        default="gsm8k,math500,humaneval,mbpp,ifeval,ifbench_loose",
+        default="gsm8k,math500,humaneval,mbpp,ifeval,ifbench",
         help="Comma-separated. A _loose suffix scores the same run with the "
-        "loose checker instead of the strict one; ifbench_loose is the view "
-        "its paper reports, which is why it is in the default and ifbench is not.",
+        "loose checker instead of the strict one; both instruction-following "
+        "metrics default to strict so their retention columns share one 口径.",
     )
     parser.add_argument(
         "--runs",

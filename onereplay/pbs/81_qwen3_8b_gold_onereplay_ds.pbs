@@ -1791,13 +1791,11 @@ RETENTION_JSON=""
 if [[ "${WITH_RETENTION}" == "1" ]]; then
   # dialogsum 不进这张表：它没有逐题的对错，只有 ROUGE/BERTScore，"base 答对的
   # 子集"对它没有定义。硬塞进去只会多一行看着像失败的 [skip]。
-  # ifbench 要换成 ifbench_loose：主表取的是 loose_prompt_accuracy，保留率若按
-  # strict 判分算，同一个 run 在同一张表的两列里就成了两个口径。
+  # IFEval 与 IFBench 的保留率都按 strict 判分算，两个 IF 指标一个口径。
   RET_METRICS=""
   for m in ${AVAIL}; do
     case "${m}" in
       dialogsum) ;;
-      ifbench)   RET_METRICS="${RET_METRICS},ifbench_loose" ;;
       *)         RET_METRICS="${RET_METRICS},${m}" ;;
     esac
   done
@@ -1852,6 +1850,8 @@ metric_names = os.environ["METRIC_NAMES"].split()
 SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
 # IFBench 例外：论文主报 prompt-level loose，73 号的表也是这个口径。落到通用
 # 顺序上会取到 strict，两张表就会对同一个 run 报出不同的数。
+# 注意 ret_* 三列按 strict 判分（与 IFEval 同口径），所以 IFBench 这一行的分数列
+# 是 loose、保留率列是 strict，不能把两者相减来读。
 METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy"}
 
 
@@ -1873,9 +1873,9 @@ def cell(value, spec=".4f", width=10):
     return f"{'-' if value is None else format(value, spec):>{width}}"
 
 
-# score_retention_subset 的 metric 名与主表不完全一致：ifbench 的保留率是按
-# loose 判分算的，落在 ifbench_loose 名下（见上面拼 RET_METRICS 那段）。
-RETENTION_ALIAS = {"ifbench": "ifbench_loose"}
+# 主表的分数列与保留率列可以取不同判分口径，需要时在这里把 metric 名映射到
+# score_retention_subset 用的名字（如 "ifbench" -> "ifbench_loose"）。
+RETENTION_ALIAS = {}
 retention = {}
 retention_path = os.environ.get("RETENTION_JSON", "")
 if retention_path and os.path.isfile(retention_path):
