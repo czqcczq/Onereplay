@@ -47,7 +47,9 @@
 #     **保尾丢头**——被砍掉的是题干开头，留下的是答案。对 Numina 影响很小（p99≈1462），
 #     但 MedQA 的 R1 轨迹和 ODA-Fin 的 235B 蒸馏 CoT 在 2048 下会被大量砍掉，而且砍掉的
 #     不是随机样本，是**所有长推理样本**，剩下的全是简单题。现在长度在数据侧解决：
-#     prepare_* 把超过 4096 的整行丢掉，所以训练时永远不会触发截断那条路径。
+#     prepare_* 把超过预算的整行丢掉，所以训练时永远不会触发截断那条路径。
+#     训练 MAXLEN 三域仍是 4096。medical 的 prepare 单独用 MEDICAL_MAX_TOKENS=2048：
+#     4096 池训出来的模型在 medqa 上 41% 顶满评测预算（也是 2048）写不到 \boxed{}。
 #
 #   BATCH   4 -> 2       （ACCUM 保持 64）
 #     纯粹是 4096 序列的显存代价。**有效 batch 没变**：trainer 里
@@ -207,7 +209,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY SMOKE_STEPS
-    SAMPLE_ROWS MAX_TRACES NEAR_DUP_THRESHOLD MAX_SOURCE_RATIO FIN_LANGUAGE
+    SAMPLE_ROWS MAX_TRACES MEDICAL_MAX_TOKENS NEAR_DUP_THRESHOLD MAX_SOURCE_RATIO FIN_LANGUAGE
     EVAL_SOURCE_PATTERNS TARGET_ROWS
   )
   for _v in "${FORWARD_VARS[@]}"; do
@@ -317,7 +319,13 @@ fi
 
 # ---- 各领域 prepare 的可调项（只影响数据，不影响训练超参）----
 SAMPLE_ROWS="${SAMPLE_ROWS:-100000}"          # math：目标池大小
-MAX_TRACES="${MAX_TRACES:-4}"                 # medical：每题最多几条正确轨迹
+# medical 数据侧长度。评测 --medical_max_new_tokens 是 2048；旧池按 4096 筛，
+# 训出来的模型学会写长于评测预算的 CoT，41% 的 medqa 回答顶满 2048 写不到
+# \boxed{}。只改 medical 的 prepare --max_tokens，训练 MAXLEN 仍是三域统一的
+# 4096（筛完的行全部更短，不会触发截断）。重建前先把 data/processed/medical_train
+# 挪走，MODE=data 拒绝覆盖已有 save_to_disk 池。
+MEDICAL_MAX_TOKENS="${MEDICAL_MAX_TOKENS:-2048}"
+MAX_TRACES="${MAX_TRACES:-5}"                 # medical：每题最多几条正确轨迹
 NEAR_DUP_THRESHOLD="${NEAR_DUP_THRESHOLD:-0.8}"
 MAX_SOURCE_RATIO="${MAX_SOURCE_RATIO:-0.15}"  # finance：单一 source 上限
 FIN_LANGUAGE="${FIN_LANGUAGE:-en}"
@@ -348,13 +356,6 @@ WHICH="${WHICH:-both}"
 # 1 = 已有 summary.json 也重算。改了 metric 实现时才用。
 FORCE="${FORCE:-0}"
 LIMIT="${LIMIT:-0}"                           # >0 只评前 N 题，冒烟用
-
-# medical 的解码预算。必须 >= 训练池的 MAXLEN，因为那是 prompt+response 的总长，
-# 蒸馏进来的长 CoT 响应本身就能接近它。2048 时 m_medical 在 medqa 上有 41% 的回答
-# 顶到上限，没抽到答案的 416 题**全部**是截断（无一例格式不服从），accuracy 被压到
-# 54.99% 而抽到答案的那 857 题里对了 81.68%。base 答得短、不受影响，所以这个预算
-# 会给每一个"训练后退化"的 delta 掺进一份纯伪影。
-MEDICAL_MAX_NEW="${MEDICAL_MAX_NEW:-4096}"
 
 # 评测结果**跨 DOMAIN 共用一个根**：每个 <metric>_summary.csv 才能把 base 和三个
 # specialist 攒成一张表。分开放就得手工拼。
@@ -454,6 +455,9 @@ echo " model       : ${MODEL_DIR}/${MODEL_NAME}"
 echo " dataset     : ${DATASET_DIR}"
 echo " run         : ${RUN}"
 echo " maxlen      : ${MAXLEN}   batch ${BATCH} x accum $((ACCUM / BATCH)) = ${ACCUM} 行/update"
+if [[ "${DOMAIN}" == "medical" ]]; then
+echo " medical data: max_tokens=${MEDICAL_MAX_TOKENS}  max_traces=${MAX_TRACES}"
+fi
 echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
 echo " system      : ${SYSTEM_PROMPT}"
 if [[ "${MODE}" == "train" || "${MODE}" == "eval" ]]; then
@@ -468,9 +472,8 @@ echo "================================================================"
 # MODE=data：原始语料 -> data/processed/{domain}_train{.jsonl,/}
 #
 # 三个 prepare 脚本都会打印一张 budget_scan 表（1024/2048/3072/4096/6144/8192 各档
-# 会保留多少行、多少 assistant token）。**定 MAXLEN 之前先读它**，尤其是 medical 和
-# finance——如果 4096 在某个领域丢掉的行远多于预期，那是该领域数据本身的信息，不是
-# 参数填错了。
+# 会保留多少行、多少 assistant token）。**定长度预算之前先读它**。medical 的筛选
+# 走 MEDICAL_MAX_TOKENS（默认 2048），不是训练 MAXLEN。
 # =============================================================================
 if [[ "${MODE}" == "data" ]]; then
   if [[ -f "${DATASET_DIR}/dataset_dict.json" ]]; then
@@ -480,10 +483,13 @@ if [[ "${MODE}" == "data" ]]; then
     exit 3
   fi
 
+  PREPARE_MAX_TOKENS="${MAXLEN}"
+  [[ "${DOMAIN}" == "medical" ]] && PREPARE_MAX_TOKENS="${MEDICAL_MAX_TOKENS}"
+
   COMMON_ARGS=(
     --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}"
     --system_prompt "${SYSTEM_PROMPT}"
-    --max_tokens "${MAXLEN}"
+    --max_tokens "${PREPARE_MAX_TOKENS}"
     --seed "${SEED}"
     --out_jsonl "${OUT_JSONL}"
     --out_stats "${OUT_STATS}"

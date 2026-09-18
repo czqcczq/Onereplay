@@ -113,15 +113,65 @@
 #       DOMAIN=if    评 ifeval + gsm8k + math500 + humaneval + mbpp
 #       DOMAIN=math  评 ifeval + gsm8k + math500
 #       DOMAIN=code  评 ifeval + humaneval + mbpp
+#       DOMAIN=mix   评全套（两侧都要评，见下）
+#
+# -----------------------------------------------------------------------------
+# DOMAIN=mix：一份 F 能不能同时保住两个域
+#
+#   与 81 号 mix 臂配对的那一条。81 号问「0.5 C_math + 0.5 C_code 能不能同时保住
+#   math 和 code」，本脚本问同一个问题的 F 版本，所以两条臂仍然只差「用 F 还是
+#   用 C 加权 ΔW」这一个变量。
+#
+#       qsub -v DRY_RUN=0,DOMAIN=mix,LAMBDA=<...> <本脚本>
+#
+#   F_mix 由本脚本在 Step 0.5 用 mix_fishers 合成一次，之后所有 λ 复用。
+#
+#   !! 裸 0.5/0.5 在 F 上不是等权，在 C 上才是
+#   这是本臂与 81 号唯一无法逐字对齐的地方，也是必须写进结果的一点：
+#     C 是 token 均值（E[x xᵗ]），两个域的尺度天然同阶，所以 0.5/0.5 就是等权。
+#     F 是序列求和的平方梯度，尺度随每行的 supervised token 数走，域间可以差
+#     几倍。0.5·F_math + 0.5·F_code 里，尺度大的那个域会按比例主导罚项。
+#   所以本脚本给两种口径，MIX_MODE 切换：
+#     half （默认）  --weights 0.5,0.5    字面的等系数。用户要的就是这个，也是
+#                                        「不做尺度归一」的对照臂 —— 它等价于
+#                                        replay 按行等比混合（83 号 mix）。
+#     equal          --equalize mean      w_i ∝ 1/mean(F_i) 再归一，两域等 Fisher
+#                                        质量贡献。这一版才是 81 号 C_mix 等权的
+#                                        真正对应物。
+#   Step 0.5 会把两个域的 mean(F) 和各自的实际贡献份额打出来。两者比值接近 1 时
+#   half 与 equal 会趋同，「哪种混法更好」这个问题也就失去了前提 —— 那本身是个
+#   有价值的结果，要报。
+#
+#   !! λ 在 mix 下要重扫
+#   mean(F_mix) = Σ w_i·mean(F_i)：half 是算术平均，equal 是调和平均，两者都与
+#   任何一个单域的 mean(F) 不同。λ 是按 1/mean(F) 起步的，所以单域臂的 λ 搬不过来，
+#   两个 MIX_MODE 之间也不能互搬。
+#
+#   !! 要报的是两侧分开的数
+#   这一臂成立的条件是 math 与 code **都**不比对应单域臂差得多。一侧保住、另一侧
+#   塌了，要报的是这个权衡，不是两边的平均分。
+#
+# -----------------------------------------------------------------------------
+# 额外指标：base 答对子集上的保留率
+#
+#   整体准确率把两件事加在一起：base 本来就不会的题上这个 run 碰巧学会了多少，
+#   和 base 会做的题里它弄丢了多少。反遗忘的主张只关于后者，而它在整体分数里
+#   被前者稀释 —— GSM8K 上 base 答错的约 300 题占近四分之一，一个 run 在那上面
+#   只能靠碰运气得分。
+#
+#   本脚本在评测之后自动跑一次 score_retention_subset（WITH_RETENTION=0 可关），
+#   结果并进主汇总表的 ret_* 三列。不重新解码，只读评测留下的逐题判分文件。
 #
 # -----------------------------------------------------------------------------
 # 投递前要有的东西
 #   1) ${MODEL_DIR}/Qwen3-8B
 #   2) 69 号产出的本域 F（fisher_*_8b_all.pt）
+#      DOMAIN=mix 要的是参与混合的每一份单域 F；F_mix 由本脚本合成。
 #   3) 68 号产出的本域 C —— 本臂不用它训练，只读它的 pool_fingerprint 来证明
 #      F 和 C 是同一批行。真没有就传 SKIP_FP_CHECK=1，但那样这条对比就没有凭据。
+#      mix 下核对的是每个源 F 与对应域的 C（F_mix 本身没有单一池指纹）。
 #   4) ${DS_DATASET} = datasets/dialogsum_sft_hf
-#   5) 74 号的 base 与 vanilla 已评完
+#   5) 74 号的 base 与 vanilla 已评完（base 缺席时 ret_* 三列会是 '-'）
 #   6) IFBench 的依赖，**必须在登录节点装**（不装就只跳过 ifbench 这一个指标，
 #      其余照常；不想评就传 WITH_IFBENCH=0）:
 #        source ${VENV}/bin/activate
@@ -140,6 +190,12 @@
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=<起点>,PROBE=1 onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
 #   拆两次投（训练与评测分开）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=...,DO_EVAL=0  ...   然后   DO_TRAIN=0
+#
+#   mix 臂（默认 0.5 F_math + 0.5 F_code，评 math + code 两侧）。λ 要重扫:
+#   qsub -v DRY_RUN=0,DOMAIN=mix,LAMBDAS=0:<0.01x>:<0.1x>:<1x>:<10x>,MAX_STEPS=2990 onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
+#   qsub -v DRY_RUN=0,DOMAIN=mix,LAMBDA=<定好的档位> onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
+#   按尺度归一的那一版（与 81 号 C_mix 等权真正对应，λ 也要单独扫）:
+#   qsub -v DRY_RUN=0,DOMAIN=mix,MIX_MODE=equal,LAMBDA=... onereplay/pbs/82_qwen3_8b_gold_ewc_ds.pbs
 #
 #   若本站点 qsub 不吃 -v（63 号文件头有过这个记录），就直接改「阶段开关」段的
 #   默认值再投。
@@ -204,6 +260,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DOMAIN LAMBDA LAMBDAS PROBE_STEPS PROBE_LOG_EVERY SKIP_FP_CHECK
     FISHER_PATH IF_FISHER MATH_FISHER CODE_FISHER
     COV_PATH IF_COV MATH_COV CODE_COV
+    MIX_DOMAINS MIX_WEIGHTS MIX_MODE MIX_FISHER FORCE_MIX WITH_RETENTION
     REGULARIZER IDENTITY_COV REG_ONCE NORM_BY_LAYERS ONEREPLAY_METRICS
     SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES LORA_RANK LORA_ALPHA LORA_DROPOUT
@@ -298,14 +355,15 @@ WITH_VANILLA="${WITH_VANILLA:-0}"
 # ---- 保护域：决定 F、run 名与评测口径 ----
 DOMAIN="${DOMAIN:-}"
 case "${DOMAIN}" in
-  if|math|code) ;;
+  if|math|code|mix) ;;
   "")
-    echo "!! 必须指定 DOMAIN（if / math / code）。"
+    echo "!! 必须指定 DOMAIN（if / math / code / mix）。"
     echo "   例: qsub -v DRY_RUN=0,DOMAIN=if,LAMBDA=1e2 ${SELF_PATH}"
+    echo "   mix = 多份 F 线性混合，默认 0.5 F_math + 0.5 F_code，评 math+code 两侧"
     exit 1
     ;;
   *)
-    echo "!! DOMAIN=${DOMAIN} 不认识，只能是 if / math / code（本轮不做 mix）"
+    echo "!! DOMAIN=${DOMAIN} 不认识，只能是 if / math / code / mix"
     exit 1
     ;;
 esac
@@ -342,11 +400,95 @@ CODE_FISHER="${CODE_FISHER:-${FISHER_DIR}/fisher_code_opcedu20k_gold_8b_all.pt}"
 IF_COV="${IF_COV:-${COV_DIR}/cov_flan_chat_20k_8b_all.pt}"
 MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_8b_all.pt}"
 CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_8b_all.pt}"
-case "${DOMAIN}" in
-  if)   FISHER_PATH="${FISHER_PATH:-${IF_FISHER}}"   ; COV_PATH="${COV_PATH:-${IF_COV}}"   ;;
-  math) FISHER_PATH="${FISHER_PATH:-${MATH_FISHER}}" ; COV_PATH="${COV_PATH:-${MATH_COV}}" ;;
-  code) FISHER_PATH="${FISHER_PATH:-${CODE_FISHER}}" ; COV_PATH="${COV_PATH:-${CODE_COV}}" ;;
-esac
+fisher_for_domain () {
+  case "$1" in
+    if)   printf '%s' "${IF_FISHER}" ;;
+    math) printf '%s' "${MATH_FISHER}" ;;
+    code) printf '%s' "${CODE_FISHER}" ;;
+    *)    echo "!! 未知的域 '$1'（只能是 if / math / code）" >&2; return 1 ;;
+  esac
+}
+cov_for_domain () {
+  case "$1" in
+    if)   printf '%s' "${IF_COV}" ;;
+    math) printf '%s' "${MATH_COV}" ;;
+    code) printf '%s' "${CODE_COV}" ;;
+    *)    echo "!! 未知的域 '$1'（只能是 if / math / code）" >&2; return 1 ;;
+  esac
+}
+
+# DOMAIN_TAG 进 run 名。单域时逐字等于旧值（ifgold / mathgold / codegold），否则
+# 74 号以来所有已有结果的目录名都会对不上。
+MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
+MIX_WEIGHTS="${MIX_WEIGHTS:-0.5,0.5}"
+# half = 裸等系数（字面的 0.5/0.5）；equal = 按 mean(F) 归一后等贡献。
+# 差别见文件头：F 不像 C 那样天然同阶，裸 0.5/0.5 会被尺度大的域主导。
+MIX_MODE="${MIX_MODE:-half}"
+MIX_FISHER_LIST=""
+MIX_COV_LIST=""
+MIX_DOMAIN_LIST=()
+MIX_WEIGHT_LIST=()
+FORCE_MIX="${FORCE_MIX:-0}"
+if [[ "${DOMAIN}" == "mix" ]]; then
+  case "${MIX_MODE}" in
+    half|equal) ;;
+    *) echo "!! MIX_MODE=${MIX_MODE} 不认识，只能是 half（裸等系数）或 equal（按 mean 归一）"; exit 1 ;;
+  esac
+  # qsub -v 自己按逗号切参数，所以冒号最稳；两种都收。
+  read -r -a MIX_DOMAIN_LIST <<< "${MIX_DOMAINS//[,:]/ }"
+  read -r -a MIX_WEIGHT_LIST <<< "${MIX_WEIGHTS//[,:]/ }"
+  if (( ${#MIX_DOMAIN_LIST[@]} < 2 )); then
+    echo "!! MIX_DOMAINS='${MIX_DOMAINS}' 至少要两个域，否则用单域 DOMAIN= 就行"
+    exit 1
+  fi
+  if (( ${#MIX_DOMAIN_LIST[@]} != ${#MIX_WEIGHT_LIST[@]} )); then
+    echo "!! MIX_DOMAINS 有 ${#MIX_DOMAIN_LIST[@]} 项而 MIX_WEIGHTS 有 ${#MIX_WEIGHT_LIST[@]} 项，对不上"
+    exit 1
+  fi
+  for d in "${MIX_DOMAIN_LIST[@]}"; do
+    f_src="$(fisher_for_domain "${d}")" || exit 1
+    c_src="$(cov_for_domain "${d}")" || exit 1
+    MIX_FISHER_LIST="${MIX_FISHER_LIST}${MIX_FISHER_LIST:+,}${f_src}"
+    MIX_COV_LIST="${MIX_COV_LIST}${MIX_COV_LIST:+,}${c_src}"
+  done
+  # equal 下权重是 mix_fishers 在运行时按 mean(F) 现算的，这里写死的那组不参与，
+  # 所以公式也不能照抄 MIX_WEIGHTS，否则标签和实际用的权重会不一致。
+  MIX_FORMULA=""
+  if [[ "${MIX_MODE}" == "equal" ]]; then
+    for d in "${MIX_DOMAIN_LIST[@]}"; do
+      MIX_FORMULA="${MIX_FORMULA}${MIX_FORMULA:+ + }w x F_${d}"
+    done
+    MIX_FORMULA="${MIX_FORMULA}   (w ∝ 1/mean(F)，运行时现算)"
+    MIX_TAG="mix-$(IFS=-; printf '%s' "${MIX_DOMAIN_LIST[*]}")-equal"
+  else
+    for i in "${!MIX_DOMAIN_LIST[@]}"; do
+      MIX_FORMULA="${MIX_FORMULA}${MIX_FORMULA:+ + }${MIX_WEIGHT_LIST[$i]} x F_${MIX_DOMAIN_LIST[$i]}"
+    done
+    MIX_TAG="mix-$(IFS=-; printf '%s' "${MIX_DOMAIN_LIST[*]}")-w$(IFS=-; printf '%s' "${MIX_WEIGHT_LIST[*]}")"
+  fi
+  # 域、权重、混法都进标签：这三样任何一个变了都是另一份 F，adapter 不能互相覆盖。
+  DOMAIN_TAG="${MIX_TAG}-gold"
+  MIX_FISHER="${MIX_FISHER:-${FISHER_DIR}/fisher_${MIX_TAG}_gold_8b_all.pt}"
+  FISHER_PATH="${FISHER_PATH:-${MIX_FISHER}}"
+  # 单域时 COV_PATH 是同池核对的参照物；mix 下参照物是 MIX_COV_LIST 里那几份，
+  # 这个变量只保留给不走 mix 分支的代码路径（plan banner 等）用。
+  COV_PATH="${COV_PATH:-$(cov_for_domain "${MIX_DOMAIN_LIST[0]}")}"
+else
+  DOMAIN_TAG="${DOMAIN}gold"
+  FISHER_PATH="${FISHER_PATH:-$(fisher_for_domain "${DOMAIN}")}"
+  COV_PATH="${COV_PATH:-$(cov_for_domain "${DOMAIN}")}"
+fi
+
+# 本脚本打印的每一条 qsub 建议都用这个。mix 下漏掉 MIX_*，抄下来的命令会退回
+# 默认的 math:code / 0.5:0.5 / half，投出去跑的就是另一个实验了。
+if [[ "${DOMAIN}" == "mix" ]]; then
+  DOMAIN_ARGS="DOMAIN=mix,MIX_DOMAINS=${MIX_DOMAINS//,/:},MIX_MODE=${MIX_MODE}"
+  if [[ "${MIX_MODE}" != "equal" ]]; then
+    DOMAIN_ARGS="${DOMAIN_ARGS},MIX_WEIGHTS=${MIX_WEIGHTS//,/:}"
+  fi
+else
+  DOMAIN_ARGS="DOMAIN=${DOMAIN}"
+fi
 
 # ---- λ 扫描 ----
 # 传 LAMBDAS 就进扫描模式：网格上每个 λ 各跑 MAX_STEPS 步，不评测不存 adapter，
@@ -386,7 +528,7 @@ if [[ "${MAX_STEPS}" != "0" || "${EPOCHS}" != "2" ]]; then
   SHORT_RUN=1
 fi
 run_name_for () {
-  local name="ds_ewc_8b_${DOMAIN}gold_${RUN_TAG}_lam${1}_lr${LR}_seed${SEED}_regonce"
+  local name="ds_ewc_8b_${DOMAIN_TAG}_${RUN_TAG}_lam${1}_lr${LR}_seed${SEED}_regonce"
   if (( SHORT_RUN == 1 )); then
     name="${name}_probe${MAX_STEPS}s${EPOCHS}e"
   fi
@@ -450,6 +592,11 @@ IFBENCH_BATCH="${IFBENCH_BATCH:-16}"
 TIMEOUT="${TIMEOUT:-10}"
 LIMIT="${LIMIT:-0}"
 DIAG_LEN="${DIAG_LEN:-1}"
+# base 答对子集上的保留率。整体准确率把两件事加在一起：base 本来就不会的题上
+# 这个 run 碰巧学会了多少，和 base 会做的题里它弄丢了多少。反遗忘的主张只关于
+# 后者，而它在整体分数里被前者稀释（GSM8K 上 base 答错的约 300 题只贡献噪声）。
+# 这一项靠 score_retention_subset 后处理逐题判分文件算出来，不需要重新解码。
+WITH_RETENTION="${WITH_RETENTION:-1}"
 EXTRA_MODELS="${EXTRA_MODELS:-}" # "name;/abs/path" 用 | 分隔，额外要评的已有 run
 MIN_HOST_FREE_GIB="${MIN_HOST_FREE_GIB:-4}"   # F 之外还要留给主机的余量
 
@@ -458,6 +605,11 @@ case "${DOMAIN}" in
   if)   DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
   math) DOMAIN_METRICS="ifeval gsm8k math500" ;;
   code) DOMAIN_METRICS="ifeval humaneval mbpp" ;;
+  # mix 保的是两个域，就必须两边都评。只评其中一边的话，「另一边被挤掉了」这个
+  # 最可能的失败模式根本不会出现在表里 —— 而那正是这一臂要回答的问题。
+  # 当前只有 if / math / code 三个域，if 域本身就是全集，math 与 code 的并集也是
+  # 全集，所以任何两域组合的口径都在这里。以后加了新域要改成按 MIX_DOMAINS 推。
+  mix)  DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
 esac
 # IFEval 的 25 类约束是公开的，「IFEval 没掉」有可能只是记住了那 25 类模板。
 # IFBench 换了 58 类训练时没见过的约束，两个一起看才能区分「能力保住了」和
@@ -500,7 +652,16 @@ echo "  run      = ${RUN}"
 echo "  分母     = base / ${VANILLA_RUN}   (74 号产出)"
 echo "  对手     = 81 号 OneReplay 同域（同批行，只差用 F 还是用 C 加权 ΔW）"
 echo "  F        = ${FISHER_PATH}"
-echo "  同池参照 = ${COV_PATH}   skip_check=${SKIP_FP_CHECK}"
+if [[ "${DOMAIN}" == "mix" ]]; then
+  echo "             = ${MIX_FORMULA}"
+  echo "             mix_mode=${MIX_MODE}（half=裸等系数 / equal=按 mean(F) 归一后等贡献）"
+  for i in "${!MIX_DOMAIN_LIST[@]}"; do
+    echo "             源 F_${MIX_DOMAIN_LIST[$i]} = $(fisher_for_domain "${MIX_DOMAIN_LIST[$i]}")"
+  done
+  echo "  同池参照 = 逐域比（${MIX_COV_LIST}）   skip_check=${SKIP_FP_CHECK}"
+else
+  echo "  同池参照 = ${COV_PATH}   skip_check=${SKIP_FP_CHECK}"
+fi
 if (( SWEEP == 1 )); then
   echo "  λ 网格   = ${LAMBDA_LIST[*]}   (扫描，每点 ${MAX_STEPS} 步)"
 else
@@ -557,16 +718,28 @@ fi
 if [[ "${IDENTITY_COV}" == "1" ]]; then
   echo "!! IDENTITY_COV=1 在 EWC 臂上无意义：它是把 C 换成单位矩阵的 L2 对照，"
   echo "   train.py 的 ewc 分支会直接抛异常。要那个消融就去 81 号:"
-  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<...>,IDENTITY_COV=1 \\"
+  echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<...>,IDENTITY_COV=1 \\"
   echo "        onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs"
   exit 1
 fi
 [[ -d "${DS_DATASET}" ]] || { echo "缺 DialogSum 训练池: ${DS_DATASET}"; exit 1; }
-[[ -f "${FISHER_PATH}" ]] || {
-  echo "!! 缺 F: ${FISHER_PATH}"
-  echo "   先跑 69 号采本域的 F（那是逐条样本反向，比采 C 慢得多，先看它的 ETA）。"
-  exit 1
-}
+if [[ "${DOMAIN}" == "mix" ]]; then
+  # F_mix 是本脚本 Step 0.5 的产物，这里要在的是它的每一个源。
+  for d in "${MIX_DOMAIN_LIST[@]}"; do
+    f_src="$(fisher_for_domain "${d}")"
+    [[ -f "${f_src}" ]] || {
+      echo "!! 缺 F_${d}: ${f_src}"
+      echo "   mix 要参与混合的每一份单域 F 都在位。先跑 69 号采这个域的 F。"
+      exit 1
+    }
+  done
+else
+  [[ -f "${FISHER_PATH}" ]] || {
+    echo "!! 缺 F: ${FISHER_PATH}"
+    echo "   先跑 69 号采本域的 F（那是逐条样本反向，比采 C 慢得多，先看它的 ETA）。"
+    exit 1
+  }
+fi
 case "${FISHER_PATH}" in
   *_qv.pt)
     echo "!! FISHER_PATH 以 _qv.pt 结尾，那是只覆盖 q_proj/v_proj 的 F。"
@@ -580,9 +753,21 @@ case "${FISHER_PATH}" in
     ;;
 esac
 # 同池凭据：F 与 C 的 pool_fingerprint 必须相等，否则这条对比比的不只是 F vs C。
+# mix 下参照物是每个域各自的 C：F_mix 是几份 F 线性叠加出来的，没有单一的池指纹，
+# 要核的是「每个源 F 与它那个域的 C 同池」。
 if [[ "${SKIP_FP_CHECK}" == "1" ]]; then
   echo "warning: SKIP_FP_CHECK=1，不比 F 与 C 的池指纹。"
   echo "         「同一批旧知识，两种编码」这个前提就没有凭据了，结论只能当参考。"
+elif [[ "${DOMAIN}" == "mix" ]]; then
+  for d in "${MIX_DOMAIN_LIST[@]}"; do
+    c_src="$(cov_for_domain "${d}")"
+    [[ -f "${c_src}" ]] || {
+      echo "!! 缺 C_${d}: ${c_src}"
+      echo "   mix 下要逐域证明源 F 与该域的 C 同池，所以每个域的 C 都要在位。"
+      echo "   68 号还没跑就先跑它；确实要先跑 EWC 就传 SKIP_FP_CHECK=1。"
+      exit 1
+    }
+  done
 elif [[ ! -f "${COV_PATH}" ]]; then
   echo "!! 缺 C: ${COV_PATH}"
   echo "   本臂不用它训练，只读它 metadata 里的 pool_fingerprint 来证明 F 与 C 同池。"
@@ -638,6 +823,198 @@ done
 [[ -d "${MBPP_DIR}" ]] || echo "warning: 缺 MBPP 目录 ${MBPP_DIR}（该指标会被跳过）"
 
 # ===========================================================================
+# Step 0.5: 合成 F_mix（只有 DOMAIN=mix 走这里）
+#   一次性，之后同一组域/权重/混法的所有 λ 都复用这份文件。
+#
+#   !! 这一步比 81 号合成 C_mix 吃内存得多
+#   mix_covariances 的输入走 mmap，常驻的只有累加器那一份；mix_fishers 是
+#   torch.load 整份读进来的，所有输入同时常驻，再加一份输出的累加器。8B 的 F
+#   一份约 26 GiB，两份就是 78 GiB 峰值。下面的预检按这个真实需求算，不是按
+#   81 号那套 mmap 的口径 —— 算少了不会报错，会被 OOM killer 杀掉（退出码 137）。
+# ===========================================================================
+if [[ "${DOMAIN}" == "mix" ]]; then
+  echo "==== Step 0.5: F_mix ===="
+  echo "     ${MIX_FORMULA}"
+  echo "     mix_mode=${MIX_MODE}  ->  ${FISHER_PATH}"
+
+  if [[ -f "${FISHER_PATH}" && "${FORCE_MIX}" != "1" ]]; then
+    echo "     F_mix 已存在，复用（FORCE_MIX=1 可重建）。"
+  elif [[ "${DRY_RUN}" == "1" ]]; then
+    echo "     DRY_RUN=1：不合成。DRY_RUN=0 时本脚本会自动执行下面这条，"
+    echo "     也可以先手工跑（合成与训练无关，可以先在别的作业里做好）:"
+    echo "       python -m onereplay.mix_fishers \\"
+    echo "         --inputs \"${MIX_FISHER_LIST}\" \\"
+    if [[ "${MIX_MODE}" == "equal" ]]; then
+      echo "         --equalize mean \\"
+    else
+      echo "         --weights \"${MIX_WEIGHTS//:/,}\" --normalize_weights 1 \\"
+    fi
+    echo "         --output_path \"${FISHER_PATH}\""
+  else
+    if ! MIX_SOURCES="${MIX_FISHER_LIST}" MIX_OUT_DIR="$(dirname "${FISHER_PATH}")" \
+      MIN_HOST_FREE_GIB="${MIN_HOST_FREE_GIB}" python - <<'PY'
+import os
+import shutil
+from pathlib import Path
+
+sources = [item for item in os.environ["MIX_SOURCES"].split(",") if item]
+sizes = [Path(item).stat().st_size for item in sources]
+largest = max(sizes)
+# mix_fishers 不走 mmap：每一份输入都整份常驻，输出再占一份最大输入的量。
+need_ram = sum(sizes) + largest + float(os.environ["MIN_HOST_FREE_GIB"]) * 2**30
+
+print(f"     输入合计 {sum(sizes) / 2**30:7.2f} GiB (整份读进内存，全部常驻)")
+print(f"     F_mix    {largest / 2**30:7.2f} GiB (累加器，要整份放内存，也要写进盘)")
+
+failures = []
+available = 0
+try:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            available = int(line.split()[1]) * 1024
+            break
+except OSError:
+    pass
+if available:
+    print(f"     MemAvailable {available / 2**30:7.2f} GiB (需要 >= {need_ram / 2**30:.2f})")
+    if available < need_ram:
+        failures.append(
+            "主机可用内存装不下「所有输入 + 一份输出」，合成会被 OOM killer 杀掉"
+        )
+else:
+    print("     读不到 /proc/meminfo，跳过内存预检")
+
+free_disk = shutil.disk_usage(os.environ["MIX_OUT_DIR"]).free
+print(f"     磁盘可用     {free_disk / 2**30:7.2f} GiB (需要 >= {largest / 2**30:.2f})")
+if free_disk < largest:
+    failures.append("目标目录放不下 F_mix，torch.save 会写到一半失败并留下半个文件")
+
+for item in failures:
+    print(f"     !! {item}")
+raise SystemExit(1 if failures else 0)
+PY
+    then
+      echo "!! F_mix 的空间预检没过（见上）。换个内存/磁盘更宽的地方，或先在别处合好再搬过来。"
+      exit 1
+    fi
+    echo "==== 合成 F_mix（一次性，之后所有 λ 复用）===="
+    if [[ "${MIX_MODE}" == "equal" ]]; then
+      # 权重由 mix_fishers 读两份 F 的 mean 现算，换一份重采的 F 会自动重算，
+      # 不会像把 0.21 硬写进脚本那样过期。
+      python -m onereplay.mix_fishers \
+        --inputs "${MIX_FISHER_LIST}" \
+        --equalize mean \
+        --output_path "${FISHER_PATH}"
+    else
+      python -m onereplay.mix_fishers \
+        --inputs "${MIX_FISHER_LIST}" \
+        --weights "${MIX_WEIGHTS//:/,}" \
+        --normalize_weights 1 \
+        --output_path "${FISHER_PATH}"
+    fi
+  fi
+
+  # ---- 混合语义自检 + 同池凭据（逐域）----
+  #   这里走不到完整的 inspect_fisher：mix 产物没有采集阶段的 length_weighting
+  #   元数据。改为读 metadata 校验三件事：混法对不对、两域各自的贡献份额是多少、
+  #   每个源 F 是否与它那个域的 C 同池。
+  if [[ -f "${FISHER_PATH}" ]]; then
+    echo "==== Step 0.5 自检: F_mix 的混合语义与逐域同池 ===="
+    MIX_FISHER_PATH="${FISHER_PATH}" MIX_MODE="${MIX_MODE}" \
+    MIX_DOMAINS_SPACED="${MIX_DOMAIN_LIST[*]}" MIX_COV_LIST="${MIX_COV_LIST}" \
+    SKIP_FP_CHECK="${SKIP_FP_CHECK}" python - <<'PY'
+import os
+
+import torch
+
+payload = torch.load(os.environ["MIX_FISHER_PATH"], map_location="cpu", mmap=True)
+meta = payload.get("metadata", {})
+mode = os.environ["MIX_MODE"]
+domains = os.environ["MIX_DOMAINS_SPACED"].split()
+covs = [item for item in os.environ["MIX_COV_LIST"].split(",") if item]
+
+failures = []
+if meta.get("type") != "weighted_fisher_mix":
+    raise SystemExit(
+        f"{os.environ['MIX_FISHER_PATH']} 不是 mix_fishers 的产物 "
+        f"(type={meta.get('type')!r})。同名的旧文件挡在这儿了，删掉或传 FORCE_MIX=1。"
+    )
+
+want_mode = "equalize:mean" if mode == "equal" else "explicit"
+if meta.get("mode") != want_mode:
+    failures.append(
+        f"MIX_MODE={mode} 要的是 mode={want_mode}，文件里是 {meta.get('mode')!r}。"
+        "这份 F_mix 是用另一种混法生成的，传 FORCE_MIX=1 重建。"
+    )
+
+weights = meta.get("weights", [])
+means = meta.get("input_means", [])
+contrib = meta.get("input_contributions", [])
+mix_mean = meta.get("fisher_scale", {}).get("mean")
+print(f"层数         = {meta.get('num_common_keys')}")
+if mix_mean is not None:
+    # λ 的起点是 1/mean(F)，而 mean(F_mix) 与任何一个单域的都不同，所以单域臂
+    # 的 λ 搬不过来。Step 1 会按这份文件再算一次建议起点。
+    print(f"mean(F_mix)  = {mix_mean:.6e}    λ 起点 ≈ {1 / mix_mean:.3e}")
+print()
+print(f"{'域':<8}{'weight':>12}{'mean(F)':>16}{'贡献 w*mean':>16}{'份额':>10}")
+total_contrib = sum(contrib) or 1.0
+for i, domain in enumerate(domains):
+    if i >= len(weights):
+        break
+    print(f"{domain:<8}{weights[i]:>12.4f}{means[i]:>16.6e}"
+          f"{contrib[i]:>16.6e}{contrib[i] / total_contrib:>9.1%}")
+print()
+if len(means) == 2 and means[1]:
+    ratio = means[0] / means[1]
+    print(f"mean(F_{domains[0]})/mean(F_{domains[1]}) = {ratio:.3f}x")
+    if mode != "equal" and (ratio > 1.5 or ratio < 1 / 1.5):
+        heavier = domains[0] if ratio > 1 else domains[1]
+        print(
+            f"note: 裸等系数下 {heavier} 按 {max(ratio, 1 / ratio):.2f}x 主导罚项。这是 half"
+            " 口径的已知性质（F 是序列求和，域间不同阶），要写进结果。想要两域等贡献"
+            "就投 MIX_MODE=equal，那一版的 λ 要单独扫。"
+        )
+    else:
+        print("note: 两域 mean(F) 接近同阶，half 与 equal 会趋同 —— 这本身是个结果，要报。")
+
+# 源池指纹：mix 产物没有自己的 pool_fingerprint，只记了每个源的。逐域与该域的 C 比。
+print()
+if os.environ["SKIP_FP_CHECK"] == "1":
+    print("SKIP_FP_CHECK=1：不逐域比池指纹，「同一批行、两种编码」没有凭据。")
+else:
+    src_fps = meta.get("source_pool_fingerprints", [])
+    for i, domain in enumerate(domains):
+        if i >= len(covs):
+            break
+        f_fp = src_fps[i] if i < len(src_fps) else None
+        cov_meta = torch.load(covs[i], map_location="cpu", mmap=True).get("metadata", {})
+        c_fp = cov_meta.get("pool_fingerprint")
+        if not f_fp or not c_fp:
+            failures.append(
+                f"{domain}: F 或 C 的 metadata 里没有 pool_fingerprint，无法证明同池。"
+                "可能是更早的脚本产的；重采，或传 SKIP_FP_CHECK=1 并在结果里注明。"
+            )
+        elif f_fp != c_fp:
+            failures.append(
+                f"{domain}: 池指纹不等（F {f_fp} vs C {c_fp}）。这个域的 F 和 C 不是在"
+                "同一批行上采的，EWC(F_mix) 与 OneReplay(C_mix) 的对比里就混进了"
+                "「看的旧知识不同」这第二个变量。"
+            )
+        else:
+            print(f"OK: {domain} 的源 F 与 C 同池 {f_fp}")
+
+if failures:
+    print("\nStep 0.5 自检失败:")
+    for item in failures:
+        print(f"  - {item}")
+    raise SystemExit(1)
+print("\nStep 0.5 自检通过")
+PY
+  fi
+fi
+
+# ===========================================================================
 # Step 1: F 的层覆盖断言 + 量级/显存预检 + 与 C 的池指纹比对
 #   这是本脚本存在的主要理由。regularizer 对找不到罚项矩阵的层静默跳过，所以
 #   「训练跑通」并不能说明正则真的覆盖了 252 层。
@@ -653,7 +1030,17 @@ export MODEL_DIR MODEL_NAME FISHER_PATH COV_PATH TARGET_MODULES LAMBDA LAMBDA_GR
 export FISHER_DIAG NORM_BY_LAYERS MIN_HOST_FREE_GIB SKIP_FP_CHECK BATCH MAXLEN
 FISHER_REPORT_FILE="${TMPDIR}/fisher_preflight_${RUN}.txt"
 
-if ! python - <<'PY' 2>&1 | tee "${FISHER_REPORT_FILE}"; then
+# DRY_RUN=1 的 mix 计划里 F_mix 还没合成（Step 0.5 只打印命令），没有文件可检。
+# 这不是错误，是「先看计划」这个模式本来的样子。
+SKIP_FISHER_PREFLIGHT=0
+if [[ "${DOMAIN}" == "mix" && ! -f "${FISHER_PATH}" ]]; then
+  SKIP_FISHER_PREFLIGHT=1
+  echo "F_mix 还不存在（DRY_RUN=1 没有真的合成），跳过 F 的层覆盖与量级检查。"
+  echo "DRY_RUN=0 投出去时会先合成，再在这里检一遍。"
+fi
+if (( SKIP_FISHER_PREFLIGHT == 1 )); then
+  : > "${FISHER_REPORT_FILE}"
+elif ! python - <<'PY' 2>&1 | tee "${FISHER_REPORT_FILE}"; then
 import json
 import math
 import os
@@ -816,6 +1203,10 @@ if mem_available:
 print()
 if os.environ["SKIP_FP_CHECK"] == "1":
     print("SKIP_FP_CHECK=1：不与 C 比池指纹，「同一批行、两种编码」没有凭据。")
+elif os.environ["DOMAIN"] == "mix":
+    # F_mix 是几份 F 线性叠加出来的，没有单一的池指纹可比。逐域的核对（每个源 F
+    # 对上它那个域的 C）已经在 Step 0.5 做过了，这里重复一遍只会拿 None 去比。
+    print("DOMAIN=mix：池指纹已在 Step 0.5 逐域核对过（F_mix 本身没有单一池指纹）。")
 else:
     cov_meta = load(os.environ["COV_PATH"]).get("metadata", {})
     f_fp = meta.get("pool_fingerprint")
@@ -938,13 +1329,20 @@ PY
   exit 1
 fi
 
-EXPECT_LAYERS="$(grep -o 'EXPECT_LAYERS=[0-9]*' "${FISHER_REPORT_FILE}" | tail -n 1)"
+# || true 是必须的：grep 没匹配时退出码 1，在 set -e 下会把整个作业带走。
+# 报告为空只在「mix 的 F_mix 还没合成」这一种情况下出现，那次投递不会训练，
+# 所以拿不到 EXPECT_LAYERS 不该拦，否则 DRY_RUN=1 看个计划都要先合一份 26 GiB。
+EXPECT_LAYERS="$(grep -o 'EXPECT_LAYERS=[0-9]*' "${FISHER_REPORT_FILE}" | tail -n 1 || true)"
 EXPECT_LAYERS="${EXPECT_LAYERS#EXPECT_LAYERS=}"
-[[ -n "${EXPECT_LAYERS}" ]] || { echo "!! 没解析到 EXPECT_LAYERS，训练后的层数断言会失效。停。"; exit 1; }
-echo "训练后要在日志里核对的层数: ${EXPECT_LAYERS}"
+if [[ -n "${EXPECT_LAYERS}" ]]; then
+  echo "训练后要在日志里核对的层数: ${EXPECT_LAYERS}"
+elif (( SKIP_FISHER_PREFLIGHT == 1 )); then
+  echo "跳过了 F 预检，没有 EXPECT_LAYERS；本次不训练，训练后的层数断言用不上。"
+else
+  echo "!! 没解析到 EXPECT_LAYERS，训练后的层数断言会失效。停。"; exit 1
+fi
 
 # FISHER_DIAG=0 时报告里没有这一行，表会把预测那一列打成 '-'，不影响实测列。
-# || true 是必须的：grep 没匹配时退出码 1，在 set -e 下会把整个作业带走。
 MEAN_F="$(grep -o 'MEAN_F=[0-9.eE+-]*' "${FISHER_REPORT_FILE}" | tail -n 1 || true)"
 MEAN_F="${MEAN_F#MEAN_F=}"
 
@@ -952,10 +1350,10 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   echo ""
   echo "DRY_RUN=1：以上为计划与前置检查，未训练未评测。"
   if (( SWEEP == 1 )); then
-    echo "确认无误后: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDAS=${LAMBDAS//[ ,]/:} ${SELF_PATH}"
+    echo "确认无误后: qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDAS=${LAMBDAS//[ ,]/:} ${SELF_PATH}"
   else
-    echo "确认无误后: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=${LAMBDA} ${SELF_PATH}"
-    echo "λ 的档位没底就先扫: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDAS=0:<0.1x>:<1x>:<10x> ${SELF_PATH}"
+    echo "确认无误后: qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=${LAMBDA} ${SELF_PATH}"
+    echo "λ 的档位没底就先扫: qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDAS=0:<0.1x>:<1x>:<10x> ${SELF_PATH}"
   fi
   echo "Job finished at: $(date)"
   exit 0
@@ -1202,9 +1600,9 @@ PY
   fi
   echo "扫描完成。每个 λ 的层覆盖都是 ${EXPECT_LAYERS} 层，罚项都来自 F。"
   echo "定了档位之后投正式 run（三次，互不覆盖）:"
-  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<0.1x> ${SELF_PATH}"
-  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<1x>   ${SELF_PATH}"
-  echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<10x>  ${SELF_PATH}"
+  echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<0.1x> ${SELF_PATH}"
+  echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<1x>   ${SELF_PATH}"
+  echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<10x>  ${SELF_PATH}"
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -1476,7 +1874,7 @@ set -x
 # 评测：按域走口径，解码预算与 batch 与 74 号逐字相同
 # ===========================================================================
 if [[ "${DO_EVAL}" != "1" ]]; then
-  echo "DO_EVAL=0：跳过评测。评测单独投: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=${LAMBDA},DO_TRAIN=0 ${SELF_PATH}"
+  echo "DO_EVAL=0：跳过评测。评测单独投: qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=${LAMBDA},DO_TRAIN=0 ${SELF_PATH}"
   set +x
   echo "Job finished at: $(date)"
   exit 0
@@ -1701,6 +2099,52 @@ if [[ "${DIAG_LEN}" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# base 答对子集上的保留率
+#   整体准确率把两件事加在一起：base 本来就不会的题上这个 run 碰巧学会了多少，
+#   和 base 会做的题里它弄丢了多少。反遗忘的主张只关于后者，而它在整体分数里被
+#   前者稀释 —— GSM8K 上 base 答错的约 300 题占近四分之一，一个 run 在那上面
+#   只能靠碰运气得分。
+#
+#   不重新解码：score_retention_subset 读的是刚才评测留下的逐题判分文件
+#   （responses.jsonl，IFEval/IFBench 是 eval_results_*.jsonl），几秒钟的事。
+# ---------------------------------------------------------------------------
+set +x
+RETENTION_JSON=""
+if [[ "${WITH_RETENTION}" == "1" ]]; then
+  # dialogsum 不进这张表：它没有逐题的对错，只有 ROUGE/BERTScore，"base 答对的
+  # 子集"对它没有定义。硬塞进去只会多一行看着像失败的 [skip]。
+  # IFEval 与 IFBench 的保留率都按 strict 判分算，两个 IF 指标一个口径。
+  RET_METRICS=""
+  for m in ${AVAIL}; do
+    case "${m}" in
+      dialogsum) ;;
+      *)         RET_METRICS="${RET_METRICS},${m}" ;;
+    esac
+  done
+  RET_METRICS="${RET_METRICS#,}"
+  if [[ -z "${RET_METRICS}" ]]; then
+    echo "note: 本轮只评了 dialogsum，没有可算保留率的指标，跳过。"
+  else
+    RETENTION_JSON="${OUT_DIR}/retention/${RUN}.json"
+    mkdir -p "$(dirname "${RETENTION_JSON}")"
+    echo ""
+    echo "==== base 答对子集上的保留率（vs base 的逐题判分）===="
+    RET_RC=0
+    python -m onereplay.scripts.score_retention_subset \
+      --results_root "${OUT_DIR}" --metrics "${RET_METRICS}" \
+      --runs "base,${VANILLA_RUN},${RUN}" --baseline base \
+      --json_out "${RETENTION_JSON}" || RET_RC=$?
+    if (( RET_RC != 0 )); then
+      echo "warning: score_retention_subset 退出码 ${RET_RC}，主表的保留率三列会是 '-'。"
+      echo "         最常见的原因是 base 在本 OUT_DIR 下还没评过（74 号的产物没搬过来），"
+      echo "         没有 base 的逐题判分就定义不出子集。补评: WITH_BASE=1,DO_TRAIN=0"
+    fi
+    # 空文件会让主表把整列打成 '-'，和"压根没跑"混在一起，不如直接当没有。
+    [[ -s "${RETENTION_JSON}" ]] || RETENTION_JSON=""
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 汇总：base / vanilla / 本臂并排
 #   delta_base 是遗忘量（负数越大越坏），delta_van 是本臂相对 vanilla 救回来
 #   多少（正数越大越好）。后者才是这个方法的效果，前者只是标尺。
@@ -1710,9 +2154,12 @@ echo ""
 echo "========================================================================"
 echo "结果汇总：保护 ${DOMAIN}   EWC λ=${LAMBDA}"
 echo "F = ${FISHER_PATH}"
+if [[ "${DOMAIN}" == "mix" ]]; then
+  echo "  = ${MIX_FORMULA}   (mix_mode=${MIX_MODE})"
+fi
 echo "========================================================================"
 OUT_DIR="${OUT_DIR}" RUN_NAME="${RUN}" VANILLA_NAME="${VANILLA_RUN}" \
-METRIC_NAMES="${AVAIL}" \
+METRIC_NAMES="${AVAIL}" RETENTION_JSON="${RETENTION_JSON}" \
 RUN_METRICS="${RESULTS_ROOT}/metrics/${RUN}.jsonl" \
 VANILLA_METRICS="${RESULTS_ROOT}/metrics/${VANILLA_RUN}.jsonl" \
 python - <<'PY'
@@ -1729,6 +2176,8 @@ metric_names = os.environ["METRIC_NAMES"].split()
 SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
 # IFBench 例外：论文主报 prompt-level loose，73 号的表也是这个口径。落到通用
 # 顺序上会取到 strict，两张表就会对同一个 run 报出不同的数。
+# 注意 ret_* 三列按 strict 判分（与 IFEval 同口径），所以 IFBench 这一行的分数列
+# 是 loose、保留率列是 strict，不能把两者相减来读。
 METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy"}
 
 
@@ -1750,8 +2199,28 @@ def cell(value, spec=".4f", width=10):
     return f"{'-' if value is None else format(value, spec):>{width}}"
 
 
-print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{'ewc':>11}{'d_base(pp)':>12}{'d_van(pp)':>11}")
-print("-" * 66)
+# 主表的分数列与保留率列可以取不同判分口径，需要时在这里把 metric 名映射到
+# score_retention_subset 用的名字（如 "ifbench" -> "ifbench_loose"）。
+RETENTION_ALIAS = {}
+retention = {}
+retention_path = os.environ.get("RETENTION_JSON", "")
+if retention_path and os.path.isfile(retention_path):
+    for record in json.loads(Path(retention_path).read_text(encoding="utf-8")):
+        retention[(record["metric"], record["run"])] = record
+
+
+def read_retention(metric, name):
+    """这个 run 在 base 答对的那些题上还对多少。"""
+
+    record = retention.get((RETENTION_ALIAS.get(metric, metric), name))
+    return None if record is None else record.get("accuracy_on_base_correct")
+
+
+print(
+    f"{'metric':<12}{'base':>10}{'vanilla':>10}{'ewc':>11}"
+    f"{'d_base(pp)':>12}{'d_van(pp)':>11}{'ret_van':>10}{'ret_ours':>10}{'d_ret(pp)':>11}"
+)
+print("-" * 97)
 for metric in metric_names:
     # dialogsum 是新任务，方向相反而且一次给四个数，进这张表只会让符号被读反。
     if metric == "dialogsum":
@@ -1761,6 +2230,13 @@ for metric in metric_names:
     ours = read_score(metric, run_name)
     d_base = (ours - base) * 100 if (base is not None and ours is not None) else None
     d_van = (ours - van) * 100 if (van is not None and ours is not None) else None
+    ret_van = read_retention(metric, vanilla_name)
+    ret_ours = read_retention(metric, run_name)
+    d_ret = (
+        (ret_ours - ret_van) * 100
+        if (ret_van is not None and ret_ours is not None)
+        else None
+    )
     print(
         f"{metric:<12}"
         + cell(base)
@@ -1768,7 +2244,21 @@ for metric in metric_names:
         + cell(ours, ".4f", 11)
         + cell(d_base, "+.2f", 12)
         + cell(d_van, "+.2f", 11)
+        + cell(ret_van)
+        + cell(ret_ours)
+        + cell(d_ret, "+.2f", 11)
     )
+
+if retention:
+    print()
+    print("ret_* = base 答对的题里这个 run 还答对的比例（1.0 = 一道没丢），d_ret = 本臂 - vanilla。")
+    print("  这才是反遗忘主张针对的那个数：整体分数里混着 base 本来就不会的题，")
+    print("  在那些题上得分是学到了新东西，不是'保住了'。两者方向可以相反。")
+    print("  d_ret 与 d_van 差得远，说明整体那一列的变化大半来自 base 答错的子集。")
+    print("  逐题的显著性（子集内基线全对，McNemar 退化成符号检验）见上面那一节。")
+else:
+    print()
+    print("ret_* 三列是 '-'：没有保留率结果（WITH_RETENTION=0，或 base 在本 OUT_DIR 下还没评过）。")
 
 
 def last_epoch(path):
@@ -1850,6 +2340,12 @@ echo "========================================================================"
 echo "接下来要做的三件事（文档 6.3 节）"
 echo "========================================================================"
 echo "1) 把格式退化和知识退化拆开 —— 光看准确率分不清这两件事:"
+if [[ -n "${RETENTION_JSON}" ]]; then
+  echo "   保留率本轮已经算过并并进主表了（${RETENTION_JSON}）。"
+  echo "   要看逐题明细或换基线再跑一次:"
+else
+  echo "   本轮没算保留率（WITH_RETENTION=0 或 base 还没评）。补:"
+fi
 echo "   python -m onereplay.scripts.score_retention_subset \\"
 echo "     --results_root ${OUT_DIR} --metrics ${AVAIL// /,} \\"
 echo "     --runs base,${VANILLA_RUN},${RUN} --baseline base"
@@ -1864,17 +2360,44 @@ echo "     --results_root ${OUT_DIR} --metrics ${AVAIL// /,} \\"
 echo "     --runs base,${VANILLA_RUN},${RUN} --baseline ${VANILLA_RUN}"
 echo ""
 echo "3) 把 λ 扫完再下结论，而且要按十倍扫（不是 0.5x/2x —— 那是给 C 的步长）:"
-echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<0.1x> ${SELF_PATH}"
-echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<10x>  ${SELF_PATH}"
+echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<0.1x> ${SELF_PATH}"
+echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<10x>  ${SELF_PATH}"
 echo "   判据是 λR/task_loss 落在 0.01~1 之间（自检 2 每个 epoch 都打）。"
 echo "   λ 写在 run 名里，不会互相覆盖。"
 echo ""
 echo "4) 与 81 号同域那条并排 —— 这才是本臂存在的理由（F vs C，同一批行）:"
-echo "   qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},LAMBDA=<...>,DO_TRAIN=0,DO_EVAL=0,\\"
+echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},LAMBDA=<...>,DO_TRAIN=0,DO_EVAL=0,\\"
 echo "        ONEREPLAY_METRICS=${RESULTS_ROOT}/metrics/<81 号那条>.jsonl ${SELF_PATH}"
 echo "   两条臂的 λ 各自扫到最好再比。拿 EWC 的一个次优点去比是没有意义的。"
 echo "   若 EWC 明显更差，先看 Step 1 打的 ess_ratio：那决定这句话是"
 echo "   「F 估得不准」还是「Fisher 这个量本身不如 C」。"
+if [[ "${DOMAIN}" == "mix" ]]; then
+  echo "   本轮的对手是 81 号的 mix 臂:"
+  echo "     ds_onereplay_8b_mix-$(IFS=-; printf '%s' "${MIX_DOMAIN_LIST[*]}")-w<权重>-gold_${RUN_TAG}_lam<等强度λ>_lr${LR}_seed${SEED}_regonce"
+  echo ""
+  echo "5) mix 臂特有：把两侧分开读。这一臂只有在两个被保护的域**都**不比对应的"
+  echo "   单域臂差得多时才算成立；若一侧保住、另一侧塌了，要报的是这个权衡，"
+  echo "   而不是两边的平均分。对照的是同强度下的:"
+  for d in "${MIX_DOMAIN_LIST[@]}"; do
+    echo "     ds_ewc_8b_${d}gold_${RUN_TAG}_lam<等强度λ>_lr${LR}_seed${SEED}_regonce"
+  done
+  echo "   注意是**等强度**不是等 λ：mean(F_mix) 与任何一份单域 F 都不同，"
+  echo "   同一个 λ 在两边不是一个量。拿各自扫描表里 λR/task_loss 相当的点来比。"
+  echo ""
+  echo "6) 还要报另一种混法。本轮是 mix_mode=${MIX_MODE}:"
+  if [[ "${MIX_MODE}" == "half" ]]; then
+    echo "   half 是字面的等系数，两域按各自 mean(F) 的比例分罚项份额（Step 0.5 打了份额）。"
+    echo "   equal 才是 81 号 C_mix 等权的真正对应物 —— C 是 token 均值所以 0.5/0.5"
+    echo "   就是等权，F 是序列求和所以不是。两版都跑完才说得清「是混法的问题还是"
+    echo "   F 本身的问题」。λ 要单独扫（mean 从算术平均变成调和平均）:"
+    echo "   qsub -v DRY_RUN=0,DOMAIN=mix,MIX_DOMAINS=${MIX_DOMAINS//,/:},MIX_MODE=equal,LAMBDAS=0:<...> ${SELF_PATH}"
+  else
+    echo "   equal 是按 mean(F) 归一后的等贡献版。另一版 half 是字面的 0.5/0.5，"
+    echo "   也就是「不做尺度归一」的对照臂（等价于 83 号 replay 按行等比混合）:"
+    echo "   qsub -v DRY_RUN=0,DOMAIN=mix,MIX_DOMAINS=${MIX_DOMAINS//,/:},MIX_WEIGHTS=${MIX_WEIGHTS//,/:},MIX_MODE=half,LAMBDAS=0:<...> ${SELF_PATH}"
+  fi
+  echo "   两版的 F_mix 文件名与 run 名都带 mix_mode，不会互相覆盖。"
+fi
 echo ""
 echo "产物:"
 echo "  adapter   : ${ADAPTERS}/${RUN}"
@@ -1883,6 +2406,12 @@ echo "  训练日志  : ${TRAIN_LOG}"
 echo "  F 预检报告: ${FISHER_REPORT_FILE}"
 echo "  汇总      : ${OUT_DIR}/<metric>_summary.csv"
 echo "  逐题      : ${OUT_DIR}/<metric>/${RUN}/responses.jsonl"
+if [[ -n "${RETENTION_JSON}" ]]; then
+  echo "  保留率    : ${RETENTION_JSON}"
+fi
+if [[ "${DOMAIN}" == "mix" ]]; then
+  echo "  F_mix     : ${FISHER_PATH}"
+fi
 echo ""
 echo "本轮的口径，其余各臂必须逐字相同才可比:"
 echo "  LoRA r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT} targets=${TARGET_MODULES}"

@@ -136,15 +136,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=4096,
-        help="Rows whose full serialized length exceeds this are dropped, never truncated.",
+        default=2048,
+        help="Rows whose full serialized length exceeds this are dropped, never truncated. "
+        "2048 matches --medical_max_new_tokens; 4096 taught the model to write past the eval budget.",
     )
     parser.add_argument(
         "--max_traces_per_question",
         type=int,
-        default=4,
-        help="Cap on correct traces kept per question. 3 or 4 per the plan; the "
-        "chosen value and the resulting pool size are both recorded.",
+        default=5,
+        help="Cap on correct traces kept per question. The chosen value and the "
+        "resulting pool size are both recorded.",
     )
     parser.add_argument(
         "--near_dup_threshold",
