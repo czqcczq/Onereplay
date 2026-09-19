@@ -9,13 +9,14 @@
 #PBS -o  /scratch/weiliu87/student/czq/Onereplay/logs
 
 # =============================================================================
-# 三域 specialist 的 Stage 1：Qwen2.5-1.5B-Instruct -> M_medical / M_finance / M_code
+# specialist 的 Stage 1：Qwen2.5-1.5B-Instruct -> M_medical / M_finance / M_code / M_law
 #
 #   qsub -v DOMAIN=medical,MODE=data  onereplay/pbs/90_specialist_sft.pbs
 #   qsub -v DOMAIN=medical,MODE=train onereplay/pbs/90_specialist_sft.pbs   # 训练+评测
 #   qsub -v DOMAIN=medical,MODE=eval  onereplay/pbs/90_specialist_sft.pbs   # 只评测
 #   qsub -v DOMAIN=finance,MODE=data  onereplay/pbs/90_specialist_sft.pbs
 #   qsub -v DOMAIN=code   ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
+#   qsub -v DOMAIN=law    ,MODE=data  onereplay/pbs/90_specialist_sft.pbs
 #
 # 1. 为什么是一个脚本而不是三个
 # -----------------------------
@@ -33,20 +34,22 @@
 # 留下的是答案，而且砍掉的不是随机样本。所以 prepare_* 把超过预算的整行丢掉，训练
 # 时永远不会触发截断那条路径。
 #
-# MAXLEN 三域统一 1216，取自 Magicoder 原论文的配置。medical/finance 在这个预算下
-# 一行都不丢（实测最长约 430 / 575 token），code 会丢掉长尾的一部分 —— 这是唯一
-# 需要在 stats 的 budget_scan 里确认代价的域。
+# MAXLEN 四域统一 1216，取自 Magicoder 原论文的配置。medical/finance 在这个预算下
+# 一行都不丢（实测最长约 430 / 575 token）；code 和 law 会丢掉长尾的一部分 ——
+# 这两个是需要在 stats 的 budget_scan 里确认代价的域。law 的长尾来自 LegalLAMA
+# us_terms：它的题干是整段判决书节选，p95 约 394 词而最长 14593 词。
 #
 # BATCH=8 是显存参数，**有效 batch 仍是 ACCUM=64 行/update**
-# （accum_steps = ACCUM / BATCH）。还 OOM 就改 BATCH，不要动 ACCUM；且三个领域必须
-# 同值，改了就三个都重跑。
+# （accum_steps = ACCUM / BATCH）。还 OOM 就改 BATCH，不要动 ACCUM；且所有领域必须
+# 同值，改了就全都重跑。
 #
-# 3. SYSTEM_PROMPT 三域统一为空
+# 3. SYSTEM_PROMPT 四域统一为空
 # -----------------------------
-# 空是有意的：三个域的训练答案都不含 CoT，也没有 \boxed{} 或 markdown fence 这种
-# 需要靠指令约定的格式（medical 是散文、finance 是单个标签词、code 本来就带 fence），
-# 所以任何自定义 system 都只是给某一个域开小灶。留空之后 Qwen2.5-Instruct 的模板会
-# 自带一条中性的默认 system，三个域、所有臂、base 和训练后完全一致。
+# 空是有意的：四个域的训练答案都不含 CoT，也没有 \boxed{} 或 markdown fence 这种
+# 需要靠指令约定的格式（medical 是散文、finance 是单个标签词、code 本来就带 fence、
+# law 是法律散文加短术语），所以任何自定义 system 都只是给某一个域开小灶。留空之后
+# Qwen2.5-Instruct 的模板会自带一条中性的默认 system，四个域、所有臂、base 和训练后
+# 完全一致。
 #
 # 但"训练时的 system 必须和 prepare 时逐字一致"这条依然是硬要求，而且是**长度正确
 # 性**问题：system turn 贡献 token，1216 那条线是按含它的完整序列量出来的。训练前
@@ -57,10 +60,10 @@
 # ---------------------------------------------
 # MODE=train 跑完会**在本脚本里**接着评测，评测口径因此只有一份。
 #
-# 评的是交叉矩阵：M_<DOMAIN> 在 EVAL_DOMAINS（默认三域）全评，base 只评当前 DOMAIN
+# 评的是交叉矩阵：M_<DOMAIN> 在 EVAL_DOMAINS（默认四域）全评，base 只评当前 DOMAIN
 # 这一边。两半都**先评本域再评其他域**：本域回答的是"学会了没"，它先出来，才好判断
-# 值不值得继续等跨域那几组。base 是三条线共用的同一个 checkpoint，让三个 DOMAIN 各
-# 自重评三边等于把同一组数字算三次，还会往 csv 里塞重复行。
+# 值不值得继续等跨域那几组。base 是所有线共用的同一个 checkpoint，让每个 DOMAIN 各
+# 自重评四边等于把同一组数字算四次，还会往 csv 里塞重复行。
 #
 # walltime 必须够训练 + 评测两段。不够也不会丢东西：checkpoint 在就跳过训练，评测
 # 组只要有 summary.json 就跳过，原样重投会从断点接着跑。DO_EVAL=0 则只训不评。
@@ -75,9 +78,12 @@
 # 5. benchmark 放在哪，为什么两套命名
 # -----------------------------------
 # medical 四件 + finance 三件走 datasets/bench/<name>/test.jsonl，用
-# test_code/download_bench.py 下。code 四件走 datasets/code/，因为 HumanEval/MBPP
-# 早就由 download_code_data.py 管着，那条线还有别的脚本在用。缺哪件，本脚本会在
-# **开跑前**就把路径打出来（只查 EVAL_DOMAINS 里真的会评的那几个域）。
+# test_code/download_bench.py 下。law 三件走 datasets/bench/mmlu/，用
+# download_mmlu_law_data.py 下（同一个 bench 根，但按 subject 命名而不是按目录，
+# 因为三个 subject 是同一个 MMLU 仓库的三个 config）。code 四件走 datasets/code/，
+# 因为 HumanEval/MBPP 早就由 download_code_data.py 管着，那条线还有别的脚本在用。
+# 缺哪件，本脚本会在 **开跑前** 就把路径打出来（只查 EVAL_DOMAINS 里真的会评的那
+# 几个域）。
 #
 # MBPP 必须用 test split（500 题）。evaluate.py 的 --dataset_split 默认是
 # validation，那只有 90 题，pass@1 的抽样噪声能盖过真实差异。MBPP_SPLIT 默认已经
@@ -121,6 +127,11 @@ MEDMEADOW_JSON="${MEDMEADOW_JSON:-${REPO_ROOT}/datasets/raw/medical_meadow_medic
 FINGPT_PARQUET="${FINGPT_PARQUET:-${REPO_ROOT}/datasets/raw/fingpt-sentiment-train}"
 # download_magicoder_data.py 的落点，和 code_replay 那条线共用同一份 parquet。
 MAGICODER_PATH="${MAGICODER_PATH:-${REPO_ROOT}/datasets/code_replay/magicoder_oss_instruct_75k.parquet}"
+# law 是唯一拿两份语料拼出一个池的域：Lawyer-Instruct 约 9.2k 行 + LegalLAMA
+# us_terms 约 5.8k 行，原样 concat 就是设计里那个 61:39，不需要重采样。两份都按
+# HF 仓库原样下载后的目录结构写。
+LAWYER_JSON="${LAWYER_JSON:-${REPO_ROOT}/datasets/raw/Lawyer-Instruct/alpacmygavel.json}"
+US_TERMS_JSONL="${US_TERMS_JSONL:-${REPO_ROOT}/datasets/raw/legal_lama/us_terms.jsonl}"
 
 # =============================================================================
 # 外层：裸计算节点，只负责起容器再把自己跑一遍。
@@ -157,11 +168,13 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     BENCH_ROOT EVAL_ROOT LIMIT WHICH FORCE
     MEDQA_DATA PUBMEDQA_DATA MEDMCQA_DATA CAREQA_DATA
     FPB_DATA FIQASA_DATA TFNS_DATA
-    MEDICAL_BATCH FINANCE_BATCH CODE_BATCH CODE_TIMEOUT
-    MEDICAL_MAX_NEW FINANCE_MAX_NEW
+    MMLU_DIR MMLU_PROFESSIONAL_LAW_DATA MMLU_INTERNATIONAL_LAW_DATA MMLU_JURISPRUDENCE_DATA
+    MEDICAL_BATCH FINANCE_BATCH CODE_BATCH LAW_BATCH CODE_TIMEOUT
+    MEDICAL_MAX_NEW FINANCE_MAX_NEW LAW_MAX_NEW
     CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS SKIP_GROUPS
     HUMANEVALPLUS_DATA MBPPPLUS_DATA
     MEDMEADOW_JSON FINGPT_PARQUET MAGICODER_PATH LANG_FILTER
+    LAWYER_JSON US_TERMS_JSONL
     DECONTAM_NGRAM DECONTAM_MIN_HITS
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
@@ -224,8 +237,8 @@ PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
 STATS_DIR="${STATS_DIR:-${DATA_ROOT}/stats}"
 
 # =============================================================================
-# 训练超参：**这一段对三个领域逐字相同**。
-# 想调任何一个，就是三个领域一起重跑，否则它们不再可比。
+# 训练超参：**这一段对所有领域逐字相同**。
+# 想调任何一个，就是所有领域一起重跑，否则它们不再可比。
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
 LR="${LR:-5e-5}"
@@ -258,11 +271,11 @@ DO_EVAL="${DO_EVAL:-1}"
 # 代价是 MAXVAL（默认 200）行的一次前向，几十秒的量级。EVAL_BEFORE_TRAIN=0 关掉。
 EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-1}"
 
-# 见文件头第 3 条：三域统一为空，并且必须和 prepare_* 的 --system_prompt 逐字相同
+# 见文件头第 3 条：四域统一为空，并且必须和 prepare_* 的 --system_prompt 逐字相同
 # （空 == 空 也要对得上，守卫在训练前拿 stats 对表）。
 #
 # 空不等于"没有 system turn"：chat_policy 在空串时不注入，Qwen2.5-Instruct 的模板
-# 于是用它自带的那条默认 system。那条对三个域、所有臂、base 和训练后完全一致，也不
+# 于是用它自带的那条默认 system。那条对四个域、所有臂、base 和训练后完全一致，也不
 # 含任何任务指令，所以它不是污染源。
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 
@@ -295,12 +308,12 @@ WHICH="${WHICH:-both}"
 FORCE="${FORCE:-0}"
 LIMIT="${LIMIT:-0}"                           # >0 只评前 N 题，冒烟用
 
-# 评测结果**跨 DOMAIN 共用一个根**：每个 <metric>_summary.csv 才能把 base 和三个
+# 评测结果**跨 DOMAIN 共用一个根**：每个 <metric>_summary.csv 才能把 base 和每个
 # specialist 攒成一张表。分开放就得手工拼。
 EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_specialist_eval}"
 
 # ---- benchmark 数据（离线，登录节点先下好）----
-# 见文件头第 5 条：medical/finance 走 bench 目录，code 走自己那套。
+# 见文件头第 5 条：medical/finance/law 走 bench 目录，code 走自己那套。
 BENCH_ROOT="${BENCH_ROOT:-${REPO_ROOT}/datasets/bench}"
 MEDQA_DATA="${MEDQA_DATA:-${BENCH_ROOT}/medqa/test.jsonl}"
 PUBMEDQA_DATA="${PUBMEDQA_DATA:-${BENCH_ROOT}/pubmedqa/test.jsonl}"
@@ -309,6 +322,13 @@ CAREQA_DATA="${CAREQA_DATA:-${BENCH_ROOT}/careqa/test.jsonl}"
 FPB_DATA="${FPB_DATA:-${BENCH_ROOT}/fpb/test.jsonl}"
 FIQASA_DATA="${FIQASA_DATA:-${BENCH_ROOT}/fiqasa/test.jsonl}"
 TFNS_DATA="${TFNS_DATA:-${BENCH_ROOT}/tfns/test.jsonl}"
+# law 的三个 MMLU subject（download_mmlu_law_data.py 的产物）。Professional Law
+# 是 1534 题的主力，International Law 和 Jurisprudence 只有百来题 —— 后两个一题
+# 约 1 个百分点，几个点的差距是噪声，要和 Professional Law 并排读。
+MMLU_DIR="${MMLU_DIR:-${BENCH_ROOT}/mmlu}"
+MMLU_PROFESSIONAL_LAW_DATA="${MMLU_PROFESSIONAL_LAW_DATA:-${MMLU_DIR}/professional_law_test.jsonl}"
+MMLU_INTERNATIONAL_LAW_DATA="${MMLU_INTERNATIONAL_LAW_DATA:-${MMLU_DIR}/international_law_test.jsonl}"
+MMLU_JURISPRUDENCE_DATA="${MMLU_JURISPRUDENCE_DATA:-${MMLU_DIR}/jurisprudence_test.jsonl}"
 # code 走的是另一套目录（download_code_data.py 的产物），不在 bench 下。
 CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
 HUMANEVAL_DATA="${HUMANEVAL_DATA:-${CODE_DATA_DIR}/humaneval_test.parquet}"
@@ -327,11 +347,16 @@ MEDICAL_BATCH="${MEDICAL_BATCH:-64}"
 FINANCE_BATCH="${FINANCE_BATCH:-128}"
 # 代码只解 512 token，prompt 也短，所以能开大。
 CODE_BATCH="${CODE_BATCH:-64}"
+# law 和 medical 同形（选项字母一个 token），但 Professional Law 的题干长得多，
+# prompt 侧的 KV 是那边的几倍，所以不跟着 MEDICAL_BATCH 一起调。
+LAW_BATCH="${LAW_BATCH:-64}"
 # 解码预算。四个 medical bench 要的是一个选项字母/一个词，finance 要的是一个标签词，
 # 但 base 臂会先写一段解释再给答案，所以不能压到刚好够 —— 顶满预算就等于没作答，
 # 会被记成 parse 失败。512/128 是给这段解释留的余量，不是答案本身的长度。
 MEDICAL_MAX_NEW="${MEDICAL_MAX_NEW:-512}"
 FINANCE_MAX_NEW="${FINANCE_MAX_NEW:-128}"
+# 和 medical 同一个理由，同一个值：0-shot 问一个字母，base 臂会先讲一段理由。
+LAW_MAX_NEW="${LAW_MAX_NEW:-512}"
 # 判分在子进程里 exec 生成的代码，卡死的那条会拖住整组。
 # 0 = 各 metric 用自己的默认值：基础版 5 秒，EvalPlus 30 秒。加号版每题跑的断言
 # 多约 80 倍，5 秒会把正确答案判成超时，而超时记作失败——那是所有臂共同的扣分，
@@ -342,16 +367,16 @@ CODE_TIMEOUT="${CODE_TIMEOUT:-0}"
 # DOMAIN 分派：只决定数据在哪、结果写哪、MODE=data 调谁。
 # =============================================================================
 case "${DOMAIN}" in
-  medical|finance|code) ;;
-  "") echo "必须指定 DOMAIN=medical|finance|code" >&2; exit 2 ;;
-  *)  echo "DOMAIN 只能是 medical / finance / code，得到 '${DOMAIN}'" >&2; exit 2 ;;
+  medical|finance|code|law) ;;
+  "") echo "必须指定 DOMAIN=medical|finance|code|law" >&2; exit 2 ;;
+  *)  echo "DOMAIN 只能是 medical / finance / code / law，得到 '${DOMAIN}'" >&2; exit 2 ;;
 esac
 
 # 一个 specialist 要在哪几个领域上评。
-EVAL_DOMAINS="${EVAL_DOMAINS:-medical finance code}"
+EVAL_DOMAINS="${EVAL_DOMAINS:-medical finance code law}"
 
 # 按**解码组**关掉评测，比 EVAL_DOMAINS 细一档（一个域可以有多组解码设置）。
-# 可用组名：medical finance code。分隔符空格或冒号 —— 冒号是给 qsub -v 准备的，
+# 可用组名：medical finance code law。分隔符空格或冒号 —— 冒号是给 qsub -v 准备的，
 # 空格在那里要整体加引号才活得下来，而忘了引号是静默失败。
 #
 #   qsub -v DOMAIN=code,MODE=train,SKIP_GROUPS=finance ...
@@ -371,10 +396,10 @@ SKIP_GROUPS="${SKIP_GROUPS:-}"
 _skip_normalized=""
 for _group in ${SKIP_GROUPS//:/ }; do
   case "${_group}" in
-    medical|finance|code) _skip_normalized+=" ${_group}" ;;
+    medical|finance|code|law) _skip_normalized+=" ${_group}" ;;
     *)
       echo "SKIP_GROUPS 里有不认识的组名 '${_group}'。" >&2
-      echo "  可用：medical finance code。分隔符用空格或冒号。" >&2
+      echo "  可用：medical finance code law。分隔符用空格或冒号。" >&2
       exit 2
       ;;
   esac
@@ -413,7 +438,7 @@ echo " system      : '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system�
 if [[ "${MODE}" == "train" || "${MODE}" == "eval" ]]; then
 echo " eval        : WHICH=${WHICH} DO_EVAL=${DO_EVAL} FORCE=${FORCE} LIMIT=${LIMIT}"
 echo " eval root   : ${EVAL_ROOT}"
-echo " bench root  : ${BENCH_ROOT}   code: ${CODE_DATA_DIR}"
+echo " bench root  : ${BENCH_ROOT}   code: ${CODE_DATA_DIR}   mmlu: ${MMLU_DIR}"
 fi
 echo "================================================================"
 
@@ -421,8 +446,8 @@ echo "================================================================"
 # MODE=data：原始语料 -> data/processed/{domain}_train{.jsonl,/}
 #
 # prepare_* 会打印一张 budget_scan 表（1024/2048/3072/4096/6144/8192 各档
-# 会保留多少行、多少 assistant token）。**定长度预算之前先读它** —— 尤其是 code，
-# 1216 是三域统一的预算，而它是唯一会因此丢行的域。
+# 会保留多少行、多少 assistant token）。**定长度预算之前先读它** —— 尤其是 code
+# 和 law，1216 是四域统一的预算，而这两个是会因此丢行的域。
 # =============================================================================
 if [[ "${MODE}" == "data" ]]; then
   if [[ -f "${DATASET_DIR}/dataset_dict.json" ]]; then
@@ -475,6 +500,16 @@ if [[ "${MODE}" == "data" ]]; then
         --fingpt_path "${FINGPT_PARQUET}" \
         "${COMMON_ARGS[@]}"
       ;;
+    law)
+      [[ -f "${LAWYER_JSON}" ]]    || { echo "找不到 Lawyer-Instruct: ${LAWYER_JSON}"; exit 1; }
+      [[ -f "${US_TERMS_JSONL}" ]] || { echo "找不到 LegalLAMA us_terms: ${US_TERMS_JSONL}"; exit 1; }
+      # 两份语料原样 concat，没有去污染这一步：law 的 benchmark 是 MMLU 的三个
+      # subject，和这两份训练语料不同源，不存在 code 那种"把评测题背下来"的路径。
+      python -m onereplay.scripts.domain_sft.prepare_law \
+        --lawyer_json "${LAWYER_JSON}" \
+        --us_terms_jsonl "${US_TERMS_JSONL}" \
+        "${COMMON_ARGS[@]}"
+      ;;
   esac
 
   echo
@@ -482,7 +517,7 @@ if [[ "${MODE}" == "data" ]]; then
   echo "  训练用 : ${DATASET_DIR}"
   echo "  可审计 : ${OUT_JSONL}"
   echo "  统计   : ${OUT_STATS}"
-  echo "三个领域都跑完后，比一下各自的 total_assistant_tokens：那才是 SFT loss 真正"
+  echo "所有领域都跑完后，比一下各自的 total_assistant_tokens：那才是 SFT loss 真正"
   echo "作用到的量。差距超过 1.5~2x 的话，再考虑补一个 matched-token 的对照。"
   exit 0
 fi
@@ -560,7 +595,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 # =============================================================================
-# 评测：交叉矩阵。M_<DOMAIN> 评三边，base 只评当前 DOMAIN 这一边。
+# 评测：交叉矩阵。M_<DOMAIN> 评 EVAL_DOMAINS 全部，base 只评当前 DOMAIN 这一边。
 # =============================================================================
 # 跑了多少组、跳过多少组。两种跳过必须分开记：
 #   DONE   已经有结果 -> 正常，补评时几乎全是这种
@@ -572,7 +607,7 @@ GROUPS_NODATA=0
 GROUPS_SKIPPED=0
 
 # 该组是否被 SKIP_GROUPS 关掉了。组名见下面 eval_* 的第一个参数：
-# medical / finance / code。
+# medical / finance / code / law。
 group_skipped () {
   [[ " ${SKIP_GROUPS} " == *" $1 "* ]]
 }
@@ -626,9 +661,9 @@ run_group () {
   fi
   GROUPS_RAN=$((GROUPS_RAN + 1))
 
-  # 评测的 system 和训练的是同一条（空），所以这里不再按组分派：三个域的判分器都
-  # 不依赖任何格式指令，medical/finance 的 prompt 自己带着"只答字母/只答标签"，code
-  # 的 fence 是 Magicoder 答案本来就有的。
+  # 评测的 system 和训练的是同一条（空），所以这里不再按组分派：四个域的判分器都
+  # 不依赖任何格式指令，medical/finance/law 的 prompt 自己带着"只答字母/只答标签"，
+  # code 的 fence 是 Magicoder 答案本来就有的。
   echo
   echo "==== eval ${run_name} / ${group} : ${metrics} ===="
   local args=(
@@ -671,6 +706,25 @@ eval_finance () {
     --finance_batch_size "${FINANCE_BATCH}"
 }
 
+eval_law () {
+  local run_name="$1" adapter="$2"
+  require_data law "${MMLU_PROFESSIONAL_LAW_DATA}" "${MMLU_INTERNATIONAL_LAW_DATA}" \
+                   "${MMLU_JURISPRUDENCE_DATA}" || return 0
+  # 三个 subject 一组：题面形态、解码预算、判分口径完全相同，分开成三组只是把
+  # 同一套设置写三遍。全部 0-shot —— 和 medical 一样，law specialist 训的是自由
+  # 文本和短术语，从没见过选择题，5-shot 会把 Professional Law 的长题干堆爆上下文。
+  #
+  # 看这三个数之前先看 parse_rate：0-shot 要一个字母，1.5B 有可能改写散文，那时
+  # accuracy 低是格式问题不是法律问题。
+  run_group law "${run_name}" "${adapter}" \
+    "mmlu_professional_law,mmlu_international_law,mmlu_jurisprudence" \
+    --mmlu_professional_law_data_path "${MMLU_PROFESSIONAL_LAW_DATA}" \
+    --mmlu_international_law_data_path "${MMLU_INTERNATIONAL_LAW_DATA}" \
+    --mmlu_jurisprudence_data_path "${MMLU_JURISPRUDENCE_DATA}" \
+    --law_max_new_tokens "${LAW_MAX_NEW}" \
+    --law_batch_size "${LAW_BATCH}"
+}
+
 eval_code () {
   local run_name="$1" adapter="$2"
   require_data code "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
@@ -699,6 +753,7 @@ eval_domain () {
     medical) eval_medical "${run_name}" "${adapter}" ;;
     finance) eval_finance "${run_name}" "${adapter}" ;;
     code)    eval_code    "${run_name}" "${adapter}" ;;
+    law)     eval_law     "${run_name}" "${adapter}" ;;
     *) echo "eval_domain: 不认识的领域 '${domain}'，跳过" >&2 ;;
   esac
 }
@@ -713,6 +768,9 @@ bench_paths_for () {
     finance) group_skipped finance || printf '%s\n' "${FPB_DATA}" "${FIQASA_DATA}" "${TFNS_DATA}" ;;
     code)    group_skipped code    || printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
                                                     "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" ;;
+    law)     group_skipped law     || printf '%s\n' "${MMLU_PROFESSIONAL_LAW_DATA}" \
+                                                    "${MMLU_INTERNATIONAL_LAW_DATA}" \
+                                                    "${MMLU_JURISPRUDENCE_DATA}" ;;
   esac
 }
 

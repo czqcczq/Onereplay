@@ -17,7 +17,7 @@
 #   qsub -v ARM=ewc,LAMBDA=2e-4         onereplay/pbs/92_continual_sft.pbs
 #
 # 默认 SRC_DOMAIN=medical NEW_DOMAIN=code，即 M_medical 学 code、保护 medical。
-# 换方向就传这两个变量，任意有序组合都行（medical/finance/code）。
+# 换方向就传这两个变量，任意有序组合都行（medical/finance/code/law）。
 #
 # 90 号产出 M_*（第一步），91 号在其上采出 C 和 F（第二步），本脚本是第三步。
 #
@@ -86,9 +86,9 @@
 # 唯一的顺序差异：collect_cov 先滤掉空 target 再 shuffle，replay 先 shuffle 再
 # 滤。池里**没有**空行时两者等价，Step 0 会查这件事并在有空行时报警。
 #
-# 5. system prompt：三域同为空，所以 replay 行不需要单独一条
+# 5. system prompt：四域同为空，所以 replay 行不需要单独一条
 # ---------------------------------------------------------
-# chat_policy 的 system turn 是**进程级**的一份，新任务和 replay 共用。以前三个域
+# chat_policy 的 system turn 是**进程级**的一份，新任务和 replay 共用。以前各个域
 # 各有自己的 system，replay 行必须单独指定旧域那条，否则复习行和阶段一真正训练过的
 # 那一行不再逐字相同 —— 而"逐字相同"正是 replay 作为 rehearsal 的全部意义。
 #
@@ -106,19 +106,47 @@
 # 域是从没学过的对照。base 这里**不评** —— 90 号已经评过，同一个 checkpoint
 # 重复评只会往 csv 里塞重复行。
 #
-# 评测顺序是 NEW_DOMAIN -> SRC_DOMAIN -> 第三个域，和 90 号"先评本域"同一个口径：
-# 本次训的是新域，它先出来；紧跟着是这条实验真正要问的旧域保护；从没学过的那个域
+# 评测顺序是 NEW_DOMAIN -> SRC_DOMAIN -> 其余的域，和 90 号"先评本域"同一个口径：
+# 本次训的是新域，它先出来；紧跟着是这条实验真正要问的旧域保护；从没学过的那些域
 # 只是对照，垫底。撞 walltime 时留下的就是前两组。
 #
-# 评测慢就砍组，和 90 号同一个开关（组名 medical / finance / code）：
+# 评测慢就砍组，和 90 号同一个开关（组名 medical / finance / code / law）：
 #   qsub -v ARM=vanilla,SKIP_GROUPS=finance onereplay/pbs/92_continual_sft.pbs
 #
-# 7. 投递前要有
+# 7. 两条 val loss：新域学到多少、旧域掉了多少
+# --------------------------------------------
+# bench 是"生成 -> 解析 -> 判分"三步的结果，前两步会因为和权重无关的原因跳：模型
+# 换一种说法、parser 不认了，读出来就是掉几十分。所以四条臂每个 epoch 还各记两条
+# 交叉熵，它们只随权重动，都落在 ${METRICS_DIR}/<run>.jsonl 里：
+#
+#   val_loss      新域 <NEW_DOMAIN> 的 held-out —— "学会了吗"
+#   old_val_loss  旧域 <SRC_DOMAIN> 的固定切片 —— "忘了吗"
+#
+# EVAL_BEFORE_TRAIN=1 时先有一条 record_type=baseline（起点就是 M_<SRC_DOMAIN>），
+# 之后每个 epoch 一条 record_type=epoch。读法是各自减掉 baseline：新域的差越负学得
+# 越多，旧域的差越接近 0 忘得越少。四条臂的两条 baseline 应当逐字相同。
+#
+# !! 旧域那批行取自 10k 子集**后面**，不是 90 号的 val 切分
+# --------------------------------------------------------
+# 最自然的做法是直接用 90 号那批 held-out。不行：train_test_split(seed=42) 取的是
+# 排列的前 1%，而 shuffle(seed=42) + 前 10000 行取的是**同一个排列**的更长前缀，
+# 两个 42 一撞，90 号那 340 行整批落在 10k 子集里（一行不漏）。而 replay 臂整轮会
+# 把这 10k 循环好几遍 —— 拿那批行当考卷，等于让它考刚背过的题。
+#
+# 所以这里取同一个 shuffle(SAMPLE_SEED) 里第 POOL_SAMPLES 行**之后**的 OLD_VAL_ROWS
+# 行：四条臂这一阶段都不碰它们。代价是阶段一训练过这批行（它训了整池的 99%），所以
+# baseline 会比 90 号记的 val_loss 低不少 —— 不影响读法，读的是相对 baseline 的变化。
+# "既在池外又是阶段一没训过的"行不存在：阶段一唯一没训过的那批已经被池子吞了。
+#
+# OLD_VAL=0 关掉（省每个 epoch 几十秒的一次前向）。
+#
+# 8. 投递前要有
 # -------------
 #   1) 90 号 MODE=train 的 M_<SRC_DOMAIN> checkpoint
 #   2) 90 号 MODE=data 的 <NEW_DOMAIN> 数据集（save_to_disk）
 #   3) ARM=onereplay 要 91 号的 C；ARM=ewc 要 F；ARM=replay 要旧域的 jsonl
-#   4) 三个域的 benchmark（Step 0 会预检并打印缺哪个）
+#   4) 旧域的 jsonl（OLD_VAL=1 时四条臂都要，旧域 val 从它里面切）
+#   5) 三个域的 benchmark（Step 0 会预检并打印缺哪个）
 #
 # 先看计划：qsub -v ARM=onereplay,LAMBDA=1.5e-3,DRY_RUN=1 onereplay/pbs/92_...
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
@@ -188,14 +216,15 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     BENCH_ROOT EVAL_ROOT LIMIT FORCE WHICH_EVAL
     MEDQA_DATA PUBMEDQA_DATA MEDMCQA_DATA CAREQA_DATA
     FPB_DATA FIQASA_DATA TFNS_DATA
-    MEDICAL_BATCH FINANCE_BATCH CODE_BATCH CODE_TIMEOUT
-    MEDICAL_MAX_NEW FINANCE_MAX_NEW
+    MMLU_DIR MMLU_PROFESSIONAL_LAW_DATA MMLU_INTERNATIONAL_LAW_DATA MMLU_JURISPRUDENCE_DATA
+    MEDICAL_BATCH FINANCE_BATCH CODE_BATCH LAW_BATCH CODE_TIMEOUT
+    MEDICAL_MAX_NEW FINANCE_MAX_NEW LAW_MAX_NEW
     CODE_DATA_DIR HUMANEVAL_DATA MBPP_DATA MBPP_SPLIT EVAL_DOMAINS SKIP_GROUPS
     HUMANEVALPLUS_DATA MBPPPLUS_DATA
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY
-    EVAL_BEFORE_TRAIN
+    EVAL_BEFORE_TRAIN OLD_VAL OLD_VAL_JSONL OLD_VAL_ROWS
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -246,8 +275,8 @@ cd "${REPO_ROOT}"
 # ---- 参数校验 ----
 for _d in "${SRC_DOMAIN}" "${NEW_DOMAIN}"; do
   case "${_d}" in
-    medical|finance|code) ;;
-    *) echo "域名只能是 medical / finance / code，得到 '${_d}'" >&2; exit 2 ;;
+    medical|finance|code|law) ;;
+    *) echo "域名只能是 medical / finance / code / law，得到 '${_d}'" >&2; exit 2 ;;
   esac
 done
 if [[ "${SRC_DOMAIN}" == "${NEW_DOMAIN}" ]]; then
@@ -312,7 +341,7 @@ REG_IMPL="${REG_IMPL:-analytic}"
 # regularizer 的时间，而报出来的墙钟会被拿去和 onereplay 比。
 MEASURE_ZERO="${MEASURE_ZERO:-0}"
 
-# 三域统一为空，和 90/91 号同一个值，见第 5 条。replay 行继承进程级这条，不再按
+# 四域统一为空，和 90/91 号同一个值，见第 5 条。replay 行继承进程级这条，不再按
 # SRC_DOMAIN 单独分派。
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 
@@ -379,6 +408,13 @@ REPLAY_MAX_LEN="${REPLAY_MAX_LEN:-${MAXLEN}}"
 # 8 行里掺 4 行 = 一半旧数据，同时让第 3 条那个 ACCUM 式子整除。改它之前先看那一条。
 REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
 
+# ---- 旧域 val，见文件头第 7 条。四条臂共享，所以不在 arm_train_args 里 ----
+# 切片 = 同一个 shuffle(SAMPLE_SEED) 里第 POOL_SAMPLES 行之后的 OLD_VAL_ROWS 行，
+# 也就是 replay 那批的紧后面一段，所以这两个变量就够了，不另开。
+OLD_VAL="${OLD_VAL:-1}"
+OLD_VAL_JSONL="${OLD_VAL_JSONL:-${REPLAY_JSONL}}"
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-${MAXVAL}}"
+
 # 本阶段的产物根，按"方向"分目录，四条臂共享（run 名里带臂名，不会撞）。
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_continual_${SRC_DOMAIN}2${NEW_DOMAIN}_${MODEL_NAME}}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
@@ -390,17 +426,17 @@ CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_specialist_eval}"
 FORCE="${FORCE:-0}"
 LIMIT="${LIMIT:-0}"
-EVAL_DOMAINS="${EVAL_DOMAINS:-medical finance code}"
-# 和 90 号同一个开关、同一套组名：medical finance code。分隔符空格或冒号 —— 冒号
-# 是给 qsub -v 准备的，空格在那里要整体加引号才活得下来，而忘了引号是静默失败。
+EVAL_DOMAINS="${EVAL_DOMAINS:-medical finance code law}"
+# 和 90 号同一个开关、同一套组名：medical finance code law。分隔符空格或冒号 ——
+# 冒号是给 qsub -v 准备的，空格在那里要整体加引号才活得下来，而忘了引号是静默失败。
 SKIP_GROUPS="${SKIP_GROUPS:-}"
 _skip_normalized=""
 for _group in ${SKIP_GROUPS//:/ }; do
   case "${_group}" in
-    medical|finance|code) _skip_normalized+=" ${_group}" ;;
+    medical|finance|code|law) _skip_normalized+=" ${_group}" ;;
     *)
       echo "SKIP_GROUPS 里有不认识的组名 '${_group}'。" >&2
-      echo "  可用：medical finance code。分隔符用空格或冒号。" >&2
+      echo "  可用：medical finance code law。分隔符用空格或冒号。" >&2
       echo "  拼错的话什么都不会匹配，那一组会照常评几个小时而日志里毫无提示，所以这里直接拒绝。" >&2
       exit 2
       ;;
@@ -433,6 +469,12 @@ CAREQA_DATA="${CAREQA_DATA:-${BENCH_ROOT}/careqa/test.jsonl}"
 FPB_DATA="${FPB_DATA:-${BENCH_ROOT}/fpb/test.jsonl}"
 FIQASA_DATA="${FIQASA_DATA:-${BENCH_ROOT}/fiqasa/test.jsonl}"
 TFNS_DATA="${TFNS_DATA:-${BENCH_ROOT}/tfns/test.jsonl}"
+# law 的三个 MMLU subject（download_mmlu_law_data.py 的产物）。后两个只有百来题，
+# 一题约 1 个百分点，要和 1534 题的 Professional Law 并排读。
+MMLU_DIR="${MMLU_DIR:-${BENCH_ROOT}/mmlu}"
+MMLU_PROFESSIONAL_LAW_DATA="${MMLU_PROFESSIONAL_LAW_DATA:-${MMLU_DIR}/professional_law_test.jsonl}"
+MMLU_INTERNATIONAL_LAW_DATA="${MMLU_INTERNATIONAL_LAW_DATA:-${MMLU_DIR}/international_law_test.jsonl}"
+MMLU_JURISPRUDENCE_DATA="${MMLU_JURISPRUDENCE_DATA:-${MMLU_DIR}/jurisprudence_test.jsonl}"
 CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
 HUMANEVAL_DATA="${HUMANEVAL_DATA:-${CODE_DATA_DIR}/humaneval_test.parquet}"
 MBPP_DATA="${MBPP_DATA:-${CODE_DATA_DIR}/mbpp_full}"
@@ -443,10 +485,13 @@ MBPP_SPLIT="${MBPP_SPLIT:-test}"
 MEDICAL_BATCH="${MEDICAL_BATCH:-64}"
 FINANCE_BATCH="${FINANCE_BATCH:-128}"
 CODE_BATCH="${CODE_BATCH:-64}"
+# law 和 medical 同形，但 Professional Law 的题干长得多，prompt 侧 KV 是那边几倍。
+LAW_BATCH="${LAW_BATCH:-64}"
 CODE_TIMEOUT="${CODE_TIMEOUT:-0}"
 # 和 90 号同值：答案本身只有一个字母/一个词，预算是给 base 臂那段解释留的余量。
 MEDICAL_MAX_NEW="${MEDICAL_MAX_NEW:-512}"
 FINANCE_MAX_NEW="${FINANCE_MAX_NEW:-128}"
+LAW_MAX_NEW="${LAW_MAX_NEW:-512}"
 
 # =============================================================================
 # 臂 -> 训练参数。这个函数是四条臂**唯一**的差异来源。
@@ -511,6 +556,9 @@ for _lam in "${LAMBDA_LIST[@]}"; do
   [[ -z "${_lam}" ]] && continue
   if ! python -c "import sys; sys.exit(0 if float('${_lam}') > 0 else 1)" 2>/dev/null; then
     echo "λ='${_lam}' 不是正数。λ=0 就是 vanilla，那是 ARM=vanilla 的事。" >&2
+    echo "  要标定 λ——即不施加惩罚、只实测 R——传 1e-12 而不是 0：罚项照常" >&2
+    echo "  计算并记进 train_replay_reg，但 λ·dR/dW 落在 bf16 梯度的最小增量" >&2
+    echo "  之下，轨迹与 vanilla 逐位相同。" >&2
     exit 2
   fi
 done
@@ -523,6 +571,19 @@ run_name_for () {
   [[ -n "${lam}" ]] && name="${name}_lam${lam}"
   printf '%s' "${name}_lr${LR}_seed${SEED}"
 }
+
+# 旧域 val 的参数。**不在** arm_train_args 里：它对四条臂逐字相同，四条臂必须打
+# 同一批行，否则 old_val_loss 之间没法比。POOL_SAMPLES / SAMPLE_SEED 和下面 replay
+# 那段、以及 91 号采 C/F 时用的是同一对值，切片就落在那批行的后面。
+OLD_VAL_ARGS=(--old_val_jsonl "")
+if [[ "${OLD_VAL}" == "1" ]]; then
+  OLD_VAL_ARGS=(
+    --old_val_jsonl "${OLD_VAL_JSONL}"
+    --old_val_pool_size "${POOL_SAMPLES}"
+    --old_val_sample_seed "${SAMPLE_SEED}"
+    --old_val_rows "${OLD_VAL_ROWS}"
+  )
+fi
 
 # 四条臂的差异**全部**集中在这个函数里 —— 它上面的超参对四条臂逐字相同，
 # 下面的 train_one 对四条臂逐字相同。要判断两条臂到底差在哪，只看这里。
@@ -604,7 +665,13 @@ else
 echo "               每次更新 ${NEW_PER_UPDATE} 行新任务（基准 ${ACCUM}）"
 fi
 echo " lr          : ${LR} ${LR_SCHEDULER} warmup=${WARMUP_RATIO} epochs=${EPOCHS} seed=${SEED}"
-echo " 起点 val    : EVAL_BEFORE_TRAIN=${EVAL_BEFORE_TRAIN}（1 = 训练前先测 M_${SRC_DOMAIN} 在 ${NEW_DOMAIN} val 上的 loss，${MAXVAL} 行）"
+echo " 起点 val    : EVAL_BEFORE_TRAIN=${EVAL_BEFORE_TRAIN}（1 = 训练前先测起点在两个域的 val 上各一次）"
+if [[ "${OLD_VAL}" == "1" ]]; then
+echo " 旧域 val    : ${OLD_VAL_ROWS} 行，取自 ${OLD_VAL_JSONL}"
+echo "               shuffle(${SAMPLE_SEED}) 第 ${POOL_SAMPLES} 行之后 —— 避开 replay 训的那批，四臂同一批行"
+else
+echo " 旧域 val    : OLD_VAL=0，不测 —— 这次只有 bench 能回答「忘了吗」"
+fi
 echo " system      : '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system，replay 行继承同一条）"
 echo " 结果        : ${RESULTS_ROOT}"
 echo " eval root   : ${EVAL_ROOT}   （与 90 号共用）"
@@ -660,6 +727,15 @@ PY
     exit 4
   else
     echo "新任务 system 与 ${NEW_STATS} 一致"
+  fi
+
+  # 旧域 val 的切片从这份 jsonl 里取，见文件头第 7 条。replay 臂本来就要它，
+  # 另外三条臂不要，所以这道检查在这里而不是在 replay 那一段。
+  if [[ "${OLD_VAL}" == "1" && ! -f "${OLD_VAL_JSONL}" ]]; then
+    echo "找不到旧域 jsonl（旧域 val 从它里面切）: ${OLD_VAL_JSONL}" >&2
+    echo "  它是 90 号 MODE=data 的产物。拿不到就 OLD_VAL=0，但那样这次只有 bench" >&2
+    echo "  能回答「忘了吗」。" >&2
+    exit 1
   fi
 fi
 
@@ -817,6 +893,9 @@ bench_paths_for () {
     finance) group_skipped finance || printf '%s\n' "${FPB_DATA}" "${FIQASA_DATA}" "${TFNS_DATA}" ;;
     code)    group_skipped code    || printf '%s\n' "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
                                                     "${HUMANEVALPLUS_DATA}" "${MBPPPLUS_DATA}" ;;
+    law)     group_skipped law     || printf '%s\n' "${MMLU_PROFESSIONAL_LAW_DATA}" \
+                                                    "${MMLU_INTERNATIONAL_LAW_DATA}" \
+                                                    "${MMLU_JURISPRUDENCE_DATA}" ;;
   esac
 }
 
@@ -852,11 +931,12 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   for _lam in "${LAMBDA_LIST[@]}"; do
     echo
     echo "  run: $(run_name_for "${_lam}")"
-    echo "  train.py 会收到（四条臂只在这一段上不同）："
+    echo "  train.py 会收到（四条臂只在最后一段上不同）："
     echo "    --model_dir ${SRC_CKPT_DIR} --model_name ${SRC_CKPT_NAME}"
     echo "    --dataset_path ${DATASET_DIR}"
     echo "    --batch_size ${BATCH} --accumulation_size ${ARM_ACCUM}"
     echo "    --eval_before_train ${EVAL_BEFORE_TRAIN}"
+    echo "    ${OLD_VAL_ARGS[*]}"
     # arm_train_args 一行一个 token，成对打印才读得出 flag 和值的对应关系。
     _pair=()
     while IFS= read -r _item; do
@@ -901,13 +981,14 @@ train_one () {
     --target_modules "${TARGET_MODULES}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --log_every "${LOG_EVERY}" \
+    "${OLD_VAL_ARGS[@]}" \
     "${arm_args[@]}" \
     --save 1 --save_path "${save_path}" \
     --metrics_path "${METRICS_DIR}/${run}.jsonl"
 }
 
 # ===========================================================================
-# 评测：三个域全评，run_name 自带臂名和 λ。逐字照搬 90 号的解码组，
+# 评测：EVAL_DOMAINS 里的域全评，run_name 自带臂名和 λ。逐字照搬 90 号的解码组，
 # 否则阶段一和阶段三的分数不可比 —— 而这两者相减就是"忘了多少"。
 # ===========================================================================
 require_data () {
@@ -953,7 +1034,7 @@ run_group () {
   fi
   GROUPS_RAN=$((GROUPS_RAN + 1))
 
-  # 和 90 号同一套规则：三域同一条 system（空），所以不再按组分派。同一个 benchmark
+  # 和 90 号同一套规则：四域同一条 system（空），所以不再按组分派。同一个 benchmark
   # 下所有模型必须收到同一条指令，否则阶段一和阶段三的分数不可比，而这两者相减就是
   # "忘了多少"。
   echo
@@ -994,6 +1075,22 @@ eval_finance () {
     --finance_batch_size "${FINANCE_BATCH}"
 }
 
+eval_law () {
+  local run_name="$1" adapter="$2"
+  require_data law "${MMLU_PROFESSIONAL_LAW_DATA}" "${MMLU_INTERNATIONAL_LAW_DATA}" \
+                   "${MMLU_JURISPRUDENCE_DATA}" || return 0
+  # 三个 subject 一组解码：题面形态、解码预算、判分口径完全相同。全部 0-shot，和
+  # 90 号逐字同一套 —— 阶段一和阶段三的分数相减才是"忘了多少"，口径差一点就不可比。
+  # 先看 parse_rate 再看 accuracy：0-shot 要一个字母，写成散文会被记成答错。
+  run_group law "${run_name}" "${adapter}" \
+    "mmlu_professional_law,mmlu_international_law,mmlu_jurisprudence" \
+    --mmlu_professional_law_data_path "${MMLU_PROFESSIONAL_LAW_DATA}" \
+    --mmlu_international_law_data_path "${MMLU_INTERNATIONAL_LAW_DATA}" \
+    --mmlu_jurisprudence_data_path "${MMLU_JURISPRUDENCE_DATA}" \
+    --law_max_new_tokens "${LAW_MAX_NEW}" \
+    --law_batch_size "${LAW_BATCH}"
+}
+
 eval_code () {
   local run_name="$1" adapter="$2"
   require_data code "${HUMANEVAL_DATA}" "${MBPP_DATA}" \
@@ -1015,6 +1112,7 @@ eval_domain () {
     medical) eval_medical "${run_name}" "${adapter}" ;;
     finance) eval_finance "${run_name}" "${adapter}" ;;
     code)    eval_code    "${run_name}" "${adapter}" ;;
+    law)     eval_law     "${run_name}" "${adapter}" ;;
     *) echo "eval_domain: 不认识的领域 '${domain}'，跳过" >&2 ;;
   esac
 }
@@ -1081,6 +1179,13 @@ echo "    cont_${SRC_DOMAIN}2${NEW_DOMAIN}_vanilla_...        <- 遗忘的分母
 echo "    cont_${SRC_DOMAIN}2${NEW_DOMAIN}_{onereplay,ewc,replay}_..."
 echo "  读法：${NEW_DOMAIN} 那几个 metric 回答「学会了吗」，${SRC_DOMAIN} 回答「忘了吗」，"
 echo "  第三个域是从没学过的对照。每条臂的收益 = 它 - vanilla，遗忘量 = 它 - m_${SRC_DOMAIN}。"
+echo
+echo "  bench 之外还有两条 val loss（见文件头第 7 条），在 ${METRICS_DIR}/<run>.jsonl："
+echo "    record_type=baseline 是起点 M_${SRC_DOMAIN}，record_type=epoch 是每轮之后"
+echo "    val_loss      -> ${NEW_DOMAIN} 学到多少（相对 baseline 降了多少）"
+echo "    old_val_loss  -> ${SRC_DOMAIN} 忘了多少（相对 baseline 涨了多少）"
+echo "  bench 会因为解析口径抖，这两条不会。两边说法不一致时先信 loss，"
+echo "  再回头查 bench 的 parse_rate。"
 echo
 echo "  四条臂还差哪几条就投哪几条："
 for _arm in vanilla onereplay ewc replay; do

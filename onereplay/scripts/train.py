@@ -37,6 +37,7 @@ from onereplay.core.regularizer import EWCRegularizer, ReplayRegularizer  # noqa
 from onereplay.data.chat import build_loader, build_opd_loader  # noqa: E402
 from onereplay.data.commonsense import load_and_prepare_dataset  # noqa: E402
 from onereplay.data.batch_mix import build_batch_mixed_loader  # noqa: E402
+from onereplay.data.old_val import build_old_val_loader  # noqa: E402
 from onereplay.data.probe import build_probe_loaders  # noqa: E402
 from onereplay.data.replay import (  # noqa: E402
     build_replay_pools,
@@ -145,6 +146,47 @@ def parse_args() -> argparse.Namespace:
             "existed byte-identical."
         ),
     )
+    # The domain the model arrived already knowing, scored on the same schedule
+    # as the new task's validation split so one record answers both "did it
+    # learn this" and "did it keep that". Off by default: only a continual run
+    # has a second domain. See data/old_val.py for why the rows are cut from
+    # behind the old-knowledge subset rather than taken from that domain's own
+    # validation split.
+    parser.add_argument(
+        "--old_val_jsonl",
+        type=str,
+        default="",
+        help=(
+            "The old domain's corpus, in the {question, response} schema the "
+            "prepare_* scripts write. Rows behind the old-knowledge subset are "
+            "scored every epoch as old_val_loss, next to the new task's "
+            "val_loss. Empty leaves the metrics records as they were."
+        ),
+    )
+    parser.add_argument(
+        "--old_val_pool_size",
+        type=int,
+        default=0,
+        help=(
+            "Rows the old-knowledge subset takes off the shuffled corpus, i.e. "
+            "collect_cov's --max_samples and the replay arm's "
+            "--replay_pool_size. The scored slice starts right after them, so "
+            "this is what keeps it clear of the rows replay trains on."
+        ),
+    )
+    parser.add_argument(
+        "--old_val_sample_seed",
+        type=int,
+        default=-1,
+        help="Shuffle seed of that subset: collect_cov's --sample_seed.",
+    )
+    parser.add_argument(
+        "--old_val_rows",
+        type=int,
+        default=-1,
+        help="Rows to score; negative inherits --max_val_samples.",
+    )
+
     parser.add_argument(
         "--profile",
         type=int,
@@ -700,6 +742,13 @@ def main() -> None:
         batch_size=args.eval_batch_size or args.batch_size,
         train=False,
     )
+    if args.old_val_jsonl and args.paradigm == "opd":
+        # The retention number is the cross-entropy of the old domain's own
+        # targets. OPD's prepare_batch throws those away and substitutes a
+        # student rollout scored by the teacher, so what came back would not be
+        # the quantity this claims to report.
+        raise ValueError("--old_val_jsonl is not defined for --paradigm opd")
+    old_val_loader = build_old_val_loader(args, tokenizer)
 
     # The trainer counts micro-batches, so convert once here. Going through
     # accumulation_steps is what makes the interval mean the same amount of
@@ -865,6 +914,12 @@ def main() -> None:
             "max_train_samples": args.max_train_samples,
             "max_val_samples": args.max_val_samples,
             "eval_before_train": args.eval_before_train,
+            # Which rows old_val_loss is measured on. Without these three the
+            # column is a number with no provenance, and the slice moves if any
+            # of them is changed between arms.
+            "old_val_jsonl": args.old_val_jsonl,
+            "old_val_pool_size": args.old_val_pool_size,
+            "old_val_sample_seed": args.old_val_sample_seed,
             # A loss curve only means something next to the schedule that
             # produced it, and "lr: 5e-5" alone no longer identifies a run now
             # that the same peak can be constant or cosine-decayed.
@@ -876,6 +931,7 @@ def main() -> None:
         },
         save_path=args.save_path if args.save == 1 else "",
         tokenizer=tokenizer,
+        old_val_loader=old_val_loader,
     )
 
 

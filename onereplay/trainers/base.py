@@ -216,14 +216,20 @@ class BaseTrainer:
         return probe_sec
 
     def evaluate_before_train(
-        self, val_loader, extra_record: dict[str, Any] | None = None
+        self,
+        val_loader,
+        extra_record: dict[str, Any] | None = None,
+        old_val_loader=None,
     ) -> dict[str, Any]:
-        """Score the validation split before the first optimizer step.
+        """Score the validation splits before the first optimizer step.
 
         The epoch records carry val_loss but nothing to compare it against, so
         a finished run cannot say how far it moved -- only where it ended up.
         This is the same loader, the same batch mean and the same no-penalty
         path evaluate_loss uses at the end of every epoch, so the two subtract.
+        The old domain's baseline is the same idea: the starting checkpoint's
+        loss on rows this stage never touches, which every later old_val_loss is
+        read as a distance from.
 
         record_type is "baseline" rather than an epoch 0 row because every
         reader downstream filters on record_type == "epoch" to build loss
@@ -240,11 +246,17 @@ class BaseTrainer:
             "val_loss": val_loss,
             "eval_sec": eval_sec,
         }
+        message = f"baseline val_loss={val_loss:.6f}"
+        if old_val_loader is not None:
+            old_start = time.time()
+            record["old_val_loss"] = self.evaluate_loss(old_val_loader)
+            record["old_val_sec"] = time.time() - old_start
+            message += f" old_val_loss={record['old_val_loss']:.6f}"
         if extra_record:
             record.update(extra_record)
         print(
-            f"baseline val_loss={val_loss:.6f} (untrained starting model, {eval_sec:.1f}s) "
-            "-- every epoch's val_loss is relative to this",
+            f"{message} (untrained starting model, {eval_sec:.1f}s) "
+            "-- every epoch's losses are relative to these",
             flush=True,
         )
         self._append_jsonl(record)
@@ -400,8 +412,15 @@ class BaseTrainer:
         save_path: str = "",
         tokenizer=None,
         eval_before_train: int = 0,
+        old_val_loader=None,
     ) -> list[dict[str, Any]]:
-        """Run epochs, optionally evaluate and save the final adapter."""
+        """Run epochs, optionally evaluate and save the final adapter.
+
+        old_val_loader is a fixed slice of the domain the model arrived already
+        knowing, scored on the same schedule as val_loader so one record
+        answers both "did it learn the new task" and "did it keep the old one".
+        None leaves the records exactly as they were before it existed.
+        """
 
         records: list[dict[str, Any]] = []
         # The anchor for every probe curve. On the self-distilled targets this
@@ -410,7 +429,9 @@ class BaseTrainer:
         # "how far the model has drifted from W0".
         self.run_probes(epoch=0)
         if eval_before_train and val_loader is not None:
-            records.append(self.evaluate_before_train(val_loader, extra_record))
+            records.append(
+                self.evaluate_before_train(val_loader, extra_record, old_val_loader)
+            )
         for epoch in range(epochs):
             start_time = time.time()
             train_loss, replay_reg = self.train_one_epoch(train_loader, epoch=epoch + 1)
@@ -436,6 +457,14 @@ class BaseTrainer:
                 "eval_sec": eval_sec,
                 **self.last_epoch_cost,
             }
+            # After the record is assembled, not before: the weights are the
+            # same either way, and this keeps eval_sec and elapsed_sec measuring
+            # what they measured before the old domain existed. Its own cost is
+            # reported separately as old_val_sec.
+            if old_val_loader is not None:
+                old_start = time.time()
+                record["old_val_loss"] = self.evaluate_loss(old_val_loader)
+                record["old_val_sec"] = time.time() - old_start
             if self.probe_loaders:
                 # elapsed_sec is wall clock and still contains the probes;
                 # train_sec and sec_per_step already have them removed.

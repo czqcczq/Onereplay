@@ -72,10 +72,13 @@ def get_metric(name: str) -> Metric:
         "math500": "onereplay.eval.metrics.math500:MATH500Metric",
         "amc": "onereplay.eval.metrics.math500:AMCMetric",
         "minervamath": "onereplay.eval.metrics.math500:MinervaMathMetric",
-        # Specialist-line domains. Every trained model is scored on all three
-        # (medical / finance / code), so these are not optional extras: a run that
-        # only reports its own domain answers "did it learn?" and says nothing
+        # Specialist-line domains. Every trained model is scored on all of them
+        # (medical / finance / code / law), so these are not optional extras: a run
+        # that only reports its own domain answers "did it learn?" and says nothing
         # about "did it forget?".
+        "mmlu_professional_law": "onereplay.eval.metrics.mmlu_law:MMLUProfessionalLawMetric",
+        "mmlu_international_law": "onereplay.eval.metrics.mmlu_law:MMLUInternationalLawMetric",
+        "mmlu_jurisprudence": "onereplay.eval.metrics.mmlu_law:MMLUJurisprudenceMetric",
         "medqa": "onereplay.eval.metrics.medical:MedQAMetric",
         "pubmedqa": "onereplay.eval.metrics.medical:PubMedQAMetric",
         "medmcqa": "onereplay.eval.metrics.medical:MedMCQAMetric",

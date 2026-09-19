@@ -5,7 +5,8 @@
 Available metrics: ifeval, ifbench, followbench, multiif, commonsense,
 commonsense_qa, gsm8k, aime, math500, amc, minervamath, humaneval, mbpp,
 humanevalplus, mbppplus, medqa, pubmedqa, medmcqa, careqa, fpb, fiqasa, tfns,
-dialogsum, direct_safety. Each metric writes
+mmlu_professional_law, mmlu_international_law, mmlu_jurisprudence, dialogsum,
+direct_safety. Each metric writes
 <out_dir>/<metric>/<run_name>/summary.json plus an appended row in
 <out_dir>/<metric>_summary.csv.
 
@@ -196,6 +197,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--careqa_data_path", type=str, default="")
     parser.add_argument("--medical_max_new_tokens", type=int, default=1024)
     parser.add_argument("--medical_batch_size", type=int, default=0)
+
+    # law: the three MMLU law subjects, run 0-shot on the medical harness. Like
+    # the medical sets, none is in-domain -- the Law specialist trains on
+    # free-form legal prose and short gold terms, never on multiple choice.
+    parser.add_argument("--mmlu_professional_law_data_path", type=str, default="")
+    parser.add_argument("--mmlu_international_law_data_path", type=str, default="")
+    parser.add_argument("--mmlu_jurisprudence_data_path", type=str, default="")
+    parser.add_argument("--law_max_new_tokens", type=int, default=1024)
+    parser.add_argument("--law_batch_size", type=int, default=0)
 
     # finance: three-way sentiment classification, which is what the Finance
     # specialist trains on. FPB and FiQA-SA are news, TFNS is tweets.

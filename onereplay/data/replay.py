@@ -130,6 +130,21 @@ def load_replay_pool(args: argparse.Namespace):
     )
 
 
+def cut_pool(dataset, sample_seed: int, pool_size: int):
+    """Shuffle then take the first pool_size rows: the old-knowledge subset.
+
+    Shared with old_val.py, which cuts the same shuffle at a later offset to get
+    rows the subset does not contain. Both sides have to mean the same rows by
+    "the pool" or that slice is not actually disjoint from it. pool_size 0 keeps
+    the whole corpus.
+    """
+
+    dataset = dataset.shuffle(seed=sample_seed)
+    if pool_size > 0:
+        dataset = dataset.select(range(min(pool_size, len(dataset))))
+    return dataset
+
+
 def load_self_distilled_pool(args: argparse.Namespace, self_distill_file: str = ""):
     """Load base-model answers written by scripts/generate_replay_targets.py.
 
@@ -218,10 +233,7 @@ def build_replay_dataset(
     if self_distill_file or getattr(args, "replay_self_distill_file", ""):
         pool = load_self_distilled_pool(args, self_distill_file)
     else:
-        pool = load_replay_pool(args)
-        pool = pool.shuffle(seed=args.replay_sample_seed)
-        if args.replay_pool_size > 0:
-            pool = pool.select(range(min(args.replay_pool_size, len(pool))))
+        pool = cut_pool(load_replay_pool(args), args.replay_sample_seed, args.replay_pool_size)
 
     dataset = to_sft_schema(pool, args)
     tag = f"replay pool[{label}]" if label else "replay pool"

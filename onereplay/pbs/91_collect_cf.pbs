@@ -83,7 +83,7 @@
 #                   和 embed_tokens.weight 是同一个张量，所以约束它等于连输入嵌入
 #                   一起约束。功能上不报错，Step 3 的覆盖断言会确认它被采到；第一
 #                   次跑完比一下它的 tr(C)/d 和 mean(F) 与其他层差几个量级再决定要
-#                   不要摘掉（摘掉就是三域一起重采）。
+#                   不要摘掉（摘掉就是所有域一起重采）。
 #   SYSTEM_PROMPT   逐字（空） —— system turn 进 chat template，激活跟着变
 #
 #   Step 0 会把 SYSTEM_PROMPT 和 data/stats/{domain}_stats.json 里记的那条对表，
@@ -233,9 +233,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 cd "${REPO_ROOT}"
 
 case "${DOMAIN}" in
-  medical|finance|code) ;;
+  medical|finance|code|law) ;;
   *)
-    echo "必须指定 DOMAIN=medical|finance|code，当前 '${DOMAIN}'"
+    echo "必须指定 DOMAIN=medical|finance|code|law，当前 '${DOMAIN}'"
     echo "  例: qsub -v DOMAIN=medical,WHAT=cov onereplay/pbs/91_collect_cf.pbs"
     exit 2
     ;;
@@ -262,7 +262,7 @@ SEED="${SEED:-42}"
 MAXLEN="${MAXLEN:-1216}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
-# 三域统一为空，和 90 号训练侧同一个值。stats 里记的也是空串，下面 Step 0 的守卫按
+# 四域统一为空，和 90 号训练侧同一个值。stats 里记的也是空串，下面 Step 0 的守卫按
 # 哨兵区分"字段缺失"和"字段是空串"，所以空值一样会被校验，不会被当成老 stats 放过。
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 

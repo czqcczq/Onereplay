@@ -240,6 +240,11 @@ class _ChoiceMetric:
     name = ""
     data_path_keys: tuple[str, ...] = ()
     valid_letters = "ABCDE"
+    # Which cfg keys carry the decode budget. Overridable so another domain can
+    # reuse this harness under its own --*_batch_size / --*_max_new_tokens
+    # without inheriting medical's, which would make one flag move both.
+    max_new_tokens_key = "medical_max_new_tokens"
+    batch_size_key = "medical_batch_size"
 
     def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         raise NotImplementedError
@@ -263,7 +268,7 @@ class _ChoiceMetric:
         output_dir.mkdir(parents=True, exist_ok=True)
         data_path = self.data_path(cfg)
         max_new_tokens = int(
-            cfg.get("medical_max_new_tokens", cfg.get("max_new_tokens", 1024))
+            cfg.get(self.max_new_tokens_key, cfg.get("max_new_tokens", 1024))
         )
         run_name = cfg.get("run_name", "base")
 
@@ -278,7 +283,7 @@ class _ChoiceMetric:
             [self.build_prompt(example) for example in examples],
             device,
             max_new_tokens,
-            resolve_batch_size(cfg, "medical_batch_size"),
+            resolve_batch_size(cfg, self.batch_size_key),
             log_label=self.name,
         )
 
