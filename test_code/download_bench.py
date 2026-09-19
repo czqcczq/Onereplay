@@ -1,25 +1,29 @@
-"""Download the nine evaluation benchmarks from HuggingFace, once, into place.
+"""Download the eleven evaluation benchmarks from HuggingFace, once, into place.
 
     python test_code/download_bench.py                  # 全部
-    python test_code/download_bench.py --only medqa,finqa
+    python test_code/download_bench.py --only medqa,fpb
     python test_code/download_bench.py --dest /scratch/.../datasets
+    python test_code/download_bench.py --only fpb,fiqasa,tfns \\
+        --fingpt_train datasets/raw/fingpt_sentiment_train.parquet   # 顺带查污染
 
 Everything lands under --dest with exactly the paths 90_specialist_sft.pbs
 expects, so after this finishes the PBS defaults just work:
 
-    datasets/math/gsm8k_test.jsonl
-    datasets/math/math500_test.jsonl
-    datasets/math/minervamath_test.jsonl
     datasets/bench/medqa/test.jsonl
     datasets/bench/pubmedqa/test.jsonl
-    datasets/bench/medxpertqa/test.jsonl
-    datasets/bench/finqa/test.jsonl
-    datasets/bench/convfinqa/dev_turn.json
-    datasets/bench/tatqa/tatqa_dataset_dev.json
+    datasets/bench/medmcqa/test.jsonl
+    datasets/bench/careqa/test.jsonl
+    datasets/bench/fpb/test.jsonl
+    datasets/bench/fiqasa/test.jsonl
+    datasets/bench/tfns/test.jsonl
+    datasets/code/humaneval_test.parquet
+    datasets/code/humanevalplus_test.parquet
+    datasets/code/mbppplus_test.parquet
+    datasets/code/mbpp_full/
 
-The math three go to datasets/math/<name>_test.jsonl rather than alongside the
-rest because that is where this project has always kept them, and gsm8k and
-math500 are already sitting there on the cluster. Anything already present is
+The code four go to datasets/code/ rather than alongside the rest because
+download_code_data.py has been putting them there since before this line
+existed and other scripts still read that path. Anything already present is
 skipped, so running this on the cluster fetches only what is genuinely missing.
 
 Why every entry pins allow_patterns
@@ -27,16 +31,24 @@ Why every entry pins allow_patterns
 snapshot_download takes the whole repo by default, and these repos are mostly
 not the eval split:
 
-    OctoMed/MedQA-5options   train is ~500MB (16 teacher responses per question),
-                             test is 0.7MB
-    TsinghuaC3I/MedXpertQA   images.zip is 517MB and belongs to the MM subset,
-                             which is not evaluated here
-    AdaptLLM/ConvFinQA       train_turn.json is 166MB, dev_turn.json is 21MB
-    qiaojin/PubMedQA         pqa_artificial is 211k generated rows; only the
-                             1000 expert-labeled ones are the benchmark
+    OctoMed/MedQA-5options       train is ~500MB (16 teacher responses per
+                                 question), test is 0.7MB
+    openlifescienceai/medmcqa    train is 182,822 rows / 132MB; the benchmark is
+                                 the 4,183-row validation split
+    qiaojin/PubMedQA             pqa_artificial is 211k generated rows; only the
+                                 1000 expert-labeled ones are the benchmark
 
 Unpinned, this script would pull well over a gigabyte of data that never gets
-evaluated. Pinned, the whole set is roughly 45MB.
+evaluated.
+
+Two substitutions worth knowing about
+-------------------------------------
+* FPB comes from ChanceFocus/en-fpb, not TheFinAI/en-fpb. They are the same
+  bytes (identical splits: 3100/776/970, identical dataset_size), but the
+  TheFinAI copy is gated behind a click-through, which makes an unattended
+  download on a login node fail with a 401.
+* TFNS is the validation split, because the released test split is unlabeled.
+  Same reason MedMCQA is evaluated on validation.
 
 Behind the Great Firewall set a mirror before running:
 
@@ -49,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -71,50 +84,21 @@ class Spec:
     source: str = ""
     # Direct download, used when no HuggingFace repo carries the actual data.
     url: str = ""
-    # "parquet" converts to jsonl, "copy" keeps the bytes, "auto" decides by
-    # extension.
+    # "parquet" converts to jsonl, "csv" likewise, "copy" keeps the bytes,
+    # "auto" decides by extension.
     mode: str = "parquet"
     note: str = ""
 
 
 SPECS: list[Spec] = [
-    # --- math ---------------------------------------------------------------
-    Spec(
-        name="gsm8k",
-        repo_id="openai/gsm8k",
-        allow=["main/test-*"],
-        source="main/test-*.parquet",
-        target="math/gsm8k_test.jsonl",
-        note="1319 grade-school word problems",
-    ),
-    Spec(
-        name="math500",
-        repo_id="HuggingFaceH4/MATH-500",
-        allow=["test.jsonl", "*.parquet"],
-        source="test*",
-        target="math/math500_test.jsonl",
-        mode="auto",
-        note="500 problems from the MATH test split",
-    ),
-    Spec(
-        name="minervamath",
-        repo_id="math-ai/minervamath",
-        allow=["*.parquet", "*.jsonl"],
-        source="*test*",
-        target="math/minervamath_test.jsonl",
-        mode="auto",
-        note="272 MIT OpenCourseWare problems",
-    ),
     # --- medical ------------------------------------------------------------
     Spec(
         name="medqa",
         repo_id="OctoMed/MedQA-5options",
-        # test only: train carries 16 teacher responses per question (~500MB)
-        # and is what the Medical specialist is fine-tuned on.
         allow=["data/test-*"],
         source="data/test-*.parquet",
         target="bench/medqa/test.jsonl",
-        note="in-domain: same corpus the Medical specialist trains on",
+        note="1273 USMLE questions, 5 options",
     ),
     Spec(
         name="pubmedqa",
@@ -127,52 +111,53 @@ SPECS: list[Spec] = [
         note="1000 expert-labeled yes/no/maybe",
     ),
     Spec(
-        name="medxpertqa",
-        repo_id="TsinghuaC3I/MedXpertQA",
-        # Text only. images.zip (517MB) serves the MM subset, which this line
-        # does not evaluate.
-        allow=["Text/test.jsonl"],
-        source="Text/test.jsonl",
-        target="bench/medxpertqa/test.jsonl",
-        mode="copy",
-        note="difficulty ruler only -- 10 options, chance is 10%",
+        name="medmcqa",
+        repo_id="openlifescienceai/medmcqa",
+        # validation, not test: the released test split has no cop column.
+        allow=["data/validation-*"],
+        source="data/validation-*.parquet",
+        target="bench/medmcqa/test.jsonl",
+        note="4183 AIIMS/NEET-PG questions, 4 options, cop is 0-based",
+    ),
+    Spec(
+        name="careqa",
+        repo_id="HPAI-BSC/CareQA",
+        # Closed-ended English only. The _open variant is free-response and the
+        # _es one is Spanish; neither is graded by this line.
+        allow=["CareQA_en.json"],
+        source="CareQA_en.json",
+        target="bench/careqa/test.jsonl",
+        mode="auto",
+        note="5621 Spanish FSE exam questions in English, cop is 1-based",
     ),
     # --- finance ------------------------------------------------------------
     Spec(
-        name="finqa",
-        # Straight from the authors' repo, not HuggingFace. dreamerdeo/finqa is
-        # only a loading script with no data files, and the mirrors that do
-        # carry data (flare-finqa, finqa-updated) flatten the qa block and drop
-        # exe_ans -- the executed numeric answer this metric grades against.
-        url="https://raw.githubusercontent.com/czyssrs/FinQA/main/dataset/test.json",
-        target="bench/finqa/test.jsonl",
-        note="1147 questions, original format with qa.exe_ans",
+        name="fpb",
+        repo_id="ChanceFocus/en-fpb",
+        allow=["data/test-*"],
+        source="data/test-*.parquet",
+        target="bench/fpb/test.jsonl",
+        note="970 sentences; non-gated mirror of TheFinAI/en-fpb",
     ),
     Spec(
-        name="convfinqa",
-        repo_id="AdaptLLM/ConvFinQA",
-        # The authors' own turn-level split. train_turn.json is 166MB.
-        allow=["dev_turn.json"],
-        source="dev_turn.json",
-        target="bench/convfinqa/dev_turn.json",
-        mode="copy",
-        note="1490 turns over 421 conversations",
+        name="fiqasa",
+        repo_id="TheFinAI/fiqa-sentiment-classification",
+        allow=["data/test-*"],
+        source="data/test-*.parquet",
+        target="bench/fiqasa/test.jsonl",
+        note="234 rows; class comes from the sign of `score`",
     ),
     Spec(
-        name="tatqa",
-        repo_id="next-tat/TAT-QA",
-        # dev, not test: the official test split is blind (leaderboard only).
-        allow=["tatqa_dataset_dev.json"],
-        source="tatqa_dataset_dev.json",
-        target="bench/tatqa/tatqa_dataset_dev.json",
-        mode="copy",
-        note="dev split; the official test split has no public answers",
+        name="tfns",
+        repo_id="zeroshot/twitter-financial-news-sentiment",
+        # csv, not parquet -- this repo ships two csv files and nothing else.
+        allow=["sent_valid.csv"],
+        source="sent_valid.csv",
+        target="bench/tfns/test.jsonl",
+        mode="csv",
+        note="2388 tweets; label 0=Bearish 1=Bullish 2=Neutral",
     ),
     # --- code ---------------------------------------------------------------
-    # These two land under datasets/code/ rather than datasets/bench/, because
-    # download_code_data.py has been putting them there since well before this
-    # line existed and other scripts still read that path. Kept here anyway so
-    # one command fetches everything the specialist runs evaluate against.
     Spec(
         name="humaneval",
         repo_id="openai/openai_humaneval",
@@ -220,6 +205,14 @@ SPECS: list[Spec] = [
     ),
 ]
 
+# Which bench files the contamination check reads, and the column holding the
+# graded sentence in each.
+FINANCE_BENCHES = {
+    "fpb": ("text", "sentence"),
+    "fiqasa": ("sentence", "text"),
+    "tfns": ("text", "sentence"),
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download evaluation benchmarks.")
@@ -239,6 +232,15 @@ def parse_args() -> argparse.Namespace:
         "--list",
         action="store_true",
         help="Print what would be downloaded and exit.",
+    )
+    parser.add_argument(
+        "--fingpt_train",
+        type=str,
+        default="",
+        help="FinGPT sentiment-train parquet. Given, the three finance benches "
+        "are checked against it for overlap -- that corpus is built from the "
+        "train splits of these same three sets, so a leak is plausible enough "
+        "to be worth one set comparison.",
     )
     return parser.parse_args()
 
@@ -282,6 +284,14 @@ def parquet_to_jsonl(paths: list[Path], target: Path) -> int:
     return to_jsonl(frame.to_dict("records"), target)
 
 
+def csv_to_jsonl(paths: list[Path], target: Path) -> int:
+    import pandas as pd
+
+    frames = [pd.read_csv(path) for path in sorted(paths)]
+    frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    return to_jsonl(frame.to_dict("records"), target)
+
+
 def jsonish_to_jsonl(path: Path, target: Path) -> int:
     if path.suffix.lower() in (".jsonl", ".ndjson"):
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -295,6 +305,12 @@ def jsonish_to_jsonl(path: Path, target: Path) -> int:
             if isinstance(payload.get(key), list):
                 payload = payload[key]
                 break
+    if isinstance(payload, dict):
+        # Column- or index-oriented json (CareQA_en.json could be either), which
+        # pandas can reorient and a hand-rolled reader would get wrong.
+        import pandas as pd
+
+        return to_jsonl(pd.read_json(path).to_dict("records"), target)
     if not isinstance(payload, list):
         raise ValueError(f"{path.name}: expected a list of records, got {type(payload).__name__}")
     return to_jsonl(payload, target)
@@ -391,6 +407,12 @@ def fetch(spec: Spec, dest: Path, force: bool) -> tuple[bool, str]:
             return False, f"没有 parquet 匹配 {spec.source!r}，实际: {[p.name for p in matches]}"
         return True, f"{parquet_to_disk(parquet, target)} -> {spec.target}"
 
+    if spec.mode == "csv":
+        csv_files = [path for path in matches if path.suffix.lower() == ".csv"]
+        if not csv_files:
+            return False, f"没有 csv 匹配 {spec.source!r}，实际: {[p.name for p in matches]}"
+        return True, f"{csv_to_jsonl(csv_files, target)} 行 -> {spec.target}"
+
     parquet = [path for path in matches if path.suffix.lower() == ".parquet"]
     if parquet or spec.mode == "parquet":
         if not parquet:
@@ -399,6 +421,58 @@ def fetch(spec: Spec, dest: Path, force: bool) -> tuple[bool, str]:
     else:
         rows = jsonish_to_jsonl(matches[0], target)
     return True, f"{rows} 行 -> {spec.target}"
+
+
+def normalize_sentence(text: str) -> str:
+    """Punctuation- and case-insensitive key for the overlap check."""
+
+    return re.sub(r"\W+", " ", str(text or "").lower()).strip()
+
+
+def check_contamination(dest: Path, fingpt_path: str) -> None:
+    """Report how many finance bench rows also appear in the training corpus.
+
+    FinGPT sentiment-train is assembled from the *train* splits of these three
+    sets, so the expected answer is "almost none". It is checked rather than
+    assumed because an overlap here would turn the finance numbers into a
+    memorization measurement, and the check costs one pass over 77k strings.
+    """
+
+    import pandas as pd
+
+    path = Path(fingpt_path)
+    if not path.exists():
+        print(f"!! 跳过污染自检：找不到 {path}")
+        return
+
+    frame = pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_json(
+        path, lines=path.suffix.lower() in (".jsonl", ".ndjson")
+    )
+    column = "input" if "input" in frame.columns else frame.columns[0]
+    train_keys = {normalize_sentence(value) for value in frame[column].tolist()}
+    train_keys.discard("")
+    print(f"训练集 {path.name}: {len(frame)} 行，{len(train_keys)} 个唯一句子")
+
+    for name, keys in FINANCE_BENCHES.items():
+        bench_file = dest / "bench" / name / "test.jsonl"
+        if not bench_file.exists():
+            print(f"  {name:8} 还没下载，跳过")
+            continue
+        sentences = []
+        with bench_file.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                for key in keys:
+                    if str(record.get(key) or "").strip():
+                        sentences.append(str(record[key]))
+                        break
+        hits = [text for text in sentences if normalize_sentence(text) in train_keys]
+        share = len(hits) / max(len(sentences), 1) * 100
+        print(f"  {name:8} {len(sentences)} 行中 {len(hits)} 行出现在训练集 ({share:.1f}%)")
+        for sample in hits[:3]:
+            print(f"      {sample[:96]}")
 
 
 def main() -> None:
@@ -421,10 +495,10 @@ def main() -> None:
     if args.list:
         for spec in specs:
             origin = spec.url if spec.url else f"{spec.repo_id}  {spec.allow}"
-            print(f"{spec.name:12} -> {spec.target}")
-            print(f"{'':12}    {origin}")
+            print(f"{spec.name:14} -> {spec.target}")
+            print(f"{'':14}    {origin}")
             if spec.note:
-                print(f"{'':12}    {spec.note}")
+                print(f"{'':14}    {spec.note}")
         return
 
     try:
@@ -447,15 +521,22 @@ def main() -> None:
             failures.append(spec.name)
         print()
 
+    if args.fingpt_train:
+        print("=" * 62)
+        print("金融三个 bench 的去污染自检")
+        check_contamination(dest, args.fingpt_train)
+        print()
+
     print("=" * 62)
     if failures:
         print(f"失败 {len(failures)} 个: {', '.join(failures)}")
         print("网络问题的话设 HF_ENDPOINT=https://hf-mirror.com 后重跑，已下好的会跳过。")
         raise SystemExit(1)
 
-    print(f"全部完成，共 {len(specs)} 个。接着验一遍 loader 能不能读懂这些文件：")
+    print(f"全部完成，共 {len(specs)} 个。接着用小 limit 验一遍判分器读得懂这些文件：")
     print()
-    print("  python test_code/check_bench_loaders.py")
+    print("  python -m onereplay.scripts.evaluate --metrics medqa,pubmedqa,medmcqa,careqa \\")
+    print("      --limit 20 --out_dir /tmp/bench_smoke ...")
 
 
 if __name__ == "__main__":
