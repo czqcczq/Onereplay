@@ -23,10 +23,17 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from onereplay.scripts.prepare_math_data import write_jsonl
+# Run as a file (`python onereplay/scripts/download_mmlu_law_data.py`) and
+# sys.path[0] is this script's directory, not the repo root, so `import
+# onereplay` fails. Every other script here carries the same two lines.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from onereplay.scripts.prepare_math_data import write_jsonl  # noqa: E402
 
 # MMLU ships one config per subject. These three are the law block: Professional
 # Law is the bar-exam-style bulk of it, International Law and Jurisprudence are

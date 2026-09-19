@@ -565,11 +565,18 @@ done
 
 # run 名：EVAL_ROOT 是和 90 号共用的，所以这里必须自带足够的标识，
 # 否则 csv 里两条臂会挤在同一行上。
+#
+# 凡是改变"训练了多少"的变量都得进名字。漏掉一个的后果不是撞名报错，是主流程
+# 看见同名 checkpoint 就跳过训练、转头去评那个旧的——换了配置，拿回来的却是上
+# 一次的分数，全程没有任何报错。EPOCHS 和 MAX_TRAIN_SAMPLES 都属于这一类。
+# MAX_TRAIN_SAMPLES 只在非全量时进名字，正常跑（0）的名字不受影响。
 run_name_for () {
   local lam="$1"
   local name="cont_${SRC_DOMAIN}2${NEW_DOMAIN}_${ARM}"
   [[ -n "${lam}" ]] && name="${name}_lam${lam}"
-  printf '%s' "${name}_lr${LR}_seed${SEED}"
+  name="${name}_lr${LR}_ep${EPOCHS}"
+  [[ "${MAX_TRAIN_SAMPLES}" != "0" ]] && name="${name}_n${MAX_TRAIN_SAMPLES}"
+  printf '%s' "${name}_seed${SEED}"
 }
 
 # 旧域 val 的参数。**不在** arm_train_args 里：它对四条臂逐字相同，四条臂必须打

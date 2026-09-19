@@ -1,0 +1,868 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N fin_cf
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# finance 线第一步：在 Qwen2.5-1.5B-Instruct base 上采三域 gold C 与对角 F
+#
+#   qsub -v DRY_RUN=0 onereplay/pbs/93_finance_gold_cf.pbs                 # 三域 C+F
+#   qsub -v DRY_RUN=0,WHAT=cov    onereplay/pbs/93_finance_gold_cf.pbs     # 只采 C
+#   qsub -v DRY_RUN=0,WHAT=fisher onereplay/pbs/93_finance_gold_cf.pbs     # 只采 F
+#   qsub -v DRY_RUN=0,WHAT=fisher,DO_IF=1,DO_MATH=0,DO_CODE=0 <本脚本>      # 一次一个域
+#   qsub -v DRY_RUN=0,WHAT=none   onereplay/pbs/93_finance_gold_cf.pbs     # 只跑诊断
+#
+# 产物是 94/95 号的全部矩阵输入：三份 C（OneReplay 臂）和三份 F（EWC 臂）。
+# 本脚本只采集和诊断，不训练、不混合、不评测。
+#
+# -----------------------------------------------------------------------------
+# 这条线是什么：主实验的骨架换一个载体
+#
+#   主实验（68/69/81/82/83 号）= Qwen3-8B + LoRA + DialogSum 当新任务，
+#   用 C_if / C_math / C_code 分别保护三种通用能力。
+#   本线        = Qwen2.5-1.5B-Instruct + **全量 SFT** + finance 当新任务，
+#   保护的域、四条臂、比较口径全部不变，只换模型、换训练方式、换新任务。
+#
+#   所以旧知识那一侧的语料参数**逐字照抄 68/69 号**，一个字都不改：改了就不再是
+#   "同一批旧知识换个载体"，而是又多了一个变量。
+#
+# -----------------------------------------------------------------------------
+# 与 68/69 号的差异，每一条都是刻意的
+#
+#   模型      Qwen3-8B -> Qwen2.5-1.5B-Instruct（28 层 / hidden 1536 /
+#             intermediate 8960 / vocab 151936 / kv_heads 2）
+#
+#   层覆盖    七类 all-linear -> **七类 + lm_head**
+#             理由是训练方式变了。68 号那边是 LoRA，只有挂了 adapter 的层会动，
+#             lm_head 根本不在可训练集合里；这条线是全量 SFT，每个参数都会动，
+#             输出头不约束就等于留了一个不受罚的自由方向。90/91/92 那条全量 SFT
+#             线也是这个口径，与它保持一致。
+#             !! Qwen2.5-1.5B 是 tie_word_embeddings=true，lm_head.weight 和
+#             embed_tokens.weight 是同一个张量，所以约束 lm_head 等于连输入嵌入
+#             一起约束。功能上不报错（snapshot_reference_weights 按 storage 去重，
+#             不会把同一个张量算两遍从而悄悄把那一层的 λ 翻倍），但 Step 3 会把
+#             lm_head 的 tr(C)/d 和其余层并排打出来 —— 如果它高几个数量级，那
+#             "λ 主要压在输出头上"这件事必须写进结果，而不是藏在"all-linear +
+#             lm_head"这个说法里。
+#
+#   采集对象  base，不是 specialist
+#             正则项是 λ tr(ΔW C ΔWᵀ)，ΔW = W - W_ref，而这条线的 W_ref 就是
+#             Qwen2.5-1.5B-Instruct 本身（95 号从它起训）。91 号默认在 specialist
+#             上采是因为那条线的 W_ref 是阶段一的 checkpoint，这里不是。
+#
+#   累加设备  device（--cov_accum_device device）
+#             1.5B 的 C 只有 9.85 GiB，整份放得下卡，hook 不必每个 batch 往主机
+#             搬 X^T X。收尾时逐层搬回主机再落盘。
+#
+#   结果目录  ${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/{cov,fisher}
+#             与 8B 主实验、与 90/91/92 的 specialist 线都彻底隔离。
+#             注意**语料**仍然读 8B 主实验那批（见下一条）。
+#
+# -----------------------------------------------------------------------------
+# !! 语料从哪来：三个池都是现成的，与模型无关
+#   if    ${FLAN_DIR}/train/*.jsonl 的 inputs/targets 两列，FLAN 的 targets 本身
+#         就是 gold，20000 行随机子集。
+#   math  1.7B 那批自蒸馏 jsonl 的 **gold_targets** 列，两个视角一起读。
+#   code  同上，OPC-edu 那一份。
+#
+#   generate_replay_targets.py 给每行都写了 gold_targets，那是数据集自带的解答、
+#   与生成它的模型无关；而且**池子在生成那一步就已经切好了**（文件名里的 30k /
+#   20k 就是当时的 --pool_size），所以这里读整份文件即可，不需要重新切池、不需要
+#   1.5B 自己生成。这也正是 68/69 号 math/code 那两段 --max_samples 0 的含义：
+#   "把已经切好的那 20k/30k 整份读完"，不是"读原始数据集的全量"。
+#
+#   因此 POOL_ROOT 指向 ${REPO_ROOT}/results（只读，1.7B 那批的产物），
+#   RESULTS_ROOT 指向本线自己的目录（只写）。别混。
+#
+# -----------------------------------------------------------------------------
+# !! C 和 F 必须同池，所以两段共用同一个 POOL_ARGS 数组
+#   三条非 vanilla 臂的前提是"同一批旧知识的不同用法"。C 和 F 只要有一个字的数据
+#   参数不同，EWC 与 OneReplay 的差别里就混进了"谁看的数据多"这个变量。
+#
+#   所以下面 pool_args_for 那个函数的输出**同时**喂给 collect_cov 和
+#   collect_fisher，Step 3 再用 pool_fingerprint 把这件事钉死，不等就报错。
+#
+#   唯一没进共用数组的是 --sample_strategy uniform：collect_fisher 没有这个 flag，
+#   传了会被 argparse 拒；而两边的 limit_dataset 都是 getattr(args,
+#   "sample_strategy", "uniform")，缺省就是 uniform，所以省掉它两边取的是同一批行。
+#
+# -----------------------------------------------------------------------------
+# maxlen 按域走，不按新任务走
+#   if 512 / math 1024 / code 1024，逐字等于 68/69 号。
+#
+#   !! 不要把它们改成新任务的 1216。C 的 max_len 要对齐的是 **replay 臂读同一个
+#   池时的 --replay_max_len**（95 号会拿 C 的 metadata 对表），不是新任务的长度
+#   预算 —— 两者量的是不同的东西，前者决定"罚项编码了旧知识的多长一段"，后者
+#   决定"新任务的行会不会被截断"。
+#   改这个值必须三处同步：本文件、95 号的 REPLAY_MAXLEN、以及重采 C 和 F。
+#
+# -----------------------------------------------------------------------------
+# COV_BATCH 怎么定：logits 是瓶颈
+#   target_modules 里虽然有 lm_head，但 collect_cov 走的是完整前向，logits 无论
+#   如何都要算。Qwen2.5 的 vocab 是 151936，logits 显存 = batch x len x 151936 x 2B，
+#   按 batch x len 约 16K token 配平：
+#       if   len 512  -> batch 32   （logits 4.98 GiB）
+#       math len 1024 -> batch 16   （同上）
+#       code len 1024 -> batch 16
+#   采集期显存 = 3.1(权重 bf16) + 9.85(C fp32) + 5.0(logits) + 激活，约 20 GB。
+#   C 是按 token 取的均值，batch 只影响累加顺序不影响结果，所以这个旋钮是安全的。
+#
+# -----------------------------------------------------------------------------
+# 落盘体积（fp32）。Step 0 会从 config.json 现读维度算准确值再和 df 比
+#   C 按**输入维度**的方阵存 -> down_proj (8960²) 独占八成，每域约 9.85 GiB
+#   F 按**权重形状**存      -> lm_head (151936x1536) 独占约 890 MiB，每域约 6.0 GiB
+#   三域 C+F 合计约 48 GiB。两者不是一回事，别拿一个的经验估另一个。
+#
+# -----------------------------------------------------------------------------
+# 时间：C 便宜，F 是大头
+#   C 只有前向；F 逐样本反向（collect_fisher 里 batch_size 写死 1，因为对 batch
+#   求和再平方是 (Σg)² 而不是 Σg²，那是另一个矩阵，且不会报错）。
+#   三域共约 66k 行，按 300 ms/样本估约 5.5 h，24 h 的 walltime 很宽松。
+#   Step 0 会按 ETA_MS_PER_EXAMPLE 估并和 walltime 比，只警告不拦；真值看
+#   collect_fisher 每 LOG_EVERY 条打印的 ms/example，拿它回来校准再投下一批。
+#
+#   !! F 没有断点续采。写到一半失败等于这个域全白跑，所以 Step 0 的磁盘预检是
+#   硬拦截，不是警告。
+#
+# -----------------------------------------------------------------------------
+# 投递前要有
+#   1) ${MODEL_DIR}/Qwen2.5-1.5B-Instruct
+#   2) ${FLAN_DIR}                                                （if 域语料）
+#   3) ${POOL_ROOT}/replay/metamath_cmath_30k_*_selfdistill_seed1.jsonl （2 个文件）
+#   4) ${POOL_ROOT}/replay/opc_edu_ccode_20k_selfdistill_seed1.jsonl
+#   5) /scratch 剩余空间 > Step 0 报的预计写入量 + 20 GiB
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/93_finance_gold_cf.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_fincf_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_fincf_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+WHAT="${WHAT:-both}"
+
+# =============================================================================
+# 外层：裸计算节点，只负责起容器再把自己跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]]    || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_fincf_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT POOL_ROOT FLAN_DIR DATASET_CACHE
+    COV_DIR FISHER_DIR
+    WHAT DO_IF DO_MATH DO_CODE DO_DIAG DRY_RUN FORCE
+    TARGET_MODULES SYSTEM_PROMPT SEED SAMPLE_SEED GOLD_COLUMN DEBUG_EXAMPLES
+    COV_ACCUM_DEVICE COV_USE_BF16 FISHER_DEVICE FISHER_USE_BF16 LOG_EVERY
+    FLAN_SAMPLES IF_MAXLEN IF_COV_BATCH
+    MATH_VIEW_PREFIX MATH_MAXLEN MATH_COV_BATCH
+    CODE_VIEW_PREFIX CODE_MAXLEN CODE_COV_BATCH
+    IF_COV MATH_COV CODE_COV IF_FISHER MATH_FISHER CODE_FISHER
+    ETA_MS_PER_EXAMPLE WALLTIME_HOURS
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+cd "${REPO_ROOT}"
+
+case "${WHAT}" in
+  cov|fisher|both|none) ;;
+  *) echo "WHAT 只能是 cov|fisher|both|none，当前 '${WHAT}'" >&2; exit 2 ;;
+esac
+
+# ---- 模型：本线的 W_ref，95 号从它起训 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-1.5B-Instruct}"
+
+# ---- 目录：写本线自己的，读 1.7B 那批的池 ----
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_finance_${MODEL_NAME}}"
+POOL_ROOT="${POOL_ROOT:-${REPO_ROOT}/results}"
+FLAN_DIR="${FLAN_DIR:-${REPO_ROOT}/datasets/flan}"
+COV_DIR="${COV_DIR:-${RESULTS_ROOT}/cov}"
+FISHER_DIR="${FISHER_DIR:-${RESULTS_ROOT}/fisher}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"
+DO_IF="${DO_IF:-1}"
+DO_MATH="${DO_MATH:-1}"
+DO_CODE="${DO_CODE:-1}"
+DO_DIAG="${DO_DIAG:-1}"
+FORCE="${FORCE:-0}"              # 1 = 已有同名 .pt 也重采
+
+# ---- 覆盖范围：必须与 95 号训练臂的 TARGET_MODULES 逐字一致，见文件头 ----
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+
+# ---- 采集协议：逐字沿用 68/69 号 ----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+GOLD_COLUMN="${GOLD_COLUMN:-gold_targets}"
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
+# 三个旧知识池都是英文通用语料，没有任何一个域需要自定义 system；训练侧（95 号）
+# 也是空。空不等于"没有 system turn"：chat_policy 在空串时不注入，Qwen2.5-Instruct
+# 的模板于是用它自带的那条默认 system，采集期和训练期因此逐字相同。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
+
+# C：hook 内部一律升 fp32 再累加，所以前向 bf16 不影响结果，只省显存和时间。
+COV_USE_BF16="${COV_USE_BF16:-1}"
+COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
+# F：梯度在到达累加器之前就被反向舍入过了，bf16 的 8 位尾数给每个平方梯度留约
+# 1% 的噪声底，事后加宽救不回来。所以这里是 fp32，别为了提速改成 1。
+FISHER_USE_BF16="${FISHER_USE_BF16:-0}"
+FISHER_DEVICE="${FISHER_DEVICE:-cuda}"
+LOG_EVERY="${LOG_EVERY:-500}"
+
+# ---- 三个域的语料与长度预算，逐字等于 68/69 号 ----
+FLAN_SAMPLES="${FLAN_SAMPLES:-20000}"
+IF_MAXLEN="${IF_MAXLEN:-512}"
+IF_COV_BATCH="${IF_COV_BATCH:-32}"
+
+# math：两个视角一起读，少读一个就等于换了池
+MATH_VIEW_PREFIX="${MATH_VIEW_PREFIX:-metamath_cmath_30k}"
+MATH_MAXLEN="${MATH_MAXLEN:-1024}"
+MATH_COV_BATCH="${MATH_COV_BATCH:-16}"
+MATH_GLOB="${POOL_ROOT}/replay/${MATH_VIEW_PREFIX}_*_selfdistill_seed${SAMPLE_SEED}.jsonl"
+
+CODE_VIEW_PREFIX="${CODE_VIEW_PREFIX:-opc_edu_ccode_20k}"
+CODE_MAXLEN="${CODE_MAXLEN:-1024}"
+CODE_COV_BATCH="${CODE_COV_BATCH:-16}"
+CODE_FILE="${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}.jsonl"
+
+# ---- 产物。目录名里已经带了模型，文件名只区分域与池 ----
+# _all 指的是本文件头那套覆盖：七类 all-linear + lm_head。
+IF_COV="${IF_COV:-${COV_DIR}/cov_if_flan20k_all.pt}"
+MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_all.pt}"
+CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_all.pt}"
+IF_FISHER="${IF_FISHER:-${FISHER_DIR}/fisher_if_flan20k_all.pt}"
+MATH_FISHER="${MATH_FISHER:-${FISHER_DIR}/fisher_math_metamath30k_gold_all.pt}"
+CODE_FISHER="${CODE_FISHER:-${FISHER_DIR}/fisher_code_opcedu20k_gold_all.pt}"
+
+# 1.2 s/样本是 8B @ 512 token 的实测值。1.5B 权重小 5 倍、长度大约 2 倍，先按
+# 300 ms 估（比线性缩放保守）。只影响 Step 0 的耗时预警，估错不改变采集结果。
+ETA_MS_PER_EXAMPLE="${ETA_MS_PER_EXAMPLE:-300}"
+WALLTIME_HOURS="${WALLTIME_HOURS:-24}"
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}" >&2; exit 1; }
+mkdir -p "${COV_DIR}" "${FISHER_DIR}" "${DATASET_CACHE}"
+
+# Step 0 / Step 3 的内嵌 Python 靠 os.environ 读这些值。上面的赋值只建普通 shell
+# 变量 —— 只有经 qsub -v 传进来的那几个才碰巧已经在环境里，其余会让 python 抛
+# KeyError。全部显式 export，别依赖调用方传了什么。
+export MODEL_DIR MODEL_NAME TARGET_MODULES COV_DIR FISHER_DIR
+export WHAT DO_IF DO_MATH DO_CODE
+export IF_COV MATH_COV CODE_COV IF_FISHER MATH_FISHER CODE_FISHER
+export ETA_MS_PER_EXAMPLE WALLTIME_HOURS
+
+echo "========================================================================"
+echo "finance 线 三域 gold C / F 采集"
+echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}   (base = 本线的 W_ref)"
+echo "  采什么   = ${WHAT}"
+echo "  层覆盖   = ${TARGET_MODULES}"
+echo "  system   = '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system，与 95 号同值）"
+echo "  语料池   = ${POOL_ROOT}/replay 与 ${FLAN_DIR}   (只读)"
+echo "  产物     = ${COV_DIR}"
+echo "             ${FISHER_DIR}"
+echo "  if       = FLAN ${FLAN_SAMPLES} 行 / maxlen ${IF_MAXLEN} / cov batch ${IF_COV_BATCH}"
+echo "             ${IF_COV}"
+echo "             ${IF_FISHER}"
+echo "  math     = ${MATH_GLOB}"
+echo "             maxlen ${MATH_MAXLEN} / cov batch ${MATH_COV_BATCH}"
+echo "             ${MATH_COV}"
+echo "             ${MATH_FISHER}"
+echo "  code     = ${CODE_FILE}"
+echo "             maxlen ${CODE_MAXLEN} / cov batch ${CODE_COV_BATCH}"
+echo "             ${CODE_COV}"
+echo "             ${CODE_FISHER}"
+echo "  C        = bf16 ${COV_USE_BF16} / accum ${COV_ACCUM_DEVICE}"
+echo "  F        = bf16 ${FISHER_USE_BF16} / device ${FISHER_DEVICE} / batch 1（写死）"
+echo "  阶段     = if:${DO_IF} math:${DO_MATH} code:${DO_CODE} diag:${DO_DIAG}  DRY_RUN=${DRY_RUN}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 前置检查（纯 CPU）
+#   1) 语料在不在，math 的 glob 必须展开成 2 个文件
+#   2) 按 config.json 现读维度算落盘体积，和 df 剩余比 —— 不够直接退出
+#   3) 打印各域行数与池指纹，F 的耗时按行数估
+# ===========================================================================
+echo
+echo "==== Step 0: 前置检查 ===="
+
+if [[ "${DO_IF}" == "1" ]]; then
+  [[ -d "${FLAN_DIR}" ]] || { echo "缺 FLAN 语料: ${FLAN_DIR}" >&2; exit 1; }
+fi
+if [[ "${DO_CODE}" == "1" ]]; then
+  [[ -f "${CODE_FILE}" ]] || { echo "缺 code 语料: ${CODE_FILE}" >&2; exit 1; }
+fi
+
+# glob 必须落到 2 个文件（canonical + rephrased）。少一个就等于换了池。
+shopt -s nullglob
+# shellcheck disable=SC2206
+MATH_FILES=( ${MATH_GLOB} )
+shopt -u nullglob
+if [[ "${DO_MATH}" == "1" ]]; then
+  echo "math glob 展开为 ${#MATH_FILES[@]} 个文件:"
+  for f in "${MATH_FILES[@]}"; do echo "    ${f}"; done
+  if [[ "${#MATH_FILES[@]}" -ne 2 ]]; then
+    echo "!! math 语料应为 2 个视角（canonical + rephrased），实际 ${#MATH_FILES[@]} 个" >&2
+    echo "   少读一个视角就等于换了池，与 68 号的 C_math 不再同源。停。" >&2
+    exit 1
+  fi
+fi
+
+DISK_PLAN=$(python - <<'PY'
+import json, os, shutil, sys
+
+model_dir = os.path.join(os.environ["MODEL_DIR"], os.environ["MODEL_NAME"])
+with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+    cfg = json.load(fh)
+
+hidden = cfg["hidden_size"]
+inter = cfg["intermediate_size"]
+layers = cfg["num_hidden_layers"]
+heads = cfg["num_attention_heads"]
+kv_heads = cfg.get("num_key_value_heads", heads)
+head_dim = cfg.get("head_dim", hidden // heads)
+vocab = cfg["vocab_size"]
+
+# C 存的是该层**输入**维度的方阵；F 存的是**权重形状**。两者量级完全不同，
+# down_proj 在 C 里独占大头，lm_head 在 F 里独占大头。
+cov_in = {
+    "q_proj": hidden, "k_proj": hidden, "v_proj": hidden,
+    "o_proj": heads * head_dim,
+    "gate_proj": hidden, "up_proj": hidden, "down_proj": inter,
+    "lm_head": hidden,
+}
+fisher_shape = {
+    "q_proj": (heads * head_dim, hidden),
+    "k_proj": (kv_heads * head_dim, hidden),
+    "v_proj": (kv_heads * head_dim, hidden),
+    "o_proj": (hidden, heads * head_dim),
+    "gate_proj": (inter, hidden),
+    "up_proj": (inter, hidden),
+    "down_proj": (hidden, inter),
+    "lm_head": (vocab, hidden),
+}
+
+targets = [m.strip() for m in os.environ["TARGET_MODULES"].split(",") if m.strip()]
+unknown = [m for m in targets if m not in cov_in]
+if unknown:
+    print(f"未知模块名，无法估算体积: {unknown}", file=sys.stderr)
+    raise SystemExit(2)
+
+print(f"config: hidden={hidden} intermediate={inter} layers={layers} "
+      f"kv_heads={kv_heads} head_dim={head_dim} vocab={vocab}")
+print(f"层覆盖期望 = {sum(1 if m == 'lm_head' else layers for m in targets)} 层")
+
+n_domains = sum(
+    1 for key in ("DO_IF", "DO_MATH", "DO_CODE") if os.environ.get(key, "0") == "1"
+)
+what = os.environ["WHAT"]
+need = 0
+
+if what in ("cov", "both"):
+    total = 0
+    print("  ---- C（按输入维度的方阵）")
+    for m in targets:
+        size = cov_in[m] ** 2 * 4
+        n = 1 if m == "lm_head" else layers
+        total += size * n
+        print(f"    {m:<10} in={cov_in[m]:>6}  {size/2**20:8.1f} MiB x {n:>3} = {size*n/2**30:7.2f} GiB")
+    print(f"    单域 {total/2**30:.2f} GiB  x {n_domains} 域 = {total*n_domains/2**30:.2f} GiB")
+    need += total * n_domains
+
+if what in ("fisher", "both"):
+    total = 0
+    print("  ---- F（按权重形状）")
+    for m in targets:
+        out_dim, in_dim = fisher_shape[m]
+        size = out_dim * in_dim * 4
+        n = 1 if m == "lm_head" else layers
+        total += size * n
+        print(f"    {m:<10} {out_dim:>6}x{in_dim:<6} {size/2**20:8.1f} MiB x {n:>3} = {size*n/2**30:7.2f} GiB")
+    print(f"    单域 {total/2**30:.2f} GiB  x {n_domains} 域 = {total*n_domains/2**30:.2f} GiB")
+    need += total * n_domains
+
+free = shutil.disk_usage(os.environ["COV_DIR"]).free
+print(f"本次预计写入 {need/2**30:.2f} GiB ({need/1e9:.1f} GB)")
+print(f"{os.environ['COV_DIR']} 剩余 {free/2**30:.2f} GiB")
+print(f"PLAN need_gib={need/2**30:.2f} free_gib={free/2**30:.2f}")
+PY
+)
+echo "${DISK_PLAN}"
+
+NEED_GIB="${DISK_PLAN##*need_gib=}"; NEED_GIB="${NEED_GIB%% *}"
+FREE_GIB="${DISK_PLAN##*free_gib=}"; FREE_GIB="${FREE_GIB%% *}"
+# 留 20 GiB 余量：torch.save 先写临时文件再改名，落盘瞬间要两份的空间。
+if ! python -c "import sys; sys.exit(0 if float('${FREE_GIB}') >= float('${NEED_GIB}') + 20 else 1)"; then
+  echo "!! 空间不足：需要 ${NEED_GIB} GiB + 20 GiB 余量，实际剩余 ${FREE_GIB} GiB" >&2
+  echo "   F 没有断点续采，写到一半失败等于全白跑，所以这里直接停。" >&2
+  echo "   要么清理，要么分批采（WHAT=cov / WHAT=fisher，或 DO_* 一次一个域）。" >&2
+  exit 1
+fi
+
+# ===========================================================================
+# 每个域的数据参数。**C 和 F 共用同一份**，见文件头 —— 这是两者同池的唯一保证，
+# Step 3 会用 pool_fingerprint 复核。改这里就是两条臂一起改。
+# ===========================================================================
+pool_args_for () {
+  case "$1" in
+    if)
+      # FLAN 原始语料的 targets 就是 gold，不需要换列。
+      printf '%s\n' \
+        --data_files "${FLAN_DIR}/train/*.jsonl" \
+        --dataset_split train \
+        --streaming 0 \
+        --input_column inputs \
+        --target_column targets \
+        --max_samples "${FLAN_SAMPLES}" \
+        --sample_shuffle 1 \
+        --sample_seed "${SAMPLE_SEED}"
+      ;;
+    math)
+      # 池在 generate_replay_targets 那一步就切好了（文件名里的 30k），所以
+      # --max_samples 0 是"整份读完"，不是"读原始数据集的全量"。
+      printf '%s\n' \
+        --data_files "${MATH_GLOB}" \
+        --dataset_split train \
+        --streaming 0 \
+        --input_column inputs \
+        --target_column "${GOLD_COLUMN}" \
+        --require_target 1 \
+        --max_samples 0 \
+        --sample_shuffle 0 \
+        --sample_seed "${SAMPLE_SEED}"
+      ;;
+    code)
+      printf '%s\n' \
+        --data_files "${CODE_FILE}" \
+        --dataset_split train \
+        --streaming 0 \
+        --input_column inputs \
+        --target_column "${GOLD_COLUMN}" \
+        --require_target 1 \
+        --max_samples 0 \
+        --sample_shuffle 0 \
+        --sample_seed "${SAMPLE_SEED}"
+      ;;
+  esac
+}
+
+maxlen_for () {
+  case "$1" in
+    if)   printf '%s' "${IF_MAXLEN}" ;;
+    math) printf '%s' "${MATH_MAXLEN}" ;;
+    code) printf '%s' "${CODE_MAXLEN}" ;;
+  esac
+}
+
+cov_batch_for () {
+  case "$1" in
+    if)   printf '%s' "${IF_COV_BATCH}" ;;
+    math) printf '%s' "${MATH_COV_BATCH}" ;;
+    code) printf '%s' "${CODE_COV_BATCH}" ;;
+  esac
+}
+
+cov_path_for () {
+  case "$1" in
+    if)   printf '%s' "${IF_COV}" ;;
+    math) printf '%s' "${MATH_COV}" ;;
+    code) printf '%s' "${CODE_COV}" ;;
+  esac
+}
+
+fisher_path_for () {
+  case "$1" in
+    if)   printf '%s' "${IF_FISHER}" ;;
+    math) printf '%s' "${MATH_FISHER}" ;;
+    code) printf '%s' "${CODE_FISHER}" ;;
+  esac
+}
+
+ACTIVE_DOMAINS=()
+[[ "${DO_IF}"   == "1" ]] && ACTIVE_DOMAINS+=(if)
+[[ "${DO_MATH}" == "1" ]] && ACTIVE_DOMAINS+=(math)
+[[ "${DO_CODE}" == "1" ]] && ACTIVE_DOMAINS+=(code)
+
+# ---- 行数与 F 的耗时预估。check_old_knowledge_pool 不加载模型，几秒的事 ----
+if [[ "${#ACTIVE_DOMAINS[@]}" -gt 0 && "${WHAT}" != "none" ]]; then
+  echo
+  echo "---- 各域行数与池指纹（F 的耗时正比于行数）----"
+  TOTAL_ROWS=0
+  for domain in "${ACTIVE_DOMAINS[@]}"; do
+    args=()
+    while IFS= read -r item; do args+=("${item}"); done < <(pool_args_for "${domain}")
+    FP_LINE="$(python -m onereplay.scripts.check_old_knowledge_pool \
+                 --cache_dir "${DATASET_CACHE}" --label "${domain}" \
+                 "${args[@]}" | tail -n 1)"
+    echo "  ${FP_LINE}"
+    ROWS="${FP_LINE##*rows=}"; ROWS="${ROWS%% *}"
+    TOTAL_ROWS=$((TOTAL_ROWS + ROWS))
+  done
+
+  if [[ "${WHAT}" == "fisher" || "${WHAT}" == "both" ]]; then
+    TOTAL_ROWS="${TOTAL_ROWS}" python - <<'PY'
+import os
+
+rows = int(os.environ["TOTAL_ROWS"])
+ms = float(os.environ["ETA_MS_PER_EXAMPLE"])
+budget = float(os.environ["WALLTIME_HOURS"])
+hours = rows * ms / 1000 / 3600
+print(f"  F 共 {rows} 行，预计 {hours:.2f} h（按 {ms:.0f} ms/样本估，不是实测）"
+      f" / walltime {budget:.0f} h")
+if hours > budget * 0.85:
+    print("  !! 逼近或超过 walltime，而 F 没有断点续采。")
+    print("     分域投：DO_IF / DO_MATH / DO_CODE 一次开一个。")
+PY
+  fi
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划，未采集任何东西。确认后 qsub -v DRY_RUN=0,... "
+  for domain in "${ACTIVE_DOMAINS[@]}"; do
+    echo
+    echo "  ${domain}: maxlen $(maxlen_for "${domain}")  cov_batch $(cov_batch_for "${domain}")"
+    echo "    C -> $(cov_path_for "${domain}")"
+    echo "    F -> $(fisher_path_for "${domain}")"
+    echo "    共用的数据参数（C 与 F 逐字相同）："
+    pool_args_for "${domain}" | paste - - | sed 's/^/      /'
+  done
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 采 C
+# ===========================================================================
+collect_cov_one () {
+  local domain="$1"
+  local out_path maxlen batch
+  out_path="$(cov_path_for "${domain}")"
+  maxlen="$(maxlen_for "${domain}")"
+  batch="$(cov_batch_for "${domain}")"
+
+  if [[ -f "${out_path}" && "${FORCE}" != "1" ]]; then
+    echo "==== 已存在，跳过 C_${domain}: ${out_path}（要重采传 FORCE=1）===="
+    return 0
+  fi
+  local args=()
+  while IFS= read -r item; do args+=("${item}"); done < <(pool_args_for "${domain}")
+
+  echo
+  echo "==== Step 1: 采 C_${domain} -> ${out_path} ===="
+  python -m onereplay.scripts.collect_cov \
+    --seed "${SEED}" \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --use_bf16 "${COV_USE_BF16}" \
+    --cache_dir "${DATASET_CACHE}" \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --enable_thinking 0 --concat_prompt_target 0 \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --cov_supervision assistant_only \
+    --debug_print_examples "${DEBUG_EXAMPLES}" \
+    --batch_size "${batch}" --max_len "${maxlen}" \
+    --truncation_side left \
+    --target_modules "${TARGET_MODULES}" \
+    --cov_accum_device "${COV_ACCUM_DEVICE}" \
+    --output_path "${out_path}" \
+    "${args[@]}"
+  ls -lh "${out_path}"
+}
+
+# ===========================================================================
+# Step 2: 采 F
+# ===========================================================================
+collect_fisher_one () {
+  local domain="$1"
+  local out_path maxlen
+  out_path="$(fisher_path_for "${domain}")"
+  maxlen="$(maxlen_for "${domain}")"
+
+  if [[ -f "${out_path}" && "${FORCE}" != "1" ]]; then
+    echo "==== 已存在，跳过 F_${domain}: ${out_path}（要重采传 FORCE=1）===="
+    return 0
+  fi
+  local args=()
+  while IFS= read -r item; do args+=("${item}"); done < <(pool_args_for "${domain}")
+
+  echo
+  echo "==== Step 2: 采 F_${domain} -> ${out_path} ===="
+  python -m onereplay.scripts.collect_fisher \
+    --seed "${SEED}" \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --use_bf16 "${FISHER_USE_BF16}" \
+    --cache_dir "${DATASET_CACHE}" \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --max_len "${maxlen}" --truncation_side left \
+    --target_modules "${TARGET_MODULES}" \
+    --fisher_device "${FISHER_DEVICE}" \
+    --log_every "${LOG_EVERY}" \
+    --output_path "${out_path}" \
+    "${args[@]}"
+  ls -lh "${out_path}"
+}
+
+for domain in "${ACTIVE_DOMAINS[@]}"; do
+  if [[ "${WHAT}" == "cov" || "${WHAT}" == "both" ]]; then
+    collect_cov_one "${domain}"
+  fi
+  if [[ "${WHAT}" == "fisher" || "${WHAT}" == "both" ]]; then
+    collect_fisher_one "${domain}"
+  fi
+done
+
+# ===========================================================================
+# Step 3: 诊断
+#   1) 层覆盖断言 —— regularizer 对缺矩阵的层是**静默跳过**的，拿一份少了层的 C
+#      去训，训练照跑 loss 照降，要到看结果时才发现方法被削掉一大半。
+#   2) lm_head 与其余层的量级对比 —— 它 tie 着 embed_tokens，见文件头。
+#   3) C 与 F 的 pool_fingerprint 必须逐域相等 —— 两条臂同源的唯一证据。
+#   4) 两个 λ 起点。C 和 F 的网格完全不通用：前者罚 tr(ΔW C ΔWᵀ)、后者
+#      Σ F_ij ΔW_ij²，量纲和量级都不是一回事。而且这两个数只是数量级参考，
+#      本线真正的中心点要靠 95 号的 λ=0 标尺法实测（ΔW 那一侧 trace 看不见）。
+# ===========================================================================
+if [[ "${DO_DIAG}" == "1" ]]; then
+  echo
+  echo "==== Step 3: 诊断 ===="
+  python - <<'PY'
+import json, os
+
+import torch
+
+model_dir = os.path.join(os.environ["MODEL_DIR"], os.environ["MODEL_NAME"])
+with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+    cfg = json.load(fh)
+layers = cfg["num_hidden_layers"]
+targets = [m.strip() for m in os.environ["TARGET_MODULES"].split(",") if m.strip()]
+# lm_head 只有一个，其余每类每层一个。
+expect = sum(1 if m == "lm_head" else layers for m in targets)
+print(f"层覆盖期望 = {expect}（{len(targets)} 类 x {layers} 层，lm_head 只算一个）")
+
+
+def load(path):
+    """mmap 读：诊断只看对角线，不必把整份矩阵拉进常驻内存。"""
+    try:
+        return torch.load(path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError):
+        return torch.load(path, map_location="cpu")
+
+
+def class_of(name):
+    return name.rsplit(".", 1)[-1]
+
+
+failures = []
+active = [
+    d for d, key in (("if", "DO_IF"), ("math", "DO_MATH"), ("code", "DO_CODE"))
+    if os.environ.get(key, "0") == "1"
+]
+
+for domain in active:
+    cov_path = os.environ[f"{domain.upper()}_COV"]
+    fisher_path = os.environ[f"{domain.upper()}_FISHER"]
+    fingerprints = {}
+    print()
+    print(f"================ {domain} ================")
+
+    if os.path.isfile(cov_path):
+        payload = load(cov_path)
+        covs = payload["covariances"]
+        meta = payload.get("metadata", {})
+        print(f"---- C: {cov_path}")
+        print(f"     层数 {len(covs)} / 期望 {expect}")
+        print(f"     pool_rows={meta.get('pool_rows')} max_len={meta.get('max_len')}")
+        print(f"     supervision={meta.get('cov_supervision')} system={meta.get('system_prompt')!r}")
+        fingerprints["C"] = meta.get("pool_fingerprint")
+        if len(covs) != expect:
+            got = sorted({class_of(k) for k in covs})
+            failures.append(f"{domain}: C 层覆盖 {len(covs)} != {expect}，实际模块类 {got}")
+
+        per_class = {}
+        for name, mat in covs.items():
+            # tr(C)/d = 每个方向的平均能量，跨维度可比；tr(C) 本身会被 d 拉着走。
+            per_class.setdefault(class_of(name), []).append(
+                float(torch.diagonal(mat).float().mean())
+            )
+        print(f"     {'module':<10} {'层数':>4} {'mean tr(C)/d':>16}")
+        for cls in targets:
+            vals = per_class.get(cls, [])
+            if vals:
+                print(f"     {cls:<10} {len(vals):>4} {sum(vals)/len(vals):>16.4e}")
+
+        # lm_head 与 embed_tokens 是同一个张量（tie_word_embeddings），约束它等于
+        # 连输入嵌入一起约束。它比其余层大几个数量级的话，λ 实际主要压在输出头上，
+        # 那是结果里必须写明的一件事，不是可以默认的实现细节。
+        head = per_class.get("lm_head", [])
+        others = [v for cls, vals in per_class.items() if cls != "lm_head" for v in vals]
+        if head and others:
+            ratio = head[0] / (sum(others) / len(others))
+            print(f"     lm_head / 其余层均值 = {ratio:.2f}x")
+            if ratio > 10 or ratio < 0.1:
+                print("     !! 量级差 10 倍以上：这份 C 的罚项主要落在输出头/输入嵌入上。")
+                print("        不是错误，但读结果时要说明，别写成'均匀约束了 all-linear'。")
+
+        allv = [v for vals in per_class.values() for v in vals]
+        if allv:
+            mean_c = sum(allv) / len(allv)
+            print(f"     全层 mean tr(C)/d = {mean_c:.4e}")
+            print(f"     -> OneReplay λ 的数量级参考 1/{mean_c:.3e} = {1.0/mean_c:.3e}")
+            print("        !! 只是数量级。本线的中心点要用 95 号的 λ=0 标尺法实测：")
+            print("           λ ≈ 目标占比 x task_loss / R(λ=0)，trace 看不见 ΔW 那一侧。")
+    else:
+        print(f"---- C: 未生成，跳过 ({cov_path})")
+
+    if os.path.isfile(fisher_path):
+        payload = load(fisher_path)
+        fishers = payload.get("fishers") or payload["covariances"]
+        meta = payload.get("metadata", {})
+        lw = meta.get("length_weighting", {}) or {}
+        scale = meta.get("fisher_scale", {}) or {}
+        print(f"---- F: {fisher_path}")
+        print(f"     层数 {len(fishers)} / 期望 {expect}")
+        print(f"     样本数 {meta.get('num_examples')}  pool_rows={meta.get('pool_rows')}")
+        print(f"     max_len={meta.get('max_len')}")
+        print(f"     mean(F)={scale.get('mean')}  max(F)={scale.get('max')}")
+        fingerprints["F"] = meta.get("pool_fingerprint")
+        if len(fishers) != expect:
+            failures.append(f"{domain}: F 层覆盖 {len(fishers)} != {expect}")
+        if scale.get("mean"):
+            print(f"     -> EWC λ 从 1/mean = {1.0/float(scale['mean']):.3e} 附近起步，按十倍展开")
+        ess = lw.get("effective_sample_size")
+        n = meta.get("num_examples")
+        if ess and n:
+            # F 实际靠多少条样本撑着。C 的收敛靠 token 数、余量三位数倍，从来不是
+            # 瓶颈；F 是按样本平均且梯度长尾，所以要不要加量看这个数，不看行数。
+            ratio = ess / n
+            print(f"     effective_sample_size {ess:.0f} / {n} ({ratio:.3f})")
+            print(f"     对角元素相对误差约 {1.0/max(ess, 1)**0.5:.1%}")
+            print(f"     length_exponent a={lw.get('length_exponent')} (1=逐token独立, 2=完全对齐)")
+            # 0.2 不是理论阈值，是"比历史上 gold 数据的 0.336 明显差"这条经验线。
+            if ratio < 0.2:
+                print(f"     !! ESS 比值 {ratio:.3f} 偏低（gold 数据历史值约 0.336）")
+                print("        F 被少数长样本主导，先查池里的长尾再考虑加量")
+    else:
+        print(f"---- F: 未生成，跳过 ({fisher_path})")
+
+    if "C" in fingerprints and "F" in fingerprints:
+        if fingerprints["C"] != fingerprints["F"]:
+            print(f"     !! 池指纹不一致  C={fingerprints['C']}  F={fingerprints['F']}")
+            failures.append(f"{domain}: C 与 F 的 pool_fingerprint 不等")
+        else:
+            print(f"     C 与 F 同池: {fingerprints['C']}")
+    elif len(fingerprints) == 1:
+        print("     只采了一半，另一半采完后重跑 WHAT=none 复核同池。")
+
+if failures:
+    print()
+    print("!! 诊断未通过:")
+    for item in failures:
+        print(f"   - {item}")
+    print("   层覆盖不足：regularizer 会静默跳过缺矩阵的层，方法被削掉一部分而不报错。")
+    print("   池指纹不等：EWC 和 OneReplay 消费的旧知识不是同一批，对比不再公平；")
+    print("   查 pool_args_for 里 max_samples / sample_shuffle / sample_seed 是否两段同值。")
+    raise SystemExit(1)
+print()
+print("诊断通过。")
+PY
+fi
+
+echo
+echo "========================================================================"
+echo "采集完成。产物："
+ls -lh "${COV_DIR}" "${FISHER_DIR}" 2>/dev/null || true
+echo
+echo "下一步："
+echo "  1) 没采的那一半接着投：WHAT=cov 或 WHAT=fisher（已有的会自动跳过）"
+echo "  2) 拿 collect_fisher 打印的 ms/example 校准 ETA_MS_PER_EXAMPLE 再投下一批"
+echo "  3) 先跑 94 号拿 base 与 vanilla 这两个分母（λ 标定要用它的 task_loss，"
+echo "     score_retention_subset 的子集也由 base 定义）："
+echo "       qsub -v DRY_RUN=0 onereplay/pbs/94_finance_probe.pbs"
+echo "  4) 再用 95 号扫 λ，每个域每个方法各一次（两条臂的尺度不通用）："
+echo "       qsub -v DRY_RUN=0,DOMAIN=if,ARM=onereplay,LAMBDAS=0:a:b:c onereplay/pbs/95_finance_arms.pbs"
+echo "       qsub -v DRY_RUN=0,DOMAIN=if,ARM=ewc,LAMBDAS=0:a:b:c       onereplay/pbs/95_finance_arms.pbs"
+echo "========================================================================"
