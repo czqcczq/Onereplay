@@ -1819,18 +1819,31 @@ van_m = last_epoch(os.environ.get("VANILLA_METRICS"))
 # 旧域交叉熵：只随权重动，不随生成和解析动。bench 掉分和这条对不上时，先信它，
 # 再回头查 parse_rate —— 这条线上新任务把答案压成一个词，解析失败是常态。
 ours_b = baseline(os.environ.get("RUN_METRICS"))
+van_b = baseline(os.environ.get("VANILLA_METRICS"))
 old_keys = sorted(k for k in ours_m if k.startswith("old_val_loss"))
 if old_keys:
     print()
-    print("旧域 val loss（起点 = 训练前的裸底座；差值越接近 0 忘得越少）:")
-    print(f"{'domain':<16}{'baseline':>12}{'final':>12}{'delta':>12}")
+    print("旧域 val loss（Δ 是相对各自训练前的起点；正数 = 忘了，越小越好）:")
+    print(
+        f"{'domain':<12}{'baseline':>12}{'van_Δ':>12}{'ours_Δ':>12}{'救回':>12}"
+    )
     for key in old_keys:
         start = ours_b.get(key)
         final = ours_m.get(key)
-        delta = (final - start) if (start is not None and final is not None) else None
+        d_ours = (final - start) if (start is not None and final is not None) else None
+        v_start, v_final = van_b.get(key), van_m.get(key)
+        d_van = (v_final - v_start) if (v_start is not None and v_final is not None) else None
+        saved = (d_van - d_ours) if (d_van is not None and d_ours is not None) else None
         name = key.replace("old_val_loss_", "").replace("old_val_loss", "(single)")
-        print(f"{name:<16}" + cell(start, ".6f", 12) + cell(final, ".6f", 12)
-              + cell(delta, "+.6f", 12))
+        print(
+            f"{name:<12}" + cell(start, ".6f", 12) + cell(d_van, "+.6f", 12)
+            + cell(d_ours, "+.6f", 12) + cell(saved, "+.6f", 12)
+        )
+    if all(van_b.get(k) is None for k in old_keys):
+        print("  van_Δ 是 '-'：94 号那条 vanilla 训练时还没有 val 切片（93 号 Step 1 没跑完）。")
+        print("  补回来要重训 vanilla —— 它是这几个数唯一的分母。")
+    print("  这条只随权重动，不随生成和解析动。它和 bench 说法不一致时先信它，")
+    print("  再回头查 bench 的 parse_rate —— 这条线上答案被压成一个词，解析失败是常态。")
     if len(old_keys) > 1:
         print("  mix 臂要读的就是这两行分开的数：一侧保住、另一侧塌了，")
         print("  才是「矩阵的容量不够，两个域在抢」这个结论。平均成一个数会把它藏起来。")

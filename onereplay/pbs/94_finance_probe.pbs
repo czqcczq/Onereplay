@@ -170,6 +170,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
+    SPLIT_DIR OLD_VAL OLD_VAL_ROWS OLD_VAL_DOMAINS
     DRY_RUN DO_TRAIN DO_EVAL WHICH FORCE_EVAL LIMIT DIAG_LEN WITH_RETENTION
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     EVAL_BATCH TARGET_MODULES SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY
@@ -247,6 +248,15 @@ PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
 STATS_DIR="${STATS_DIR:-${DATA_ROOT}/stats}"
 DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/finance_train}"
 FIN_STATS="${STATS_DIR}/finance_stats.json"
+
+# ---- 旧域 val：93 号 Step 1 切好的那几份 ----
+# vanilla 与保护域无关，所以三个域全打：95 号不管保护哪一个，都能在这里找到
+# 同一批行上的分母。推导规则与 93/95 逐字相同，check_finance_line.py 会比对。
+SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
+OLD_VAL="${OLD_VAL:-1}"
+OLD_VAL_DOMAINS="${OLD_VAL_DOMAINS:-if math code}"
+val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
 
 # =============================================================================
 # 训练超参：与 95 号逐字相同，见文件头第 3 条。
@@ -410,6 +420,42 @@ for f in "${FPB_DATA}" "${FIQASA_DATA}" "${TFNS_DATA}" \
 done
 [[ -d "${MBPP_DIR}" ]] || echo "warning: 缺 MBPP 目录 ${MBPP_DIR}（该指标会被跳过）"
 
+# ---- 旧域 val：95 号每条臂都要和这里的 vanilla 比"忘了多少" ----
+# 那个比较只有在打同一批行时才成立，所以这几个参数必须和 95 号逐字相同。
+# 缺文件不拦训练：93 号还没跑完时照样能先把 vanilla 训出来，只是那几列会空着，
+# 而补回来要重训 —— 所以这里说得重一点。
+OLD_VAL_ARGS=()
+if [[ "${OLD_VAL}" == "1" ]]; then
+  _spec=""
+  _missing=""
+  for _d in ${OLD_VAL_DOMAINS}; do
+    _f="$(val_file_for "${_d}")"
+    if [[ -f "${_f}" ]]; then
+      _spec="${_spec}${_spec:+,}${_d}=${_f}"
+    else
+      _missing="${_missing}${_missing:+ }${_d}"
+    fi
+  done
+  if [[ -n "${_missing}" ]]; then
+    echo
+    echo "!! 缺这几个域的 val 切片：${_missing}"
+    echo "   它们是 93 号 Step 1 的产物（${SPLIT_DIR}）。"
+    echo "   现在训出来的 vanilla 不会有这几列，而 95 号的每条臂都要和它比"
+    echo "   'old_val_loss 涨了多少' —— 补回来只能重训。"
+    echo "   93 号 Step 1 在作业开头几分钟就跑完了，等它落盘再投本脚本更省事："
+    echo "     qsub -v DRY_RUN=0,WHAT=none,DO_MIX=0 onereplay/pbs/93_finance_gold_cf.pbs"
+    echo "   （WHAT=none 只切池不采矩阵，几分钟的事）"
+  fi
+  if [[ -n "${_spec}" ]]; then
+    OLD_VAL_ARGS=(
+      --prior_val_jsonl "${_spec}"
+      --old_val_presliced 1
+      --old_val_rows "${OLD_VAL_ROWS}"
+    )
+    echo "旧域 val: ${_spec}"
+  fi
+fi
+
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo
   echo "DRY_RUN=1：以上为计划，不训练不评测。确认后 qsub -v DRY_RUN=0 ..."
@@ -446,6 +492,7 @@ if [[ "${DO_TRAIN}" == "1" && "${WHICH}" != "base" ]]; then
       --target_modules "${TARGET_MODULES}" \
       --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN_VANILLA}" \
       --log_every "${LOG_EVERY}" \
+      ${OLD_VAL_ARGS[@]+"${OLD_VAL_ARGS[@]}"} \
       --replay_lambda 0 \
       --measure_replay_when_lambda_zero 0 \
       --cov_path "" \
