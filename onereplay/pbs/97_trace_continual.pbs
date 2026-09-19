@@ -1,0 +1,934 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N trace_cl
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# TRACE 八任务顺序全量 SFT —— Llama-3.2-3B-Instruct
+#
+#   # 一次性：建数据（CPU 即可，登录节点跑更快）
+#   qsub -v DRY_RUN=0,MODE=data onereplay/pbs/97_trace_continual.pbs
+#
+#   # 配置 A（先跑）：每任务 1 epoch、lr 1e-4
+#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=base_eval  onereplay/pbs/97_trace_continual.pbs
+#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=chain      onereplay/pbs/97_trace_continual.pbs
+#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=final_eval onereplay/pbs/97_trace_continual.pbs
+#
+#   # 配置 B：官方 5,3,7,5,3,5,5,7、lr 1e-5。切两段投，见第 5 条
+#   qsub -v DRY_RUN=0,CONFIG=official,MODE=chain,START_STAGE=1,END_STAGE=4 onereplay/pbs/97_trace_continual.pbs
+#   qsub -v DRY_RUN=0,CONFIG=official,MODE=chain,START_STAGE=5            onereplay/pbs/97_trace_continual.pbs
+#
+#   # 冒烟：每个 test 只评前 20 题，每个训练集只取 200 行
+#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=chain,LIMIT=20,MAX_TRAIN_SAMPLES=200 onereplay/pbs/97_trace_continual.pbs
+#
+# -----------------------------------------------------------------------------
+# 1. 这条线要回答两个互相独立的问题
+# ---------------------------------
+#   Q1 持续学习意义上的遗忘：阶段 i 训完之后，任务 j<i 的 test 分数比"刚训完 j 时"
+#      掉了多少。这是 TRACE 这个 benchmark 本来的用法，8x8 上三角矩阵就是答案。
+#   Q2 通用能力崩塌：整套八任务训完之后 gsm8k / math500 / humaneval / mbpp /
+#      ifeval / ifbench 相对 base 掉了多少。TRACE 论文报告过 GSM8K 会塌，这一栏
+#      成立的话，这个数据集就可以当成一个"够狠的破坏性训练集"，后面用 Cmath /
+#      Ccode 去救，可提升的空间很大。
+#
+# 两个问题不需要同一个配置回答，所以有两个 CONFIG：
+#
+#   CONFIG=fast      每任务 1 epoch、lr 1e-4。8 个阶段共 8 个 epoch。先跑这个，
+#                    它只为 Q2 服务 —— 便宜，而且 lr 拉到 1e-4 就是冲着打坏去的。
+#   CONFIG=official  官方 5,3,7,5,3,5,5,7、lr 1e-5，共 40 个 epoch。为 Q1 服务。
+#
+# fast 先跑的理由：它三小时就能回答"这个数据集到底能不能把 math/code 打坏"。
+# 答案是否，那 official 那 13 小时也不必花在 Q2 上；答案是是，Q2 就已经拿到了，
+# official 只需要专心看 Q1。
+#
+# -----------------------------------------------------------------------------
+# 2. 与 TRACE 官方实现的三处有意偏离
+# ---------------------------------
+# a) **用模型原生 chat template，不用官方的裸拼接。**
+#    官方是 BOS + prompt + answer + EOS，没有 chat template
+#    （utils/data/data_collator.py:77-81）。这里走 apply_train_template。
+#    理由是 Q2 的有效性：gsm8k / ifeval 全部经由 chat template 解码，用裸拼接训练
+#    会先把 chat 格式本身毁掉，六个 benchmark 一起归零 —— 那是格式破坏而不是知识
+#    遗忘，也没法和你已有的 base 数字比。代价是 TRACE test 的绝对值对不上论文表格；
+#    Q1 和 Q2 都是本流水线内部的相对比较，不受影响。
+#
+# b) **截断发生在建数据阶段，切的是任务正文。**
+#    tokenizer_to_ids 的截断是 full_input_ids[-max_length:]，保留**最后** max_len
+#    个 token，也就是把 <|begin_of_text|> 和 user 头切掉。MeetingBank 让这件事
+#    无法回避：它的 prompt 最长 373k 字符（p90 就有 40k）。所以 prepare_trace.py
+#    把正文缩到"渲染后的整条序列刚好装得下"，训练阶段一行都不会被截。
+#    指令前缀和答案提示（"Summary:" 之类）永远保留 —— 官方的左截断恰好会把自己的
+#    指令删掉，那是实现缺陷不是设计，不跟。
+#
+# c) **有效 batch 64 行/update，不是官方的 256。**
+#    官方是 2 x 8卡 x 16。这里沿用本仓库 90-96 号线的 64，为的是和已有的 base /
+#    vanilla 数字可比。lr 1e-5 是在 256 的 batch 下调的，换到 64 相当于每 token
+#    的步长变大，所以 official 这一档的遗忘量可能比论文更强 —— 对 Q1 无害（要看的
+#    是掉没掉），读论文数字时要记得这条。
+#
+# lr_scheduler 固定 constant、warmup 0：官方 shell 传的是 cosine，但
+# training/main.py:400-403 硬编码 get_constant_schedule_with_warmup，
+# args.lr_scheduler_type 从头到尾没被用过。照它实际跑的来。
+#
+# -----------------------------------------------------------------------------
+# 3. checkpoint：中间权重用完即删，末阶段永久保留
+# ----------------------------------------------
+# 顺序训练必须拿上一阶段的权重当基座，所以磁盘上至少要有一份"上一阶段"活着。
+# 两个槽位交替承载：奇数阶段写 slot_b，偶数阶段写 slot_a。
+#
+#   ${CKPT_DIR}/trace_${CONFIG}_slot_a/     交替承载，用完即删
+#   ${CKPT_DIR}/trace_${CONFIG}_slot_b/
+#   ${CKPT_DIR}/trace_${CONFIG}_final/      第 8 阶段 mv 过来，永久保留
+#   ${CKPT_DIR}/trace_${CONFIG}_state.json  断点续跑用
+#
+# !! 删除时机是**阶段 i+1 训练成功之后**，不是阶段 i 评测完就删
+# 阶段 i 的权重在阶段 i+1 训练期间仍是唯一的续训起点。提前删掉的话，job 在
+# 阶段 i+1 中途被 kill（walltime 到、节点掉）就得从第 1 阶段重来 —— official 的
+# 第 3 阶段是 7 个 epoch 约 2.3 小时，赔不起。所以磁盘峰值是过渡期的 2 份约 13GB，
+# 这多出来的 6.4GB 买的是"任何时刻被中断都有有效回退点"。
+#
+# 删除用显式 rm -rf 而不是靠 save_pretrained 覆盖：分片数变了旧 shard 会残留。
+# 第 8 阶段用 mv 改名成 final（同文件系统内改名，不产生拷贝）。末阶段权重无条件
+# 保留，它是后面证明 Cmath/Ccode 保护有效的对照组。
+#
+# !! 代价：per-stage 的 TRACE test 必须和训练在同一个 job 内联
+# 下一阶段会覆盖这一阶段的权重，事后补评不可能。所以 MODE=chain 是一个不可再分的
+# job；只有 base_eval（不需要 checkpoint）和 final_eval（读 final）能独立投。
+#
+# -----------------------------------------------------------------------------
+# 4. state.json 与断点续跑
+# ------------------------
+# 每个阶段"训练 + 评测都成功"之后才更新 state.json。它同时是续跑依据：
+# START_STAGE 缺省就是 state.stage + 1，基座取 state.slot。job 死在第 6 阶段，
+# 原样重投一次就从第 6 阶段接着跑，前 5 阶段已落盘的 test 结果不受影响。
+#
+# 换 CONFIG 不会串：state 文件名带 CONFIG，槽位目录名也带。
+#
+# -----------------------------------------------------------------------------
+# 5. 时间预算
+# -----------
+#   CONFIG=fast      8 个 epoch 训练约 3 小时 + per-stage test 约 1.5 小时
+#   CONFIG=official  40 个 epoch 训练约 13 小时 + per-stage test 约 1.5 小时
+#
+# official 在 24 小时 walltime 内但余量不多。用 END_STAGE 主动切段更稳：
+# START_STAGE=1 END_STAGE=4 与 START_STAGE=5 两段各约 7 小时。真被截断也不要紧，
+# state.json 让重投从断点继续。
+#
+# per-stage test 的成本靠两件事压住：只评**已见过**的任务（上三角，不是全 8x8），
+# 以及每个任务分开给解码预算（分类任务 16 token，不是官方一律 512）。
+#
+# -----------------------------------------------------------------------------
+# 6. Llama-3.2 与 Qwen 线的三处不同
+# --------------------------------
+#   1) DECODE_STOP_ON_IM_END 必须是 0。那个开关是 Qwen 的 <|im_end|> 专用；
+#      Llama-3.2-Instruct 的 eos_token 就是 <|eot_id|>，默认路径已经会停对。
+#   2) Llama-3.1/3.2 的 template 在没有 system message 时仍会注入一个含
+#      "Cutting Knowledge Date" / "Today Date" 的 system 块。这不破坏正确性
+#      （训练和评测走同一个函数），但 SYSTEM_PROMPT="" 的实际渲染和 Qwen 线不同，
+#      所以数据必须用这个 tokenizer 重建，不能复用别的池子。
+#   3) lm_head 与 embed_tokens 是 tied 的。本脚本 --full_finetune 1 不受影响，
+#      但后面上 Cmath/Ccode 保护时，target_modules 里的 lm_head 会和 embedding
+#      共享权重，协方差 / Fisher 的口径要单独确认。
+#
+# Step 0 会调 check_trace_render.py 把这三条实测一遍：prompt 是 full 的真 token
+# 前缀、EOS 不重复、每行都在预算内。这一步不过就不训练。
+#
+# -----------------------------------------------------------------------------
+# 7. 投递前要有
+# -------------
+#   1) ${MODEL_DIR}/Llama-3.2-3B-Instruct   —— compute node 是 HF_HUB_OFFLINE=1，
+#      必须先在**登录节点**下好：
+#        huggingface-cli download meta-llama/Llama-3.2-3B-Instruct \
+#          --local-dir ${MODEL_DIR}/Llama-3.2-3B-Instruct
+#   2) ${TRACE_DIR} = data_check/LLM-CL-Benchmark_5000 的九个任务目录
+#   3) MODE=data 的产物：data/processed/trace_<key>_{train,test.jsonl}
+#   4) 数学 ${MATH_DATA_DIR}/{math500,gsm8k}_test.jsonl
+#   5) 代码 ${CODE_DATA_DIR}/humaneval_test.parquet 与 ${CODE_DATA_DIR}/mbpp_full
+#   6) IFEval 的 input_data.jsonl（仓库自带）；IFBench 的两个一次性安装（可选）
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/97_trace_continual.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_tracecl_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_tracecl_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点，只负责起容器再把自己跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]]    || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_tracecl_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
+    MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT
+    DATA_ROOT PROCESSED_DIR STATS_DIR TRACE_DIR
+    CONFIG MODE START_STAGE END_STAGE
+    DRY_RUN FORCE_EVAL FORCE_TRAIN LIMIT DIAG_LEN RENDER_CHECK
+    EPOCHS_LIST LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN MAX_PROMPT_TOKENS
+    VAL_FRAC MAXVAL EVAL_BATCH SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY
+    MAX_STEPS EVAL_BEFORE_TRAIN BUILD_MIX INCLUDE_LIMA
+    MATH_DATA_DIR CODE_DATA_DIR MATH500_FILE GSM8K_FILE
+    HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT IFBENCH_INPUT WITH_IFBENCH
+    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS IFBENCH_MAX_NEW_TOKENS
+    MATH_BATCH CODE_BATCH IFEVAL_BATCH IFBENCH_BATCH CODE_TIMEOUT TRACE_BATCH
+    DECODE_STOP_ON_IM_END
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # 不能用 exec：会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+export NLTK_DATA="${NLTK_DATA}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv || true
+
+cd "${REPO_ROOT}"
+
+# ---- 模型 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Llama-3.2-3B-Instruct}"
+
+# ---- 产物 ----
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_trace_${MODEL_NAME}}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+TRAIN_LOG_DIR="${TRAIN_LOG_DIR:-${RESULTS_ROOT}/train_logs}"
+EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_trace_eval_${MODEL_NAME}}"
+
+# ---- 数据 ----
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
+STATS_DIR="${STATS_DIR:-${DATA_ROOT}/stats}"
+TRACE_DIR="${TRACE_DIR:-${REPO_ROOT}/data_check/LLM-CL-Benchmark_5000}"
+
+# =============================================================================
+# 任务顺序与 epoch 表。位置一一对应，改了顺序就等于改了 epoch 分配。
+# =============================================================================
+TASK_KEYS=(cstance fomc meetingbank py150 scienceqa numglue_cm numglue_ds 20minuten)
+TASK_DIRS=(C-STANCE FOMC MeetingBank Py150 ScienceQA NumGLUE-cm NumGLUE-ds 20Minuten)
+OFFICIAL_EPOCHS=(5 3 7 5 3 5 5 7)
+NUM_STAGES="${#TASK_KEYS[@]}"
+
+CONFIG="${CONFIG:-fast}"
+case "${CONFIG}" in
+  fast)
+    # 每任务 1 epoch，lr 拉到 1e-4：这一档只为 Q2（通用能力崩塌）服务，
+    # 便宜且足够狠。8 个 epoch 总量。
+    EPOCHS_LIST="${EPOCHS_LIST:-1,1,1,1,1,1,1,1}"
+    LR="${LR:-1e-4}"
+    ;;
+  official)
+    EPOCHS_LIST="${EPOCHS_LIST:-5,3,7,5,3,5,5,7}"
+    LR="${LR:-1e-5}"
+    ;;
+  *)
+    echo "CONFIG 只能是 fast|official，当前 '${CONFIG}'" >&2
+    exit 2
+    ;;
+esac
+IFS=',' read -r -a EPOCHS <<< "${EPOCHS_LIST}"
+if [[ "${#EPOCHS[@]}" -ne "${NUM_STAGES}" ]]; then
+  echo "EPOCHS_LIST 要 ${NUM_STAGES} 个值，收到 ${#EPOCHS[@]} 个: ${EPOCHS_LIST}" >&2
+  exit 2
+fi
+
+# =============================================================================
+# 训练超参
+# =============================================================================
+LR_SCHEDULER="${LR_SCHEDULER:-constant}"
+WARMUP_RATIO="${WARMUP_RATIO:-0}"
+# BATCH 是显存参数，ACCUM 才是"每次更新多少行"（accum_steps = ACCUM / BATCH）。
+BATCH="${BATCH:-8}"
+ACCUM="${ACCUM:-64}"
+# 必须和 prepare_trace.py 建数据时的 --max_len 一致：那边保证了没有一行超过它，
+# 也就是训练侧永远不会走到左截断那个分支。
+MAXLEN="${MAXLEN:-2048}"
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-200}"
+EVAL_BATCH="${EVAL_BATCH:-${BATCH}}"
+SEED="${SEED:-42}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+LOG_EVERY="${LOG_EVERY:-200}"
+MAX_STEPS="${MAX_STEPS:-0}"
+EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-1}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
+
+MODE="${MODE:-chain}"
+DRY_RUN="${DRY_RUN:-1}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+LIMIT="${LIMIT:-0}"
+DIAG_LEN="${DIAG_LEN:-1}"
+BUILD_MIX="${BUILD_MIX:-1}"
+INCLUDE_LIMA="${INCLUDE_LIMA:-0}"
+
+case "${MODE}" in
+  data|base_eval|chain|final_eval) ;;
+  *) echo "MODE 只能是 data|base_eval|chain|final_eval，当前 '${MODE}'" >&2; exit 2 ;;
+esac
+
+# =============================================================================
+# 通用能力 benchmark。解码预算与 batch 照抄 94 号，两边相减才是"忘了多少"。
+# =============================================================================
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+HUMANEVAL_FILE="${HUMANEVAL_FILE:-${CODE_DATA_DIR}/humaneval_test.parquet}"
+MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
+# !! 必须是 test（500 题）。evaluate.py 的默认是 validation，那只有 90 题。
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"
+WITH_IFBENCH="${WITH_IFBENCH:-1}"
+
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
+IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-768}"
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
+MATH_BATCH="${MATH_BATCH:-32}"
+CODE_BATCH="${CODE_BATCH:-64}"
+IFEVAL_BATCH="${IFEVAL_BATCH:-32}"
+IFBENCH_BATCH="${IFBENCH_BATCH:-16}"
+CODE_TIMEOUT="${CODE_TIMEOUT:-10}"
+# TRACE 的 test 大多是短答案，batch 可以比 math 大得多；各任务的 max_new_tokens
+# 由 trace_tasks.DEFAULT_MAX_NEW_TOKENS 分别给，不在这里统一覆盖。
+TRACE_BATCH="${TRACE_BATCH:-64}"
+# !! Llama-3.2 必须是 0，见文件头第 6 条。
+DECODE_STOP_ON_IM_END="${DECODE_STOP_ON_IM_END:-0}"
+
+GENERAL_METRICS="ifeval gsm8k math500 humaneval mbpp"
+[[ "${WITH_IFBENCH}" == "1" ]] && GENERAL_METRICS="${GENERAL_METRICS} ifbench"
+
+SLOT_A="trace_${CONFIG}_slot_a"
+SLOT_B="trace_${CONFIG}_slot_b"
+FINAL_CKPT="trace_${CONFIG}_final"
+STATE_FILE="${CKPT_DIR}/trace_${CONFIG}_state.json"
+
+mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${EVAL_ROOT}" "${TRAIN_LOG_DIR}"
+
+# 阶段 i（1 起）写哪个槽位：奇数写 slot_b，偶数写 slot_a。
+slot_for_stage () {
+  local stage="$1"
+  if (( stage % 2 == 1 )); then printf '%s' "${SLOT_B}"; else printf '%s' "${SLOT_A}"; fi
+}
+
+echo "========================================================================"
+echo "TRACE 八任务顺序全量 SFT"
+echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  CONFIG   = ${CONFIG}  epochs = ${EPOCHS_LIST}  lr = ${LR}"
+echo "  MODE     = ${MODE}  DRY_RUN=${DRY_RUN}  LIMIT=${LIMIT}"
+echo "  顺序     = ${TASK_DIRS[*]}"
+echo "  训练     = ${LR_SCHEDULER} warmup ${WARMUP_RATIO}"
+echo "             batch ${BATCH} x accum $((ACCUM / BATCH)) = ${ACCUM} 行/update"
+echo "             maxlen ${MAXLEN} val_frac ${VAL_FRAC} max_val ${MAXVAL} seed ${SEED}"
+echo "             system '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system）"
+echo "  数据     = ${PROCESSED_DIR}/trace_<key>_train"
+echo "  ckpt     = ${CKPT_DIR}/{${SLOT_A},${SLOT_B},${FINAL_CKPT}}"
+echo "  eval root= ${EVAL_ROOT}"
+echo "  通用指标 = ${GENERAL_METRICS}"
+echo "  解码预算 = math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} /"
+echo "             ifeval ${IF_MAX_NEW_TOKENS} / ifbench ${IFBENCH_MAX_NEW_TOKENS}"
+echo "  stop_on_im_end = ${DECODE_STOP_ON_IM_END}（Llama 必须 0）"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 前置检查
+# ===========================================================================
+echo
+echo "==== Step 0: 前置检查 ===="
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || {
+  echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}" >&2
+  echo "  compute node 是 HF_HUB_OFFLINE=1，必须先在登录节点下好：" >&2
+  echo "    huggingface-cli download meta-llama/${MODEL_NAME} \\" >&2
+  echo "      --local-dir ${MODEL_DIR}/${MODEL_NAME}" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# MODE=data: 建八个训练池 + 八份 test jsonl
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "data" ]]; then
+  [[ -d "${TRACE_DIR}" ]] || { echo "缺 TRACE 原始数据: ${TRACE_DIR}" >&2; exit 1; }
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo
+    echo "DRY_RUN=1：以上为计划。确认后 qsub -v DRY_RUN=0,MODE=data ${SELF_PATH}"
+    exit 0
+  fi
+  echo
+  echo "==== 建数据 ===="
+  # --max_len 必须与训练时的 MAXLEN 同值：prepare 保证的"没有一行超过它"就是
+  # 训练侧不会左截断的依据，两个数分开就等于没保证。
+  python -m onereplay.scripts.prepare_trace \
+    --trace_dir "${TRACE_DIR}" \
+    --tokenizer_path "${MODEL_DIR}/${MODEL_NAME}" \
+    --out_root "${PROCESSED_DIR}" \
+    --stats_root "${STATS_DIR}" \
+    --max_prompt_tokens "${MAX_PROMPT_TOKENS}" \
+    --max_len "${MAXLEN}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --include_lima "${INCLUDE_LIMA}" \
+    --build_mix "${BUILD_MIX}" \
+    --seed "${SEED}"
+
+  echo
+  echo "==== 渲染预检 ===="
+  python -m onereplay.scripts.check_trace_render \
+    --model_path "${MODEL_DIR}/${MODEL_NAME}" \
+    --trace_data_dir "${PROCESSED_DIR}" \
+    --max_len "${MAXLEN}" \
+    --max_prompt_tokens "${MAX_PROMPT_TOKENS}" \
+    --system_prompt "${SYSTEM_PROMPT}"
+
+  echo
+  echo "数据就绪。下一步："
+  echo "  qsub -v DRY_RUN=0,CONFIG=fast,MODE=base_eval ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ---- 训练池与 test 文件必须齐 ----
+MISSING_DATA=0
+for key in "${TASK_KEYS[@]}"; do
+  [[ -d "${PROCESSED_DIR}/trace_${key}_train" ]] || {
+    echo "缺训练池: ${PROCESSED_DIR}/trace_${key}_train" >&2; MISSING_DATA=1; }
+  [[ -f "${PROCESSED_DIR}/trace_${key}_test.jsonl" ]] || {
+    echo "缺 test: ${PROCESSED_DIR}/trace_${key}_test.jsonl" >&2; MISSING_DATA=1; }
+done
+if (( MISSING_DATA )); then
+  echo "先跑: qsub -v DRY_RUN=0,MODE=data ${SELF_PATH}" >&2
+  exit 1
+fi
+
+# ---- 建数据时的 system / max_len 必须和这次训练一致 ----
+# 不一致的后果是静默的：system turn 贡献 token，长度是按含它的完整序列量的，
+# 差一个块就会有行超过 MAXLEN 而被左截断（保尾丢头），prepare 的保证作废。
+STATS_MISSING='<<<NO_FIELD>>>'
+MANIFEST="${STATS_DIR}/trace_manifest.json"
+# max_len first, system_prompt last: `read -r VAR` takes a whole line, so putting
+# the one value that can contain spaces on its own final line keeps it intact.
+{ read -r STATS_MAXLEN; read -r STATS_SYSTEM; } <<<"$(MANIFEST="${MANIFEST}" STATS_MISSING="${STATS_MISSING}" python - <<'PY'
+import json, os
+missing = os.environ["STATS_MISSING"]
+# 读失败也打哨兵而不是让解释器崩：崩了命令替换就是空串，而空串正是本该被校验的
+# 那个值，守卫会静默判成"一致"。
+try:
+    with open(os.environ["MANIFEST"], encoding="utf-8") as handle:
+        payload = json.load(handle)
+    system = payload.get("system_prompt", missing)
+    print(payload.get("max_len", missing))
+    print(system if system else "<<<EMPTY>>>")
+except Exception:
+    print(missing)
+    print(missing)
+PY
+)"
+[[ "${STATS_SYSTEM}" == "<<<EMPTY>>>" ]] && STATS_SYSTEM=""
+if [[ "${STATS_SYSTEM}" == "${STATS_MISSING}" ]]; then
+  echo "!! ${MANIFEST} 读不到，跳过 system / max_len 对表"
+else
+  if [[ "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
+    echo "拒绝训练：SYSTEM_PROMPT 和建数据时不一致。" >&2
+    echo "  数据 (${MANIFEST}): '${STATS_SYSTEM}'" >&2
+    echo "  本次              : '${SYSTEM_PROMPT}'" >&2
+    exit 4
+  fi
+  if [[ "${STATS_MAXLEN}" != "${MAXLEN}" ]]; then
+    echo "拒绝训练：MAXLEN (${MAXLEN}) 和建数据时的 max_len (${STATS_MAXLEN}) 不一致。" >&2
+    echo "  prepare 保证的'没有一行超过 max_len'只在同值时才等于'训练不会左截断'。" >&2
+    exit 4
+  fi
+  echo "system / max_len 与 ${MANIFEST} 一致"
+fi
+
+# ---- 渲染预检：这一步不过就不训练 ----
+# 一分钟的 tokenizer 检查，挡住的是"训了 13 小时才发现 prompt 不是 full 的真前缀、
+# label 掩在错位置上"这种全程无报错的失败。它的症状是"模型什么都忘了"—— 正好是
+# 本实验期待的结论，所以不会有人去质疑它。见文件头第 6 条。
+RENDER_CHECK="${RENDER_CHECK:-1}"
+if [[ "${RENDER_CHECK}" == "1" ]]; then
+  echo
+  echo "---- 渲染预检 ----"
+  if ! python -m onereplay.scripts.check_trace_render \
+      --model_path "${MODEL_DIR}/${MODEL_NAME}" \
+      --trace_data_dir "${PROCESSED_DIR}" \
+      --max_len "${MAXLEN}" \
+      --max_prompt_tokens "${MAX_PROMPT_TOKENS}" \
+      --system_prompt "${SYSTEM_PROMPT}" \
+      --show 0; then
+    echo "渲染预检没过，停在这里。" >&2
+    echo "  多半是数据池不是用 ${MODEL_NAME} 建的（换过模型就要重建）：" >&2
+    echo "    qsub -v DRY_RUN=0,MODE=data ${SELF_PATH}" >&2
+    echo "  确认无误要强行继续：RENDER_CHECK=0" >&2
+    exit 4
+  fi
+fi
+
+# ---- benchmark 预检：缺哪个跳哪个 ----
+for f in "${MATH500_FILE}" "${GSM8K_FILE}" "${HUMANEVAL_FILE}" "${IFEVAL_INPUT}"; do
+  [[ -f "${f}" ]] || echo "warning: 缺 ${f}（对应指标会被跳过）"
+done
+[[ -d "${MBPP_DIR}" ]] || echo "warning: 缺 MBPP 目录 ${MBPP_DIR}（该指标会被跳过）"
+
+# IFBench 的前置不是一个文件，是装好的包加四份 NLTK 语料，而它缺失时的失败发生在
+# **打分阶段** —— 300 条已经解码完，一小时 GPU 白烧。所以先探一次。
+ifbench_ready () {
+  python - <<'PY' >/dev/null 2>&1
+from ifbench import instructions_registry
+from onereplay.eval.metrics.ifbench import check_nltk_data
+
+assert len(instructions_registry.INSTRUCTION_DICT) >= 83
+check_nltk_data()
+PY
+}
+
+AVAIL_GENERAL=""
+for m in ${GENERAL_METRICS}; do
+  case "${m}" in
+    ifeval)    [[ -f "${IFEVAL_INPUT}"   ]] && AVAIL_GENERAL="${AVAIL_GENERAL} ${m}" || echo "跳过 ifeval：缺 ${IFEVAL_INPUT}" ;;
+    gsm8k)     [[ -f "${GSM8K_FILE}"     ]] && AVAIL_GENERAL="${AVAIL_GENERAL} ${m}" || echo "跳过 gsm8k：缺 ${GSM8K_FILE}" ;;
+    math500)   [[ -f "${MATH500_FILE}"   ]] && AVAIL_GENERAL="${AVAIL_GENERAL} ${m}" || echo "跳过 math500：缺 ${MATH500_FILE}" ;;
+    humaneval) [[ -f "${HUMANEVAL_FILE}" ]] && AVAIL_GENERAL="${AVAIL_GENERAL} ${m}" || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}" ;;
+    mbpp)      [[ -d "${MBPP_DIR}"       ]] && AVAIL_GENERAL="${AVAIL_GENERAL} ${m}" || echo "跳过 mbpp：缺 ${MBPP_DIR}" ;;
+    ifbench)
+      if ifbench_ready; then
+        AVAIL_GENERAL="${AVAIL_GENERAL} ${m}"
+      else
+        echo "跳过 ifbench：依赖没就绪。在**登录节点**补齐后重投："
+        echo "  source ${VENV}/bin/activate"
+        echo '  pip install "ifbench @ git+https://github.com/allenai/IFBench.git@1c40f0c10d9b5c5c2f10a175a28007ebb64f7f4d"'
+        echo "  python -m nltk.downloader punkt punkt_tab stopwords averaged_perceptron_tagger_eng"
+      fi
+      ;;
+  esac
+done
+AVAIL_GENERAL="${AVAIL_GENERAL# }"
+echo "通用指标可评: ${AVAIL_GENERAL:-<无>}"
+
+# ===========================================================================
+# 共用：评测一次
+# ===========================================================================
+# 已有 summary.json 的指标不再重算（撞了 walltime 重投会从断点接着跑）。
+pending_metrics () {
+  local name="$1"; shift
+  local out=""
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" == "1" || ! -f "${EVAL_ROOT}/${m}/${name}/summary.json" ]]; then
+      out="${out}${out:+,}${m}"
+    fi
+  done
+  printf '%s' "${out}"
+}
+
+# eval_one <run_name> <ckpt_dir 或空> <指标空格分隔>
+eval_one () {
+  local name="$1" ckpt="$2"; shift 2
+  local mp
+  mp="$(pending_metrics "${name}" "$@")"
+  if [[ -z "${mp}" ]]; then
+    echo "==== skip ${name}：指标都已有结果（FORCE_EVAL=1 可重评）===="
+    return 0
+  fi
+  echo
+  echo "==== eval ${name} (${mp}) ===="
+  local args=(
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}"
+    --run_name "${name}" --out_dir "${EVAL_ROOT}"
+    --metrics "${mp}" --seed "${SEED}"
+    --system_prompt "${SYSTEM_PROMPT}"
+    --decode_stop_on_im_end "${DECODE_STOP_ON_IM_END}"
+    --limit "${LIMIT}"
+    --trace_data_dir "${PROCESSED_DIR}"
+    --trace_limit "${LIMIT}"
+    --trace_batch_size "${TRACE_BATCH}"
+    --math500_data_path "${MATH500_FILE}"
+    --gsm8k_data_path "${GSM8K_FILE}"
+    --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}"
+    --math_batch_size "${MATH_BATCH}"
+    --humaneval_data_file "${HUMANEVAL_FILE}"
+    --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}"
+    --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}"
+    --code_batch_size "${CODE_BATCH}"
+    --timeout "${CODE_TIMEOUT}"
+    --ifeval_input "${IFEVAL_INPUT}"
+    --ifeval_batch_size "${IFEVAL_BATCH}"
+    --max_new_tokens "${IF_MAX_NEW_TOKENS}"
+    --ifbench_limit "${LIMIT}"
+    --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}"
+    --ifbench_batch_size "${IFBENCH_BATCH}"
+  )
+  [[ -n "${IFBENCH_INPUT}" ]] && args+=(--ifbench_input "${IFBENCH_INPUT}")
+  # base 不传 adapter_path；阶段 checkpoint 是全量权重，runner 靠
+  # is_lora_adapter_dir 自动识别成"整个模型目录"而不是 LoRA adapter。
+  [[ -n "${ckpt}" ]] && args+=(--adapter_path "${ckpt}")
+  python -m onereplay.scripts.evaluate "${args[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# MODE=base_eval: 一步都没走的模型，六个通用 benchmark + 八个 TRACE test
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "base_eval" ]]; then
+  BASE_TRACE=""
+  for key in "${TASK_KEYS[@]}"; do BASE_TRACE="${BASE_TRACE} trace_${key}"; done
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo
+    echo "DRY_RUN=1：将评 base 的 ${AVAIL_GENERAL} 与${BASE_TRACE}"
+    echo "确认后 qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=base_eval ${SELF_PATH}"
+    exit 0
+  fi
+  # base 的 TRACE 分数不是 0：模型没训过这些任务，但会用自然语言作答，宽松抽取
+  # 那一列能给出"训练之前就能做到多少"。Q1 的分母是"刚训完该任务时"，不是这个，
+  # 但没有它就读不出每个任务实际被学会了多少。
+  # shellcheck disable=SC2086
+  eval_one "base" "" ${AVAIL_GENERAL} ${BASE_TRACE}
+  echo
+  echo "base 评完。下一步: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=chain ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# state.json：断点续跑
+# ===========================================================================
+STATE_STAGE=0
+STATE_SLOT=""
+if [[ -f "${STATE_FILE}" ]]; then
+  { read -r STATE_STAGE; read -r STATE_SLOT; } <<<"$(STATE_FILE="${STATE_FILE}" python - <<'PY'
+import json, os
+try:
+    with open(os.environ["STATE_FILE"], encoding="utf-8") as handle:
+        payload = json.load(handle)
+    print(int(payload.get("stage", 0)))
+    print(payload.get("slot", ""))
+except Exception:
+    print(0)
+    print("")
+PY
+)"
+fi
+STATE_STAGE="${STATE_STAGE:-0}"
+
+START_STAGE="${START_STAGE:-$((STATE_STAGE + 1))}"
+END_STAGE="${END_STAGE:-${NUM_STAGES}}"
+# 链已经跑完时 START_STAGE 会算成 NUM_STAGES+1。那不是配置错误，是"没事可做"，
+# 所以单独说清楚，而不是丢一个范围校验的报错让人以为参数传错了。
+if [[ "${MODE}" == "chain" ]] && (( START_STAGE > NUM_STAGES )); then
+  echo
+  echo "chain 已经跑完 ${NUM_STAGES} 个阶段（state.json: stage=${STATE_STAGE} slot=${STATE_SLOT}）。"
+  echo "  要评通用能力: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=final_eval ${SELF_PATH}"
+  echo "  要重跑某一段: 加 START_STAGE=<n>（注意它需要阶段 n-1 的槽位还在盘上）"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+if (( START_STAGE < 1 || START_STAGE > NUM_STAGES )); then
+  echo "START_STAGE 要在 1..${NUM_STAGES}，当前 ${START_STAGE}" >&2
+  exit 2
+fi
+if (( END_STAGE < START_STAGE || END_STAGE > NUM_STAGES )); then
+  echo "END_STAGE 要在 ${START_STAGE}..${NUM_STAGES}，当前 ${END_STAGE}" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# MODE=final_eval: 末阶段权重的六个通用 benchmark
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "final_eval" ]]; then
+  if [[ ! -d "${CKPT_DIR}/${FINAL_CKPT}" ]]; then
+    echo "缺末阶段权重: ${CKPT_DIR}/${FINAL_CKPT}" >&2
+    echo "  它由 MODE=chain 跑到第 ${NUM_STAGES} 阶段后 mv 生成。" >&2
+    echo "  当前 state: stage=${STATE_STAGE} slot=${STATE_SLOT}" >&2
+    exit 1
+  fi
+  FINAL_RUN="trace_${CONFIG}_stage${NUM_STAGES}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo
+    echo "DRY_RUN=1：将用 ${CKPT_DIR}/${FINAL_CKPT} 评 ${FINAL_RUN} 的 ${AVAIL_GENERAL}"
+    exit 0
+  fi
+  # shellcheck disable=SC2086
+  eval_one "${FINAL_RUN}" "${CKPT_DIR}/${FINAL_CKPT}" ${AVAIL_GENERAL}
+  echo
+  echo "==== 汇总 ===="
+  python -m onereplay.scripts.summarize_trace_matrix \
+    --eval_root "${EVAL_ROOT}" --config "${CONFIG}" \
+    --base_run base --num_stages "${NUM_STAGES}" \
+    --general_metrics "${AVAIL_GENERAL// /,}" \
+    --json_out "${EVAL_ROOT}/trace_${CONFIG}_matrix.json" || true
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# MODE=chain: 顺序训练 + 每阶段内联评已见任务
+# ===========================================================================
+echo
+echo "==== 链式训练计划 ===="
+echo "  state.json  : stage=${STATE_STAGE} slot=${STATE_SLOT:-<无>}"
+echo "  本次跑阶段  : ${START_STAGE}..${END_STAGE} / ${NUM_STAGES}"
+for (( i = START_STAGE; i <= END_STAGE; i++ )); do
+  idx=$((i - 1))
+  src_desc="${MODEL_NAME}"
+  (( i > 1 )) && src_desc="$(slot_for_stage $((i - 1)))"
+  seen=""
+  for (( j = 0; j < i; j++ )); do seen="${seen} trace_${TASK_KEYS[$j]}"; done
+  echo "  stage ${i}: ${TASK_DIRS[$idx]} epochs=${EPOCHS[$idx]} ${src_desc} -> $(slot_for_stage "${i}")"
+  echo "            eval:${seen}"
+done
+
+# 续跑时基座必须真的在盘上。state 说它在，目录却没了（手动删过、上个 job 挂在
+# mv 前后），现在就该停 —— 不然 train.py 会把 MODEL_NAME 当基座，静默地从
+# 没训过的权重重新开始，而结果文件名看起来和正常续跑一模一样。
+if (( START_STAGE > 1 )); then
+  SRC_SLOT="$(slot_for_stage $((START_STAGE - 1)))"
+  if [[ ! -d "${CKPT_DIR}/${SRC_SLOT}" ]]; then
+    echo
+    echo "拒绝续跑：阶段 $((START_STAGE - 1)) 的权重不在 ${CKPT_DIR}/${SRC_SLOT}" >&2
+    echo "  state.json 记的是 stage=${STATE_STAGE} slot=${STATE_SLOT}" >&2
+    echo "  要从头重跑就传 START_STAGE=1（会覆盖槽位）。" >&2
+    exit 5
+  fi
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划，不训练不评测。"
+  echo "确认后 qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=chain ${SELF_PATH}"
+  exit 0
+fi
+
+write_state () {
+  local stage="$1" slot="$2"
+  STATE_FILE="${STATE_FILE}" STAGE="${stage}" SLOT="${slot}" CONFIG="${CONFIG}" \
+  MODEL_NAME="${MODEL_NAME}" python - <<'PY'
+import json, os
+from pathlib import Path
+
+path = Path(os.environ["STATE_FILE"])
+path.parent.mkdir(parents=True, exist_ok=True)
+# 先写临时文件再原子替换：直接覆盖的话，正好在这一步被 kill 会留下半个 JSON，
+# 而它是下一次续跑唯一的依据。
+tmp = path.with_suffix(".json.tmp")
+tmp.write_text(
+    json.dumps(
+        {
+            "stage": int(os.environ["STAGE"]),
+            "slot": os.environ["SLOT"],
+            "config": os.environ["CONFIG"],
+            "model_name": os.environ["MODEL_NAME"],
+        },
+        indent=2,
+    ),
+    encoding="utf-8",
+)
+tmp.replace(path)
+PY
+}
+
+for (( STAGE = START_STAGE; STAGE <= END_STAGE; STAGE++ )); do
+  IDX=$((STAGE - 1))
+  TASK_KEY="${TASK_KEYS[$IDX]}"
+  TASK_DIR="${TASK_DIRS[$IDX]}"
+  STAGE_EPOCHS="${EPOCHS[$IDX]}"
+  DST_SLOT="$(slot_for_stage "${STAGE}")"
+  RUN="trace_${CONFIG}_stage${STAGE}"
+
+  if (( STAGE == 1 )); then
+    SRC_PARENT="${MODEL_DIR}"
+    SRC_NAME="${MODEL_NAME}"
+    PREV_SLOT=""
+  else
+    PREV_SLOT="$(slot_for_stage $((STAGE - 1)))"
+    SRC_PARENT="${CKPT_DIR}"
+    SRC_NAME="${PREV_SLOT}"
+  fi
+
+  echo
+  echo "########################################################################"
+  echo "# stage ${STAGE}/${NUM_STAGES}: ${TASK_DIR}  epochs=${STAGE_EPOCHS}  lr=${LR}"
+  echo "#   基座 ${SRC_PARENT}/${SRC_NAME}  ->  ${CKPT_DIR}/${DST_SLOT}"
+  echo "########################################################################"
+
+  # 目标槽位可能还留着两阶段前的权重，显式清掉再写：save_pretrained 覆盖时
+  # 不保证清掉旧的分片文件，残留的 shard 会让加载读到混合的权重。
+  if [[ -d "${CKPT_DIR}/${DST_SLOT}" ]]; then
+    echo "清空目标槽位: ${CKPT_DIR}/${DST_SLOT}"
+    rm -rf --one-file-system "${CKPT_DIR}/${DST_SLOT}"
+  fi
+
+  mkdir -p "${JOB_TMPDIR}/map_cache/${RUN}"
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${SRC_PARENT}" --model_name "${SRC_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --dataset_path "${PROCESSED_DIR}/trace_${TASK_KEY}_train" \
+    --epochs "${STAGE_EPOCHS}" --lr "${LR}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
+    --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --eval_before_train "${EVAL_BEFORE_TRAIN}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --max_steps "${MAX_STEPS}" \
+    --map_cache_dir "${JOB_TMPDIR}/map_cache/${RUN}" \
+    --log_every "${LOG_EVERY}" \
+    --replay_lambda 0 \
+    --measure_replay_when_lambda_zero 0 \
+    --cov_path "" \
+    --save 1 --save_path "${CKPT_DIR}/${DST_SLOT}" \
+    --metrics_path "${METRICS_DIR}/${RUN}.jsonl" \
+    2>&1 | tee "${TRAIN_LOG_DIR}/${RUN}.train.log"
+
+  [[ -d "${CKPT_DIR}/${DST_SLOT}" ]] || {
+    echo "训练结束但没有 checkpoint: ${CKPT_DIR}/${DST_SLOT}" >&2
+    exit 7
+  }
+  echo "stage ${STAGE} 训练完成 -> ${CKPT_DIR}/${DST_SLOT}"
+
+  # 到这里阶段 STAGE 的权重已经落盘，阶段 STAGE-1 再没人要了。见文件头第 3 条：
+  # 删在这个点而不是更早，是为了让"训练中途被 kill"始终有一个有效回退点。
+  if [[ -n "${PREV_SLOT}" && -d "${CKPT_DIR}/${PREV_SLOT}" ]]; then
+    echo "删除上一阶段槽位: ${CKPT_DIR}/${PREV_SLOT}"
+    rm -rf --one-file-system "${CKPT_DIR}/${PREV_SLOT}"
+  fi
+
+  # 已见过的任务，含刚训完这个。上三角的一行。
+  SEEN_METRICS=""
+  for (( j = 0; j < STAGE; j++ )); do
+    SEEN_METRICS="${SEEN_METRICS} trace_${TASK_KEYS[$j]}"
+  done
+  # shellcheck disable=SC2086
+  eval_one "${RUN}" "${CKPT_DIR}/${DST_SLOT}" ${SEEN_METRICS}
+
+  write_state "${STAGE}" "${DST_SLOT}"
+  echo "state 更新: stage=${STAGE} slot=${DST_SLOT}"
+done
+
+# ---- 跑到最后一阶段：mv 成 final，清掉另一个槽位 ----
+if (( END_STAGE == NUM_STAGES )); then
+  LAST_SLOT="$(slot_for_stage "${NUM_STAGES}")"
+  OTHER_SLOT="$(slot_for_stage $((NUM_STAGES - 1)))"
+  if [[ -d "${CKPT_DIR}/${LAST_SLOT}" ]]; then
+    if [[ -d "${CKPT_DIR}/${FINAL_CKPT}" ]]; then
+      echo "已有 ${CKPT_DIR}/${FINAL_CKPT}，先移走它"
+      rm -rf --one-file-system "${CKPT_DIR}/${FINAL_CKPT}"
+    fi
+    mv "${CKPT_DIR}/${LAST_SLOT}" "${CKPT_DIR}/${FINAL_CKPT}"
+    write_state "${NUM_STAGES}" "${FINAL_CKPT}"
+    echo "末阶段权重保留为: ${CKPT_DIR}/${FINAL_CKPT}"
+  fi
+  [[ -d "${CKPT_DIR}/${OTHER_SLOT}" ]] && rm -rf --one-file-system "${CKPT_DIR}/${OTHER_SLOT}"
+  echo
+  echo "八个阶段跑完。下一步："
+  echo "  qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=final_eval ${SELF_PATH}"
+else
+  echo
+  echo "本段跑到阶段 ${END_STAGE}，权重留在 ${CKPT_DIR}/$(slot_for_stage "${END_STAGE}")"
+  echo "接着投: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=chain ${SELF_PATH}"
+  echo "  （START_STAGE 会自动从 state.json 续到 $((END_STAGE + 1))）"
+fi
+
+# ===========================================================================
+# 汇总：遗忘矩阵
+# ===========================================================================
+echo
+echo "========================================================================"
+echo "遗忘矩阵（每行一个阶段，每列一个任务）"
+echo "========================================================================"
+python -m onereplay.scripts.summarize_trace_matrix \
+  --eval_root "${EVAL_ROOT}" --config "${CONFIG}" \
+  --base_run base --num_stages "${NUM_STAGES}" \
+  --general_metrics "${AVAIL_GENERAL// /,}" \
+  --json_out "${EVAL_ROOT}/trace_${CONFIG}_matrix.json" || true
+
+echo
+echo "========================================================================"
+echo "读法："
+echo "  Q1 遗忘：看矩阵每一列。对角线是'刚训完这个任务'，它下面的格子都该接近它；"
+echo "     明显往下掉就是遗忘。BWT 那一行是把这些落差平均之后的一个数。"
+echo "  Q2 崩塌：final_eval 跑完后看通用能力那张表。gsm8k / math500 / humaneval /"
+echo "     mbpp 相对 base 掉得够多，TRACE 就可以当成破坏性训练集用。"
+echo "  注意 accuracy 与 accuracy_strict 两列一起读：strict 是 TRACE 原样的全串"
+echo "     相等，accuracy 是抽取后的。只有 strict 掉而 accuracy 没掉，说明模型只是"
+echo "     不再输出裸标签，不是真忘了 —— 那种掉分靠改 prompt 就能拿回来。"
+echo "========================================================================"
+echo "Job finished at: $(date)"

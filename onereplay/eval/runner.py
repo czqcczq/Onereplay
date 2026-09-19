@@ -86,6 +86,19 @@ def get_metric(name: str) -> Metric:
         "fpb": "onereplay.eval.metrics.finance:FPBMetric",
         "fiqasa": "onereplay.eval.metrics.finance:FiQASAMetric",
         "tfns": "onereplay.eval.metrics.finance:TFNSMetric",
+        # TRACE's eight continual-learning tasks. Unlike every other entry here
+        # these are both new-task and retention metrics depending on when they
+        # run: the task just trained on reads "did it learn", the ones before it
+        # read "did it forget". summarize_trace_matrix.py assembles both from
+        # the per-stage summary.json files.
+        "trace_cstance": "onereplay.eval.metrics.trace_tasks:TraceCStanceMetric",
+        "trace_fomc": "onereplay.eval.metrics.trace_tasks:TraceFOMCMetric",
+        "trace_meetingbank": "onereplay.eval.metrics.trace_tasks:TraceMeetingBankMetric",
+        "trace_py150": "onereplay.eval.metrics.trace_tasks:TracePy150Metric",
+        "trace_scienceqa": "onereplay.eval.metrics.trace_tasks:TraceScienceQAMetric",
+        "trace_numglue_cm": "onereplay.eval.metrics.trace_tasks:TraceNumGLUECmMetric",
+        "trace_numglue_ds": "onereplay.eval.metrics.trace_tasks:TraceNumGLUEDsMetric",
+        "trace_20minuten": "onereplay.eval.metrics.trace_tasks:Trace20MinutenMetric",
     }
     if name not in registry:
         raise ValueError(f"Unknown metric {name!r}. Choose from: {sorted(registry)}")

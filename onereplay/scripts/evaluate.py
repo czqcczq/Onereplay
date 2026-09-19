@@ -6,8 +6,9 @@ Available metrics: ifeval, ifbench, followbench, multiif, commonsense,
 commonsense_qa, gsm8k, aime, math500, amc, minervamath, humaneval, mbpp,
 humanevalplus, mbppplus, medqa, pubmedqa, medmcqa, careqa, fpb, fiqasa, tfns,
 mmlu_professional_law, mmlu_international_law, mmlu_jurisprudence, dialogsum,
-direct_safety. Each metric writes
-<out_dir>/<metric>/<run_name>/summary.json plus an appended row in
+direct_safety, trace_cstance, trace_fomc, trace_meetingbank, trace_py150,
+trace_scienceqa, trace_numglue_cm, trace_numglue_ds, trace_20minuten. Each
+metric writes <out_dir>/<metric>/<run_name>/summary.json plus an appended row in
 <out_dir>/<metric>_summary.csv.
 
 commonsense and commonsense_qa are not the same measurement: the first is
@@ -139,6 +140,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dialogsum_bertscore_model", type=str, default="")
     parser.add_argument("--dialogsum_bertscore_layers", type=int, default=17)
     parser.add_argument("--dialogsum_bertscore_batch_size", type=int, default=64)
+
+    # TRACE's eight tasks. One directory holds every trace_<key>_test.jsonl that
+    # prepare_trace.py wrote, so a stage evaluation names the tasks it has seen
+    # via --metrics and nothing else has to change. Token budgets default per
+    # task (see trace_tasks.DEFAULT_MAX_NEW_TOKENS); --trace_max_new_tokens
+    # overrides all eight at once, and --trace_<name>_max_new_tokens one of them.
+    parser.add_argument("--trace_data_dir", type=str, default="data/processed")
+    parser.add_argument("--trace_limit", type=int, default=0)
+    parser.add_argument("--trace_batch_size", type=int, default=0)
+    parser.add_argument("--trace_max_new_tokens", type=int, default=0)
+    for _trace_name in (
+        "cstance",
+        "fomc",
+        "meetingbank",
+        "py150",
+        "scienceqa",
+        "numglue_cm",
+        "numglue_ds",
+        "20minuten",
+    ):
+        parser.add_argument(f"--trace_{_trace_name}_max_new_tokens", type=int, default=0)
+        parser.add_argument(f"--trace_{_trace_name}_input", type=str, default="")
 
     # ifeval / ifbench / multiif
     parser.add_argument("--ifeval_input", type=str, default="")
