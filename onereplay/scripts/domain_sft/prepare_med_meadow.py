@@ -5,8 +5,9 @@ no chain of thought, no \\boxed{}, no multiple choice. That shape is why nothing
 here filters -- the whole corpus goes in. A row only disappears if it is empty
 or does not fit --max_tokens, and at 1216 none do (the longest is ~430 tokens).
 
+    MEADOW=datasets/raw/medical_meadow_medical_flashcards
     python -m onereplay.scripts.domain_sft.prepare_med_meadow \\
-        --meadow_json datasets/raw/medical_meadow_flashcards.json \\
+        --meadow_json "${MEADOW}/medical_meadow_wikidoc_medical_flashcards.json" \\
         --tokenizer_path models/Qwen2.5-1.5B-Instruct \\
         --system_prompt '' --max_tokens 1216 --seed 42
 """

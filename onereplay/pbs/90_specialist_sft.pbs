@@ -114,8 +114,11 @@ MODE="${MODE:-train}"
 
 # ---- 原始语料（离线，必须在登录节点先下好）----
 # 计算节点上 HF_HUB_OFFLINE=1，prepare_* 走不了 Hub，所以这几条都得是本地路径。
-MEDMEADOW_JSON="${MEDMEADOW_JSON:-${REPO_ROOT}/datasets/raw/medical_meadow_flashcards.json}"
-FINGPT_PARQUET="${FINGPT_PARQUET:-${REPO_ROOT}/datasets/raw/fingpt_sentiment_train.parquet}"
+# 两条都按 HF 仓库原样下载后的目录结构写。FinGPT 给的是目录而不是具体 parquet：
+# 文件名里带内容 hash（train-00000-of-00001-<hash>.parquet），重下一次就会变，
+# prepare_fin_sentiment 对目录会自己 glob **/*.parquet。
+MEDMEADOW_JSON="${MEDMEADOW_JSON:-${REPO_ROOT}/datasets/raw/medical_meadow_medical_flashcards/medical_meadow_wikidoc_medical_flashcards.json}"
+FINGPT_PARQUET="${FINGPT_PARQUET:-${REPO_ROOT}/datasets/raw/fingpt-sentiment-train}"
 # download_magicoder_data.py 的落点，和 code_replay 那条线共用同一份 parquet。
 MAGICODER_PATH="${MAGICODER_PATH:-${REPO_ROOT}/datasets/code_replay/magicoder_oss_instruct_75k.parquet}"
 

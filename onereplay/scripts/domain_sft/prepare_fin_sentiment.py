@@ -17,7 +17,7 @@ Nothing is filtered. A row only disappears if it is empty or does not fit
 --max_tokens, and at 1216 none do (p99 is ~136 tokens).
 
     python -m onereplay.scripts.domain_sft.prepare_fin_sentiment \\
-        --fingpt_path datasets/raw/fingpt_sentiment_train.parquet \\
+        --fingpt_path datasets/raw/fingpt-sentiment-train \\
         --tokenizer_path models/Qwen2.5-1.5B-Instruct \\
         --system_prompt '' --max_tokens 1216 --seed 42
 """
