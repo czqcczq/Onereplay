@@ -1,33 +1,22 @@
-"""Finance evaluation: FinQA and ConvFinQA.
+"""Finance evaluation: FPB, FiQA-SA, TFNS -- three-way sentiment classification.
 
-Both sets ask a numerical-reasoning question about one filing page -- some
-paragraphs of text and one table -- and both grade on the executed numeric
-answer, so they share the document rendering, the answer extraction and the
-scorer here. ConvFinQA is FinQA's corpus turned into multi-turn dialogues; the
-only real difference is that a question may depend on earlier turns.
+The Finance specialist trains on FinGPT sentiment-train, whose answer is a single
+label word, so these three sets are graded the way that corpus is written: the
+prompt is the instruction the corpus itself carries, and the answer is one of
+negative / neutral / positive.
 
-The prompt ends in the same "reason step by step, then \\boxed{...}" contract as
-Math and Medical. That is not cosmetic: these three specialists are compared
-against each other for forgetting, so the answer must be found the same way in
-all three domains, or grader strictness shows up as a domain effect.
+Two things the graders have to tolerate, both consequences of the training data:
 
-Percent scale is the trap in this benchmark
--------------------------------------------
-FinQA stores two versions of the same answer. ``exe_ans`` is what the annotated
-program evaluates to, usually a ratio like ``0.1111``, while ``answer`` is the
-human-written string, ``"11.1%"``. A model asked for a percentage change will
-write either one and be right both times. Comparing against ``exe_ans`` alone
-would mark every ``\\boxed{11.1\\%}`` wrong, which is a structural zero on a
-whole question type -- the same failure mode AMC had when integer golds arrived
-as "142.0" and string equality scored the entire set wrong.
+  * 16,184 training rows answer on a nine-level scale ("mildly positive"), so a
+    trained model will sometimes answer that way here. Those collapse onto the
+    three classes rather than counting as unparsed.
+  * TFNS spells its classes Bearish / Bullish / Neutral. Those are the same three
+    classes under different names and are mapped, on both the gold and the
+    prediction side.
 
-So a mismatch is retried at 100x and 1/100x, but **only when a percent sign
-appears on one of the two sides**. Gating on the percent sign is what keeps this
-from becoming a blanket "answers within two orders of magnitude are correct":
-without it, a model that misread thousands for millions would be given credit.
-
-Numbers are compared with a relative tolerance because the golds are rounded
-quantities: the annotator's "11.1%" and a correct 11.1349% are the same answer.
+macro_f1 is reported next to accuracy because all three sets are unbalanced --
+FPB is roughly 60% neutral -- so a model that answers neutral to everything
+posts a respectable accuracy and a poor macro F1.
 """
 
 from __future__ import annotations
@@ -39,100 +28,64 @@ from pathlib import Path
 from typing import Any
 
 from onereplay.eval.generation import batched_generate, resolve_batch_size
-from onereplay.eval.metrics.math500 import (
-    extract_answer,
-    is_equiv,
-    numbers_close,
-    to_number,
+from onereplay.eval.metrics.math500 import extract_answer
+
+LABELS = ("negative", "neutral", "positive")
+
+# Byte-identical to the two instructions FinGPT sentiment-train carries, so the
+# model is asked at eval time exactly what it was taught. The nine-level variant
+# in that corpus is deliberately not reused: the gold here is three-way, and
+# asking for nine levels would make every answer need a mapping instead of only
+# the ones that volunteer it.
+NEWS_INSTRUCTION = (
+    "What is the sentiment of this news? Please choose an answer from "
+    "{negative/neutral/positive}."
+)
+TWEET_INSTRUCTION = (
+    "What is the sentiment of this tweet? Please choose an answer from "
+    "{negative/neutral/positive}."
 )
 
-INSTRUCTION_PREFIX = (
-    "Answer the following financial question using the report excerpt below. "
-    "Reason step by step, then give the final answer as \\boxed{...} at the end."
-)
+_SENTIMENT_WORD = re.compile(r"\b(positive|negative|neutral|bullish|bearish)\b", re.IGNORECASE)
 
 
-def render_table(table: Any) -> str:
-    """Flatten a filing table to one pipe-separated row per line.
+def normalize_label(value: Any) -> str:
+    """Map any spelling of the three classes onto one of LABELS, or "".
 
-    Plain enough that the tokenizer does not spend the budget on markdown rules,
-    structured enough that column alignment survives -- which is the entire task
-    in TAT-QA-style table reasoning.
+    Substring matching is what collapses the nine-level scale ("moderately
+    negative" -> negative) and TFNS's Bearish/Bullish onto the three classes.
     """
 
-    if not isinstance(table, (list, tuple)):
+    lowered = str(value or "").strip().lower()
+    if not lowered:
         return ""
-    lines = []
-    for row in table:
-        if isinstance(row, (list, tuple)):
-            lines.append(" | ".join(str(cell).strip() for cell in row))
-        else:
-            lines.append(str(row).strip())
-    return "\n".join(line for line in lines if line)
+    if "positive" in lowered or "bullish" in lowered:
+        return "positive"
+    if "negative" in lowered or "bearish" in lowered:
+        return "negative"
+    if "neutral" in lowered:
+        return "neutral"
+    return ""
 
 
-def render_document(record: dict[str, Any]) -> str:
-    """Assemble pre_text / table / post_text into the prompt's context block."""
+def extract_sentiment(response: str) -> str:
+    """Pull one sentiment label out of a response, or "" if there is none.
 
-    def join(value: Any) -> str:
-        if isinstance(value, (list, tuple)):
-            return " ".join(str(part).strip() for part in value if str(part).strip())
-        return str(value or "").strip()
-
-    parts = []
-    pre_text = join(record.get("pre_text"))
-    if pre_text:
-        parts.append(pre_text)
-    table = render_table(record.get("table") or record.get("table_ori"))
-    if table:
-        parts.append("Table:\n" + table)
-    post_text = join(record.get("post_text"))
-    if post_text:
-        parts.append(post_text)
-    return "\n\n".join(parts)
-
-
-def build_prompt(document: str, question: str, history: str = "") -> str:
-    """Render the eval prompt. Module level so probes measure the real thing."""
-
-    blocks = [INSTRUCTION_PREFIX, f"Report:\n{document}"]
-    if history:
-        blocks.append(f"Previous questions and answers:\n{history}")
-    blocks.append(f"Question: {question}")
-    return "\n\n".join(blocks)
-
-
-def _percent_involved(*texts: str) -> bool:
-    return any("%" in (text or "") for text in texts)
-
-
-def answer_matches(
-    prediction: str | None, gold_text: str, gold_value: float | None, rel_tol: float
-) -> bool:
-    """Numeric comparison with a percent-scale retry, falling back to strings.
-
-    Non-numeric answers do exist (a handful of FinQA rows answer "yes"/"no"), so
-    anything that will not parse as a number is handed to the MATH string
-    equivalence check -- conservative, in that it can only withhold credit.
+    The first line is searched before the whole response: a trained model answers
+    with the bare label, while a base model writes a paragraph that may mention
+    other classes on the way ("this is not negative, it is positive"). Within a
+    scope the last mention wins, which is what resolves that construction.
     """
 
-    if not prediction:
-        return False
-    predicted_value = to_number(prediction)
-    if gold_value is None:
-        gold_value = to_number(gold_text)
-
-    if predicted_value is not None and gold_value is not None:
-        if numbers_close(predicted_value, gold_value, rel_tol):
-            return True
-        # See the module docstring: only a percent sign on one side licenses the
-        # rescale, so this cannot rescue an answer that is merely off by 100x.
-        if _percent_involved(prediction, gold_text):
-            for scaled in (predicted_value / 100.0, predicted_value * 100.0):
-                if numbers_close(scaled, gold_value, rel_tol):
-                    return True
-        return False
-    return is_equiv(prediction, gold_text)
+    boxed = extract_answer(response)
+    text = (boxed or response).strip()
+    if not text:
+        return ""
+    for scope in (text.splitlines()[0], text):
+        hits = _SENTIMENT_WORD.findall(scope)
+        if hits:
+            return normalize_label(hits[-1])
+    return ""
 
 
 def load_records(path: str) -> list[dict[str, Any]]:
@@ -163,20 +116,131 @@ def load_records(path: str) -> list[dict[str, Any]]:
     return []
 
 
-class _FinanceMetric:
-    """Shared decode/score/report body. Subclasses only build the example list."""
+def macro_f1(pairs: list[tuple[str, str]]) -> float:
+    """Unweighted mean of the per-class F1 scores.
+
+    Averaged over the classes the *gold* actually uses, not over all three:
+    FiQA-SA's polarity scores are almost never exactly zero, so its gold set is
+    effectively two-class, and including an absent class would cap the score at
+    2/3 for reasons that have nothing to do with the model.
+
+    Unparsed predictions are "" and therefore count as a false negative for
+    their gold class and nothing else, which is the same convention accuracy
+    uses: an answer the grader cannot find was not given.
+    """
+
+    present = [label for label in LABELS if any(gold == label for gold, _ in pairs)]
+    if not present:
+        return 0.0
+
+    scores = []
+    for label in present:
+        true_positive = sum(1 for gold, pred in pairs if gold == label and pred == label)
+        false_positive = sum(1 for gold, pred in pairs if gold != label and pred == label)
+        false_negative = sum(1 for gold, pred in pairs if gold == label and pred != label)
+        precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else 0.0
+        recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else 0.0
+        scores.append(
+            2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        )
+    return sum(scores) / len(scores)
+
+
+class _SentimentMetric:
+    """Shared body for the three sentiment sets: render, decode, extract, score.
+
+    Subclasses only declare where the sentence and the gold label live, because
+    every mirror spells those differently while the task is identical.
+    """
 
     name = ""
     data_path_keys: tuple[str, ...] = ()
-
-    def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-        raise NotImplementedError
+    instruction = NEWS_INSTRUCTION
+    # query last: on the TheFinAI mirrors it holds a fully rendered prompt, which
+    # would put a second instruction inside ours.
+    text_keys: tuple[str, ...] = ("text", "sentence", "tweet", "input", "query")
+    label_keys: tuple[str, ...] = ("answer", "label", "sentiment", "gold", "output")
+    # Only consulted when the label arrives as a bare integer and the row carries
+    # no `choices` column to resolve it against.
+    int_labels: dict[int, str] = {}
 
     def data_path(self, cfg: dict[str, Any]) -> str:
         for key in self.data_path_keys:
             if cfg.get(key):
                 return str(cfg[key])
         return ""
+
+    def sentence(self, record: dict[str, Any]) -> str:
+        for key in self.text_keys:
+            value = str(record.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    def gold(self, record: dict[str, Any]) -> str:
+        # choices[gold] first: the FinBen-style mirrors ship the label names in
+        # the row itself, which beats any mapping table we could hardcode.
+        choices = record.get("choices")
+        if isinstance(choices, (list, tuple)) and choices:
+            for key in ("gold", "label", "answer"):
+                value = record.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(choices):
+                    label = normalize_label(choices[value])
+                    if label:
+                        return label
+
+        for key in self.label_keys:
+            if key not in record:
+                continue
+            value = record[key]
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                label = normalize_label(self.int_labels.get(value, ""))
+            elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+                label = normalize_label(self.int_labels.get(int(value.strip()), ""))
+            else:
+                label = normalize_label(value)
+            if label:
+                return label
+
+        # FiQA-SA publishes a polarity score in [-1, 1] instead of a class. Sign
+        # is the dataset's own definition of the class boundary; any other
+        # threshold would be one we invented.
+        score = record.get("score")
+        if isinstance(score, str):
+            try:
+                score = float(score.strip())
+            except ValueError:
+                score = None
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            if score > 0:
+                return "positive"
+            if score < 0:
+                return "negative"
+            return "neutral"
+        return ""
+
+    def build_prompt(self, sentence: str) -> str:
+        # Same shape as the training rows: instruction, newline, sentence.
+        return f"{self.instruction}\n{sentence}"
+
+    def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        examples: list[dict[str, Any]] = []
+        for index, record in enumerate(load_records(self.data_path(cfg))):
+            sentence = self.sentence(record)
+            gold = self.gold(record)
+            if not sentence or not gold:
+                continue
+            examples.append(
+                {
+                    "id": record.get("id", record.get("_id", index)),
+                    "sentence": sentence,
+                    "prompt": self.build_prompt(sentence),
+                    "gold": gold,
+                }
+            )
+        return examples
 
     def run(self, model, tokenizer, device, cfg: dict[str, Any]) -> dict[str, Any]:
         output_dir = Path(cfg["output_dir"])
@@ -185,7 +249,6 @@ class _FinanceMetric:
         max_new_tokens = int(
             cfg.get("finance_max_new_tokens", cfg.get("max_new_tokens", 1024))
         )
-        rel_tol = float(cfg.get("finance_rel_tol", 0.01) or 0.01)
         run_name = cfg.get("run_name", "base")
 
         examples = self.load_examples(cfg)
@@ -205,21 +268,21 @@ class _FinanceMetric:
 
         correct = 0
         parsed = 0
+        pairs: list[tuple[str, str]] = []
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
             for example, response in zip(examples, responses):
-                prediction = extract_answer(response)
-                is_correct = answer_matches(
-                    prediction, example["gold_text"], example["gold_value"], rel_tol
-                )
+                prediction = extract_sentiment(response)
+                is_correct = bool(prediction) and prediction == example["gold"]
                 correct += int(is_correct)
                 parsed += int(bool(prediction))
+                pairs.append((example["gold"], prediction))
                 file.write(
                     json.dumps(
                         {
                             "id": example.get("id", ""),
-                            "question": example["question"],
-                            "gold": example["gold_text"],
+                            "sentence": example["sentence"],
+                            "gold": example["gold"],
                             "prediction": prediction,
                             "correct": is_correct,
                             "response": response,
@@ -237,9 +300,10 @@ class _FinanceMetric:
             "num_examples": len(examples),
             "correct": correct,
             "accuracy": correct / total,
-            # Rows where nothing was boxed. A base model that reasons in prose
-            # and never boxes would score zero here for reasons that have nothing
-            # to do with finance, so the two numbers have to be read together.
+            "macro_f1": macro_f1(pairs),
+            # Rows where no label could be found. Counted as wrong in accuracy,
+            # so a base model that refuses the format has to be read through this
+            # number rather than through accuracy alone.
             "parse_rate": parsed / total,
             "output_dir": str(output_dir),
         }
@@ -256,146 +320,36 @@ class _FinanceMetric:
         return summary
 
 
-class FinQAMetric(_FinanceMetric):
-    """FinQA test split (1147 questions over S&P 500 filing pages)."""
+class FPBMetric(_SentimentMetric):
+    """Financial PhraseBank test split (970 sentences, ~60% neutral)."""
 
-    name = "finqa"
-    data_path_keys = ("finqa_data_path", "data_path")
-
-    def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-        examples: list[dict[str, Any]] = []
-        for index, record in enumerate(load_records(self.data_path(cfg))):
-            document = render_document(record)
-            # The qa block is "qa" in the original release but "qa_0"/"qa_1" on
-            # pages carrying two questions. The HuggingFace mirror
-            # (dreamerdeo/finqa) instead flattens question/answers to the top
-            # level and drops exe_ans entirely, so a flat row is its own block.
-            blocks = [record[key] for key in ("qa", "qa_0", "qa_1") if isinstance(record.get(key), dict)]
-            if not blocks and isinstance(record.get("question"), str):
-                blocks = [record]
-            for block_index, block in enumerate(blocks):
-                question = str(block.get("question", "")).strip()
-                # "answers" (plural) is the mirror's spelling. Reading only
-                # "answer" would leave every gold empty and score a clean 0.
-                gold_text = str(block.get("answer") or block.get("answers") or "").strip()
-                gold_value = block.get("exe_ans")
-                gold_value = float(gold_value) if isinstance(gold_value, (int, float)) else None
-                if not question or (not gold_text and gold_value is None):
-                    continue
-                examples.append(
-                    {
-                        "id": f"{record.get('id', index)}#{block_index}",
-                        "question": question,
-                        "prompt": build_prompt(document, question),
-                        "gold_text": gold_text,
-                        "gold_value": gold_value,
-                    }
-                )
-        return examples
+    name = "fpb"
+    data_path_keys = ("fpb_data_path", "data_path")
+    instruction = NEWS_INSTRUCTION
+    int_labels = {0: "negative", 1: "neutral", 2: "positive"}
 
 
-class ConvFinQAMetric(_FinanceMetric):
-    """ConvFinQA dev: FinQA pages turned into multi-turn dialogues.
+class FiQASAMetric(_SentimentMetric):
+    """FiQA-2018 Task 1 sentiment test split (235 headlines and posts).
 
-    Every turn is scored as its own row, and the turns before it are supplied
-    with their **gold** answers rather than the model's. Feeding the model its own
-    earlier answers would let one early arithmetic slip corrupt the rest of the
-    conversation, so a single mistake would cost several rows and the score would
-    partly measure conversation length. Teacher forcing keeps each turn an
-    independent question, which is how the set is normally reported.
-
-    Two file layouts are accepted, because the release ships both and which one
-    gets downloaded is a coin flip:
-
-    * ``dev_turn.json`` (1490 rows) is already one row per turn, carrying
-      ``cur_dial`` (the questions up to and including this one) and ``exe_ans``.
-      Preferred -- the turn boundaries are the authors', not ours.
-    * ``dev.json`` (421 conversations) needs expanding through
-      ``annotation.dialogue_break`` and ``annotation.exe_ans_list``.
+    The release grades a continuous polarity score; the three-way class comes
+    from its sign. See ``_SentimentMetric.gold``.
     """
 
-    name = "convfinqa"
-    data_path_keys = ("convfinqa_data_path", "data_path")
+    name = "fiqasa"
+    data_path_keys = ("fiqasa_data_path", "data_path")
+    instruction = NEWS_INSTRUCTION
+    int_labels = {0: "negative", 1: "neutral", 2: "positive"}
 
-    def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-        examples: list[dict[str, Any]] = []
-        for index, record in enumerate(load_records(self.data_path(cfg))):
-            document = render_document(record)
-            annotation = record.get("annotation")
-            annotation = annotation if isinstance(annotation, dict) else {}
-            # In the released dev_turn.json the turn fields sit under
-            # "annotation", not at the top level. The top-level qa block there is
-            # the conversation's *source* FinQA question and is byte-identical on
-            # every turn of that conversation, so reading it would score all 1490
-            # rows against only 421 distinct golds -- and silently, since every
-            # field it needs is present and well-formed.
-            dialogue = record.get("cur_dial") or annotation.get("cur_dial")
-            if isinstance(dialogue, (list, tuple)) and dialogue:
-                gold = record.get("exe_ans")
-                if gold is None:
-                    gold = annotation.get("exe_ans")
-                turn = record.get("turn_ind", annotation.get("turn_ind", 0))
-                example = self._from_turn_row(record, document, index, dialogue, gold, turn)
-                if example:
-                    examples.append(example)
-                continue
-            examples.extend(self._from_conversation_row(record, document, index))
-        return examples
 
-    @staticmethod
-    def _from_turn_row(
-        record: dict[str, Any],
-        document: str,
-        index: int,
-        dialogue: Any,
-        gold: Any,
-        turn: Any,
-    ) -> dict[str, Any] | None:
-        question = str(dialogue[-1]).strip()
-        if not question or gold is None:
-            return None
-        # cur_dial holds this turn's question as its last element; the rest is
-        # context. Their gold answers are not on a turn row, so history is the
-        # question thread alone -- enough to resolve "and in 2018?" style
-        # references, which is what the earlier turns are there for.
-        history = "\n".join(f"Q: {str(part).strip()}" for part in dialogue[:-1])
-        # A handful of turns give exe_ans as a string ("yes", "12.5%").
-        value = float(gold) if isinstance(gold, (int, float)) else to_number(str(gold))
-        return {
-            "id": f"{record.get('id', index)}#turn{turn}",
-            "question": question,
-            "prompt": build_prompt(document, question, history),
-            "gold_text": str(gold),
-            "gold_value": value,
-        }
+class TFNSMetric(_SentimentMetric):
+    """Twitter Financial News Sentiment validation split (2388 tweets).
 
-    @staticmethod
-    def _from_conversation_row(
-        record: dict[str, Any], document: str, index: int
-    ) -> list[dict[str, Any]]:
-        annotation = record.get("annotation")
-        if not isinstance(annotation, dict):
-            return []
-        questions = annotation.get("dialogue_break") or []
-        golds = annotation.get("exe_ans_list") or []
-        if not questions or len(golds) < len(questions):
-            return []
+    The validation split, not test: the released test split has no labels. Its
+    classes are Bearish / Bullish / Neutral, mapped in ``normalize_label``.
+    """
 
-        rows: list[dict[str, Any]] = []
-        history: list[str] = []
-        for turn, raw_question in enumerate(questions):
-            question = str(raw_question).strip()
-            gold = golds[turn]
-            gold_text = str(gold)
-            if question:
-                rows.append(
-                    {
-                        "id": f"{record.get('id', index)}#turn{turn}",
-                        "question": question,
-                        "prompt": build_prompt(document, question, "\n".join(history)),
-                        "gold_text": gold_text,
-                        "gold_value": float(gold) if isinstance(gold, (int, float)) else None,
-                    }
-                )
-            history.append(f"Q: {question}\nA: {gold_text}")
-        return rows
+    name = "tfns"
+    data_path_keys = ("tfns_data_path", "data_path")
+    instruction = TWEET_INSTRUCTION
+    int_labels = {0: "negative", 1: "positive", 2: "neutral"}

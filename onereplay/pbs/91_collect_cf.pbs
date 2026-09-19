@@ -11,9 +11,9 @@
 # =============================================================================
 # NUS Hopper: specialist 的 C / Fisher 采集（continual 阶段的输入）
 #
-# 90 号的下游。90 号产出 M_math / M_medical，本脚本在其中**一个** specialist 上，
-# 用**它自己那个域**的训练池，采出 C 和对角 F。这两份东西是下一阶段
-# （M_math -> Medical 之类）正则化项的全部输入。
+# 90 号的下游。90 号产出 M_medical / M_finance / M_code，本脚本在其中**一个**
+# specialist 上，用**它自己那个域**的训练池，采出 C 和对角 F。这两份东西是下一阶段
+# （M_medical -> Code 之类）正则化项的全部输入。
 #
 # 只采集和诊断。不训练、不混合、不评测。
 #
@@ -32,8 +32,8 @@
 # -----------------------------------------------------------------------------
 # !! C 和 F 必须同池，所以两边都走 POOL_SAMPLES 子集
 #   F 是逐样本反向的（对 batch 求和的梯度平方是 (Σg)² 而不是 Σg²，所以
-#   collect_fisher 里 batch_size 写死 1）。math 池 10 万行，按下面估的
-#   1.2 s/行 要 33 小时，walltime 放不下，而 F 没有断点续采。
+#   collect_fisher 里 batch_size 写死 1）。三个池分别是 34k / 77k / 75k 行，全池按
+#   下面估的 0.3 s/行 要 3 到 6 小时以上，而 F 没有断点续采。
 #
 #   于是 F 只能取子集。而一旦 F 取子集、C 用全池，两者就不再是"同一批旧知识"，
 #   后面 EWC 臂和 OneReplay 臂的差别里就混进了"谁看的数据多"这个变量。C 本来
@@ -45,34 +45,46 @@
 #   要改就 C 和 F 一起重采，改一半等于两份不同源。
 #
 # -----------------------------------------------------------------------------
-# POOL_SAMPLES=10000 的依据，以及为什么**两个域取同一个数**
+# POOL_SAMPLES=10000 的依据，以及为什么**三个域取同一个数**
 #   C 按 token 平均（collect_cov 末尾 cov_sum / counts），F 按样本平均
 #   （fisher.py finalize 里 total / num_examples）。两者都是均值不是求和，所以
 #   采多少行**不影响 C/F 的量级**，只影响估计方差 —— λ 网格因此在域之间可比，
-#   这是下面敢给两个域取同一个数的前提。
+#   这是下面敢给三个域取同一个数的前提。
 #
-#   C：每行贡献几百个 assistant token，10000 行约 9e6 个受监督 token。最大的
-#      矩阵是 down_proj 的 9728²，过采样约 925 倍；其余层 d=2560，3500 倍。
-#      估 d×d 协方差要求 n≫d，这个余量下 5000 行都够，C 不是限制因素。
+#   C：--cov_supervision assistant_only，所以进 C 的 token 数 = 采到的
+#      **response** token 数，而这三个域的 response 长度差了两个数量级：
+#
+#        medical  每行几十到上百 token   -> 10000 行约 5e5，d=8960 的 50 倍以上
+#        code     每行几百 token         -> 更充足
+#        finance  每行 1-3 个标签词       -> 10000 行只有约 2e4，d=8960 的 2 倍出头
+#
+#      C 只当惩罚度量用、不需要可逆，所以薄不等于错；但 finance 那份 C 的估计方差
+#      明显大于另外两个域，**它的 λ 起点不要直接照搬**。Step 3 会把每层的
+#      tokens_seen 打出来，看一眼再定。真要加厚就把 finance 的 POOL_SAMPLES 调大
+#      （C 和 F 必须一起调，见上一段），代价是三个域不再是同一个样本量。
 #
 #   F：按样本平均，而逐样本梯度是长尾的，有效样本远少于名义样本。按历史 gold
 #      数据 0.336 的 ESS 比例，10000 行约合 3400 有效样本，对角元素相对误差
 #      约 1.7%。**F 才是限制因素**，所以 Step 3 把 effective_sample_size 打出来，
 #      拿实测值判断要不要加量，别照搬这里的估算。
 #
-#   为什么不按池子比例缩放（math 100k 取 20k、medical 37k 取 10k 之类）：决定
-#   估计质量的是绝对样本量，不是占池比例，而 10000 在两个域都过了收敛线。取
-#   不同的数只会多出一个没有收益、却要解释的自由度。
+#   为什么不按池子比例缩放（大池取 20k、小池取 10k 之类）：决定估计质量的是绝对
+#   样本量，不是占池比例，而 10000 在三个域都过了收敛线。取不同的数只会多出一个
+#   没有收益、却要解释的自由度。
 #
-#   medical 的池是 ~9500 题 x ~3.9 traces。采 10000 行是 27% 的**行**，但覆盖
-#   1-(1-0.27)^3.9 ≈ 70% 的**题** —— 同一道题有多条 trace 可以被采中。激活的
-#   主方向由题目决定，70% 足够。
+#   三个池分别是 33,955 / 76,772 / Magicoder 在 1216 下的保留数，10000 行是其中
+#   29% / 13% / 约 15% —— 覆盖率不同不影响上面那条结论：决定估计质量的是绝对样本量。
 #
 # -----------------------------------------------------------------------------
 # !! 三个值必须和 90 号逐字相同，否则 C/F 保护的东西和训练的东西对不上
-#   MAXLEN          4096      —— 短了 C/F 就只覆盖了序列的一部分
-#   TARGET_MODULES  含 lm_head —— regularizer 对找不到 C 的层是**静默跳过**的
-#   SYSTEM_PROMPT   逐字      —— system turn 进 chat template，激活跟着变
+#   MAXLEN          1216      —— 短了 C/F 就只覆盖了序列的一部分
+#   TARGET_MODULES  含 lm_head —— regularizer 对找不到 C 的层是**静默跳过**的。
+#                   注意 Qwen2.5-1.5B 是 tie_word_embeddings=true，lm_head.weight
+#                   和 embed_tokens.weight 是同一个张量，所以约束它等于连输入嵌入
+#                   一起约束。功能上不报错，Step 3 的覆盖断言会确认它被采到；第一
+#                   次跑完比一下它的 tr(C)/d 和 mean(F) 与其他层差几个量级再决定要
+#                   不要摘掉（摘掉就是三域一起重采）。
+#   SYSTEM_PROMPT   逐字（空） —— system turn 进 chat template，激活跟着变
 #
 #   Step 0 会把 SYSTEM_PROMPT 和 data/stats/{domain}_stats.json 里记的那条对表，
 #   不等就退出。TARGET_MODULES 的覆盖数在 Step 3 断言。
@@ -85,25 +97,25 @@
 #
 # -----------------------------------------------------------------------------
 # 默认 WHAT=both，一次投完
-#   F 逐样本反向，在 POOL_SAMPLES=10000 下约 3.3 小时（按 1.2 s/样本估），
-#   加上 C 的不到 1 小时，离 36 小时的 walltime 很远，没有拆开投的必要。
+#   F 逐样本反向，在 POOL_SAMPLES=10000 下约 50 分钟（按 0.3 s/样本估），
+#   加上 C 的十几分钟，离 36 小时的 walltime 很远，没有拆开投的必要。
 #
 #   Step 0 会按 ETA_MS_PER_EXAMPLE 估 F 的耗时并和 walltime 比，只警告不拦。
 #   真值看 collect_fisher 每 LOG_EVERY 条打印的 ms/example，拿它回来校准再投
 #   下一个域。只有把 POOL_SAMPLES 调大到预估逼近 walltime 时才需要拆：
-#   qsub -v DOMAIN=math,WHAT=cov ... 和 qsub -v DOMAIN=math,WHAT=fisher ...
+#   qsub -v DOMAIN=medical,WHAT=cov ... 和 qsub -v DOMAIN=medical,WHAT=fisher ...
 #
 # -----------------------------------------------------------------------------
 # 投递
 #   DRY_RUN=1 先看计划：
-#     qsub -v DOMAIN=math,DRY_RUN=1 onereplay/pbs/91_collect_cf.pbs
+#     qsub -v DOMAIN=medical,DRY_RUN=1 onereplay/pbs/91_collect_cf.pbs
 #   正式采（分两次）：
-#     qsub -v DOMAIN=math,WHAT=cov    onereplay/pbs/91_collect_cf.pbs
-#     qsub -v DOMAIN=math,WHAT=fisher onereplay/pbs/91_collect_cf.pbs
+#     qsub -v DOMAIN=medical,WHAT=cov    onereplay/pbs/91_collect_cf.pbs
+#     qsub -v DOMAIN=medical,WHAT=fisher onereplay/pbs/91_collect_cf.pbs
 #   在 base 上采：
-#     qsub -v DOMAIN=math,SRC=base,WHAT=cov onereplay/pbs/91_collect_cf.pbs
+#     qsub -v DOMAIN=medical,SRC=base,WHAT=cov onereplay/pbs/91_collect_cf.pbs
 #   只跑诊断：
-#     qsub -v DOMAIN=math,WHAT=none onereplay/pbs/91_collect_cf.pbs
+#     qsub -v DOMAIN=medical,WHAT=none onereplay/pbs/91_collect_cf.pbs
 #
 # 投递前要有
 #   1) 90 号 MODE=train 的 checkpoint（SRC=specialist 时）
@@ -221,10 +233,10 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 cd "${REPO_ROOT}"
 
 case "${DOMAIN}" in
-  math|medical|code|finance) ;;
+  medical|finance|code) ;;
   *)
-    echo "必须指定 DOMAIN=math|medical|code，当前 '${DOMAIN}'"
-    echo "  例: qsub -v DOMAIN=math,WHAT=cov onereplay/pbs/91_collect_cf.pbs"
+    echo "必须指定 DOMAIN=medical|finance|code，当前 '${DOMAIN}'"
+    echo "  例: qsub -v DOMAIN=medical,WHAT=cov onereplay/pbs/91_collect_cf.pbs"
     exit 2
     ;;
 esac
@@ -235,10 +247,10 @@ esac
 
 # ---- 模型 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
-MODEL_NAME="${MODEL_NAME:-Qwen3-4B-Base}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-1.5B-Instruct}"
 # 必须和 90 号那一行**逐字相同**，否则 SRC=specialist 找不到 checkpoint。曾经
 # 这里写的是 ${REPO_ROOT}/results/specialist，而 90 号按领域和模型名分目录，于是
-# 90 号存到 results_specialist_medical_Qwen3-4B-Base/checkpoints/，91 号去
+# 90 号存到 results_specialist_medical_Qwen2.5-1.5B-Instruct/checkpoints/，91 号去
 # results/specialist/checkpoints/ 找，报"找不到采集对象"。
 # 改这一行就要同时改 90 号，test_code/check_cf_pbs_flags.py 会比对两边。
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_specialist_${DOMAIN}_${MODEL_NAME}}"
@@ -247,22 +259,12 @@ CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 # ---- 训练侧口径：必须和 90 号逐字相同，见文件头 ----
 LR="${LR:-5e-5}"
 SEED="${SEED:-42}"
-MAXLEN="${MAXLEN:-4096}"
+MAXLEN="${MAXLEN:-1216}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
 
-# 见 90 号文件头：不能写成 ${SYSTEM_PROMPT:-...\boxed{}.}，参数展开会在 \boxed{}
-# 自己那个 } 上提前收尾，实得 "\boxed{.}"。用独立赋值绕开，单引号防反斜杠再被吃一层。
-#
-# 两条、按 DOMAIN 选，和 90 号训练侧同一套规则：code 那一臂是用 code 那条训的，
-# stats 里记的也是它，拿 boxed 来采会直接被下面 Step 0 的守卫挡掉（exit 4）。
-SYSTEM_PROMPT_BOXED='Please reason step by step, and put your final answer within \boxed{}.'
-SYSTEM_PROMPT_CODE='Please reason step by step, and put your final code in a Python code block.'
-if [[ -z "${SYSTEM_PROMPT:-}" ]]; then
-  case "${DOMAIN}" in
-    code) SYSTEM_PROMPT="${SYSTEM_PROMPT_CODE}" ;;
-    *)    SYSTEM_PROMPT="${SYSTEM_PROMPT_BOXED}" ;;
-  esac
-fi
+# 三域统一为空，和 90 号训练侧同一个值。stats 里记的也是空串，下面 Step 0 的守卫按
+# 哨兵区分"字段缺失"和"字段是空串"，所以空值一样会被校验，不会被当成老 stats 放过。
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 
 # ---- 采哪个 checkpoint ----
 case "${SRC}" in
@@ -315,7 +317,9 @@ export HF_DATASETS_CACHE="${DATASET_CACHE}"
 # C：hook 内部一律升 fp32 再累加，所以前向 bf16 不影响结果，只省显存和时间。
 COV_USE_BF16="${COV_USE_BF16:-1}"
 COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
-COV_BATCH="${COV_BATCH:-2}"
+# 只前向、无梯度，1216 x 1.5B 下这个值很宽松。C 是按 token 平均的，batch 只影响
+# 速度和显存，不影响结果（和 F 的 batch_size=1 不同，那个是数学上的要求）。
+COV_BATCH="${COV_BATCH:-8}"
 # F：梯度在到达累加器之前就被反向舍入过了，bf16 的 8 位尾数给每个平方梯度留约
 # 1% 的噪声底，事后加宽救不回来。所以这里是 fp32，别为了提速改成 1。
 FISHER_USE_BF16="${FISHER_USE_BF16:-0}"
@@ -325,9 +329,10 @@ LOG_EVERY="${LOG_EVERY:-500}"
 DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
 DRY_RUN="${DRY_RUN:-1}"
 FORCE="${FORCE:-0}"
-# 1.2 s/样本是 8B @ 512 token 的实测值。4B 权重减半、这里的平均长度约翻倍，
-# 两个因子大致抵消，所以先沿用。第一次跑完拿实测 ms/example 回来改。
-ETA_MS_PER_EXAMPLE="${ETA_MS_PER_EXAMPLE:-1200}"
+# 1.2 s/样本是 8B @ 512 token 的实测值。现在是 1.5B @ ≤1216 token，权重小了 5 倍、
+# 长度大了约 2 倍，先按 300 ms 估（比线性缩放保守）。第一次跑完拿 collect_fisher 打
+# 印的实测 ms/example 回填 —— 它只影响 Step 0 的耗时预警，估错不会改变采集结果。
+ETA_MS_PER_EXAMPLE="${ETA_MS_PER_EXAMPLE:-300}"
 WALLTIME_HOURS="${WALLTIME_HOURS:-36}"
 
 mkdir -p "${COV_DIR}" "${FISHER_DIR}" "${DATASET_CACHE}"
@@ -346,7 +351,7 @@ echo "  采集对象 = ${SRC_MODEL_DIR}/${SRC_MODEL_NAME}   (SRC=${SRC})"
 echo "  语料     = ${POOL_JSONL}"
 echo "             子集 ${POOL_SAMPLES} 行 / seed ${SAMPLE_SEED} / maxlen ${MAXLEN}"
 echo "  层覆盖   = ${TARGET_MODULES}"
-echo "  system   = ${SYSTEM_PROMPT}"
+echo "  system   = '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system）"
 echo "  C        = ${COV_PATH}"
 echo "             bf16=${COV_USE_BF16} accum=${COV_ACCUM_DEVICE} batch=${COV_BATCH}"
 echo "  F        = ${FISHER_PATH}"
@@ -375,26 +380,32 @@ echo "==== Step 0: 前置检查 ===="
 
 # SYSTEM_PROMPT 一致性：和 90 号训练前那道守卫同源。system turn 进 chat template，
 # 它一变整个序列的激活就变，采出来的 C 保护的就不是训练时那个模型的行为。
+# 现在这个值是空串，所以"读到空"不能再当成"老版本 stats"放过去 —— 那样这道守卫就永
+# 远不触发了。哨兵把"字段不存在"和"字段是空串"分开（不用 \0：命令替换会丢 NUL）。
+STATS_MISSING='<<<NO_SYSTEM_FIELD>>>'
+export STATS_MISSING
 STATS_SYSTEM="$(python - <<'PY'
 import json, os
-path = os.environ["POOL_STATS"]
-if os.path.isfile(path):
-    with open(path, encoding="utf-8") as handle:
+missing = os.environ["STATS_MISSING"]
+# 读失败也打哨兵而不是让解释器崩：崩了命令替换就是空串，而空串正是本该被校验的
+# 那个值，守卫会静默判成"一致"。
+try:
+    with open(os.environ["POOL_STATS"], encoding="utf-8") as handle:
         meta = json.load(handle).get("metadata", {})
-    print(meta.get("system_prompt", ""), end="")
-else:
-    print("", end="")
+    print(meta.get("system_prompt", missing), end="")
+except Exception:
+    print(missing, end="")
 PY
 )"
-if [[ -n "${STATS_SYSTEM}" && "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
+if [[ "${STATS_SYSTEM}" == "${STATS_MISSING}" ]]; then
+  echo "!! ${POOL_STATS} 里没有 system_prompt，跳过一致性校验（老版本的 stats）"
+elif [[ "${STATS_SYSTEM}" != "${SYSTEM_PROMPT}" ]]; then
   echo "拒绝采集：SYSTEM_PROMPT 和数据准备时用的不一致。"
-  echo "  数据 (${POOL_STATS}): ${STATS_SYSTEM}"
-  echo "  本次采集            : ${SYSTEM_PROMPT}"
+  echo "  数据 (${POOL_STATS}): '${STATS_SYSTEM}'"
+  echo "  本次采集            : '${SYSTEM_PROMPT}'"
   echo "  system turn 会进 chat template，它一变激活就变，C/F 保护的就不是训练"
   echo "  时那个模型的行为了。"
   exit 4
-elif [[ -z "${STATS_SYSTEM}" ]]; then
-  echo "!! ${POOL_STATS} 里没有 system_prompt，跳过一致性校验（老版本的 stats）"
 else
   echo "system prompt 与 ${POOL_STATS} 一致"
 fi

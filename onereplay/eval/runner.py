@@ -73,15 +73,16 @@ def get_metric(name: str) -> Metric:
         "amc": "onereplay.eval.metrics.math500:AMCMetric",
         "minervamath": "onereplay.eval.metrics.math500:MinervaMathMetric",
         # Specialist-line domains. Every trained model is scored on all three
-        # (math / medical / finance), so these are not optional extras: a run that
+        # (medical / finance / code), so these are not optional extras: a run that
         # only reports its own domain answers "did it learn?" and says nothing
         # about "did it forget?".
         "medqa": "onereplay.eval.metrics.medical:MedQAMetric",
-        "medxpertqa": "onereplay.eval.metrics.medical:MedXpertQAMetric",
         "pubmedqa": "onereplay.eval.metrics.medical:PubMedQAMetric",
-        "finqa": "onereplay.eval.metrics.finance:FinQAMetric",
-        "convfinqa": "onereplay.eval.metrics.finance:ConvFinQAMetric",
-        "tatqa": "onereplay.eval.metrics.tatqa:TATQAMetric",
+        "medmcqa": "onereplay.eval.metrics.medical:MedMCQAMetric",
+        "careqa": "onereplay.eval.metrics.medical:CareQAMetric",
+        "fpb": "onereplay.eval.metrics.finance:FPBMetric",
+        "fiqasa": "onereplay.eval.metrics.finance:FiQASAMetric",
+        "tfns": "onereplay.eval.metrics.finance:TFNSMetric",
     }
     if name not in registry:
         raise ValueError(f"Unknown metric {name!r}. Choose from: {sorted(registry)}")

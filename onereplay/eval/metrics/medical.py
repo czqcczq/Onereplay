@@ -1,40 +1,17 @@
-"""Medical evaluation: MedQA, PubMedQA, MedXpertQA.
+"""Medical evaluation: MedQA, PubMedQA, MedMCQA, CareQA.
 
-All three are multiple choice and all three are graded by pulling one token out
-of ``\\boxed{...}``, which is the contract the Medical specialist was trained on
-(prepare_medical rewrites ``<answer>E</answer>`` to ``\\boxed{E}`` for exactly
-this reason). Math and Finance end in a boxed answer too, so one extractor
-grades all three domains -- necessary because these models are evaluated against
-each other for forgetting, and a grader that happened to be stricter on one
-domain would be indistinguishable from a model that forgot it.
+Four sets, one harness: decode once, extract one token, score. Three are option
+letters and PubMedQA is yes/no/maybe.
 
-What each set is for
---------------------
-MedQA is the **in-domain** set: the specialist trains on the train split of this
-same corpus, so its prompt is imported from prepare_medical rather than rebuilt
-here. A reworded eval prompt would measure how well the model tolerates a new
-surface form, not how much medicine it knows, and the forgetting curves would
-inherit that confound.
+The prompts do not ask for \\boxed{} any more. The Medical specialist now trains
+on Medical Meadow flashcards, which answer in plain prose with no CoT and no
+boxed span, so a boxed contract would be a format the trained model was never
+taught -- and the base model would fail it for reasons that have nothing to do
+with medicine. The prompts instead ask for the bare answer, and extraction still
+accepts a boxed one so an old checkpoint remains gradable.
 
-PubMedQA is out-of-domain: yes/no/maybe over a PubMed abstract, so it tests
-whether the medical ability generalizes past USMLE-style vignettes.
-
-MedXpertQA is a **difficulty ruler, not a forgetting metric**. Ten options, so
-chance is 10%, and the paper's own table has Qwen2.5-32B at 15.06% -- a 4B model
-sits close enough to chance that a drop of a few points says nothing about what
-it forgot. It is reported because "how far is this model from expert level" is
-worth knowing; it must not be read as retention.
-
-Why parse_rate is reported next to accuracy
--------------------------------------------
-The base model is scored on these sets too, and a base model that answers
-correctly in prose but never writes ``\\boxed{}`` would score zero. That is not
-a measurement of medical knowledge, it is a measurement of format compliance,
-and it would inflate every "training helped" delta and corrupt the forgetting
-baseline. So extraction falls back to a few explicit answer-statement patterns,
-and the fraction of rows that yielded any answer is reported. A run whose
-accuracy looks bad should be checked against its parse_rate before it is
-believed.
+parse_rate is reported next to accuracy because unparsed rows count as wrong: an
+accuracy that looks bad has to be checked against it before it is believed.
 """
 
 from __future__ import annotations
@@ -47,39 +24,44 @@ from typing import Any
 
 from onereplay.eval.generation import batched_generate, resolve_batch_size
 from onereplay.eval.metrics.math500 import extract_answer, load_json_records
-from onereplay.scripts.domain_sft.prepare_medical import build_question, gold_letter
 
-# Fallbacks for a response that never boxed anything. Deliberately anchored on an
-# explicit answer statement: a looser rule ("any capital letter near the end")
-# would fire on "option D is wrong because ..." and award credit the model never
-# claimed. Ordered most-specific first; the last match in the text wins, since
-# models restate the answer after reconsidering.
+# Anchored on an explicit answer statement: a looser "any capital letter near the
+# end" would fire on "option D is wrong because ..." and award credit the model
+# never claimed. The last match wins, since models restate after reconsidering.
 _ANSWER_STATEMENT = re.compile(
     r"(?:final\s+answer|answer|choice|option)\s*(?:is|:)\s*\**\s*\(?([A-J])\)?\b",
     re.IGNORECASE,
 )
-_TRAILING_LETTER = re.compile(r"\b([A-J])\b[\s.)\]]*$")
+# A response that opens with the bare answer -- "C", "C.", "(C) Nitrofurantoin",
+# "**C**". The trailing delimiter is required so "A is wrong, ..." does not match A.
+_LEADING_LETTER = re.compile(r"^\s*\**\s*\(?([A-J])\)?\**\s*(?:[.:,)\]]|$|\n)")
+_TRAILING_LETTER = re.compile(r"\b([A-J])\b[\s.)\]*]*$")
 _DECISION_STATEMENT = re.compile(
     r"(?:final\s+answer|answer|decision)\s*(?:is|:)\s*\**\s*(yes|no|maybe)\b",
     re.IGNORECASE,
 )
-_TRAILING_DECISION = re.compile(r"\b(yes|no|maybe)\b[\s.!)\]]*$", re.IGNORECASE)
+_LEADING_DECISION = re.compile(r"^\s*\**\s*(yes|no|maybe)\b", re.IGNORECASE)
+_TRAILING_DECISION = re.compile(r"\b(yes|no|maybe)\b[\s.!)\]*]*$", re.IGNORECASE)
+
+
+def _unwrap_boxed(boxed: str) -> str:
+    """Strip the LaTeX wrappers a boxed answer arrives in."""
+
+    return re.sub(r"\\(?:text|mathrm|mathbf)\s*\{([^{}]*)\}", r"\1", boxed)
 
 
 def extract_choice(response: str, valid: str) -> str:
     """Pull a single option letter out of a response, or "" if there is none.
 
-    ``valid`` is the live option set ("ABCDE" for MedQA, "ABCDEFGHIJ" for
-    MedXpertQA); a letter outside it is treated as no answer rather than as a
-    wrong one, so a model that writes prose containing a stray "F" on a 5-option
-    question is not recorded as having answered F.
+    ``valid`` is the live option set ("ABCD" for MedMCQA, "ABCDE" for MedQA); a
+    letter outside it is treated as no answer rather than as a wrong one, so a
+    model writing prose containing a stray "F" on a 4-option question is not
+    recorded as having answered F.
     """
 
     boxed = extract_answer(response)
     if boxed:
-        # \boxed{E}, \boxed{\text{E}}, \boxed{E: Nitrofurantoin} all appear.
-        cleaned = re.sub(r"\\(?:text|mathrm|mathbf)\s*\{([^{}]*)\}", r"\1", boxed)
-        letter = cleaned.strip().strip("()$ ").upper()[:1]
+        letter = _unwrap_boxed(boxed).strip().strip("()$ ").upper()[:1]
         if letter in valid:
             return letter
 
@@ -88,9 +70,10 @@ def extract_choice(response: str, valid: str) -> str:
         if candidate.upper() in valid:
             return candidate.upper()
 
-    tail = _TRAILING_LETTER.search(response.strip())
-    if tail and tail.group(1).upper() in valid:
-        return tail.group(1).upper()
+    for pattern in (_LEADING_LETTER, _TRAILING_LETTER):
+        hit = pattern.search(response.strip())
+        if hit and hit.group(1).upper() in valid:
+            return hit.group(1).upper()
     return ""
 
 
@@ -99,16 +82,18 @@ def extract_decision(response: str) -> str:
 
     boxed = extract_answer(response)
     if boxed:
-        cleaned = re.sub(r"\\(?:text|mathrm|mathbf)\s*\{([^{}]*)\}", r"\1", boxed)
-        token = cleaned.strip().strip("().$ ").lower()
+        token = _unwrap_boxed(boxed).strip().strip("().$ ").lower()
         if token in ("yes", "no", "maybe"):
             return token
 
     matches = _DECISION_STATEMENT.findall(response)
     if matches:
         return matches[-1].lower()
-    tail = _TRAILING_DECISION.search(response.strip())
-    return tail.group(1).lower() if tail else ""
+    for pattern in (_LEADING_DECISION, _TRAILING_DECISION):
+        hit = pattern.search(response.strip())
+        if hit:
+            return hit.group(1).lower()
+    return ""
 
 
 def field(record: dict[str, Any], *names: str, default: Any = "") -> Any:
@@ -152,11 +137,57 @@ def normalize_options(raw: Any) -> list[str]:
             options.append(f"{key}: {value}")
         else:
             text = str(item).strip()
-            # Already "A: text"? Leave it; prepare_medical emits options verbatim
-            # and the training prompt has to be reproduced character for character.
             options.append(text if re.match(r"^[A-J]\s*[:.)]", text) else
                            f"{chr(ord('A') + index)}: {text}")
     return options
+
+
+# MedMCQA spells its options opa/opb/opc/opd, CareQA op1..op4. Both are read by
+# pattern rather than by a per-dataset field list, because the two mirrors differ
+# only in that suffix and a missing spelling yields an empty option set, which
+# skips every row and reports a clean 0.0.
+_OPTION_KEY = re.compile(r"^op(?:tion)?[_\s]?([a-e]|[1-5])$", re.IGNORECASE)
+_GOLD_INDEX_KEYS = ("cop", "correct_option", "answer_index", "answer_idx")
+
+
+def spread_options(record: dict[str, Any]) -> list[str]:
+    """Collect ``op*`` columns into ``["A: text", ...]`` in their natural order."""
+
+    found: list[tuple[str, str]] = []
+    for key, value in record.items():
+        match = _OPTION_KEY.match(str(key))
+        text = str(value or "").strip()
+        if match and text:
+            found.append((match.group(1).lower(), text))
+    found.sort(key=lambda item: item[0])
+    return [f"{chr(ord('A') + index)}: {text}" for index, (_, text) in enumerate(found)]
+
+
+def gold_index(record: dict[str, Any]) -> int | None:
+    """The gold option as an integer, under whichever column carries it."""
+
+    for key in _GOLD_INDEX_KEYS:
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
+def index_base(records: list[dict[str, Any]]) -> int:
+    """Whether the gold index column counts from 0 or from 1.
+
+    Decided once from the whole column, not per row: MedMCQA's ``cop`` is
+    0-based and CareQA's is 1-based, and guessing per row would silently shift
+    every answer by one on one of them. A 0 anywhere in the column settles it --
+    a 1-based column cannot contain one.
+    """
+
+    values = [value for value in (gold_index(record) for record in records) if value is not None]
+    return 0 if values and min(values) == 0 else 1
 
 
 def resolve_gold_letter(record: dict[str, Any], options: list[str]) -> str:
@@ -168,20 +199,37 @@ def resolve_gold_letter(record: dict[str, Any], options: list[str]) -> str:
             return value
 
     answer = str(record.get("answer", "")).strip()
-    letter = gold_letter(answer)
-    if letter:
-        return letter
+    head = re.match(r"^([A-J])\s*[:.)]", answer.upper())
+    if head:
+        return head.group(1)
+    if len(answer) == 1 and answer.upper().isalpha():
+        return answer.upper()
     # Gold given as the option *text* ("Nitrofurantoin"): match it back to a letter.
     if answer:
         for option in options:
-            head, _, body = option.partition(":")
+            prefix, _, body = option.partition(":")
             if body.strip().lower() == answer.lower():
-                return head.strip().upper()[:1]
+                return prefix.strip().upper()[:1]
     return ""
 
 
+def render_mcq(stem: str, options: list[str]) -> str:
+    """The one multiple-choice prompt all three MCQ sets use.
+
+    Shared so a difference between two medical numbers cannot come from the
+    prompt. No \\boxed{} instruction: see the module docstring.
+    """
+
+    body = "\n".join(option.strip() for option in options if option and option.strip())
+    return (
+        "Answer the following multiple-choice medical question.\n\n"
+        f"Question: {stem.strip()}\n\nOptions:\n{body}\n\n"
+        "Answer with the option letter only."
+    )
+
+
 class _ChoiceMetric:
-    """Shared body for the three medical sets: decode once, extract, score.
+    """Shared body for the four medical sets: decode once, extract, score.
 
     Subclasses supply the data loader and the prompt; everything below the
     prompt -- decoding, extraction, the responses.jsonl, the summary, the
@@ -192,18 +240,17 @@ class _ChoiceMetric:
     name = ""
     data_path_keys: tuple[str, ...] = ()
     valid_letters = "ABCDE"
-    # Set on MedXpertQA. Carried into the summary so a reader who finds the row
-    # in a forgetting table knows the number does not belong there.
-    ruler_only = False
 
     def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     def build_prompt(self, example: dict[str, Any]) -> str:
-        raise NotImplementedError
+        return example["prompt"]
 
-    def extract(self, response: str) -> str:
-        return extract_choice(response, self.valid_letters)
+    def extract(self, response: str, example: dict[str, Any]) -> str:
+        # Per-example valid set: CareQA rows do not all carry the same number of
+        # options, and a letter outside a row's own set is not an answer.
+        return extract_choice(response, example.get("valid") or self.valid_letters)
 
     def data_path(self, cfg: dict[str, Any]) -> str:
         for key in self.data_path_keys:
@@ -240,7 +287,7 @@ class _ChoiceMetric:
         response_path = output_dir / "responses.jsonl"
         with response_path.open("w", encoding="utf-8") as file:
             for example, response in zip(examples, responses):
-                prediction = self.extract(response)
+                prediction = self.extract(response, example)
                 is_correct = bool(prediction) and prediction == example["gold"]
                 correct += int(is_correct)
                 parsed += int(bool(prediction))
@@ -273,8 +320,6 @@ class _ChoiceMetric:
             "parse_rate": parsed / total,
             "output_dir": str(output_dir),
         }
-        if self.ruler_only:
-            summary["ruler_only"] = 1
         (output_dir / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -289,12 +334,7 @@ class _ChoiceMetric:
 
 
 class MedQAMetric(_ChoiceMetric):
-    """MedQA 5-option test split (1273 USMLE questions). In-domain.
-
-    The prompt is prepare_medical.build_question, imported rather than copied:
-    the specialist saw that exact string on every one of its training rows, and
-    two copies of a prompt drift the moment either side is edited.
-    """
+    """MedQA 5-option test split (1273 USMLE questions)."""
 
     name = "medqa"
     data_path_keys = ("medqa_data_path", "data_path")
@@ -313,73 +353,71 @@ class MedQAMetric(_ChoiceMetric):
             examples.append(
                 {
                     "id": record.get("id", record.get("qid", index)),
-                    "prompt": build_question(stem, options),
+                    "prompt": render_mcq(stem, options),
                     "gold": gold,
+                    "valid": "".join(chr(ord("A") + i) for i in range(len(options))),
                 }
             )
         return examples
 
-    def build_prompt(self, example: dict[str, Any]) -> str:
-        return example["prompt"]
 
-
-class MedXpertQAMetric(_ChoiceMetric):
-    """MedXpertQA Text (2450 questions, options A-J). Difficulty ruler only.
-
-    Chance is 10% and Qwen2.5-32B scores 15.06% in the source paper, so for a 4B
-    model the spread between "knows some medicine" and "guessing" is a couple of
-    points. Reported for the ceiling it marks, excluded from retention claims --
-    see ``ruler_only`` in the summary.
-    """
-
-    name = "medxpertqa"
-    data_path_keys = ("medxpertqa_data_path", "data_path")
-    valid_letters = "ABCDEFGHIJ"
-    ruler_only = True
-
-    # The dataset's `question` field already ends with the option block, so
-    # re-emitting `options` under it would show the model every choice twice.
-    _HAS_OPTIONS = re.compile(r"^\s*A[\s.:)]", re.MULTILINE)
+class _IndexedMCQMetric(_ChoiceMetric):
+    """MedMCQA and CareQA: options in ``op*`` columns, gold as an integer index."""
 
     def load_examples(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        records = [
+            record for record in load_json_records(self.data_path(cfg)) if isinstance(record, dict)
+        ]
+        base = index_base(records)
         examples: list[dict[str, Any]] = []
-        for index, record in enumerate(load_json_records(self.data_path(cfg))):
-            if not isinstance(record, dict):
+        for index, record in enumerate(records):
+            stem = str(field(record, "question", "Question")).strip()
+            options = spread_options(record) or normalize_options(
+                field(record, "options", "choices", default=None)
+            )
+            if not stem or len(options) < 2:
                 continue
-            stem = str(record.get("question", "")).strip()
-            options = normalize_options(record.get("options"))
-            gold = resolve_gold_letter(record, options)
-            if not stem or not gold:
-                continue
-            if self._HAS_OPTIONS.search(stem):
-                body = stem
-            elif options:
-                body = f"{stem}\n\nOptions:\n" + "\n".join(options)
+
+            position = gold_index(record)
+            if position is not None:
+                position -= base
+                gold = chr(ord("A") + position) if 0 <= position < len(options) else ""
             else:
+                gold = resolve_gold_letter(record, options)
+            if not gold:
                 continue
             examples.append(
                 {
-                    "id": record.get("id", index),
-                    "prompt": (
-                        "Answer the following multiple-choice medical question. "
-                        "Reason step by step, then give the final answer as "
-                        "\\boxed{...} at the end.\n\nQuestion: " + body
-                    ),
+                    "id": field(record, "id", "qid", "unique_id", default=index),
+                    "prompt": render_mcq(stem, options),
                     "gold": gold,
+                    "valid": "".join(chr(ord("A") + i) for i in range(len(options))),
                 }
             )
         return examples
 
-    def build_prompt(self, example: dict[str, Any]) -> str:
-        return example["prompt"]
+
+class MedMCQAMetric(_IndexedMCQMetric):
+    """MedMCQA validation split (4183 AIIMS/NEET-PG questions, 4 options).
+
+    The validation split, not test: the released test split has no labels.
+    """
+
+    name = "medmcqa"
+    data_path_keys = ("medmcqa_data_path", "data_path")
+    valid_letters = "ABCD"
+
+
+class CareQAMetric(_IndexedMCQMetric):
+    """CareQA English split (Spanish MIR-style healthcare exams, 4 options)."""
+
+    name = "careqa"
+    data_path_keys = ("careqa_data_path", "data_path")
+    valid_letters = "ABCD"
 
 
 class PubMedQAMetric(_ChoiceMetric):
     """PubMedQA PQA-L (1000 expert-labeled): yes/no/maybe over an abstract.
-
-    Graded through the same boxed contract as the other two so the specialist is
-    not asked to produce a format it was never trained on -- the answer token is
-    a word instead of a letter, which is all that changes.
 
     The label distribution is skewed toward "yes", so a model that answers yes to
     everything lands around 55%. Read this set as a floor check, not as a ranking.
@@ -429,13 +467,9 @@ class PubMedQAMetric(_ChoiceMetric):
             body = str(context or "")
         return (
             "Answer the following biomedical research question using the abstract "
-            "below. Reason step by step, then give the final answer as "
-            "\\boxed{yes}, \\boxed{no}, or \\boxed{maybe} at the end.\n\n"
-            f"Abstract:\n{body.strip()}\n\nQuestion: {question}"
+            f"below.\n\nAbstract:\n{body.strip()}\n\nQuestion: {question}\n\n"
+            "Answer yes, no, or maybe."
         )
 
-    def build_prompt(self, example: dict[str, Any]) -> str:
-        return example["prompt"]
-
-    def extract(self, response: str) -> str:
+    def extract(self, response: str, example: dict[str, Any]) -> str:
         return extract_decision(response)

@@ -4,6 +4,7 @@
 
 Available metrics: ifeval, ifbench, followbench, multiif, commonsense,
 commonsense_qa, gsm8k, aime, math500, amc, minervamath, humaneval, mbpp,
+humanevalplus, mbppplus, medqa, pubmedqa, medmcqa, careqa, fpb, fiqasa, tfns,
 dialogsum, direct_safety. Each metric writes
 <out_dir>/<metric>/<run_name>/summary.json plus an appended row in
 <out_dir>/<metric>_summary.csv.
@@ -186,27 +187,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--question_field", type=str, default="")
     parser.add_argument("--answer_field", type=str, default="")
 
-    # medical: MedQA is in-domain for the Medical specialist (it trains on the
-    # train split of this corpus); the other two are out-of-domain. MedXpertQA is
-    # reported as a difficulty ruler only -- 10 options, chance 10%, and
-    # Qwen2.5-32B scores 15% in the source paper, so a few points of movement
-    # there is noise and must not be read as forgetting.
+    # medical: four multiple-choice sets. None is in-domain in the strict sense --
+    # the specialist trains on Medical Meadow flashcards, which are free-form --
+    # so all four measure transfer of medical knowledge rather than format.
     parser.add_argument("--medqa_data_path", type=str, default="")
-    parser.add_argument("--medxpertqa_data_path", type=str, default="")
     parser.add_argument("--pubmedqa_data_path", type=str, default="")
+    parser.add_argument("--medmcqa_data_path", type=str, default="")
+    parser.add_argument("--careqa_data_path", type=str, default="")
     parser.add_argument("--medical_max_new_tokens", type=int, default=1024)
     parser.add_argument("--medical_batch_size", type=int, default=0)
 
-    # finance: FinQA and ConvFinQA grade the executed numeric answer; TAT-QA uses
-    # the official EM/F1, which folds the answer together with its scale.
-    parser.add_argument("--finqa_data_path", type=str, default="")
-    parser.add_argument("--convfinqa_data_path", type=str, default="")
-    parser.add_argument("--tatqa_data_path", type=str, default="")
+    # finance: three-way sentiment classification, which is what the Finance
+    # specialist trains on. FPB and FiQA-SA are news, TFNS is tweets.
+    parser.add_argument("--fpb_data_path", type=str, default="")
+    parser.add_argument("--fiqasa_data_path", type=str, default="")
+    parser.add_argument("--tfns_data_path", type=str, default="")
     parser.add_argument("--finance_max_new_tokens", type=int, default=1024)
     parser.add_argument("--finance_batch_size", type=int, default=0)
-    # Golds are rounded quantities ("11.1%" for a true 11.1349%), so equality
-    # would fail on correct answers.
-    parser.add_argument("--finance_rel_tol", type=float, default=0.01)
     parser.add_argument("--humaneval_data_file", type=str, default="")
     parser.add_argument("--mbpp_dataset_path", type=str, default="")
     # EvalPlus. Both are parquet files: humanevalplus has the same columns as
