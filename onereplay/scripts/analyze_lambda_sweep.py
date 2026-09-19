@@ -60,6 +60,7 @@ class Point:
     lambda_reg: float  # lambda * R
     old_val: dict[str, float] = field(default_factory=dict)
     old_val_start: dict[str, float] = field(default_factory=dict)
+    val_loss_start: float | None = None
     updates: int = 0
 
     @property
@@ -110,6 +111,12 @@ def read_point(path: Path) -> Point | None:
         lambda_reg=float(last.get("train_lambda_reg") or 0.0),
         old_val=old_val,
         old_val_start=start,
+        # The untrained checkpoint's own val_loss. Without it "d val is ~0 across
+        # three decades of lambda" has two readings that look identical: every
+        # lambda is free, or no arm is learning the new task in the first place.
+        val_loss_start=(
+            float(baseline["val_loss"]) if baseline.get("val_loss") is not None else None
+        ),
         updates=int(last.get("total_updates") or 0),
     )
 
@@ -194,6 +201,35 @@ def main() -> None:
         print()
         print("old_val at the untrained starting point (the 100%-recovered line): "
               + ", ".join(f"{name}={value:.4f}" for name, value in sorted(zero.old_val_start.items())))
+        # recovered% divides by how much the unregularized run forgot. When that
+        # is small the ratio is unstable, and when an arm lands below the starting
+        # point the "fraction of forgetting undone" framing has been left behind
+        # entirely. Both happen, and both silently make the column unreadable.
+        for domain in domains:
+            start = zero.old_val_start.get(domain)
+            if start is None or domain not in zero.old_val:
+                continue
+            forgotten = zero.old_val[domain] - start
+            best = min(point.old_val[domain] for point in points if domain in point.old_val)
+            spread = zero.old_val[domain] - best
+            if forgotten <= 0:
+                print(f"  !! [{domain}] the unregularized run did not forget at all "
+                      f"({zero.old_val[domain]:.4f} vs {start:.4f} at the start), so recovered% "
+                      "has no denominator. Read the raw old_val column.")
+            elif spread > forgotten:
+                print(
+                    f"  !! [{domain}] recovered% overshoots 100% because the best arm "
+                    f"({best:.4f}) is *below* the starting checkpoint ({start:.4f}). That is no "
+                    "longer 'retained some of what vanilla lost' -- the old domain improved "
+                    "while the new one was learned. Report the raw loss and the transfer, not a "
+                    "retention percentage."
+                )
+            elif forgotten < 0.1 * max(abs(start), 1e-9):
+                print(
+                    f"  !! [{domain}] vanilla only forgot {forgotten:.4f} from a base of "
+                    f"{start:.4f}, so recovered% divides by a small number and swings wildly. "
+                    "Compare the raw old_val column instead."
+                )
 
     # ---- is the summary's extrapolation usable here ----
     print()
@@ -212,7 +248,59 @@ def main() -> None:
         else:
             print("  -> yes, R barely moved, so the linear estimate is in the right decade.")
 
+        # The gap between lambda=0 and the weakest swept lambda. R is quadratic in
+        # DeltaW, so an unconstrained R(0) is a runaway value and a single decade
+        # of lambda can cross most of the interesting range. If the first real
+        # point already sits near zero, the grid never looked at the transition.
+        weakest = min((point for point in points if point.lam > 0), key=lambda p: p.lam, default=None)
+        if weakest is not None and zero.reg:
+            first = weakest.reg / zero.reg
+            if first < 0.05:
+                print(
+                    f"  !! the weakest lambda swept ({weakest.lam:.3e}) already collapses R to "
+                    f"{first:.4f} of R(0). The whole transition from unconstrained to constrained "
+                    f"happens below {weakest.lam:.3e}, where there is not a single measurement. "
+                    "The low end is as unbracketed as the high end -- add points a decade or two "
+                    "further down before concluding the curve is monotone."
+                )
+
     # ---- where does the new task start paying ----
+    # ---- did the new task move at all ----
+    # This has to come before any statement about lambda being "free". If the
+    # untrained checkpoint already sits at the same val_loss every arm reaches,
+    # then d val ~= 0 everywhere means nothing is being learned, and the sweep
+    # measures only how well each lambda preserves a model that never moved.
+    print()
+    print("---- did the new task actually get learned?")
+    start_val = next((point.val_loss_start for point in points if point.val_loss_start), None)
+    if start_val is None:
+        print(
+            "  unknown: no baseline val_loss in these files. Re-run the sweep with "
+            "--eval_before_train 1 so every point records the untrained starting loss. "
+            "Until then 'lambda is free' cannot be distinguished from 'nothing is learning'."
+        )
+    else:
+        learned = start_val - min(point.val_loss for point in points)
+        span = max(point.val_loss for point in points) - min(point.val_loss for point in points)
+        print(f"  untrained val_loss = {start_val:.4f}; best arm = "
+              f"{min(point.val_loss for point in points):.4f} (learned {learned:+.4f})")
+        print(f"  spread across the swept lambdas = {span:.4f}")
+        if learned <= 0:
+            print(
+                "  !! no arm beat the untrained checkpoint. The new task is not being learned, "
+                "so nothing in this table is a lambda trade-off -- fix lr / steps / data first."
+            )
+        elif span < 0.1 * learned:
+            print(
+                f"  -> the new task moved {learned:.4f} while lambda moved val_loss only "
+                f"{span:.4f} ({span / learned:.1%} of it). So lambda genuinely is cheap over this "
+                "whole range, and the pick has to come from the retention column and the "
+                "benchmark, not from val_loss."
+            )
+        else:
+            print(f"  -> lambda moves val_loss by {span / learned:.1%} of what learning moved it, "
+                  "so the trade-off is visible in val_loss and worth reading there.")
+
     print()
     print("---- reading it")
     if zero is not None:
@@ -299,9 +387,16 @@ def main() -> None:
                     ),
                     best,
                 )
-                print(f"  [{domain}] knee at lambda={knee.lam:.3e}: within 10% of the best "
-                      "retention while keeping more plasticity -- prefer this unless the "
-                      "benchmark disagrees.")
+                if knee.lam == max(point.lam for point in usable):
+                    print(
+                        f"  [{domain}] no knee inside the grid: retention is still improving at "
+                        f"the largest lambda ({knee.lam:.3e}). That number is the grid edge, not "
+                        "an operating point -- extend upward until retention flattens."
+                    )
+                else:
+                    print(f"  [{domain}] knee at lambda={knee.lam:.3e}: within 10% of the best "
+                          "retention while keeping more plasticity -- prefer this unless the "
+                          "benchmark disagrees.")
     print()
     print("!! These are short-run numbers. DeltaW is still growing, so R keeps rising and "
           "task_loss keeps falling; the same lambda will sit at a higher lamR/task by the end "
