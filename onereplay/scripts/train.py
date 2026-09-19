@@ -19,6 +19,7 @@ import argparse
 import datetime
 import sys
 from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -282,6 +283,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--target_modules", type=str, default="q_proj,v_proj")
+
+    parser.add_argument(
+        "--osft",
+        type=int,
+        default=0,
+        help=(
+            "1 runs the OSFT baseline (arXiv:2504.07097) instead of a DeltaW penalty. "
+            "Every targeted 2D weight is replaced by its SVD, the top singular "
+            "directions are frozen as old knowledge, and both gradients and "
+            "parameters are projected into the orthogonal complement at each step. "
+            "The decomposition and the projections are executed out of the authors' "
+            "repository under baseline/mini_trainer; see onereplay/core/osft.py. "
+            "Requires --full_finetune 1 and is mutually exclusive with the penalty "
+            "arms, since it constrains DeltaW structurally rather than by a loss term."
+        ),
+    )
+    parser.add_argument(
+        "--osft_unfreeze_rank_ratio",
+        type=float,
+        default=-1.0,
+        help=(
+            "Fraction of each matrix's singular directions that train. This is "
+            "upstream's user-facing knob and runs in the protection direction you "
+            "would expect: 0.0 freezes every targeted matrix, 1.0 degenerates to "
+            "plain full fine-tuning, and their README's example is 0.25. It is the "
+            "method's only hyperparameter, so it plays the role --replay_lambda "
+            "plays for OneReplay and needs its own sweep. Required with --osft 1."
+        ),
+    )
+    parser.add_argument(
+        "--osft_target_patterns",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated layer-name patterns to decompose, e.g. "
+            "'self_attn.q_proj,mlp.down_proj'. Empty lets upstream resolve them from "
+            "the checkpoint path against its per-architecture table, which is what "
+            "their own runs do. Worth setting explicitly when the model path contains "
+            "a substring that collides with another architecture's key -- their "
+            "lookup scans the path and 'opt' is tested before 'qwen'."
+        ),
+    )
+    parser.add_argument(
+        "--osft_upcast_dtype",
+        type=str,
+        choices=["fp32", "fp64"],
+        default="fp32",
+        help=(
+            "Precision the SVD and the weight reconstruction run in. fp32 is "
+            "upstream's default; the factors themselves are stored in the training "
+            "dtype."
+        ),
+    )
 
     parser.add_argument(
         "--regularizer",
@@ -716,6 +770,84 @@ def build_regularizer(args: argparse.Namespace, device) -> ReplayRegularizer | E
     return regularizer
 
 
+def build_osft_factory(args: argparse.Namespace):
+    """A model_factory that swaps in the OSFT-decomposed class.
+
+    Returned as a closure rather than plumbed through the loader's signature so
+    that core/modeling.py stays unaware of OSFT, and so the OSFT arm still picks
+    up the loader's config munging, dtype and pad-token handling unchanged.
+    """
+
+    from onereplay.core.osft import build_osft_model, parse_target_patterns
+
+    patterns = parse_target_patterns(args.osft_target_patterns)
+    upcast_dtype = {"fp32": torch.float32, "fp64": torch.float64}[args.osft_upcast_dtype]
+
+    def factory(model_path, *, config, torch_dtype, tokenizer):
+        return build_osft_model(
+            model_path,
+            unfreeze_rank_ratio=args.osft_unfreeze_rank_ratio,
+            target_patterns=patterns,
+            torch_dtype=torch_dtype,
+            config=config,
+            upcast_dtype=upcast_dtype,
+            tokenizer=tokenizer,
+        )
+
+    return factory
+
+
+def validate_osft_args(args: argparse.Namespace) -> None:
+    """Refuse the combinations where an OSFT run would not be an OSFT run.
+
+    OSFT constrains DeltaW structurally: it deletes each targeted weight and
+    replaces it with SVD factors whose frozen half is never updated. That makes
+    it incompatible with the two things this script otherwise does.
+
+    LoRA, because PEFT wraps a base layer whose `weight` no longer exists.
+
+    The DeltaW penalties, because snapshot_reference_weights reads
+    module.weight off every covered Linear to freeze W0, which now raises -- and
+    because stacking a second constraint on top would produce a run that is
+    neither baseline. Combining them may be worth measuring one day, but it
+    cannot be the arm labelled OSFT in a comparison table.
+    """
+
+    if args.osft != 1:
+        if args.osft_unfreeze_rank_ratio >= 0:
+            raise ValueError(
+                "--osft_unfreeze_rank_ratio was set but --osft is 0, so nothing would read "
+                "it and the run would silently be a vanilla one. Pass --osft 1."
+            )
+        return
+
+    if args.osft_unfreeze_rank_ratio < 0:
+        raise ValueError(
+            "--osft 1 requires --osft_unfreeze_rank_ratio. It is the method's only "
+            "hyperparameter (fraction of singular directions that train, 0.25 in "
+            "upstream's README) and has no defensible default, the same way "
+            "--replay_lambda has none."
+        )
+    if args.full_finetune != 1:
+        raise ValueError(
+            "--osft 1 requires --full_finetune 1. OSFT replaces each targeted weight "
+            "with SVD factors and removes the original parameter, so there is no "
+            "base_layer.weight for a LoRA adapter to wrap."
+        )
+    if args.replay_lambda > 0:
+        raise ValueError(
+            "--osft 1 with --replay_lambda > 0 would apply the subspace constraint and a "
+            "DeltaW penalty at once, which is neither baseline. Run them as separate arms."
+        )
+    if args.replay_ratio > 0 or args.replay_per_batch > 0 or args.replay_steps_per_update > 0:
+        raise ValueError(
+            "--osft 1 with replay mixing enabled would be an OSFT+replay combination, not "
+            "the OSFT baseline. Run them as separate arms."
+        )
+    if args.paradigm != "sft":
+        raise ValueError("--osft 1 is only defined for --paradigm sft")
+
+
 def main() -> None:
     args = parse_args()
     print("the file is " + str(Path(__file__).resolve()))
@@ -724,6 +856,7 @@ def main() -> None:
         print(f"\t{attr.upper()}={value}")
     set_seed(args.seed)
     configure_system_prompt(args.system_prompt)
+    validate_osft_args(args)
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     model, tokenizer = load_causal_lm_and_tokenizer(
@@ -731,6 +864,7 @@ def main() -> None:
         args.model_name,
         args.use_bf16,
         args,
+        model_factory=build_osft_factory(args) if args.osft == 1 else None,
     )
     target_modules = [item.strip() for item in args.target_modules.split(",") if item.strip()]
     if args.full_finetune == 1:
@@ -747,7 +881,16 @@ def main() -> None:
         model.to(device)
         model.print_trainable_parameters()
 
-    regularizer = build_regularizer(args, device)
+    osft_record: dict[str, Any] = {}
+    if args.osft == 1:
+        from onereplay.core.osft import describe_osft
+
+        osft_record = describe_osft(model, args.osft_unfreeze_rank_ratio)
+
+    # validate_osft_args already refused a penalty on this arm; skipping the load
+    # entirely also keeps C off the device, since measure_replay_when_lambda_zero
+    # would otherwise pull it in just to report a number no longer being applied.
+    regularizer = None if args.osft == 1 else build_regularizer(args, device)
     if args.full_finetune == 1 and regularizer is not None:
         # The snapshot has to be taken before the first optimizer step, and
         # after .to(device) so DeltaW never crosses devices mid-training.
@@ -924,6 +1067,13 @@ def main() -> None:
         filter(lambda parameter: parameter.requires_grad, model.parameters()),
         lr=args.lr,
     )
+    if args.osft == 1:
+        from onereplay.core.osft import wrap_optimizer
+
+        # Before the scheduler is built: an LRScheduler patches optimizer.step
+        # with its own call counter, and it has to sit outside the projections so
+        # that one step() is still one scheduler tick.
+        optimizer = wrap_optimizer(optimizer, model)
 
     # The schedule advances once per optimizer update, not once per micro-batch,
     # so its horizon has to be counted in the same unit the trainer steps in.
@@ -1113,6 +1263,11 @@ def main() -> None:
             "warmup_ratio": args.warmup_ratio,
             "warmup_updates": warmup_updates if args.lr_scheduler != "constant" else 0,
             "total_updates": total_updates,
+            "osft": args.osft,
+            # Realized ranks and the upstream commit they came out of. Absent on
+            # every non-OSFT run, which keeps their records byte-identical to the
+            # ones already in results_log.
+            **osft_record,
         },
         save_path=args.save_path if args.save == 1 else "",
         tokenizer=tokenizer,

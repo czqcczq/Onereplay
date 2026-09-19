@@ -29,13 +29,14 @@ E_old ||scale * B A x||^2 / ||W x||^2
 ```text
 onereplay/
 ├── core/         regularizer.py  covariance.py  fisher.py  modeling.py
+│                 osft.py        glue onto the vendored OSFT baseline
 │                                                             framework-agnostic kernel
 ├── data/         chat.py  commonsense.py  old_knowledge.py  replay.py  probe.py
 ├── trainers/     base.py  sft.py  opd.py                      shared loop + two paradigms
 ├── eval/         runner.py  generation.py  metrics/           one model load, many metrics
 ├── scripts/      collect_cov.py  collect_fisher.py  generate_replay_targets.py
 │                 train.py  evaluate.py  check_old_knowledge_pool.py
-│                 compare_cov_scale.py                        the only CLI entry points
+│                 compare_cov_scale.py  check_osft.py         the only CLI entry points
 ├── legacy/       archived single-purpose scripts, not on the active path
 ├── slurm/        01..27 cluster jobs
 ├── pbs/          01..33 the same jobs for the PBS + Singularity cluster
@@ -176,6 +177,75 @@ matters here specifically: EWC-LoRA (arXiv 2602.17559) reports that a
 precomputed fixed Fisher has the lowest plasticity of the variants it tried, so
 a retention gain that comes from failing to learn the new task is the failure
 mode to rule out.
+
+### The OSFT baseline: a constraint instead of a penalty
+
+OSFT (Orthogonal Subspace Fine-Tuning, arXiv:2504.07097) is the third
+regularization-family baseline. It sits in the same place as OneReplay and EWC --
+it restricts `DeltaW` -- but it does so structurally rather than through a loss
+term. Each targeted 2D weight is replaced by its SVD, the top `k` singular
+directions are frozen as old knowledge, and both the gradient and the parameters
+are projected into the orthogonal complement of that subspace at every optimizer
+step:
+
+```text
+W = U_high S_high V_high^T + U_low S_low V_low^T     (U_high, S_high, V_high frozen)
+dU_low <- dU_low - U_high (U_high^T dU_low)
+dV_low <- dV_low - (dV_low V_high^T) V_high
+```
+
+The one thing to flag when reporting it: **OSFT needs no old data at all.** Where
+`C` and `F` are estimated on an old-knowledge pool, OSFT reads its notion of
+importance out of the weight matrix's own spectrum. That is a different
+assumption, not a detail, and belongs in the table as its own column.
+
+```bash
+python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+  --dataset_path /path/to/new_domain_hf \
+  --osft 1 --osft_unfreeze_rank_ratio 0.25 \
+  --save_path results/ckpt/cs_osft_urr0.25_seed1
+```
+
+`--osft_unfreeze_rank_ratio` is the fraction of each matrix's singular directions
+that trains, and it is the method's only hyperparameter, so it plays the role
+`--replay_lambda` plays for the other two and needs its own sweep. It runs in the
+direction you would expect: 0.0 freezes everything, 1.0 degenerates to plain full
+fine-tuning. Upstream's own example is 0.25.
+
+Three constraints are enforced by `train.py` rather than left to a run to
+discover:
+
+* `--full_finetune 1` is required. OSFT deletes each targeted `weight` parameter
+  and replaces the module's forward, so there is no `base_layer.weight` for a
+  LoRA adapter to wrap.
+* `--replay_lambda > 0` and any replay mixing are refused. Either would produce
+  an OSFT-plus-something arm, which is neither baseline.
+* Peak host memory during loading is roughly twice the checkpoint, because
+  upstream's non-distributed loader holds the base model and the decomposed model
+  at once; the SVD factors then roughly double the resident size again, since a
+  `(N, M)` matrix becomes `U (N, R) + S (R) + V (R, M)` with `R = min(N, M)`.
+  Budget for that before picking a model size.
+
+Every line of the method runs out of the authors' repository, kept as an
+unmodified clone at `baseline/mini_trainer` and imported rather than copied --
+see the header of `onereplay/core/osft.py` for the pinned commit and for the two
+places where our call order had to be stated explicitly. Before spending cluster
+time, run both checks:
+
+```bash
+# No GPU, no checkpoint: the decomposition math and our glue.
+python test_code/check_osft_integration.py
+
+# Needs a checkpoint: step-0 logit parity against the plain model, the frozen
+# factors really being frozen, and a save/reload round trip.
+python -m onereplay.scripts.check_osft \
+  --model_dir /home/weiliu1/huggingface/models/ --model_name Qwen3-1.7B \
+  --osft_unfreeze_rank_ratio 0.25
+```
+
+The end-to-end guard is a training run at `--osft_unfreeze_rank_ratio 1.0`: it
+freezes nothing, so its loss curve has to land on the vanilla arm's. If it does
+not, the integration is wrong and no other OSFT number is trustworthy.
 
 On-policy distillation against a frozen same-family teacher:
 

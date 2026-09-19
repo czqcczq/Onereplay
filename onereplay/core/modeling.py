@@ -35,11 +35,21 @@ def load_causal_lm_and_tokenizer(
     model_name: str,
     use_bf16: int,
     extra_config: Any | None = None,
+    model_factory: Any | None = None,
 ):
     """Load the base causal LM and tokenizer used by both stages.
 
     extra_config is usually argparse.Namespace. We copy its fields into the
     HuggingFace config to preserve the behavior of your vanilla_lora.py.
+
+    model_factory replaces the AutoModelForCausalLM call for arms that need a
+    different class behind the same checkpoint -- currently only OSFT, which
+    trains an SVD-factored subclass. It is called as
+    factory(model_path, config=..., torch_dtype=..., tokenizer=...) and must
+    return a causal LM. Routing that arm through here rather than giving it its
+    own loader is what keeps the config munging, the dtype and the pad-token
+    handling identical across arms, so the decomposition stays the only
+    difference between them.
     """
 
     model_weight = join_model_path(model_dir, model_name)
@@ -51,11 +61,19 @@ def load_causal_lm_and_tokenizer(
 
     tokenizer = AutoTokenizer.from_pretrained(model_weight, padding_side="left")
     dtype = torch.bfloat16 if use_bf16 == 1 else None
-    model = AutoModelForCausalLM.from_pretrained(
-        model_weight,
-        config=config,
-        torch_dtype=dtype,
-    )
+    if model_factory is None:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_weight,
+            config=config,
+            torch_dtype=dtype,
+        )
+    else:
+        model = model_factory(
+            model_weight,
+            config=config,
+            torch_dtype=dtype,
+            tokenizer=tokenizer,
+        )
 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
