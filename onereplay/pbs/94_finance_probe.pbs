@@ -263,7 +263,7 @@ val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
 # 2e-4 是刻意选大的，见文件头第 3 条：这条线要的是一个够狠的遗忘分母。
-LR="${LR:-2e-4}"
+LR="${LR:-8e-5}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 # BATCH 是显存参数，ACCUM 才是"每次更新多少行"（accum_steps = ACCUM / BATCH）。

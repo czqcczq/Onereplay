@@ -374,7 +374,7 @@ CODE_VIEW_PREFIX="${CODE_VIEW_PREFIX:-opc_edu_ccode_20k}"
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
 # 与 94 号同值。2e-4 对全量微调偏大，是为了造出足够的遗忘，见 94 号文件头第 3 条。
-LR="${LR:-2e-4}"
+LR="${LR:-8e-5}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH="${BATCH:-8}"
