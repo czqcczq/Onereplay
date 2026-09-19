@@ -14,17 +14,22 @@
 #   # 一次性：建数据（CPU 即可，登录节点跑更快）
 #   qsub -v DRY_RUN=0,MODE=data onereplay/pbs/97_trace_continual.pbs
 #
-#   # 配置 A（先跑）：每任务 1 epoch、lr 1e-4
+#   # 配置 A（先跑）：每任务 1 epoch、lr 1e-4。一次投完，约 10 小时
+#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=all onereplay/pbs/97_trace_continual.pbs
+#
+#   # 想分开投也可以，三步的含义与 MODE=all 内部的顺序完全一致
 #   qsub -v DRY_RUN=0,CONFIG=fast,MODE=base_eval  onereplay/pbs/97_trace_continual.pbs
 #   qsub -v DRY_RUN=0,CONFIG=fast,MODE=chain      onereplay/pbs/97_trace_continual.pbs
 #   qsub -v DRY_RUN=0,CONFIG=fast,MODE=final_eval onereplay/pbs/97_trace_continual.pbs
 #
-#   # 配置 B：官方 5,3,7,5,3,5,5,7、lr 1e-5。切两段投，见第 5 条
+#   # 配置 B：官方 5,3,7,5,3,5,5,7、lr 1e-5。约 19 小时，MODE=all 顶得住但余量不多，
+#   # 想稳一点就切两段，见第 5 条
+#   qsub -v DRY_RUN=0,CONFIG=official,MODE=all onereplay/pbs/97_trace_continual.pbs
 #   qsub -v DRY_RUN=0,CONFIG=official,MODE=chain,START_STAGE=1,END_STAGE=4 onereplay/pbs/97_trace_continual.pbs
 #   qsub -v DRY_RUN=0,CONFIG=official,MODE=chain,START_STAGE=5            onereplay/pbs/97_trace_continual.pbs
 #
 #   # 冒烟：每个 test 只评前 20 题，每个训练集只取 200 行
-#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=chain,LIMIT=20,MAX_TRAIN_SAMPLES=200 onereplay/pbs/97_trace_continual.pbs
+#   qsub -v DRY_RUN=0,CONFIG=fast,MODE=all,LIMIT=20,MAX_TRAIN_SAMPLES=200 onereplay/pbs/97_trace_continual.pbs
 #
 # -----------------------------------------------------------------------------
 # 1. 这条线要回答两个互相独立的问题
@@ -97,8 +102,12 @@
 # 保留，它是后面证明 Cmath/Ccode 保护有效的对照组。
 #
 # !! 代价：per-stage 的 TRACE test 必须和训练在同一个 job 内联
-# 下一阶段会覆盖这一阶段的权重，事后补评不可能。所以 MODE=chain 是一个不可再分的
-# job；只有 base_eval（不需要 checkpoint）和 final_eval（读 final）能独立投。
+# 下一阶段会覆盖这一阶段的权重，事后补评不可能。所以 chain 本身是一个不可再分的
+# 单位；只有 base_eval（不需要 checkpoint）和 final_eval（读 final）能独立投。
+#
+# 这是"能不能拆"的约束，不是"必须拆"的要求 —— MODE=all 就是在一个 job 里依次做完
+# base_eval、chain、final_eval，三者本来就是连续的三步。拆开投的唯一理由是
+# walltime，见第 5 条。
 #
 # -----------------------------------------------------------------------------
 # 4. state.json 与断点续跑
@@ -110,14 +119,32 @@
 # 换 CONFIG 不会串：state 文件名带 CONFIG，槽位目录名也带。
 #
 # -----------------------------------------------------------------------------
-# 5. 时间预算
-# -----------
-#   CONFIG=fast      8 个 epoch 训练约 3 小时 + per-stage test 约 1.5 小时
-#   CONFIG=official  40 个 epoch 训练约 13 小时 + per-stage test 约 1.5 小时
+# 5. MODE 与时间预算
+# ------------------
+#   MODE=data        建八个训练池与八份 test，只需跑一次，与 CONFIG 无关
+#   MODE=base_eval   没训过的基座：六个通用 benchmark + 八个 TRACE test
+#   MODE=chain       八阶段顺序训练，每阶段训完立刻评已见过的任务
+#   MODE=final_eval  末阶段权重的六个通用 benchmark + 汇总
+#   MODE=all         上面三个评/训阶段依次做完（不含 data）
 #
-# official 在 24 小时 walltime 内但余量不多。用 END_STAGE 主动切段更稳：
-# START_STAGE=1 END_STAGE=4 与 START_STAGE=5 两段各约 7 小时。真被截断也不要紧，
-# state.json 让重投从断点继续。
+# 粗估，Llama-3.2-3B 单卡：
+#
+#                  base_eval   chain(训练)  chain(test)   final_eval   合计
+#   CONFIG=fast      ~2.5h        ~3h         ~1.5h         ~2.5h      ~10h
+#   CONFIG=official  ~2.5h       ~13h         ~1.5h         ~2.5h      ~19h
+#
+# fast 用 MODE=all 一次投完很舒服。official 的 19 小时在 24 小时 walltime 内但
+# 余量不多，想稳一点就用 END_STAGE 切段：START_STAGE=1 END_STAGE=4 与
+# START_STAGE=5 两段各约 7 小时。
+#
+# 被 walltime 截断不需要换 MODE 重投：原样再投一次 MODE=all 即可 ——
+#   已评过的指标有 summary.json，eval_one 整段跳过（包括 base 那两个多小时）
+#   已训过的阶段记在 state.json 里，START_STAGE 自动续到下一阶段
+#   八阶段都训完了的话，MODE=all 会跳过训练直接跑 final_eval
+# 所以 MODE=all 是幂等的，重投只会补上没做完的部分。
+#
+# base 与 CONFIG 无关（就是没训过的基座），两个配置共用 run_name "base"。第二个
+# 配置投 MODE=all 时那两个多小时会被整段跳过，不会重复烧。
 #
 # per-stage test 的成本靠两件事压住：只评**已见过**的任务（上三角，不是全 8x8），
 # 以及每个任务分开给解码预算（分类任务 16 token，不是官方一律 512）。
@@ -342,8 +369,8 @@ BUILD_MIX="${BUILD_MIX:-1}"
 INCLUDE_LIMA="${INCLUDE_LIMA:-0}"
 
 case "${MODE}" in
-  data|base_eval|chain|final_eval) ;;
-  *) echo "MODE 只能是 data|base_eval|chain|final_eval，当前 '${MODE}'" >&2; exit 2 ;;
+  data|base_eval|chain|final_eval|all) ;;
+  *) echo "MODE 只能是 data|base_eval|chain|final_eval|all，当前 '${MODE}'" >&2; exit 2 ;;
 esac
 
 # =============================================================================
@@ -644,27 +671,60 @@ eval_one () {
   python -m onereplay.scripts.evaluate "${args[@]}"
 }
 
+# 末阶段权重的通用能力评测 + 汇总。MODE=final_eval 和 MODE=all 都走这里，抽成函数
+# 是为了让"一次投完"和"分开投"跑的是同一段代码，而不是两份会各自漂移的副本。
+run_final_eval () {
+  local fatal="${1:-1}"
+  if [[ ! -d "${CKPT_DIR}/${FINAL_CKPT}" ]]; then
+    echo "缺末阶段权重: ${CKPT_DIR}/${FINAL_CKPT}" >&2
+    echo "  它由 chain 跑到第 ${NUM_STAGES} 阶段后 mv 生成。" >&2
+    echo "  当前 state: stage=${STATE_STAGE:-?} slot=${STATE_SLOT:-?}" >&2
+    [[ "${fatal}" == "1" ]] && return 1
+    return 0
+  fi
+  local final_run="trace_${CONFIG}_stage${NUM_STAGES}"
+  # shellcheck disable=SC2086
+  eval_one "${final_run}" "${CKPT_DIR}/${FINAL_CKPT}" ${AVAIL_GENERAL}
+  echo
+  echo "==== 汇总 ===="
+  python -m onereplay.scripts.summarize_trace_matrix \
+    --eval_root "${EVAL_ROOT}" --config "${CONFIG}" \
+    --base_run base --num_stages "${NUM_STAGES}" \
+    --general_metrics "${AVAIL_GENERAL// /,}" \
+    --json_out "${EVAL_ROOT}/trace_${CONFIG}_matrix.json" || true
+}
+
 # ---------------------------------------------------------------------------
 # MODE=base_eval: 一步都没走的模型，六个通用 benchmark + 八个 TRACE test
 # ---------------------------------------------------------------------------
-if [[ "${MODE}" == "base_eval" ]]; then
+if [[ "${MODE}" == "base_eval" || "${MODE}" == "all" ]]; then
   BASE_TRACE=""
   for key in "${TASK_KEYS[@]}"; do BASE_TRACE="${BASE_TRACE} trace_${key}"; done
-  if [[ "${DRY_RUN}" == "1" ]]; then
+  if [[ "${DRY_RUN}" == "1" && "${MODE}" == "base_eval" ]]; then
     echo
     echo "DRY_RUN=1：将评 base 的 ${AVAIL_GENERAL} 与${BASE_TRACE}"
     echo "确认后 qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=base_eval ${SELF_PATH}"
     exit 0
   fi
-  # base 的 TRACE 分数不是 0：模型没训过这些任务，但会用自然语言作答，宽松抽取
-  # 那一列能给出"训练之前就能做到多少"。Q1 的分母是"刚训完该任务时"，不是这个，
-  # 但没有它就读不出每个任务实际被学会了多少。
-  # shellcheck disable=SC2086
-  eval_one "base" "" ${AVAIL_GENERAL} ${BASE_TRACE}
-  echo
-  echo "base 评完。下一步: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=chain ${SELF_PATH}"
-  echo "Job finished at: $(date)"
-  exit 0
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    echo
+    echo "==== base 评测 ===="
+    # base 的 TRACE 分数不是 0：模型没训过这些任务，但会用自然语言作答，宽松抽取
+    # 那一列能给出"训练之前就能做到多少"。Q1 的分母是"刚训完该任务时"，不是这个，
+    # 但没有它就读不出每个任务实际被学会了多少。
+    #
+    # base 与 CONFIG 无关，两个配置共用同一个 run_name "base"。第二次跑到这里时
+    # 每个指标都已有 summary.json，eval_one 会整段跳过，所以 MODE=all 投两遍
+    # 不会重复烧掉这几个小时。
+    # shellcheck disable=SC2086
+    eval_one "base" "" ${AVAIL_GENERAL} ${BASE_TRACE}
+  fi
+  if [[ "${MODE}" == "base_eval" ]]; then
+    echo
+    echo "base 评完。下一步: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=chain ${SELF_PATH}"
+    echo "Job finished at: $(date)"
+    exit 0
+  fi
 fi
 
 # ===========================================================================
@@ -692,9 +752,17 @@ START_STAGE="${START_STAGE:-$((STATE_STAGE + 1))}"
 END_STAGE="${END_STAGE:-${NUM_STAGES}}"
 # 链已经跑完时 START_STAGE 会算成 NUM_STAGES+1。那不是配置错误，是"没事可做"，
 # 所以单独说清楚，而不是丢一个范围校验的报错让人以为参数传错了。
-if [[ "${MODE}" == "chain" ]] && (( START_STAGE > NUM_STAGES )); then
+if [[ "${MODE}" == "chain" || "${MODE}" == "all" ]] && (( START_STAGE > NUM_STAGES )); then
   echo
   echo "chain 已经跑完 ${NUM_STAGES} 个阶段（state.json: stage=${STATE_STAGE} slot=${STATE_SLOT}）。"
+  if [[ "${MODE}" == "all" ]]; then
+    # 上一次 MODE=all 撞了 walltime，但死在 final_eval 而不是 chain 里。没什么可
+    # 训的了，直接把剩下那一步做掉，而不是报"没事可做"让人再换一个 MODE 投一次。
+    echo "MODE=all：跳过训练，直接跑 final_eval。"
+    run_final_eval 0
+    echo "Job finished at: $(date)"
+    exit 0
+  fi
   echo "  要评通用能力: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=final_eval ${SELF_PATH}"
   echo "  要重跑某一段: 加 START_STAGE=<n>（注意它需要阶段 n-1 的槽位还在盘上）"
   echo "Job finished at: $(date)"
@@ -713,27 +781,13 @@ fi
 # MODE=final_eval: 末阶段权重的六个通用 benchmark
 # ---------------------------------------------------------------------------
 if [[ "${MODE}" == "final_eval" ]]; then
-  if [[ ! -d "${CKPT_DIR}/${FINAL_CKPT}" ]]; then
-    echo "缺末阶段权重: ${CKPT_DIR}/${FINAL_CKPT}" >&2
-    echo "  它由 MODE=chain 跑到第 ${NUM_STAGES} 阶段后 mv 生成。" >&2
-    echo "  当前 state: stage=${STATE_STAGE} slot=${STATE_SLOT}" >&2
-    exit 1
-  fi
-  FINAL_RUN="trace_${CONFIG}_stage${NUM_STAGES}"
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo
-    echo "DRY_RUN=1：将用 ${CKPT_DIR}/${FINAL_CKPT} 评 ${FINAL_RUN} 的 ${AVAIL_GENERAL}"
+    echo "DRY_RUN=1：将用 ${CKPT_DIR}/${FINAL_CKPT} 评 trace_${CONFIG}_stage${NUM_STAGES}"
+    echo "           的 ${AVAIL_GENERAL}"
     exit 0
   fi
-  # shellcheck disable=SC2086
-  eval_one "${FINAL_RUN}" "${CKPT_DIR}/${FINAL_CKPT}" ${AVAIL_GENERAL}
-  echo
-  echo "==== 汇总 ===="
-  python -m onereplay.scripts.summarize_trace_matrix \
-    --eval_root "${EVAL_ROOT}" --config "${CONFIG}" \
-    --base_run base --num_stages "${NUM_STAGES}" \
-    --general_metrics "${AVAIL_GENERAL// /,}" \
-    --json_out "${EVAL_ROOT}/trace_${CONFIG}_matrix.json" || true
+  run_final_eval 1
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -898,13 +952,31 @@ if (( END_STAGE == NUM_STAGES )); then
   fi
   [[ -d "${CKPT_DIR}/${OTHER_SLOT}" ]] && rm -rf --one-file-system "${CKPT_DIR}/${OTHER_SLOT}"
   echo
-  echo "八个阶段跑完。下一步："
-  echo "  qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=final_eval ${SELF_PATH}"
+  echo "八个阶段跑完。"
+  if [[ "${MODE}" != "all" ]]; then
+    echo "下一步: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=final_eval ${SELF_PATH}"
+  fi
 else
   echo
   echo "本段跑到阶段 ${END_STAGE}，权重留在 ${CKPT_DIR}/$(slot_for_stage "${END_STAGE}")"
   echo "接着投: qsub -v DRY_RUN=0,CONFIG=${CONFIG},MODE=chain ${SELF_PATH}"
   echo "  （START_STAGE 会自动从 state.json 续到 $((END_STAGE + 1))）"
+fi
+
+# ===========================================================================
+# MODE=all: 接着把末阶段的通用能力评掉
+# ===========================================================================
+if [[ "${MODE}" == "all" ]]; then
+  if (( END_STAGE == NUM_STAGES )); then
+    echo
+    echo "==== final_eval（MODE=all 续跑）===="
+    # 0 = 缺权重不算致命：END_STAGE 被手动截短时 final 还不存在，那不是错误。
+    run_final_eval 0
+    echo "Job finished at: $(date)"
+    exit 0
+  fi
+  echo
+  echo "END_STAGE=${END_STAGE} < ${NUM_STAGES}，还没到末阶段，先不评通用能力。"
 fi
 
 # ===========================================================================
