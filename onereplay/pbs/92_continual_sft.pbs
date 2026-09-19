@@ -269,8 +269,12 @@ MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Qwen2.5-1.5B-Instruct}"
 
 # =============================================================================
-# 训练超参：**全部照抄 90 号**，四条臂之间也逐字相同。
-# 想调任何一个，就是四条臂一起重跑，否则它们不再可比。
+# 训练超参：四条臂之间逐字相同。想调任何一个，就是四条臂一起重跑，否则不再可比。
+#
+# LR 是**本阶段**的学习率，不必等于 90 号那条：阶段一是从 Instruct 底座学一个域，
+# 阶段二是从已经学过一个域的模型上再学一个，两者的最优步长没有理由相同。起点
+# checkpoint 的目录名里带的是 90 号那个 LR，所以下面 SRC_CKPT_NAME 不靠拼名字定死，
+# 拼不中就去 checkpoints/ 里找。
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
 LR="${LR:-2e-4}"
@@ -329,6 +333,29 @@ NEW_STATS="${STATS_DIR}/${NEW_DOMAIN}_stats.json"
 SRC_RESULTS_ROOT="${SRC_RESULTS_ROOT:-${REPO_ROOT}/results_specialist_${SRC_DOMAIN}_${MODEL_NAME}}"
 SRC_CKPT_DIR="${SRC_CKPT_DIR:-${SRC_RESULTS_ROOT}/checkpoints}"
 SRC_CKPT_NAME="${SRC_CKPT_NAME:-specialist_${SRC_DOMAIN}_lr${LR}_seed${SEED}}"
+
+# 名字里带的是 90 号训练时的 LR，而本阶段的 LR 不必与它相同，所以上面那行经常拼不
+# 中。拼不中就去 checkpoints/ 里找：只有一个候选就直接用它，有多个才停下来让人指定
+# ——"猜一个来用"在这里是最坏的结果，起点选错了整条实验都是错的，而且不会报错。
+if [[ ! -d "${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" && -d "${SRC_CKPT_DIR}" ]]; then
+  SRC_CANDIDATES=()
+  while IFS= read -r _dir; do
+    [[ -n "${_dir}" ]] && SRC_CANDIDATES+=("$(basename "${_dir}")")
+  done < <(find "${SRC_CKPT_DIR}" -mindepth 1 -maxdepth 1 -type d \
+             -name "specialist_${SRC_DOMAIN}_*" 2>/dev/null | sort)
+
+  if [[ "${#SRC_CANDIDATES[@]}" -eq 1 ]]; then
+    echo "!! 按本阶段 LR=${LR} 拼的 '${SRC_CKPT_NAME}' 不存在，"
+    echo "   改用 ${SRC_CKPT_DIR} 下唯一的 '${SRC_CANDIDATES[0]}'"
+    SRC_CKPT_NAME="${SRC_CANDIDATES[0]}"
+  elif [[ "${#SRC_CANDIDATES[@]}" -gt 1 ]]; then
+    echo "${SRC_CKPT_DIR} 下有 ${#SRC_CANDIDATES[@]} 个 ${SRC_DOMAIN} 的 checkpoint，无法判断用哪个：" >&2
+    printf '     %s\n' "${SRC_CANDIDATES[@]}" >&2
+    echo "  显式指定，且四条臂必须传同一个值（起点不同源的话臂之间不可比）：" >&2
+    echo "    qsub -v SRC_DOMAIN=${SRC_DOMAIN},NEW_DOMAIN=${NEW_DOMAIN},ARM=${ARM},SRC_CKPT_NAME=${SRC_CANDIDATES[0]} ..." >&2
+    exit 1
+  fi
+fi
 
 # C/F 与 replay 池：同一个 10k 子集，见第 4 条。
 POOL_SAMPLES="${POOL_SAMPLES:-10000}"
