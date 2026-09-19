@@ -36,7 +36,10 @@ from onereplay.core.chat_policy import configure_system_prompt  # noqa: E402
 from onereplay.core.regularizer import EWCRegularizer, ReplayRegularizer  # noqa: E402
 from onereplay.data.chat import build_loader, build_opd_loader  # noqa: E402
 from onereplay.data.commonsense import load_and_prepare_dataset  # noqa: E402
-from onereplay.data.batch_mix import build_batch_mixed_loader  # noqa: E402
+from onereplay.data.batch_mix import (  # noqa: E402
+    build_batch_mixed_loader,
+    build_step_mixed_loader,
+)
 from onereplay.data.old_val import build_old_val_loader, build_prior_val_loaders  # noqa: E402
 from onereplay.data.probe import build_probe_loaders  # noqa: E402
 from onereplay.data.replay import (  # noqa: E402
@@ -185,6 +188,37 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Rows to score; negative inherits --max_val_samples.",
+    )
+    # The {question, response} pair the prepare_* scripts write is not what a
+    # corpus reached through a replay pool is called: FLAN is {inputs, targets}.
+    # Both flags also cover --prior_val_jsonl, so a chain whose domains disagree
+    # on their schema has to be normalized before it gets here.
+    parser.add_argument(
+        "--old_val_input_column",
+        type=str,
+        default="question",
+        help=(
+            "Prompt column of --old_val_jsonl. Must be the column the replay arm "
+            "reads from the same corpus (--replay_input_column), or the two arms "
+            "are not looking at the same old knowledge."
+        ),
+    )
+    parser.add_argument(
+        "--old_val_target_column",
+        type=str,
+        default="response",
+        help="Answer column of --old_val_jsonl; the replay arm's --replay_target_column.",
+    )
+    parser.add_argument(
+        "--old_val_max_len",
+        type=int,
+        default=0,
+        help=(
+            "Token budget for the held-out rows only; 0 reuses --max_len. Set it "
+            "to the domain's --replay_max_len: truncation keeps the last tokens, "
+            "so an over-long row scored at the new task's budget would be a "
+            "different row than the one replay trained on."
+        ),
     )
     parser.add_argument(
         "--old_val_presliced",
@@ -379,6 +413,28 @@ def parse_args() -> argparse.Namespace:
             "past the rows that produced C."
         ),
     )
+    parser.add_argument(
+        "--replay_steps_per_update",
+        type=int,
+        default=0,
+        help=(
+            "Replay micro-batches per optimizer update, i.e. step-level mixing. "
+            "0 disables it. The window holds --accumulation_size / --batch_size "
+            "micro-batches; this many of them are drawn entirely from the replay "
+            "pool and the rest entirely from the new task, so the accumulated "
+            "gradient is exactly (1 - w) * L_new + w * L_replay with w = R / K. "
+            "Two things this buys over --replay_per_batch, and both matter only "
+            "when the ratio is the experiment's independent variable: the ratio "
+            "stops being quantized by --batch_size (at batch_size 4 the "
+            "batch-level scheme can only do 25/50/75%%), and the loss weight "
+            "stops depending on answer length, because each micro-batch averages "
+            "over its own supervised tokens instead of sharing one average with "
+            "the other corpus. Set --accumulation_size to "
+            "(new_steps + R) * batch_size so the trainer's window boundary "
+            "coincides with the loader's; new_steps * batch_size is then the "
+            "new-task rows per update, which every arm must hold equal."
+        ),
+    )
     parser.add_argument("--replay_dataset_path", type=str, default="")
     parser.add_argument(
         "--replay_data_files",
@@ -555,10 +611,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--probe_old_val_size",
+        type=int,
+        default=1000,
+        help=(
+            "Rows of --old_val_jsonl's held-out slice to probe, evenly strided; "
+            "0 skips that curve, and it is skipped anyway when --old_val_jsonl "
+            "is unset. This is the protected-domain curve for a line with no "
+            "self-distilled corpus to point --probe_heldout_file at: same rows "
+            "and same rendering as the epoch-level old_val_loss, just scored on "
+            "the probe schedule and token-weighted instead of batch-averaged."
+        ),
+    )
+    parser.add_argument(
         "--probe_cs_val_size",
         type=int,
         default=1000,
-        help="Rows of the Commonsense validation split to probe; 0 skips that curve.",
+        help="Rows of the new task's validation split to probe; 0 skips that curve.",
     )
     parser.add_argument(
         "--probe_batch_size",
@@ -705,10 +774,18 @@ def main() -> None:
                 "This is a LoRA run, so the rank x rank autograd shortcut is used and "
                 "the flag has no effect beyond being recorded in the metrics."
             )
-    if args.replay_per_batch > 0 and args.replay_ratio > 0:
+    schemes = [
+        name
+        for name, enabled in (
+            ("--replay_ratio (data-level)", args.replay_ratio > 0),
+            ("--replay_per_batch (batch-level)", args.replay_per_batch > 0),
+            ("--replay_steps_per_update (step-level)", args.replay_steps_per_update > 0),
+        )
+        if enabled
+    ]
+    if len(schemes) > 1:
         raise ValueError(
-            "--replay_per_batch (batch-level) and --replay_ratio (data-level) are two "
-            "different mixing schemes; set exactly one."
+            f"{' and '.join(schemes)} are different mixing schemes; set exactly one."
         )
     replay_mix = parse_replay_mix(args)
     if replay_mix:
@@ -718,18 +795,20 @@ def main() -> None:
                 "--replay_self_distill_file too leaves it ambiguous which one the single-pool "
                 "path would use. Put the IF corpus in --replay_mix_files as well."
             )
-        if args.replay_per_batch <= 0:
+        if args.replay_per_batch <= 0 and args.replay_steps_per_update <= 0:
             raise ValueError(
-                "--replay_mix_files needs --replay_per_batch: the domain ratio is spent per "
-                "micro-batch by the batch-level scheduler. Data-level mixing (--replay_ratio) "
-                "would only reach the ratio in expectation, and cannot reach 0.5 at all with a "
-                "17k pool."
+                "--replay_mix_files needs --replay_per_batch or --replay_steps_per_update: "
+                "the domain ratio is spent per draw by the scheduler. Data-level mixing "
+                "(--replay_ratio) would only reach the ratio in expectation, and cannot reach "
+                "0.5 at all with a 17k pool."
             )
-    if args.replay_per_batch > 0 and args.paradigm == "opd":
+    if (args.replay_per_batch > 0 or args.replay_steps_per_update > 0) and args.paradigm == "opd":
         # OPD replaces the batch's targets with a student rollout scored by the
         # teacher. What that should mean for a replay row is undefined, so
         # refuse rather than silently distilling the replay corpus too.
-        raise ValueError("--replay_per_batch is not defined for --paradigm opd")
+        raise ValueError(
+            "--replay_per_batch / --replay_steps_per_update are not defined for --paradigm opd"
+        )
 
     if args.replay_ratio > 0:
         # Validation stays pure new-task so val_loss remains comparable with
@@ -760,6 +839,48 @@ def main() -> None:
             f"{new_per_batch} new-task rows = "
             f"{max(args.accumulation_size // args.batch_size, 1) * new_per_batch} new-task rows "
             f"per update",
+            flush=True,
+        )
+    elif args.replay_steps_per_update > 0:
+        # The loader's window has to be the trainer's window, or the optimizer
+        # would step in the middle of a new/replay pattern and every update
+        # would see a different mix. accumulation_steps is the only thing the
+        # trainer counts, so derive the new-task steps from it rather than
+        # taking a second flag that could disagree with it.
+        window_steps = max(args.accumulation_size // args.batch_size, 1)
+        new_steps = window_steps - args.replay_steps_per_update
+        if new_steps <= 0:
+            raise ValueError(
+                f"--replay_steps_per_update {args.replay_steps_per_update} leaves {new_steps} "
+                f"new-task micro-batches in a window of {window_steps} "
+                f"(--accumulation_size {args.accumulation_size} / --batch_size "
+                f"{args.batch_size}). Raise --accumulation_size to "
+                f"(new_steps + {args.replay_steps_per_update}) * {args.batch_size}."
+            )
+        if args.accumulation_size % args.batch_size != 0:
+            raise ValueError(
+                f"--accumulation_size {args.accumulation_size} is not a multiple of "
+                f"--batch_size {args.batch_size}, so the window the loader builds and the "
+                "window the trainer closes would drift apart after the first update."
+            )
+        replay_pools = build_replay_pools(args, tokenizer)
+        train_loader = build_step_mixed_loader(
+            train_dataset,
+            None,
+            tokenizer,
+            batch_size=args.batch_size,
+            new_steps_per_window=new_steps,
+            replay_steps_per_window=args.replay_steps_per_update,
+            seed=args.seed,
+            replay_pools=replay_pools,
+        )
+        print(train_loader.describe(), flush=True)
+        print(
+            f"accumulation: {window_steps} steps/window x {args.batch_size} rows = "
+            f"{args.accumulation_size} rows per update, of which "
+            f"{train_loader.new_per_update} are new-task rows "
+            f"({new_steps} steps) and {train_loader.replay_per_update} are replay "
+            f"({args.replay_steps_per_update} steps)",
             flush=True,
         )
     else:
@@ -839,6 +960,31 @@ def main() -> None:
             "pass --lr_scheduler cosine (or constant_with_warmup) as well."
         )
 
+    # What the mixing scheme actually did, resolved once. new_per_update is the
+    # quantity every arm of a comparison has to hold equal -- it is the new-task
+    # data behind one optimizer step -- and each scheme reaches it differently,
+    # so deriving it from the flags at read time is how a table ends up
+    # comparing runs that are not comparable.
+    if args.replay_steps_per_update > 0:
+        new_per_update = train_loader.new_per_update
+        replay_per_update = train_loader.replay_per_update
+        replay_ratio_r = train_loader.replay_ratio_r
+        # Exact only here. Under batch-level mixing the two corpora share one
+        # token average inside the micro-batch, so their gradient shares follow
+        # answer length rather than row counts; batch_mix's describe() prints
+        # the measured token share for that case.
+        replay_loss_weight = train_loader.replay_loss_weight
+    elif args.replay_per_batch > 0:
+        new_per_update = accumulation_steps * (args.batch_size - args.replay_per_batch)
+        replay_per_update = accumulation_steps * args.replay_per_batch
+        replay_ratio_r = args.replay_per_batch / (args.batch_size - args.replay_per_batch)
+        replay_loss_weight = None
+    else:
+        new_per_update = args.accumulation_size
+        replay_per_update = 0
+        replay_ratio_r = args.replay_ratio
+        replay_loss_weight = None
+
     common = {
         "model": model,
         "optimizer": optimizer,
@@ -909,20 +1055,25 @@ def main() -> None:
             "eval_batch_size": args.eval_batch_size or args.batch_size,
             "replay_ratio": args.replay_ratio,
             "replay_per_batch": args.replay_per_batch,
+            "replay_steps_per_update": args.replay_steps_per_update,
             # train_samples counts replay rows too, so record the split needed
-            # to recover the new-task volume from the cost metrics.
+            # to recover the new-task volume from the cost metrics. These two
+            # describe the batch-level split only; step-level micro-batches are
+            # homogeneous and leave them at 0, like vanilla.
             "new_per_batch": (
                 args.batch_size - args.replay_per_batch if args.replay_per_batch > 0 else 0
             ),
             "replay_row_share": (
                 args.replay_per_batch / args.batch_size if args.replay_per_batch > 0 else 0.0
             ),
-            "new_per_update": (
-                max(args.accumulation_size // args.batch_size, 1)
-                * (args.batch_size - args.replay_per_batch)
-                if args.replay_per_batch > 0
-                else args.accumulation_size
-            ),
+            "new_per_update": new_per_update,
+            "replay_per_update": replay_per_update,
+            # N_replay / N_new, which is also the extra cost this arm pays: the
+            # run takes (1 + r) times the micro-batches of a vanilla one.
+            "replay_ratio_r": replay_ratio_r,
+            # Replay's exact share of the accumulated gradient, or null on the
+            # schemes where row share and loss weight come apart.
+            "replay_loss_weight": replay_loss_weight,
             "replay_self_distill": int(
                 bool(args.replay_self_distill_file) or bool(replay_mix)
             ),
@@ -945,12 +1096,14 @@ def main() -> None:
             "max_train_samples": args.max_train_samples,
             "max_val_samples": args.max_val_samples,
             "eval_before_train": args.eval_before_train,
-            # Which rows old_val_loss is measured on. Without these three the
-            # column is a number with no provenance, and the slice moves if any
-            # of them is changed between arms.
+            # Which rows old_val_loss is measured on, and how they were
+            # rendered. Without these the column is a number with no provenance,
+            # and the slice moves if any of them is changed between arms.
             "old_val_jsonl": args.old_val_jsonl,
             "old_val_pool_size": args.old_val_pool_size,
             "old_val_sample_seed": args.old_val_sample_seed,
+            "old_val_max_len": args.old_val_max_len,
+            "old_val_target_column": args.old_val_target_column,
             "prior_val_jsonl": args.prior_val_jsonl,
             # A loss curve only means something next to the schedule that
             # produced it, and "lr: 5e-5" alone no longer identifies a run now

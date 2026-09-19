@@ -50,7 +50,22 @@ from onereplay.data.chat import build_loader, build_sft_tokenize_fn
 from onereplay.data.replay import cut_pool
 
 
-def _slice_loader(
+def old_val_max_len(args: argparse.Namespace) -> int:
+    """Token budget for the held-out rows; 0 falls back to --max_len.
+
+    Sized per corpus for the same reason replay_max_len is (see data/replay.py):
+    truncation keeps the *last* max_len tokens, so a row that does not fit loses
+    its question and keeps its answer, and the number stops being a loss on
+    question-answering. It has to match the budget the replay arm tokenizes that
+    same corpus at, or the arms are scored on rows shaped differently from the
+    ones they trained on -- FLAN at 512 while a DialogSum new task stays at 1024.
+    """
+
+    value = int(getattr(args, "old_val_max_len", 0) or 0)
+    return value if value > 0 else args.max_len
+
+
+def _slice_dataset(
     corpus_path: str,
     args: argparse.Namespace,
     tokenizer,
@@ -62,6 +77,11 @@ def _slice_loader(
     Every domain is cut at the same two offsets of its own shuffle, so a domain
     carried through several stages is scored on the same rows each time and its
     numbers subtract across stages.
+
+    Returns the tokenized dataset rather than a loader so data/probe.py can put
+    the same rows on a step-level schedule. The epoch-level loader gives one
+    point per epoch, which on a two-epoch run is a before and an after, not a
+    curve.
     """
 
     presliced = int(getattr(args, "old_val_presliced", 0)) == 1
@@ -118,18 +138,33 @@ def _slice_loader(
             f"seed {sample_seed}, outside the {pool_size}-row subset"
         )
 
+    # {question, response} is what the prepare_* scripts write, but a corpus
+    # that reaches this by way of a replay pool keeps its own names -- FLAN is
+    # {inputs, targets}. Which pair is right is a property of the file, and the
+    # wrong one does not fail near the flag that caused it: it raises a KeyError
+    # from inside a datasets worker.
+    input_column = str(getattr(args, "old_val_input_column", "") or "question")
+    target_column = str(getattr(args, "old_val_target_column", "") or "response")
+    missing = [name for name in (input_column, target_column) if name not in dataset.column_names]
+    if missing:
+        raise ValueError(
+            f"{corpus_path} has no column(s) {missing}; available: {dataset.column_names}. "
+            "Set --old_val_input_column / --old_val_target_column to the pair the replay "
+            "arm reads from this same corpus."
+        )
     dataset = dataset.map(
         lambda example: {
-            "instruction": str(example["question"] or "").strip(),
+            "instruction": str(example[input_column] or "").strip(),
             "input": "",
-            "output": str(example["response"] or "").strip(),
+            "output": str(example[target_column] or "").strip(),
         },
         remove_columns=dataset.column_names,
     )
     # An empty side means no supervised tokens, which would be a NaN in the mean.
     dataset = dataset.filter(lambda example: bool(example["instruction"]) and bool(example["output"]))
 
-    tokenize = build_sft_tokenize_fn(tokenizer, args.max_len)
+    max_len = old_val_max_len(args)
+    tokenize = build_sft_tokenize_fn(tokenizer, max_len)
     map_cache_dir = getattr(args, "map_cache_dir", "")
     if map_cache_dir:
         cache_dir = Path(map_cache_dir)
@@ -145,9 +180,42 @@ def _slice_loader(
     else:
         dataset = dataset.map(tokenize)
 
+    budget = f"max_len={max_len}" + (
+        f" (new task stays at {args.max_len})" if max_len != args.max_len else ""
+    )
+    print(
+        f"{label}: {len(dataset)} rows from {origin}, "
+        f"columns {input_column}/{target_column}, {budget}"
+    )
+    return dataset
+
+
+def _slice_loader(
+    corpus_path: str,
+    args: argparse.Namespace,
+    tokenizer,
+    cache_name: str,
+    label: str,
+):
+    """Epoch-level loader over one domain's held-out slice."""
+
+    dataset = _slice_dataset(corpus_path, args, tokenizer, cache_name, label)
     batch_size = args.eval_batch_size or args.batch_size
-    print(f"{label}: {len(dataset)} rows from {origin}, batch size {batch_size}")
+    print(f"{label}: epoch-level loader at batch size {batch_size}")
     return build_loader(dataset, tokenizer, batch_size=batch_size, train=False)
+
+
+def build_old_val_dataset(args: argparse.Namespace, tokenizer):
+    """The old domain's held-out slice, tokenized, or None when disabled.
+
+    Same rows and same rendering as build_old_val_loader; the probes take this
+    one so the step-level curve and the epoch-level number cannot drift apart.
+    """
+
+    corpus_path = str(getattr(args, "old_val_jsonl", "") or "")
+    if not corpus_path:
+        return None
+    return _slice_dataset(corpus_path, args, tokenizer, "old_val_tokenized.arrow", "old val")
 
 
 def build_old_val_loader(args: argparse.Namespace, tokenizer):
@@ -214,4 +282,9 @@ def build_prior_val_loaders(args: argparse.Namespace, tokenizer):
     return loaders
 
 
-__all__ = ["build_old_val_loader", "build_prior_val_loaders"]
+__all__ = [
+    "build_old_val_dataset",
+    "build_old_val_loader",
+    "build_prior_val_loaders",
+    "old_val_max_len",
+]

@@ -1,4 +1,13 @@
-"""Strict batch-level replay mixing.
+"""Strict replay mixing, at two granularities.
+
+`BatchMixedReplayLoader` puts new-task and replay rows in the *same*
+micro-batch. `StepMixedReplayLoader` gives each kind micro-batches of its own
+and spends the ratio across an accumulation window instead. The first is the
+standard rehearsal baseline; the second exists because a ratio *sweep* needs
+two things the first cannot give -- a ratio that is not quantized by the
+micro-batch size, and a loss weight that does not move with answer length. Each
+class's docstring has the details; everything below about pools, cycling and
+determinism applies to both.
 
 Data-level mixing (`replay.mix_replay_into_train`) appends replay rows to the
 training set and shuffles globally, so the new/replay split inside a
@@ -116,38 +125,32 @@ def _normalize_pools(
     return [ReplayPool(pool.label, pool.dataset, pool.weight / total) for pool in pools]
 
 
-class BatchMixedReplayLoader:
-    """Iterable of micro-batches with a fixed new/replay composition."""
+class _ReplayScheduler:
+    """Pool bookkeeping shared by the two mixing schemes.
+
+    Both need the same three things from the replay side: a largest-remainder
+    split of a step's replay slots across the pools, a cursor that cycles each
+    pool with a fresh permutation per pass, and the per-pool draw counts the
+    end-of-run log reports. What differs is only *where* the replay rows go --
+    inside every micro-batch, or in micro-batches of their own.
+    """
 
     def __init__(
         self,
         new_dataset,
         collate_fn,
-        new_per_batch: int,
-        replay_per_batch: int,
-        replay_dataset=None,
-        replay_pools: Sequence[ReplayPool | tuple] | None = None,
-        seed: int = 1,
+        pools: list[ReplayPool],
+        replay_rows_per_draw: int,
+        seed: int,
     ) -> None:
-        if new_per_batch <= 0:
-            raise ValueError("new_per_batch must be >= 1")
-        if replay_per_batch <= 0:
-            raise ValueError("replay_per_batch must be >= 1; use build_loader for no replay")
-
         self.new_dataset = new_dataset
-        self.pools = _normalize_pools(replay_dataset, replay_pools)
         self.collate_fn = collate_fn
-        self.new_per_batch = new_per_batch
-        self.replay_per_batch = replay_per_batch
+        self.pools = pools
+        # Replay rows one draw asks for. Batch-level mixing draws
+        # replay_per_batch of them on every step; step-level mixing draws a
+        # whole micro-batch, but only on the steps that are replay steps.
+        self.replay_rows_per_draw = replay_rows_per_draw
         self.seed = int(seed)
-
-        # Drop the tail that cannot fill a micro-batch, so every step carries
-        # exactly new_per_batch new-task rows and the update boundary is exact.
-        self.steps_per_epoch = len(new_dataset) // new_per_batch
-        if self.steps_per_epoch == 0:
-            raise ValueError(
-                f"new dataset has {len(new_dataset)} rows, fewer than new_per_batch={new_per_batch}"
-            )
 
         self.epoch = 0
         self._orders: list[list[int]] = [[] for _ in self.pools]
@@ -169,52 +172,6 @@ class BatchMixedReplayLoader:
             )
         return self.pools[0].dataset
 
-    @property
-    def new_samples_per_epoch(self) -> int:
-        return self.steps_per_epoch * self.new_per_batch
-
-    @property
-    def replay_samples_per_epoch(self) -> int:
-        return self.steps_per_epoch * self.replay_per_batch
-
-    def describe(self) -> str:
-        dropped = len(self.new_dataset) - self.new_samples_per_epoch
-        new_tokens = _mean_supervised_tokens(self.new_dataset)
-        pool_tokens = [_mean_supervised_tokens(pool.dataset) for pool in self.pools]
-
-        replay_tokens_per_row = sum(
-            pool.weight * tokens for pool, tokens in zip(self.pools, pool_tokens)
-        )
-        row_share = self.replay_per_batch / (self.new_per_batch + self.replay_per_batch)
-        token_total = self.new_per_batch * new_tokens + self.replay_per_batch * replay_tokens_per_row
-        token_share = (
-            self.replay_per_batch * replay_tokens_per_row / token_total if token_total else 0.0
-        )
-
-        lines = [
-            f"batch-level replay: {self.new_per_batch} new + {self.replay_per_batch} replay "
-            f"per micro-batch (micro-batch={self.new_per_batch + self.replay_per_batch}), "
-            f"{self.steps_per_epoch} steps/epoch, "
-            f"{self.new_samples_per_epoch} new-task rows/epoch (dropped {dropped} tail rows), "
-            f"{self.replay_samples_per_epoch} replay rows/epoch from {len(self.pools)} pool(s)"
-        ]
-        for pool, tokens in zip(self.pools, pool_tokens):
-            rows_per_epoch = pool.weight * self.replay_samples_per_epoch
-            within = pool.weight * tokens / replay_tokens_per_row if replay_tokens_per_row else 0.0
-            lines.append(
-                f"  pool[{pool.label or 'replay'}]: row weight={pool.weight:.4f} "
-                f"({pool.weight * self.replay_per_batch:.2f} rows/batch), "
-                f"{rows_per_epoch:.0f} rows/epoch from a pool of {len(pool.dataset)} "
-                f"(cycled {rows_per_epoch / len(pool.dataset):.2f}x per epoch), "
-                f"mean supervised tokens={tokens:.1f}, token share within replay={within:.4f}"
-            )
-        lines.append(
-            f"  replay share of rows={row_share:.4f}, of supervised tokens={token_share:.4f} "
-            f"(mean supervised tokens: new={new_tokens:.1f}, "
-            f"replay={replay_tokens_per_row:.1f})"
-        )
-        return "\n".join(lines)
-
     def __len__(self) -> int:
         return self.steps_per_epoch
 
@@ -227,17 +184,17 @@ class BatchMixedReplayLoader:
 
         Deterministic on purpose: a stochastic draw would put binomial noise on
         the domain ratio, which is the one variable the multi-domain arms differ
-        in. With one pool this returns [replay_per_batch] every step, so the
+        in. With one pool this returns [replay_rows_per_draw] every step, so the
         single-corpus schedule is byte-identical to the pre-mixing version.
         """
 
         if len(self.pools) == 1:
-            return [self.replay_per_batch]
+            return [self.replay_rows_per_draw]
 
         for index, pool in enumerate(self.pools):
-            self._quota_debt[index] += pool.weight * self.replay_per_batch
+            self._quota_debt[index] += pool.weight * self.replay_rows_per_draw
         counts = [int(debt) for debt in self._quota_debt]
-        remaining = self.replay_per_batch - sum(counts)
+        remaining = self.replay_rows_per_draw - sum(counts)
         if remaining > 0:
             order = sorted(
                 range(len(self.pools)),
@@ -288,6 +245,104 @@ class BatchMixedReplayLoader:
             pool.label or "replay": count for pool, count in zip(self.pools, self._draws)
         }
 
+    def _draw_replay_rows(self) -> list[dict]:
+        """One draw's worth of replay rows, split across the pools."""
+
+        rows: list[dict] = []
+        for pool_index, count in enumerate(self._next_counts()):
+            if count == 0:
+                continue
+            rows.extend(
+                self._rows(
+                    self.pools[pool_index].dataset,
+                    self._next_replay_indices(pool_index, count),
+                )
+            )
+        return rows
+
+
+class BatchMixedReplayLoader(_ReplayScheduler):
+    """Iterable of micro-batches with a fixed new/replay composition."""
+
+    def __init__(
+        self,
+        new_dataset,
+        collate_fn,
+        new_per_batch: int,
+        replay_per_batch: int,
+        replay_dataset=None,
+        replay_pools: Sequence[ReplayPool | tuple] | None = None,
+        seed: int = 1,
+    ) -> None:
+        if new_per_batch <= 0:
+            raise ValueError("new_per_batch must be >= 1")
+        if replay_per_batch <= 0:
+            raise ValueError("replay_per_batch must be >= 1; use build_loader for no replay")
+
+        super().__init__(
+            new_dataset=new_dataset,
+            collate_fn=collate_fn,
+            pools=_normalize_pools(replay_dataset, replay_pools),
+            replay_rows_per_draw=replay_per_batch,
+            seed=seed,
+        )
+        self.new_per_batch = new_per_batch
+        self.replay_per_batch = replay_per_batch
+
+        # Drop the tail that cannot fill a micro-batch, so every step carries
+        # exactly new_per_batch new-task rows and the update boundary is exact.
+        self.steps_per_epoch = len(new_dataset) // new_per_batch
+        if self.steps_per_epoch == 0:
+            raise ValueError(
+                f"new dataset has {len(new_dataset)} rows, fewer than new_per_batch={new_per_batch}"
+            )
+
+    @property
+    def new_samples_per_epoch(self) -> int:
+        return self.steps_per_epoch * self.new_per_batch
+
+    @property
+    def replay_samples_per_epoch(self) -> int:
+        return self.steps_per_epoch * self.replay_per_batch
+
+    def describe(self) -> str:
+        dropped = len(self.new_dataset) - self.new_samples_per_epoch
+        new_tokens = _mean_supervised_tokens(self.new_dataset)
+        pool_tokens = [_mean_supervised_tokens(pool.dataset) for pool in self.pools]
+
+        replay_tokens_per_row = sum(
+            pool.weight * tokens for pool, tokens in zip(self.pools, pool_tokens)
+        )
+        row_share = self.replay_per_batch / (self.new_per_batch + self.replay_per_batch)
+        token_total = self.new_per_batch * new_tokens + self.replay_per_batch * replay_tokens_per_row
+        token_share = (
+            self.replay_per_batch * replay_tokens_per_row / token_total if token_total else 0.0
+        )
+
+        lines = [
+            f"batch-level replay: {self.new_per_batch} new + {self.replay_per_batch} replay "
+            f"per micro-batch (micro-batch={self.new_per_batch + self.replay_per_batch}), "
+            f"{self.steps_per_epoch} steps/epoch, "
+            f"{self.new_samples_per_epoch} new-task rows/epoch (dropped {dropped} tail rows), "
+            f"{self.replay_samples_per_epoch} replay rows/epoch from {len(self.pools)} pool(s)"
+        ]
+        for pool, tokens in zip(self.pools, pool_tokens):
+            rows_per_epoch = pool.weight * self.replay_samples_per_epoch
+            within = pool.weight * tokens / replay_tokens_per_row if replay_tokens_per_row else 0.0
+            lines.append(
+                f"  pool[{pool.label or 'replay'}]: row weight={pool.weight:.4f} "
+                f"({pool.weight * self.replay_per_batch:.2f} rows/batch), "
+                f"{rows_per_epoch:.0f} rows/epoch from a pool of {len(pool.dataset)} "
+                f"(cycled {rows_per_epoch / len(pool.dataset):.2f}x per epoch), "
+                f"mean supervised tokens={tokens:.1f}, token share within replay={within:.4f}"
+            )
+        lines.append(
+            f"  replay share of rows={row_share:.4f}, of supervised tokens={token_share:.4f} "
+            f"(mean supervised tokens: new={new_tokens:.1f}, "
+            f"replay={replay_tokens_per_row:.1f})"
+        )
+        return "\n".join(lines)
+
     def __iter__(self):
         # Advance before yielding so an early break (max_steps) still moves the
         # epoch on, matching DataLoader(shuffle=True) reshuffling per epoch.
@@ -300,17 +355,224 @@ class BatchMixedReplayLoader:
             start = step * self.new_per_batch
             new_indices = new_order[start : start + self.new_per_batch]
             rows = self._rows(self.new_dataset, new_indices)
-            for pool_index, count in enumerate(self._next_counts()):
-                if count == 0:
-                    continue
-                rows.extend(
-                    self._rows(
-                        self.pools[pool_index].dataset,
-                        self._next_replay_indices(pool_index, count),
-                    )
-                )
+            rows.extend(self._draw_replay_rows())
             order = torch.randperm(len(rows), generator=shuffle_generator).tolist()
             yield self.collate_fn([rows[position] for position in order])
+
+
+def _replay_step_positions(window_steps: int, replay_steps: int) -> list[bool]:
+    """Which positions of a window are replay steps, spread as evenly as possible.
+
+    Placing the j-th replay step at floor((j + 0.5) * K / R) gives even gaps and
+    centers them, so replay_steps=1 lands mid-window rather than at either edge.
+    Positions are distinct because K/R >= 1 makes the expression strictly
+    increasing in j.
+
+    Deterministic rather than a random draw. The accumulated gradient does not
+    care about the order -- backward only adds into .grad and the optimizer runs
+    at the window boundary -- but three other things do: bf16 accumulation is
+    not associative, `log_every` prints whichever step it lands on and a random
+    layout would make that line alternate between new-task and replay loss for
+    no reason, and a fixed layout is what lets `is_replay_step` recover the kind
+    of a step from its index alone.
+    """
+
+    slots = [False] * window_steps
+    if replay_steps <= 0:
+        return slots
+    for index in range(replay_steps):
+        slots[int((index + 0.5) * window_steps / replay_steps)] = True
+    return slots
+
+
+class StepMixedReplayLoader(_ReplayScheduler):
+    """Iterable whose micro-batches are homogeneous: all new-task, or all replay.
+
+    The replay share is spent across an accumulation window instead of inside a
+    micro-batch, which buys two things the batch-level scheme cannot give.
+
+    The ratio stops being quantized by the micro-batch size. At batch_size=4 the
+    batch-level scheme can only do 25 / 50 / 75 percent; here the knob is the
+    number of replay micro-batches per window, so with 16 new-task steps the
+    reachable shares run 1/17, 2/18, 4/20, 8/24, 16/32 and so on.
+
+    And the loss weight stops depending on answer length. The task loss averages
+    over the supervised tokens of its own micro-batch, and train_one_epoch
+    divides every micro-batch by accumulation_steps, so a window of K steps with
+    R of them replay accumulates exactly
+
+        ((K - R) / K) * mean(L_new) + (R / K) * mean(L_replay)
+
+    whatever the two corpora's answers weigh. Under batch-level mixing the same
+    two corpora share one token average, so the row share and the loss weight
+    come apart -- on the IF-only line a 50% row share carried 93% of the loss.
+    When the experiment's independent variable *is* the mixing ratio, that
+    difference is the whole point.
+
+    Callers hold batch_size at the baseline's value and set new_steps_per_window
+    so that new_steps_per_window * batch_size equals the baseline's rows per
+    update. The optimizer then takes the same number of steps on the same amount
+    of new-task data at every ratio, which is what puts every arm's curve on one
+    x axis. accumulation_size must be (new_steps + replay_steps) * batch_size so
+    the trainer's window boundary coincides with this loader's.
+    """
+
+    def __init__(
+        self,
+        new_dataset,
+        collate_fn,
+        batch_size: int,
+        new_steps_per_window: int,
+        replay_steps_per_window: int,
+        replay_dataset=None,
+        replay_pools: Sequence[ReplayPool | tuple] | None = None,
+        seed: int = 1,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be >= 1")
+        if new_steps_per_window <= 0:
+            raise ValueError(
+                "new_steps_per_window must be >= 1; a window with no new-task step would "
+                "take an optimizer step on the replay pool alone"
+            )
+        if replay_steps_per_window <= 0:
+            raise ValueError(
+                "replay_steps_per_window must be >= 1; use build_loader for no replay"
+            )
+
+        super().__init__(
+            new_dataset=new_dataset,
+            collate_fn=collate_fn,
+            pools=_normalize_pools(replay_dataset, replay_pools),
+            replay_rows_per_draw=batch_size,
+            seed=seed,
+        )
+        self.batch_size = batch_size
+        self.new_steps_per_window = new_steps_per_window
+        self.replay_steps_per_window = replay_steps_per_window
+        self.window_steps = new_steps_per_window + replay_steps_per_window
+        self._replay_slots = _replay_step_positions(self.window_steps, replay_steps_per_window)
+
+        # Whole windows only. The trainer closes a window on
+        # step % accumulation_steps == 0, so a partial one at the end of an epoch
+        # would take an optimizer step on a different new/replay mix than every
+        # other update -- and this line only has ~186 updates per epoch, so that
+        # one update is not negligible.
+        self.windows_per_epoch = len(new_dataset) // (new_steps_per_window * batch_size)
+        if self.windows_per_epoch == 0:
+            raise ValueError(
+                f"new dataset has {len(new_dataset)} rows, fewer than the "
+                f"{new_steps_per_window * batch_size} one window consumes"
+            )
+        self.steps_per_epoch = self.windows_per_epoch * self.window_steps
+
+    @property
+    def new_per_update(self) -> int:
+        return self.new_steps_per_window * self.batch_size
+
+    @property
+    def replay_per_update(self) -> int:
+        return self.replay_steps_per_window * self.batch_size
+
+    @property
+    def replay_ratio_r(self) -> float:
+        """Replay rows per new-task row.
+
+        Reported instead of a percentage because it is also the extra cost: the
+        window holds (1 + r) times the micro-batches a vanilla one does, so r is
+        directly the fraction of wall clock this arm pays over the baseline.
+        """
+
+        return self.replay_steps_per_window / self.new_steps_per_window
+
+    @property
+    def replay_loss_weight(self) -> float:
+        """Replay's share of the accumulated gradient, i.e. r / (1 + r)."""
+
+        return self.replay_steps_per_window / self.window_steps
+
+    @property
+    def new_samples_per_epoch(self) -> int:
+        return self.windows_per_epoch * self.new_per_update
+
+    @property
+    def replay_samples_per_epoch(self) -> int:
+        return self.windows_per_epoch * self.replay_per_update
+
+    def is_replay_step(self, step: int) -> bool:
+        """Whether the 1-based step of an epoch is a replay micro-batch.
+
+        The trainer counts with enumerate(..., start=1) and steps_per_epoch is an
+        exact multiple of window_steps, so the position inside the window is just
+        (step - 1) % window_steps.
+        """
+
+        return self._replay_slots[(step - 1) % self.window_steps]
+
+    def describe(self) -> str:
+        dropped = len(self.new_dataset) - self.new_samples_per_epoch
+        new_tokens = _mean_supervised_tokens(self.new_dataset)
+        pool_tokens = [_mean_supervised_tokens(pool.dataset) for pool in self.pools]
+        replay_tokens_per_row = sum(
+            pool.weight * tokens for pool, tokens in zip(self.pools, pool_tokens)
+        )
+        layout = "".join("R" if slot else "n" for slot in self._replay_slots)
+
+        lines = [
+            f"step-level replay: {self.new_steps_per_window} new + "
+            f"{self.replay_steps_per_window} replay micro-batches per update "
+            f"(window={self.window_steps} steps x {self.batch_size} rows), layout {layout}",
+            f"  per update: {self.new_per_update} new-task rows + "
+            f"{self.replay_per_update} replay rows, "
+            f"r = N_replay/N_new = {self.replay_ratio_r:.4f} "
+            f"= {1 + self.replay_ratio_r:.4f}x the micro-batches of a vanilla update",
+            f"  replay's share of the accumulated gradient = {self.replay_loss_weight:.4f}. "
+            f"Each micro-batch averages over its own supervised tokens and the window "
+            f"averages the micro-batches, so this weight does not move with answer length "
+            f"(mean supervised tokens: new={new_tokens:.1f}, replay={replay_tokens_per_row:.1f})",
+            f"  {self.windows_per_epoch} updates/epoch x {self.window_steps} steps = "
+            f"{self.steps_per_epoch} steps/epoch, "
+            f"{self.new_samples_per_epoch} new-task rows/epoch (dropped {dropped} tail rows), "
+            f"{self.replay_samples_per_epoch} replay rows/epoch from {len(self.pools)} pool(s)",
+        ]
+        for pool, tokens in zip(self.pools, pool_tokens):
+            rows_per_epoch = pool.weight * self.replay_samples_per_epoch
+            cycles = rows_per_epoch / len(pool.dataset)
+            within = pool.weight * tokens / replay_tokens_per_row if replay_tokens_per_row else 0.0
+            lines.append(
+                f"  pool[{pool.label or 'replay'}]: row weight={pool.weight:.4f}, "
+                f"{rows_per_epoch:.0f} rows/epoch from a pool of {len(pool.dataset)} "
+                f"(cycled {cycles:.3f}x per epoch, so one epoch reaches at most "
+                f"{min(cycles, 1.0):.1%} of it; the cursor carries over, so multiply by "
+                f"the epoch count for the run's coverage), "
+                f"mean supervised tokens={tokens:.1f}, token share within replay={within:.4f}"
+            )
+        lines.append(
+            "  a small r is two things at once: less rehearsal, and less of the pool ever "
+            "seen. The coverage above has to be reported next to the curve, or the ratio "
+            "sweep reads as a pure rehearsal-strength effect when it is not."
+        )
+        return "\n".join(lines)
+
+    def __iter__(self):
+        # Advance before yielding so an early break (max_steps) still moves the
+        # epoch on, matching DataLoader(shuffle=True) reshuffling per epoch.
+        epoch_seed = self.seed * 7919 + self.epoch
+        self.epoch += 1
+        new_order = self._permutation(len(self.new_dataset), epoch_seed)
+
+        cursor = 0
+        for _ in range(self.windows_per_epoch):
+            for is_replay in self._replay_slots:
+                if is_replay:
+                    # No shuffle inside the batch: it is homogeneous, and with
+                    # several pools the largest-remainder split already fixed its
+                    # composition, so the order within it changes nothing.
+                    yield self.collate_fn(self._draw_replay_rows())
+                    continue
+                indices = new_order[cursor : cursor + self.batch_size]
+                cursor += self.batch_size
+                yield self.collate_fn(self._rows(self.new_dataset, indices))
 
 
 def build_batch_mixed_loader(
@@ -351,4 +613,50 @@ def build_batch_mixed_loader(
     )
 
 
-__all__ = ["BatchMixedReplayLoader", "ReplayPool", "build_batch_mixed_loader"]
+def build_step_mixed_loader(
+    new_dataset,
+    replay_dataset,
+    tokenizer,
+    batch_size: int,
+    new_steps_per_window: int,
+    replay_steps_per_window: int,
+    seed: int = 1,
+    replay_pools: Sequence[ReplayPool | tuple] | None = None,
+) -> StepMixedReplayLoader:
+    """Build a step-level replay loader matching build_loader's collation.
+
+    Pass replay_dataset for one corpus, or replay_pools (and replay_dataset=None)
+    for a weighted mix of several.
+    """
+
+    tokenizer.padding_side = "left"
+    collate_fn = DataCollatorForTokenClassification(tokenizer=tokenizer)
+    return StepMixedReplayLoader(
+        new_dataset=_keep_token_columns(new_dataset),
+        replay_dataset=None if replay_dataset is None else _keep_token_columns(replay_dataset),
+        replay_pools=(
+            None
+            if replay_pools is None
+            else [
+                ReplayPool(pool.label, _keep_token_columns(pool.dataset), pool.weight)
+                for pool in (
+                    pool if isinstance(pool, ReplayPool) else ReplayPool(*pool)
+                    for pool in replay_pools
+                )
+            ]
+        ),
+        collate_fn=collate_fn,
+        batch_size=batch_size,
+        new_steps_per_window=new_steps_per_window,
+        replay_steps_per_window=replay_steps_per_window,
+        seed=seed,
+    )
+
+
+__all__ = [
+    "BatchMixedReplayLoader",
+    "ReplayPool",
+    "StepMixedReplayLoader",
+    "build_batch_mixed_loader",
+    "build_step_mixed_loader",
+]

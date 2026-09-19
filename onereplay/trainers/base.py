@@ -62,6 +62,9 @@ class BaseTrainer:
         # turn it on for a short cost-measurement run.
         self.timer = PhaseTimer(device, enabled=bool(profile))
         self.last_epoch_cost: dict[str, Any] = {}
+        # Filled only by a loader that can say which kind each step was; see
+        # train_one_epoch. Empty leaves the epoch record as it has always been.
+        self.last_split_loss: dict[str, Any] = {}
         # Fixed held-out sets scored every probe_every micro-batches. Their
         # cost is subtracted from the training clock rather than folded into
         # it, so a probed run still reports the same ms/step as a bare one.
@@ -310,6 +313,13 @@ class BaseTrainer:
         inject_reg = self.regularizer is not None and getattr(
             self.regularizer, "injects_grad", False
         )
+        # Step-level replay makes every micro-batch either all new-task or all
+        # replay, so the two can be reported apart. Worth doing because
+        # train_task_loss otherwise means something different at every ratio --
+        # it is an average over a mixture whose composition is the independent
+        # variable -- and a column like that cannot be read across a sweep.
+        # Absent on every other loader, which keeps the single-number behavior.
+        is_replay_step = getattr(train_loader, "is_replay_step", None)
         reg_stats: dict[str, float] = {}
         total_steps = len(train_loader)
         if self.max_steps > 0:
@@ -321,6 +331,8 @@ class BaseTrainer:
         total_samples = 0
         total_tokens = 0
         done_steps = 0
+        split_loss = {"new": 0.0, "replay": 0.0}
+        split_samples = {"new": 0, "replay": 0}
 
         self.timer.reset()
         reset_peak_memory(self.profiled_devices())
@@ -368,6 +380,10 @@ class BaseTrainer:
             total_task_loss += stats["task_loss"] * num_samples
             total_replay_reg += window_reg * num_samples
             total_samples += num_samples
+            if is_replay_step is not None:
+                kind = "replay" if is_replay_step(step) else "new"
+                split_loss[kind] += stats["task_loss"] * num_samples
+                split_samples[kind] += num_samples
             done_steps = step
             if step == 1 and "used_layers" in stats:
                 print(
@@ -405,6 +421,21 @@ class BaseTrainer:
                 window_start += probe_sec
 
         train_sec = time.time() - epoch_start
+        if is_replay_step is not None:
+            # train_new_loss is the column that compares with a vanilla run's
+            # train_task_loss; train_replay_loss says how hard the model is
+            # still working on the rehearsal rows, which is the other half of
+            # whether a small ratio is doing anything.
+            self.last_split_loss = {
+                f"train_{kind}_loss": split_loss[kind] / count
+                for kind, count in split_samples.items()
+                if count
+            }
+            self.last_split_loss.update(
+                {f"train_{kind}_samples": count for kind, count in split_samples.items()}
+            )
+        else:
+            self.last_split_loss = {}
         self.last_epoch_cost = {
             "train_sec": train_sec,
             "train_steps": done_steps,
@@ -480,6 +511,11 @@ class BaseTrainer:
                 "elapsed_sec": time.time() - start_time,
                 "replay_lambda": self.replay_lambda,
                 "eval_sec": eval_sec,
+                # train_task_loss above averages over whatever the loader
+                # served. When the two kinds arrive in separate micro-batches
+                # they are also reported apart, so the new-task column stays
+                # comparable with a vanilla run across a ratio sweep.
+                **self.last_split_loss,
                 **self.last_epoch_cost,
             }
             # After the record is assembled, not before: the weights are the

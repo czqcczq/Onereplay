@@ -5,12 +5,14 @@ says nothing about what happens to the old knowledge *while* training runs, and
 three points per run cannot show the shape of anything. These probes add a
 step-level view on the side the replay baseline is supposed to protect.
 
-Three sets, all scored with the same forward pass the trainer uses:
+Four sets, all scored with the same forward pass the trainer uses:
 
   flan_heldout  FLAN rows the training pool never contained, self-distilled the
                 same way. Measures whether the old *ability* survives.
   flan_inpool   Rows drawn from the pool replay actually trains on. Measures
                 how far the model has memorized those specific rows.
+  old_val       The held-out slice data/old_val.py cuts from behind the
+                old-knowledge subset, on the corpus's own gold answers.
   cs_val        The existing Commonsense validation split, so the new task is
                 on the same axis.
 
@@ -23,6 +25,17 @@ own answers) through identical tokenization.
 A vanilla run should show the two FLAN curves lying on top of each other, since
 neither slice is in its training data. That coincidence is the control: any gap
 a replay run opens is caused by replay and nothing else.
+
+old_val is the option for a line that has no self-distilled corpus for its
+protected domain -- the 8B arms rehearse raw FLAN, so there is no file with the
+index/truncated columns load_self_distilled_pool needs. It answers the same
+question as flan_heldout (does the old ability survive on rows no arm trains
+on) but against the corpus's gold answers, so it starts at the base model's own
+loss on that domain rather than near zero, and it is read as a distance from
+that first point rather than as an absolute drift from W0. It is the same rows
+and the same rendering the epoch-level old_val_loss uses, so the curve and the
+epoch number cannot disagree -- only the averaging differs, token-weighted here
+against batch-mean there.
 """
 
 from __future__ import annotations
@@ -35,6 +48,7 @@ from torch.utils.data import DataLoader
 from transformers import DataCollatorForTokenClassification
 
 from onereplay.data.chat import build_sft_tokenize_fn
+from onereplay.data.old_val import build_old_val_dataset
 from onereplay.data.replay import load_self_distilled_pool, to_sft_schema
 
 TOKEN_COLUMNS = ["input_ids", "labels", "attention_mask"]
@@ -160,6 +174,17 @@ def build_probe_loaders(args: argparse.Namespace, tokenizer, valid_dataset) -> d
         loaders["flan_inpool"] = build_probe_loader(inpool, tokenizer, batch_size)
         print(f"probe flan_inpool: {len(inpool)} rows from {inpool_file}")
 
+    # The gold-target route into the same question flan_heldout answers, for a
+    # protected domain that has no self-distilled corpus. build_old_val_dataset
+    # returns None when --old_val_jsonl is unset, so a line that does not use it
+    # is untouched.
+    if args.probe_old_val_size != 0:
+        old_val = build_old_val_dataset(args, tokenizer)
+        if old_val is not None:
+            subset = _subsample(old_val, args.probe_old_val_size)
+            loaders["old_val"] = build_probe_loader(subset, tokenizer, batch_size)
+            print(f"probe old_val: {len(subset)} rows of the held-out slice")
+
     if args.probe_cs_val_size != 0 and valid_dataset is not None:
         subset = _subsample(valid_dataset, args.probe_cs_val_size)
         loaders["cs_val"] = build_probe_loader(subset, tokenizer, batch_size)
@@ -168,7 +193,7 @@ def build_probe_loaders(args: argparse.Namespace, tokenizer, valid_dataset) -> d
     if not loaders:
         raise ValueError(
             "--probe_every is set but no probe set was built; pass "
-            "--probe_heldout_file and/or --probe_inpool_file"
+            "--probe_heldout_file, --probe_inpool_file and/or --old_val_jsonl"
         )
     return loaders
 

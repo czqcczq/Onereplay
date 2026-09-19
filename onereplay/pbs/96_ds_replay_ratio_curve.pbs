@@ -1,0 +1,1285 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_ds_ratio
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: DialogSum 线 —— replay ratio 扫描的 loss 曲线（说明性实验）
+#
+# 一次投递跑完全部八条臂，回答一个问题：
+#
+#     vanilla replay 要花多少额外的历史数据与计算，才能追上 OneReplay 的保留效果？
+#
+# 81/82/83 号各给了一个点（OneReplay / EWC / replay 2n2r），回答不了"多少"。
+# 本脚本把 replay 强度做成连续的自变量，在训练**过程中**同时记录两条 loss 曲线：
+#
+#     probe_cs_val    新任务（DialogSum 验证集）—— 学得怎么样
+#     probe_old_val   保护域（FLAN 池外切片）   —— 旧知识掉了多少
+#
+# 每 PROBE_EVERY_UPDATES 次参数更新打一个点，八条臂共用同一套探针。
+#
+# !! 本脚本不做任何评测
+#   不调 evaluate.py、不算 IFEval/GSM8K/ROUGE、SAVE=0 连 adapter 都不留。
+#   要的是曲线不是分数；分数是 81/82/83 号的事。所以八条臂串起来也就 6-7 小时。
+#
+# -----------------------------------------------------------------------------
+# !! 为什么不是 83 号那种 batch 内混合，而是 step 级编排
+#
+#   83 号把 replay 行从 micro-batch 里切出来（2 new + 2 old）。那是标准的 rehearsal
+#   baseline，本身没问题，但拿它扫 ratio 有两个硬伤：
+#
+#   1) 比例被 micro-batch 量化死了。这条线 BATCH=4（74 号文件头：maxlen 1024 下
+#      batch 8 的实测 peak 是 125 GiB，各臂再加 C/F 就 OOM），于是 ratio 只能取
+#      25% / 50% / 75% 三档，画不出趋势，更取不到 10% 这种小值。
+#
+#   2) 行比例不等于 loss 权重。同一个 micro-batch 里两个语料共用一次 token 平均，
+#      所以各自占多少梯度取决于答案长度。CS 线上实测：50.00% 的行份额携带了
+#      93.16% 的 supervised token（data/batch_mix.py 文件头）。自变量本来就是
+#      "比例"的实验，这一点是致命的。
+#
+#   本脚本改用 step 级编排（train.py 的 --replay_steps_per_update）：一个
+#   accumulation window 里 NEW_STEPS 个 micro-batch 全是新任务、R 个全是 replay。
+#   每个 micro-batch 各自按自己的 token 平均，window 再把 micro-batch 等权相加
+#   （trainers/base.py 的 loss = task_loss / accum_steps），所以累积梯度精确等于
+#
+#       (1 - w) * L_new + w * L_replay ,   w = R / (NEW_STEPS + R)
+#
+#   与两边答案长度无关。这正是"把两个数据集按比例混成一个"想表达的东西。
+#
+# -----------------------------------------------------------------------------
+# !! 三个比例口径，报结果时必须分开写
+#
+#       r = N_replay / N_new = R / NEW_STEPS      <- 主报这个
+#       loss 权重 w = r / (1 + r) = R / (NEW_STEPS + R)
+#       额外墙钟 = (1 + r) x                      <- 与 r 是同一个数
+#
+#   主报 r 而不是百分比，是因为它同时就是开销：r=0.5 表示"多花 50% 的训练时间"。
+#   一张 x=r、y=末点 old_val loss 的图，横纵轴因此直接可读。
+#   注意 r=1.0 时 w=0.5，"replay 和新任务各一半"说的是 w 不是 r，别混。
+#
+#   本轮网格（BATCH=4、NEW_STEPS=16，即每次更新恒 64 行新任务）：
+#
+#       R    K=16+R   ACCUM=K*4   r=R/16    w=R/K     墙钟
+#       0    16       64          0         0         1.00x   <- vanilla
+#       1    17       68          0.0625    0.0588    1.06x
+#       2    18       72          0.1250    0.1111    1.13x   <- 就是"9:1"那档
+#       4    20       80          0.2500    0.2000    1.25x
+#       8    24       96          0.5000    0.3333    1.50x
+#       16   32       128         1.0000    0.5000    2.00x   <- 行数与 83 号 2n2r 相同
+#
+# -----------------------------------------------------------------------------
+# !! 每次更新的新任务行数恒为 64，这是整个扫描成立的前提
+#
+#   如果固定总 batch、让 replay 从里面挤掉新任务（56 new + 8 old 这种），那
+#   "旧能力掉得少"就有两个解释：replay 起作用了，还是新任务梯度变少了？分不开。
+#   所以这里是**固定 new=64，额外再加 replay**，代价就明摆在墙钟上。
+#
+#   附带的好处是 x 轴天然对齐：每 epoch 的 window 数 = floor(11962/64) = 186，
+#   与 R **和 BATCH** 都无关，所以每条臂都是 186 x EPOCHS 次更新。探针按 update
+#   计数（train.py 把 --probe_every_updates 乘上 accum_steps 再交给 trainer），
+#   于是八条曲线的探针点逐点重合，可以直接相减。
+#
+# -----------------------------------------------------------------------------
+# !! EWC 必须用 BATCH=2，否则 OOM —— 这不是随手改的
+#
+#   09-11 的实测（results_log/.../结果统计.md 显存表，DialogSum 线）:
+#       vanilla    batch 4   peak reserved  72.75 GiB
+#       OneReplay  batch 4                 106.48 GiB   (常驻 C 33.75)
+#       EWC        batch 2                 119.22 GiB   (常驻 F 25.88)
+#   H200 只有 143 GiB。EWC 在 batch 2 就已经 119 GiB，batch 4 必炸 —— 那份统计里
+#   写的"ewc 的 batch size 为 2，是因为用 4 的时候会出现 OOM"就是这件事。
+#
+#   解法不是给 EWC 放宽 new_per_update，而是换一条路凑同一个数：
+#       BATCH=2  ->  NEW_STEPS = 64 / 2 = 32  ->  ACCUM = 32 * 2 = 64
+#   每次更新仍是 64 行新任务，每 epoch 仍是 186 次更新，x 轴仍然对齐。
+#   EWC_BATCH 就是这个旋钮，默认 2。别为了"统一"把它改回 4。
+#
+#   !! 这样换来的可比性有多强，以及在哪里失效（test_code 里实测过）
+#   曲线可比，而且比想象的更强：DataLoader(shuffle=True) 抽的是整个数据集的一个
+#   排列，batch 只是把它切成块，**排列本身与 batch_size 无关**。所以 batch 4 的
+#   第 1 个 micro-batch 恰好等于 batch 2 的第 1+2 个拼起来，186 个窗口逐个对上，
+#   每次更新看到的是同一批 64 行。唯一的差别是 micro-batch 内 token 平均的分母
+#   （32 组 x 2 行 vs 16 组 x 4 行），实测在 DialogSum 的长度分布下窗口 loss 只差
+#   +0.04%（sd 0.73%）—— 没有系统性尺度漂移，不是变相改学习率，只是逐窗口的重
+#   加权噪声，372 次更新上零均值。
+#
+#   失效的地方是**开销**：train_sec 与 peak memory 不可跨 batch 比。EWC 的
+#   train_sec 里混着罚项的每步开销和 batch 2 的 GPU 利用率损失，两者分不开。
+#   所以默认网格里放了一条 vanilla@2 作对照：
+#       vanilla@4 -> 基准
+#       vanilla@2 -> 单独的 batch-2 吞吐代价
+#       ewc@2     -> batch-2 代价 + 罚项代价，两者一减就分开了
+#   它同时还是个免费的验证：两条 vanilla 的曲线本该重合（同样的行、同样的更新
+#   数），重合了就把上面那段推理在真机上验了一遍。末尾的汇总会自动做这个减法。
+#
+# -----------------------------------------------------------------------------
+# !! 保护域只能是 if（FLAN），math/code 进不来
+#
+#   old_val 的切片定义是"旧知识子集停在哪，就从哪往后取"：同一次
+#   shuffle(seed=1)，池取 [0, 20000)，val 取 [20000, 21000)。
+#   math/code 在 83 号用的是**全池**（--replay_pool_size 0），池后面一行不剩，
+#   要测池外就得缩池，那样就与 68/69 号的 C/F 不同池了，整条对比链断掉。
+#
+#   !! 行号不重叠 != 文本不重叠
+#   FLAN 自身有约 6.4% 的重复 prompt（27 号 slurm 文件头实测）。所以 Step 1 不
+#   要求交集为 0，而是**量出这个比例**：
+#     约 6%   = 语料自身的重复，正常，写进报告
+#     接近100% = 两侧 shuffle 不是同一个，old_val 打的就是 replay 正在训的行，作废
+#
+# -----------------------------------------------------------------------------
+# !! old_val 的列名与 token 预算必须跟着 replay 走
+#   FLAN 是 {inputs, targets}，不是 prepare_* 写的 {question, response}。
+#   预算要 512 而不是新任务的 1024：训练侧截断保留末尾 token，一条超长的行在不同
+#   预算下是**两条不同的行**，打分的行必须和 replay 训的行是同一条。
+#
+# -----------------------------------------------------------------------------
+# !! 结论里必须带上池覆盖率
+#   小 r 不只是"复习得少"，也是"见过的旧数据种类少"：r=1.0 两个 epoch 消耗约
+#   23.8k replay 行、把 2 万池过 1.19 遍；r=0.125 只消耗约 3k 行，只摸到池的 15%。
+#   固定 epoch 预算下这两件事绑在一起，是 replay 的真实处境而不是配置缺陷，但
+#   不能把曲线说成纯粹的"复习强度"效应。loader 的 describe() 与末尾汇总都会打它。
+#
+# -----------------------------------------------------------------------------
+# 时间预算（九条臂串行，单卡 H200）
+#   训练   vanilla 1408s / vanilla@2 约 1700s / onereplay 1447s / ewc 2154s(batch2)
+#          replay 按 (16+R)/16 倍：1496 / 1584 / 1760 / 2112 / 2816
+#          合计约 4.6 h
+#   探针   每臂 32 个点 x (500 + 500 行) 约 13 min，九臂约 2.0 h
+#   加载   8B 读九次 + C/F 各一次，约 0.5 h
+#   合计约 7.1 h，walltime 给 24 h 留足余量。
+#   每条臂各写各的 metrics 文件，中途挂掉只丢正在跑的那条；重投会自动跳过已完成的。
+#
+# -----------------------------------------------------------------------------
+# 投递前要有的东西
+#   1) ${MODEL_DIR}/Qwen3-8B
+#   2) ${DS_DATASET} = datasets/dialogsum_sft_hf   （74 号的 prepare 步骤产出）
+#   3) ${FLAN_DIR}/train/*.jsonl                   （if 域的旧知识语料）
+#   4) 68 号的 C 与 69 号的 F
+#   5) λ：81/82 号在这条线上定稿的值。两条臂的尺度不通用，所以是两个变量。
+#
+# 投递:
+#   # 先看计划（DRY_RUN=1 是默认）—— 会把八条臂的编排算术全列出来
+#   qsub -v ONEREPLAY_LAMBDA=1.5e-2,EWC_LAMBDA=1e2 onereplay/pbs/96_ds_replay_ratio_curve.pbs
+#
+#   # 一次跑完九条臂
+#   qsub -v DRY_RUN=0,ONEREPLAY_LAMBDA=1.5e-2,EWC_LAMBDA=1e2 \
+#        onereplay/pbs/96_ds_replay_ratio_curve.pbs
+#
+#   # 只跑其中几条。语法 kind[:R][@batch]：R 是每次更新里纯 replay 的 micro-batch
+#   # 数（只有 replay 吃），@batch 覆盖该臂的 micro-batch（NEW_STEPS 会跟着配平，
+#   # 每次更新仍是 64 行新任务）。
+#   qsub -v DRY_RUN=0,ARMS='vanilla,replay:2,replay:16' onereplay/pbs/96_ds_replay_ratio_curve.pbs
+#   qsub -v DRY_RUN=0,ARMS='vanilla@2' onereplay/pbs/96_ds_replay_ratio_curve.pbs   # 只补成本对照
+#
+#   # 冒烟（约 10 min，八条臂各跑 6 次更新，确认编排与探针写得出来）
+#   qsub -v DRY_RUN=0,PROBE=1,ONEREPLAY_LAMBDA=1.5e-2,EWC_LAMBDA=1e2 \
+#        onereplay/pbs/96_ds_replay_ratio_curve.pbs
+#
+#   # 补跑挂掉的那条：直接重投，已完成的臂会被跳过（FORCE_TRAIN=1 可强制重跑）
+#
+# 画图（跑完之后，登录节点即可）:
+#   python -m onereplay.scripts.plot_replay_ratio_curves \
+#     --metrics_dir <RESULTS_ROOT>/metrics --pattern 'dsratio_*' \
+#     --out_dir results_log/figs/ds_ratio
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/96_ds_replay_ratio_curve.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME DS_DATASET RESULTS_ROOT FLAN_DIR
+    DATASET_CACHE
+    DRY_RUN PROBE ALLOW_DRIFT SKIP_POOL_CHECK FORCE_TRAIN KEEP_GOING
+    ARMS ARM REPLAY_STEPS
+    ONEREPLAY_LAMBDA EWC_LAMBDA COV_PATH FISHER_PATH
+    IDENTITY_COV REG_ONCE NORM_BY_LAYERS REG_IMPL
+    REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN REPLAY_POOL_SIZE
+    REPLAY_SAMPLE_SEED REPLAY_MAXLEN
+    OLD_VAL_ROWS OVERLAP_ABORT_RATIO OVERLAP_SAMPLE
+    PROBE_EVERY_UPDATES PROBE_OLD_VAL_SIZE PROBE_NEW_VAL_SIZE PROBE_BATCH
+    SEED EPOCHS LR BATCH EWC_BATCH NEW_PER_UPDATE MAXLEN VAL_FRAC MAXVAL
+    TARGET_MODULES LORA_RANK LORA_ALPHA LORA_DROPOUT
+    EVAL_BATCH SAVE MAX_STEPS RUN_TAG RUN_PREFIX VANILLA_RUN LOG_EVERY
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的检查与训练。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+DS_DATASET="${DS_DATASET:-${REPO_ROOT}/datasets/dialogsum_sft_hf}"
+FLAN_DIR="${FLAN_DIR:-${REPO_ROOT}/datasets/flan}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+COV_DIR="${RESULTS_ROOT}/cov"
+FISHER_DIR="${RESULTS_ROOT}/fisher"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+METRICS_DIR="${RESULTS_ROOT}/metrics"
+TRAIN_LOG_DIR="${RESULTS_ROOT}/train_logs"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"   # 1 = 已完成的臂也重跑
+KEEP_GOING="${KEEP_GOING:-1}"     # 1 = 某条臂失败时继续跑后面的（默认，八条臂串行）
+PROBE="${PROBE:-0}"               # 1 = 每条臂只跑 6 次更新，看编排与探针
+ALLOW_DRIFT="${ALLOW_DRIFT:-0}"
+SKIP_POOL_CHECK="${SKIP_POOL_CHECK:-0}"
+
+# ---- 训练超参：与 74 号逐字一致 ----
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-2}"
+LR="${LR:-2e-4}"
+BATCH="${BATCH:-4}"              # 除 EWC 外各臂的 micro-batch
+EWC_BATCH="${EWC_BATCH:-2}"      # EWC 专用，见文件头：batch 4 必 OOM
+NEW_PER_UPDATE="${NEW_PER_UPDATE:-64}"   # 八条臂共同的不变量
+EVAL_BATCH="${EVAL_BATCH:-8}"
+MAXLEN="${MAXLEN:-1024}"
+VAL_FRAC="${VAL_FRAC:-0.04}"
+MAXVAL="${MAXVAL:-1000}"
+LORA_RANK="${LORA_RANK:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+SAVE="${SAVE:-0}"                # 这轮只要曲线，不留 adapter
+MAX_STEPS="${MAX_STEPS:-0}"
+LOG_EVERY="${LOG_EVERY:-200}"
+
+# ---- λ：两条罚项臂的尺度不通用，所以是两个独立变量 ----
+ONEREPLAY_LAMBDA="${ONEREPLAY_LAMBDA:-}"
+EWC_LAMBDA="${EWC_LAMBDA:-}"
+IDENTITY_COV="${IDENTITY_COV:-0}"
+REG_ONCE="${REG_ONCE:-1}"
+NORM_BY_LAYERS="${NORM_BY_LAYERS:-1}"
+REG_IMPL="${REG_IMPL:-autograd}"
+COV_PATH="${COV_PATH:-${COV_DIR}/cov_flan_chat_20k_8b_all.pt}"
+FISHER_PATH="${FISHER_PATH:-${FISHER_DIR}/fisher_flan_chat_20k_8b_all.pt}"
+
+# ---- 旧知识语料（if 域）：每一项都与 68 号采 C 时逐字对应 ----
+FLAN_GLOB="${FLAN_DIR}/train/*.jsonl"
+REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN:-inputs}"
+REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-targets}"
+REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-20000}"   # = 68 号的 FLAN_SAMPLES
+REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"   # = 68 号的 --sample_seed
+REPLAY_MAXLEN="${REPLAY_MAXLEN:-512}"           # = 68 号的 IF_MAXLEN
+
+# ---- old_val：池后面紧接着的一段，八条臂逐字相同 ----
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-1000}"
+OVERLAP_ABORT_RATIO="${OVERLAP_ABORT_RATIO:-0.25}"
+OVERLAP_SAMPLE="${OVERLAP_SAMPLE:-0}"
+
+# ---- 探针 ----
+# 372 次更新 / 12 = 31 个点 + 训练前锚点。12 是 372 的因数，所以末点正好落在
+# 训练结束处；换成非因数（18 之类）最后一段会缺一个点。
+# 每点 500+500 行约 25 s，一条臂约 13 min。要更细的曲线就把 SIZE 提到 1000
+# （old_val 的完整切片），代价是探针时间翻倍。
+PROBE_EVERY_UPDATES="${PROBE_EVERY_UPDATES:-12}"
+PROBE_OLD_VAL_SIZE="${PROBE_OLD_VAL_SIZE:-500}"
+PROBE_NEW_VAL_SIZE="${PROBE_NEW_VAL_SIZE:-500}"
+PROBE_BATCH="${PROBE_BATCH:-8}"
+
+if [[ "${PROBE}" == "1" ]]; then
+  SAVE=0
+  EPOCHS=1
+  PROBE_EVERY_UPDATES=2
+  PROBE_OLD_VAL_SIZE=64
+  PROBE_NEW_VAL_SIZE=64
+  LOG_EVERY=1
+  echo "PROBE=1：每条臂 6 次更新、EPOCHS=1、探针每 2 次更新各 64 行"
+fi
+
+RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
+RUN_PREFIX="${RUN_PREFIX:-dsratio}"
+# 74 号的 vanilla：本脚本的 vanilla 臂应与它逐位对得上（探针只做 forward，
+# eval 模式下 dropout 恒等、不抽全局 RNG，探针 loader 也是 shuffle=False）。
+VANILLA_RUN="${VANILLA_RUN:-ds_vanilla_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS}_seed${SEED}}"
+
+# ===========================================================================
+# 要跑哪些臂
+#   ARMS 用逗号分隔，replay 后面跟冒号加 R。ARM/REPLAY_STEPS 是旧的单臂写法，
+#   保留为别名，免得已经写好的投递命令失效。
+# ===========================================================================
+# vanilla@2 是 EWC 的成本对照，不是凑数的：EWC 的 train_sec 里混着两样东西 ——
+# 罚项自己的每步开销，和被显存逼到 batch 2 之后的 GPU 利用率损失。没有这一条就
+# 分不开，效率图上 EWC 那个点的 x 坐标也就说不清是哪一半。
+# 它还顺带是个免费的对照：batch 2 与 batch 4 每次更新覆盖的是同一批 64 行
+# （DataLoader 的排列与 batch_size 无关），所以两条 vanilla 曲线本该重合。
+DEFAULT_ARMS="vanilla,vanilla@2,replay:1,replay:2,replay:4,replay:8,replay:16,onereplay,ewc"
+ARMS="${ARMS:-}"
+if [[ -z "${ARMS}" ]]; then
+  if [[ -n "${ARM:-}" ]]; then
+    ARMS="${ARM}"
+    if [[ "${ARM}" == "replay" && -n "${REPLAY_STEPS:-}" ]]; then
+      ARMS="replay:${REPLAY_STEPS}"
+    fi
+  else
+    ARMS="${DEFAULT_ARMS}"
+  fi
+fi
+
+# 语法: kind[:R][@batch]
+#   R     只有 replay 吃，是每次更新里纯 replay 的 micro-batch 数
+#   batch 覆盖该臂的默认 micro-batch；留空就用 kind 的默认值（EWC 是 EWC_BATCH，
+#         其余是 BATCH）。NEW_STEPS 跟着它走，所以每次更新仍是 NEW_PER_UPDATE 行。
+ARM_KINDS=()
+ARM_RSTEPS=()
+ARM_BATCHES=()
+IFS=',' read -r -a _ARM_SPECS <<< "${ARMS}"
+for _spec in "${_ARM_SPECS[@]}"; do
+  _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+  [[ -z "${_spec}" ]] && continue
+  # @batch 先摘掉，再拆 :R —— 反过来的话 "replay:2@4" 的 R 会带上 "@4"。
+  _batch=0
+  if [[ "${_spec}" == *@* ]]; then
+    _batch="${_spec##*@}"
+    _spec="${_spec%@*}"
+    if ! [[ "${_batch}" =~ ^[0-9]+$ ]] || (( _batch <= 0 )); then
+      echo "!! '${_spec}@${_batch}' 的 batch 非法，@ 后面要是正整数"
+      exit 1
+    fi
+  fi
+  _kind="${_spec%%:*}"
+  _rsteps=0
+  if [[ "${_spec}" == *:* ]]; then
+    _rsteps="${_spec#*:}"
+  fi
+  case "${_kind}" in
+    vanilla|ewc|onereplay)
+      if (( _rsteps != 0 )); then
+        echo "!! '${_spec}'：只有 replay 臂吃冒号后面的 R，${_kind} 不做 replay。"
+        exit 1
+      fi
+      ;;
+    replay)
+      if ! [[ "${_rsteps}" =~ ^[0-9]+$ ]] || (( _rsteps <= 0 )); then
+        echo "!! '${_spec}' 缺少或非法的 R。写法是 replay:<每次更新的纯 replay micro-batch 数>，"
+        echo "   例如 replay:2。网格: 1 / 2 / 4 / 8 / 16 -> r = 0.0625 / 0.125 / 0.25 / 0.5 / 1.0"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "!! ARMS 里的 '${_spec}' 不认识，只能是 vanilla / replay:<R> / ewc / onereplay"
+      exit 1
+      ;;
+  esac
+  ARM_KINDS+=("${_kind}")
+  ARM_RSTEPS+=("${_rsteps}")
+  ARM_BATCHES+=("${_batch}")
+done
+if (( ${#ARM_KINDS[@]} == 0 )); then
+  echo "!! ARMS='${ARMS}' 解析不出任何臂"; exit 1
+fi
+
+# ---- 按臂解析 batch / λ / 编排 ----
+# EWC 单独一个 batch，见文件头的显存实测。new_per_update 是不变量，所以
+# NEW_STEPS 跟着 batch 走而不是写死 16 —— batch 2 时它是 32，每次更新仍是 64 行。
+plan_arm () {
+  P_KIND="$1"
+  P_RSTEPS="$2"
+  local override="${3:-0}"
+  case "${P_KIND}" in
+    ewc)       P_DEFAULT_BATCH="${EWC_BATCH}"; P_LAMBDA="${EWC_LAMBDA}" ;;
+    onereplay) P_DEFAULT_BATCH="${BATCH}";     P_LAMBDA="${ONEREPLAY_LAMBDA}" ;;
+    *)         P_DEFAULT_BATCH="${BATCH}";     P_LAMBDA="" ;;
+  esac
+  if (( override > 0 )); then
+    P_BATCH="${override}"
+  else
+    P_BATCH="${P_DEFAULT_BATCH}"
+  fi
+  if (( NEW_PER_UPDATE % P_BATCH != 0 )); then
+    echo "!! ${P_KIND}: NEW_PER_UPDATE=${NEW_PER_UPDATE} 不能被 batch ${P_BATCH} 整除，"
+    echo "   凑不出整数个新任务 micro-batch。"
+    return 1
+  fi
+  P_NEW_STEPS=$(( NEW_PER_UPDATE / P_BATCH ))
+  P_WINDOW=$(( P_NEW_STEPS + P_RSTEPS ))
+  P_ACCUM=$(( P_WINDOW * P_BATCH ))
+  P_REPLAY_PER_UPDATE=$(( P_RSTEPS * P_BATCH ))
+  case "${P_KIND}" in
+    vanilla)   P_TAG="vanilla" ;;
+    replay)    P_TAG="replay_ifgold_${P_NEW_STEPS}n${P_RSTEPS}r" ;;
+    ewc)       P_TAG="ewc_ifgold_lam${P_LAMBDA}" ;;
+    onereplay) P_TAG="onereplay_ifgold_lam${P_LAMBDA}" ;;
+  esac
+  # 只有 replay 臂的标签带 R。非 replay 臂的 P_RSTEPS 是字符串 "0"，非空，所以
+  # ${P_RSTEPS:+...} 会展开成 ":0" —— 那是它们不认的参数，印在日志里误导人。
+  if [[ "${P_KIND}" == "replay" ]]; then
+    P_LABEL="replay:${P_RSTEPS}"
+  else
+    P_LABEL="${P_KIND}"
+  fi
+  # batch 只有偏离该 kind 的默认值时才进标签和 run 名。不这样的话
+  # vanilla@2 和 vanilla@4 会同名，后跑的那条直接覆盖前一条的 metrics；
+  # 而 EWC 的默认本来就是 2，它的名字不该因此多一截、和已有结果对不上。
+  if (( P_BATCH != P_DEFAULT_BATCH )); then
+    P_LABEL="${P_LABEL}@${P_BATCH}"
+    P_TAG="${P_TAG}_b${P_BATCH}"
+  fi
+  P_RUN="${RUN_PREFIX}_${P_TAG}_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS}_seed${SEED}"
+  [[ "${PROBE}" == "1" ]] && P_RUN="${P_RUN}_smoke"
+  P_METRICS="${METRICS_DIR}/${P_RUN}.jsonl"
+  P_LOG="${TRAIN_LOG_DIR}/${P_RUN}.train.log"
+  # awk, not python: these two numbers go into the run's banner and into the
+  # comparison at the end, and a python that is not on PATH yet would hand back
+  # an empty string instead of failing, leaving a blank column nobody notices.
+  # awk is in every image, and R=0 gives 0.0000 without a special case.
+  P_R="$(awk -v a="${P_RSTEPS}" -v b="${P_NEW_STEPS}" 'BEGIN{printf "%.4f", a/b}')"
+  P_W="$(awk -v a="${P_RSTEPS}" -v b="${P_WINDOW}" 'BEGIN{printf "%.4f", a/b}')"
+  if [[ -z "${P_R}" || -z "${P_W}" ]]; then
+    echo "!! ${P_KIND}: 算不出 r / w（awk 没跑起来？）"
+    return 1
+  fi
+  return 0
+}
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${METRICS_DIR}" "${DATASET_CACHE}" "${TRAIN_LOG_DIR}" "${ADAPTERS}"
+
+set +x
+echo "========================================================================"
+echo "DialogSum replay ratio 曲线：${#ARM_KINDS[@]} 条臂，一次投递跑完"
+echo "  本作业不做任何评测，只训练 + 打 loss 曲线"
+echo "  保护域   = if (FLAN)，池 = shuffle(seed=${REPLAY_SAMPLE_SEED}) 前 ${REPLAY_POOL_SIZE} 行"
+echo "  语料     = ${FLAN_GLOB}   列 ${REPLAY_INPUT_COLUMN}/${REPLAY_TARGET_COLUMN} @ max_len ${REPLAY_MAXLEN}"
+echo "  old_val  = 行 [${REPLAY_POOL_SIZE}, ${REPLAY_POOL_SIZE}+${OLD_VAL_ROWS}) 同一次 shuffle"
+echo "  探针     = 每 ${PROBE_EVERY_UPDATES} 次更新；old_val ${PROBE_OLD_VAL_SIZE} 行 / new_val ${PROBE_NEW_VAL_SIZE} 行 @ batch ${PROBE_BATCH}"
+echo "  LoRA     = r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT}"
+echo "  训练     = LR ${LR} / EPOCHS ${EPOCHS} / MAXLEN ${MAXLEN} / seed ${SEED} / 每次更新 ${NEW_PER_UPDATE} 行新任务"
+echo "  阶段     = DRY_RUN=${DRY_RUN} PROBE=${PROBE} FORCE_TRAIN=${FORCE_TRAIN} KEEP_GOING=${KEEP_GOING}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 逐臂的编排算术 + 与 74 号的对齐检查
+# ===========================================================================
+echo "==== Step 0: 编排算术与对齐检查 ===="
+printf '%-26s %6s %6s %6s %6s %8s %8s %9s %s\n' \
+  arm batch new_st R window ACCUM r w run
+for _i in "${!ARM_KINDS[@]}"; do
+  plan_arm "${ARM_KINDS[$_i]}" "${ARM_RSTEPS[$_i]}" "${ARM_BATCHES[$_i]}" || exit 1
+  printf '%-26s %6s %6s %6s %6s %8s %8s %9s %s\n' \
+    "${P_LABEL}" "${P_BATCH}" "${P_NEW_STEPS}" "${P_RSTEPS}" \
+    "${P_WINDOW}" "${P_ACCUM}" "${P_R}" "${P_W}" "${P_RUN}"
+  # 这是整个扫描的不变量。不等的话各臂的优化器看到的新任务量不同，曲线不可比。
+  if (( P_NEW_STEPS * P_BATCH != NEW_PER_UPDATE )); then
+    echo "!! ${P_KIND}: 每次更新的新任务行数 ${P_NEW_STEPS}x${P_BATCH} != ${NEW_PER_UPDATE}"; exit 1
+  fi
+  if (( P_ACCUM % P_BATCH != 0 )); then
+    echo "!! ${P_KIND}: ACCUM=${P_ACCUM} 不能被 batch ${P_BATCH} 整除"; exit 1
+  fi
+done
+echo "每条臂每次更新都是 ${NEW_PER_UPDATE} 行新任务，每 epoch 的更新数因此与 R 和 batch 都无关。"
+
+# λ 与罚项矩阵：只有真的要跑那条臂时才要求
+NEED_COV=0
+NEED_FISHER=0
+for _kind in "${ARM_KINDS[@]}"; do
+  [[ "${_kind}" == "onereplay" ]] && NEED_COV=1
+  [[ "${_kind}" == "ewc" ]] && NEED_FISHER=1
+done
+if (( NEED_COV )); then
+  if [[ -z "${ONEREPLAY_LAMBDA}" ]]; then
+    echo "!! ARMS 里有 onereplay，必须给 ONEREPLAY_LAMBDA=<81 号在这条线、if 域上定稿的值>。"
+    echo "   别从 CS 线或别的域搬：λ 压的是 ΔW，更新次数与 tr(C) 都不同。"
+    exit 1
+  fi
+  awk -v x="${ONEREPLAY_LAMBDA}" 'BEGIN{exit !(x > 0)}' 2>/dev/null \
+    || { echo "!! ONEREPLAY_LAMBDA=${ONEREPLAY_LAMBDA} 不是正数。λ=0 就是 vanilla。"; exit 1; }
+  [[ -f "${COV_PATH}" ]] || { echo "!! 缺 C: ${COV_PATH}（68 号产出）"; exit 1; }
+fi
+if (( NEED_FISHER )); then
+  if [[ -z "${EWC_LAMBDA}" ]]; then
+    echo "!! ARMS 里有 ewc，必须给 EWC_LAMBDA=<82 号在这条线、if 域上定稿的值>。"
+    echo "   与 OneReplay 的 λ 不是一把尺子，不能互相搬。"
+    exit 1
+  fi
+  awk -v x="${EWC_LAMBDA}" 'BEGIN{exit !(x > 0)}' 2>/dev/null \
+    || { echo "!! EWC_LAMBDA=${EWC_LAMBDA} 不是正数。"; exit 1; }
+  [[ -f "${FISHER_PATH}" ]] || { echo "!! 缺 F: ${FISHER_PATH}（69 号产出）"; exit 1; }
+  if (( EWC_BATCH >= 4 )); then
+    echo "warning: EWC_BATCH=${EWC_BATCH}。09-11 实测 EWC 在 batch 2 已占 119.22 GiB"
+    echo "         （H200 143 GiB），batch 4 会 OOM。确有把握再往上调。"
+  fi
+fi
+
+[[ -d "${DS_DATASET}" ]] || { echo "缺 DialogSum 训练池: ${DS_DATASET}（74 号的 prepare 步骤会生成）"; exit 1; }
+
+# 74 号钉下来的值。ACCUM 与 batch 不在其中：前者按 R 变，后者 EWC 要单独低一档，
+# 两者要守的都是 NEW_PER_UPDATE（上面已逐臂断言）。
+DRIFT=()
+[[ "${TARGET_MODULES}" == "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" ]] \
+  || DRIFT+=("target_modules=${TARGET_MODULES}（74 号: all-linear 七类）")
+[[ "${LORA_RANK}"    == "16"   ]] || DRIFT+=("lora_rank=${LORA_RANK}（74 号: 16）")
+[[ "${LORA_ALPHA}"   == "32"   ]] || DRIFT+=("lora_alpha=${LORA_ALPHA}（74 号: 32）")
+[[ "${LORA_DROPOUT}" == "0.05" ]] || DRIFT+=("lora_dropout=${LORA_DROPOUT}（74 号: 0.05）")
+[[ "${BATCH}"        == "4"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 4）")
+[[ "${EVAL_BATCH}"   == "8"    ]] || DRIFT+=("eval_batch_size=${EVAL_BATCH}（74 号: 8）")
+[[ "${MAXLEN}"       == "1024" ]] || DRIFT+=("max_len=${MAXLEN}（74 号: 1024）")
+[[ "${VAL_FRAC}"     == "0.04" ]] || DRIFT+=("val_fraction=${VAL_FRAC}（74 号: 0.04）")
+[[ "${MAXVAL}"       == "1000" ]] || DRIFT+=("max_val_samples=${MAXVAL}（74 号: 1000）")
+[[ "${NEW_PER_UPDATE}" == "64" ]] || DRIFT+=("new_per_update=${NEW_PER_UPDATE}（74/81/82/83 号: 64）")
+[[ "${REPLAY_MAXLEN}" == "512" ]] || DRIFT+=("replay/old_val max_len=${REPLAY_MAXLEN}（68 号采 if 的 C 用的是 512）")
+if [[ "${PROBE}" != "1" ]]; then
+  [[ "${EPOCHS}"    == "2" ]] || DRIFT+=("epochs=${EPOCHS}（74 号: 2，val_loss 在 epoch 2 触底）")
+  [[ "${MAX_STEPS}" == "0" ]] || DRIFT+=("max_steps=${MAX_STEPS}（正式 run 应为 0）")
+fi
+if (( ${#DRIFT[@]} > 0 )); then
+  echo "与 74 号不一致的项:"
+  for item in "${DRIFT[@]}"; do echo "  - ${item}"; done
+  if [[ "${ALLOW_DRIFT}" != "1" ]]; then
+    echo "!! 这些偏差会让曲线之间的差值混进第二个变量。确实要改就传 ALLOW_DRIFT=1，"
+    echo "   并把偏差写进结果表。停。"
+    exit 1
+  fi
+  echo "ALLOW_DRIFT=1：继续，但上面每一条都要写进结果表。"
+else
+  echo "训练超参与 74 号逐字一致（EWC 的 batch 是有意的例外，见文件头）。"
+fi
+
+# shellcheck disable=SC2086
+POOL_FILES=$(ls -1 ${FLAN_GLOB} 2>/dev/null | wc -l)
+if (( POOL_FILES == 0 )); then
+  echo "!! ${FLAN_GLOB} 没匹配到任何文件。if 域读 FLAN_DIR=${FLAN_DIR}。"; exit 1
+fi
+echo "FLAN 分片 ${POOL_FILES} 个: ${FLAN_GLOB}"
+
+# ===========================================================================
+# Step 1: old_val 切片的两条断言（只做一次，八条臂共用同一批行）
+#
+#   1) 它与 replay 池行号不重叠 —— 靠的是两侧读同一批文件、同一个 shuffle(seed)，
+#      池取 [0, pool)，val 取 [pool, pool+rows)。这里不复写那两步，而是直接
+#      import data/replay.py 用的同一个 cut_pool 把两段切出来。
+#   2) prompt 文本的交集比例 —— 行号不重叠推不出文本不重叠，FLAN 自身约 6.4%
+#      的重复 prompt 会留在里面。判据是比例不是 0，见文件头。
+#
+#   顺带把 json -> arrow 的转换落进 DATASET_CACHE，八条臂训练时直接命中。
+# ===========================================================================
+echo "==== Step 1: old_val 切片检查（八条臂共用）===="
+export FLAN_GLOB DATASET_CACHE REPLAY_POOL_SIZE REPLAY_SAMPLE_SEED OLD_VAL_ROWS
+export REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN REPLAY_MAXLEN
+export OVERLAP_ABORT_RATIO OVERLAP_SAMPLE
+export COV_PATH SKIP_POOL_CHECK NEED_COV
+POOL_REPORT_FILE="${TMPDIR}/pool_preflight_${RUN_PREFIX}.txt"
+
+if ! python - <<'PY' 2>&1 | tee "${POOL_REPORT_FILE}"; then
+import argparse
+import os
+
+import torch
+from datasets import load_dataset
+
+from onereplay.data.replay import cut_pool, to_sft_schema
+
+pool_size = int(os.environ["REPLAY_POOL_SIZE"])
+sample_seed = int(os.environ["REPLAY_SAMPLE_SEED"])
+want_rows = int(os.environ["OLD_VAL_ROWS"])
+input_column = os.environ["REPLAY_INPUT_COLUMN"]
+target_column = os.environ["REPLAY_TARGET_COLUMN"]
+abort_ratio = float(os.environ["OVERLAP_ABORT_RATIO"])
+overlap_sample = int(os.environ["OVERLAP_SAMPLE"])
+
+failures = []
+
+# 同一次 load_dataset、同一个 cut_pool(seed, 0)，两段只差 select 的偏移 ——
+# 这正是 data/replay.py 的 build_replay_dataset 和 data/old_val.py 的
+# _slice_dataset 各自会做的事。
+corpus = load_dataset(
+    "json",
+    data_files=os.environ["FLAN_GLOB"],
+    split="train",
+    cache_dir=os.environ["DATASET_CACHE"],
+)
+print(f"FLAN 全量     = {len(corpus)} 行")
+for column in (input_column, target_column):
+    if column not in corpus.column_names:
+        failures.append(
+            f"语料没有列 {column!r}；实有 {corpus.column_names}。"
+            "REPLAY_INPUT_COLUMN / REPLAY_TARGET_COLUMN 传错了。"
+        )
+if failures:
+    for item in failures:
+        print(f"!! {item}")
+    raise SystemExit(1)
+
+shuffled = cut_pool(corpus, sample_seed, 0)
+available = len(shuffled) - pool_size
+if available <= 0:
+    print(
+        f"!! 语料只有 {len(shuffled)} 行，池就要走前 {pool_size} 行，"
+        "池外一行不剩，old_val 无从切起。"
+    )
+    raise SystemExit(1)
+rows = min(want_rows, available)
+if rows < want_rows:
+    print(f"warning: 池外只有 {available} 行，old_val 取 {rows} 行而不是 {want_rows}")
+
+pool = shuffled.select(range(pool_size))
+old_val = shuffled.select(range(pool_size, pool_size + rows))
+print(f"replay 池     = 行 [0, {pool_size})            shuffle(seed={sample_seed})")
+print(f"old_val 切片  = 行 [{pool_size}, {pool_size + rows})   同一次 shuffle")
+print(f"池外余量      = {available} 行")
+
+# 训练侧真正会用的行数：to_sft_schema 把空 instruction/output 的行滤掉（那些行
+# 标签全是 -100，一个批次全是它们就是 NaN loss）。训练日志打的是滤之后的数，
+# 所以这里也要走同一个函数，否则训练后的断言会拿两个口径的数去比。
+schema_args = argparse.Namespace(
+    replay_input_column=input_column,
+    replay_target_column=target_column,
+)
+pool_usable = len(to_sft_schema(pool, schema_args))
+old_val_usable = len(to_sft_schema(old_val, schema_args))
+print(f"池装配后      = {pool_size} -> 滤空行后 {pool_usable}")
+print(f"old_val 装配后 = {rows} -> 滤空行后 {old_val_usable}")
+
+# ---- prompt 文本的交集比例 ----
+pool_prompts = set(pool[input_column] if overlap_sample <= 0 else
+                   pool.select(range(min(overlap_sample, len(pool))))[input_column])
+val_prompts = list(old_val[input_column])
+overlap = sum(1 for prompt in val_prompts if prompt in pool_prompts)
+ratio = overlap / max(len(val_prompts), 1)
+checked = pool_size if overlap_sample <= 0 else min(overlap_sample, pool_size)
+print(f"池内不同 prompt = {len(pool_prompts)} / {checked}"
+      f"  (语料自身重复率 {1 - len(pool_prompts) / checked:.2%})")
+print(f"old_val 与池的 prompt 文本交集 = {overlap}/{len(val_prompts)}  ({ratio:.2%})")
+if ratio >= abort_ratio:
+    failures.append(
+        f"交集 {ratio:.2%} 远超语料自身的重复 prompt 率，说明 old_val 基本就是池本身。"
+        "两侧的 shuffle 不是同一个 —— 查 FLAN_GLOB 是否一致、DATASET_CACHE 里是否混进了"
+        "另一次不同 glob 的缓存、REPLAY_SAMPLE_SEED 是否与 68 号相同。"
+    )
+else:
+    print(
+        f"  -> 低于 {abort_ratio:.0%} 的判据。这个量级就是 FLAN 自身的重复 prompt，"
+        "不是切片串了。把这个百分比写进报告。"
+    )
+
+blank_share = 1 - old_val_usable / max(rows, 1)
+if blank_share > 0.01:
+    failures.append(
+        f"old_val 的空行占 {blank_share:.2%}，超过 1%：多半是答案列读错了（读到一列"
+        "几乎全空的东西）。先人工确认那一列。"
+    )
+
+# ---- 同池参照：C 的 pool_rows 就该是这个池的行数 ----
+#   68 号在 if 域没传 --require_target 1，所以它的 pool_rows 落在**空行过滤前**
+#   的数上，而 replay 非滤不可。两个数都认，差额只能是那道过滤。
+if os.environ["SKIP_POOL_CHECK"] == "1":
+    print("SKIP_POOL_CHECK=1：不与 C 对表，replay 臂与 81 号是否同池没有证据。")
+elif os.environ.get("NEED_COV") != "1":
+    print("note: 本次不跑 onereplay 臂，跳过与 C 的同池对表。")
+elif not os.path.isfile(os.environ["COV_PATH"]):
+    print(f"note: 没有 {os.environ['COV_PATH']}，跳过同池对表。")
+else:
+    cov_path = os.environ["COV_PATH"]
+    try:
+        payload = torch.load(cov_path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError):
+        payload = torch.load(cov_path, map_location="cpu")
+    meta = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    cov_rows = meta.get("pool_rows")
+    cov_max_len = meta.get("max_len")
+    print(f"C             = {cov_path}")
+    print(f"  pool_rows        = {cov_rows}   (本脚本的池 = {pool_size}，可用 {pool_usable})")
+    print(f"  max_len          = {cov_max_len}")
+    print(f"  pool_fingerprint = {meta.get('pool_fingerprint')}")
+    if cov_rows is None:
+        print("  note: metadata 里没有 pool_rows，这份 C 来自更早的脚本，无从对表。")
+    elif int(cov_rows) == pool_usable:
+        print(f"  -> 行数一致（{pool_usable}），两条臂同池。")
+    elif int(cov_rows) == pool_size:
+        blank = pool_size - pool_usable
+        print(f"  -> C 的 pool_rows={cov_rows} 等于空行过滤**前**的行数。两条臂取的是")
+        print(f"     同一批 {pool_size} 行，差的 {blank} 行（{blank / pool_size:.2%}）是")
+        print("     inputs/targets 为空的行，replay 必须丢、collect_cov 不必丢。放行。")
+        if blank / pool_size > 0.01:
+            failures.append(
+                f"但空行占 {blank / pool_size:.2%} 超过 1%，这个比例本身说明列可能读错了。"
+            )
+    else:
+        failures.append(
+            f"C 是在 {cov_rows} 行上采的，本脚本的池是 {pool_size} 行（可用 {pool_usable}），"
+            "两个都对不上。replay 臂与 OneReplay 臂消费的旧知识不同，比出来的就不是"
+            "「怎么用旧知识」而是「用了多少」。查 REPLAY_POOL_SIZE / REPLAY_SAMPLE_SEED / FLAN_GLOB。"
+        )
+    if cov_max_len is not None and int(cov_max_len) != int(os.environ["REPLAY_MAXLEN"]):
+        failures.append(
+            f"REPLAY_MAXLEN={os.environ['REPLAY_MAXLEN']} 与 C 的 max_len={cov_max_len} 不等。"
+            "训练截断保留末尾 token，两条臂看到的旧知识长度不同。"
+        )
+
+print()
+if failures:
+    print("!! Step 1 未通过:")
+    for item in failures:
+        print(f"   - {item}")
+    raise SystemExit(1)
+print(f"EXPECT_POOL_ROWS={pool_usable}")
+print(f"EXPECT_OLD_VAL_ROWS={old_val_usable}")
+print("old_val 切片检查通过。")
+PY
+  echo "!! Step 1 未通过，不进入训练。"
+  exit 1
+fi
+
+# 训练后的断言要拿 Step 1 数出来的行数去比，而不是拿 REPLAY_POOL_SIZE —— 后者是
+# 过滤前的数，训练日志打的是过滤后的。锚到行首：EXPECT_POOL_ROWS 与
+# EXPECT_OLD_VAL_ROWS 互为前缀之外的键，不锚会互相匹配。
+parse_expect () {
+  local key="$1" value
+  value="$(grep -o "^${key}=[0-9]*" "${POOL_REPORT_FILE}" | tail -n 1 || true)"
+  printf '%s' "${value#"${key}="}"
+}
+EXPECT_POOL_ROWS="$(parse_expect EXPECT_POOL_ROWS)"
+EXPECT_OLD_VAL_ROWS="$(parse_expect EXPECT_OLD_VAL_ROWS)"
+if [[ -z "${EXPECT_POOL_ROWS}" || -z "${EXPECT_OLD_VAL_ROWS}" ]]; then
+  echo "!! 没解析到 EXPECT_POOL_ROWS / EXPECT_OLD_VAL_ROWS，训练后的断言会失效。停。"
+  exit 1
+fi
+echo "训练后要核对: replay 池 ${EXPECT_POOL_ROWS} 行，old_val ${EXPECT_OLD_VAL_ROWS} 行"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo ""
+  echo "DRY_RUN=1：以上为计划与前置检查，未训练。"
+  echo "确认无误后把 DRY_RUN=0 加进去重投即可。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# 逐臂训练
+#   一条臂一次独立的 train.py 调用，所以显存在臂之间是释放干净的，8B 与 C/F
+#   各自重读一遍（这正是把八条臂放进一个作业的代价，约 0.5 h）。
+#   每条臂各写各的 metrics 文件，中途挂掉只丢正在跑的那条。
+#
+#   !! 非罚项臂不许加载 C
+#   --replay_lambda 0 只是不把罚项加进 loss；决定要不要读 C 的是
+#       should_load = replay_lambda > 0 or (measure_replay_when_lambda_zero == 1
+#                                           and Path(penalty_path).exists())
+#   而 Path("") 会解析成 Path(".")、exists() 为真，所以单靠 --cov_path "" 挡不住。
+# ===========================================================================
+OLD_VAL_ARGS=(
+  --old_val_jsonl "${FLAN_GLOB}"
+  --old_val_pool_size "${REPLAY_POOL_SIZE}"
+  --old_val_sample_seed "${REPLAY_SAMPLE_SEED}"
+  --old_val_rows "${OLD_VAL_ROWS}"
+  --old_val_input_column "${REPLAY_INPUT_COLUMN}"
+  --old_val_target_column "${REPLAY_TARGET_COLUMN}"
+  --old_val_max_len "${REPLAY_MAXLEN}"
+)
+PROBE_ARGS=(
+  --probe_every_updates "${PROBE_EVERY_UPDATES}"
+  --probe_old_val_size "${PROBE_OLD_VAL_SIZE}"
+  --probe_cs_val_size "${PROBE_NEW_VAL_SIZE}"
+  --probe_batch_size "${PROBE_BATCH}"
+)
+
+arm_train_args () {
+  case "${P_KIND}" in
+    vanilla)
+      printf '%s\n' --replay_lambda 0 --measure_replay_when_lambda_zero 0 --cov_path ""
+      ;;
+    replay)
+      printf '%s\n' \
+        --replay_lambda 0 --measure_replay_when_lambda_zero 0 --cov_path "" \
+        --replay_steps_per_update "${P_RSTEPS}" \
+        --replay_data_files "${FLAN_GLOB}" \
+        --replay_split train \
+        --replay_input_column "${REPLAY_INPUT_COLUMN}" \
+        --replay_target_column "${REPLAY_TARGET_COLUMN}" \
+        --replay_pool_size "${REPLAY_POOL_SIZE}" \
+        --replay_sample_seed "${REPLAY_SAMPLE_SEED}" \
+        --replay_max_len "${REPLAY_MAXLEN}" \
+        --replay_cache_dir "${DATASET_CACHE}"
+      ;;
+    onereplay)
+      printf '%s\n' \
+        --regularizer onereplay --cov_path "${COV_PATH}" --replay_lambda "${P_LAMBDA}" \
+        --identity_cov "${IDENTITY_COV}" \
+        --normalize_replay_by_layers "${NORM_BY_LAYERS}" \
+        --reg_once_per_update "${REG_ONCE}" --reg_impl "${REG_IMPL}"
+      ;;
+    ewc)
+      printf '%s\n' \
+        --regularizer ewc --fisher_path "${FISHER_PATH}" --cov_path "" \
+        --replay_lambda "${P_LAMBDA}" \
+        --identity_cov 0 \
+        --normalize_replay_by_layers "${NORM_BY_LAYERS}" \
+        --reg_once_per_update "${REG_ONCE}"
+      ;;
+  esac
+}
+
+# 这条臂是不是已经跑完了。metrics 是追加写的，所以判据是"有 WANT_EPOCHS 条 epoch
+# 记录"而不是"文件存在" —— 半截的文件要重跑，不然曲线是断的。
+arm_is_done () {
+  [[ -f "${P_METRICS}" ]] || return 1
+  RUN_METRICS="${P_METRICS}" WANT_EPOCHS="${EPOCHS}" python - <<'PY'
+import json
+import os
+import sys
+
+count = 0
+with open(os.environ["RUN_METRICS"], encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip() and json.loads(line).get("record_type") == "epoch":
+            count += 1
+sys.exit(0 if count >= int(os.environ["WANT_EPOCHS"]) else 1)
+PY
+}
+
+train_one_arm () {
+  local rc=0
+  echo ""
+  echo "########################################################################"
+  echo "# 臂 ${ARM_INDEX}/${#ARM_KINDS[@]}: ${P_LABEL}   r=${P_R}  w=${P_W}"
+  echo "#   run    = ${P_RUN}"
+  echo "#   编排   = window ${P_WINDOW} 步 (${P_NEW_STEPS} new + ${P_RSTEPS} replay) x batch ${P_BATCH}"
+  echo "#   ACCUM  = ${P_ACCUM}，每次更新 ${NEW_PER_UPDATE} 新任务 + ${P_REPLAY_PER_UPDATE} replay"
+  [[ -n "${P_LAMBDA}" ]] && echo "#   λ      = ${P_LAMBDA}"
+  echo "########################################################################"
+
+  if [[ "${FORCE_TRAIN}" != "1" ]] && arm_is_done; then
+    echo "跳过：${P_METRICS} 已有 ${EPOCHS} 条 epoch 记录（FORCE_TRAIN=1 可重跑）"
+    return 0
+  fi
+  # 追加写的 jsonl：半截的文件先挪走，否则两次的探针点会串在一起。
+  if [[ -f "${P_METRICS}" ]]; then
+    mv "${P_METRICS}" "${P_METRICS}.$(date +%Y%m%d_%H%M%S).bak"
+    echo "已把上一次未跑完的 ${P_METRICS} 改名备份"
+  fi
+
+  # 一行一个 token（92 号同款读法）。`--cov_path ""` 那个空串也要保留成一个独立
+  # 参数，printf 给它留了自己的一行，read 就会读到空字符串。
+  local arm_args=()
+  while IFS= read -r item; do arm_args+=("${item}"); done < <(arm_train_args)
+  mkdir -p "${RESULTS_ROOT}/map_cache/${P_RUN}"
+
+  set -x
+  python -m onereplay.scripts.train --paradigm sft \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --dataset_path "${DS_DATASET}" \
+    --epochs "${EPOCHS}" --lr "${LR}" \
+    --batch_size "${P_BATCH}" --accumulation_size "${P_ACCUM}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${RESULTS_ROOT}/map_cache/${P_RUN}" \
+    --max_steps "${MAX_STEPS}" --log_every "${LOG_EVERY}" \
+    --eval_before_train 1 \
+    "${arm_args[@]}" \
+    "${OLD_VAL_ARGS[@]}" \
+    "${PROBE_ARGS[@]}" \
+    --save "${SAVE}" --save_path "${ADAPTERS}/${P_RUN}" \
+    --metrics_path "${P_METRICS}" 2>&1 | tee "${P_LOG}"
+  rc=$?
+  set +x
+  if (( rc != 0 )); then
+    echo "!! ${P_RUN} 训练退出码 ${rc}"
+    return "${rc}"
+  fi
+
+  # ---- 这条臂的日志自检：只查 stdout 上才有的那几句 ----
+  local log_fail=()
+  assert_log () {
+    if ! grep -qF -- "$1" "${P_LOG}"; then
+      log_fail+=("找不到 '$1'   <- $2")
+    fi
+  }
+  if [[ "${P_KIND}" == "replay" ]]; then
+    assert_log "step-level replay: ${P_NEW_STEPS} new + ${P_RSTEPS} replay micro-batches per update" \
+      "实际编排与 run 名不符。"
+    assert_log "per update: ${NEW_PER_UPDATE} new-task rows + ${P_REPLAY_PER_UPDATE} replay rows" \
+      "每次更新的行数不对；与其余各臂对不齐，x 轴就错位了。"
+    assert_log "replay pool: ${EXPECT_POOL_ROWS} usable rows (no cut)" \
+      "池行数与 Step 1 数出的不符，不再与 68 号的 C 同池。"
+    assert_log "replay targets: gold-target" "if 域读的应该是 FLAN 自己的 targets 列"
+    assert_log "replay pool: tokenizing at max_len=${REPLAY_MAXLEN} (new task stays at ${MAXLEN})" \
+      "replay 的 token 预算没生效，长行会丢题干。"
+  fi
+  # 八条臂都要有，曲线能相减就靠它们打的是同一批行。
+  assert_log "old val: ${EXPECT_OLD_VAL_ROWS} rows from rows ${REPLAY_POOL_SIZE}.." \
+    "old_val 的行数或起点与 Step 1 数出的不符，各臂打的不是同一批行。"
+  assert_log "columns ${REPLAY_INPUT_COLUMN}/${REPLAY_TARGET_COLUMN}, max_len=${REPLAY_MAXLEN}" \
+    "old_val 的列或 token 预算不对，打分的行与 replay 训的行不同形。"
+  assert_log "probe old_val:" "没有保护域探针曲线"
+  assert_log "probe cs_val:" "没有新任务探针曲线"
+  assert_log "TARGET_MODULES=${TARGET_MODULES}" "LoRA 覆盖与 74 号不同"
+  assert_log "MAX_LEN=${MAXLEN}" "新任务的 token 预算与 74 号不同"
+  if [[ "${P_KIND}" == "vanilla" || "${P_KIND}" == "replay" ]]; then
+    assert_log "REPLAY_LAMBDA=0.0" "本臂不该有罚项"
+    assert_log "MEASURE_REPLAY_WHEN_LAMBDA_ZERO=0" "λ=0 但仍会加载 C，白付显存"
+    if grep -q "covariance matrices from" "${P_LOG}"; then
+      log_fail+=("日志里出现了 'covariance matrices from'   <- C 被加载了，开销数字作废。")
+    fi
+  else
+    assert_log "regularizer covers" "罚项一层都没接上，这条臂等于 vanilla"
+  fi
+  if (( ${#log_fail[@]} > 0 )); then
+    echo "!! ${P_RUN} 日志自检失败:"
+    for item in "${log_fail[@]}"; do echo "   - ${item}"; done
+    return 1
+  fi
+  echo "${P_RUN}: 日志自检通过。"
+  return 0
+}
+
+OK_ARMS=()
+FAILED_ARMS=()
+ARM_INDEX=0
+for _i in "${!ARM_KINDS[@]}"; do
+  ARM_INDEX=$(( _i + 1 ))
+  plan_arm "${ARM_KINDS[$_i]}" "${ARM_RSTEPS[$_i]}" "${ARM_BATCHES[$_i]}" || exit 1
+  if train_one_arm; then
+    OK_ARMS+=("${P_RUN}")
+  else
+    FAILED_ARMS+=("${P_LABEL} (${P_RUN})")
+    if [[ "${KEEP_GOING}" != "1" ]]; then
+      echo "!! KEEP_GOING=0，就此停止。"
+      break
+    fi
+    echo "!! 这条臂失败了，继续跑后面的（KEEP_GOING=0 可改成立即停止）。"
+  fi
+done
+
+# ===========================================================================
+# 跨臂汇总：八条曲线并排，外加开销与池覆盖率
+#   这是本作业的产物。画图另外跑 plot_replay_ratio_curves.py。
+# ===========================================================================
+set +x
+echo ""
+echo "========================================================================"
+echo "跨臂汇总"
+echo "========================================================================"
+# 汇总失败不该把已经跑完的八条臂的退出码也带坏，所以先关掉 set -e 再取码。
+set +e
+METRICS_DIR="${METRICS_DIR}" RUN_PREFIX="${RUN_PREFIX}" \
+WANT_EPOCHS="${EPOCHS}" POOL_ROWS="${EXPECT_POOL_ROWS}" \
+RUN_LIST="$(IFS=$'\n'; printf '%s' "${OK_ARMS[*]:-}")" \
+VANILLA_METRICS="${METRICS_DIR}/${VANILLA_RUN}.jsonl" VANILLA_NAME="${VANILLA_RUN}" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+
+def load(path):
+    rows = []
+    if not path or not os.path.isfile(path):
+        return rows
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+metrics_dir = Path(os.environ["METRICS_DIR"])
+names = [name for name in os.environ.get("RUN_LIST", "").split("\n") if name.strip()]
+if not names:
+    raise SystemExit("这一轮没有跑成功的臂，没什么可汇总的。")
+
+pool_rows = int(os.environ["POOL_ROWS"])
+want_epochs = int(os.environ["WANT_EPOCHS"])
+
+runs = []
+for name in names:
+    records = load(metrics_dir / f"{name}.jsonl")
+    epochs = [row for row in records if row.get("record_type") == "epoch"]
+    probes = [row for row in records if row.get("record_type") == "probe"]
+    if not epochs or not probes:
+        print(f"note: {name} 缺 epoch 或 probe 记录，跳过")
+        continue
+    last = epochs[-1]
+    runs.append(
+        {
+            "name": name,
+            "r": float(last.get("replay_ratio_r") or 0.0),
+            "w": last.get("replay_loss_weight"),
+            "batch": last.get("batch_size"),
+            "accum": last.get("accumulation_size"),
+            "new_per_update": last.get("new_per_update"),
+            "replay_per_update": int(last.get("replay_per_update") or 0),
+            "lam": float(last.get("replay_lambda") or 0.0),
+            "reg": last.get("regularizer"),
+            "steps": int(last.get("replay_steps_per_update") or 0),
+            "train_sec": sum(float(row.get("train_sec") or 0.0) for row in epochs),
+            "peak": max(float(row.get("peak_memory_gb") or 0.0) for row in epochs),
+            "resident": float(last.get("covariance_memory_gb") or 0.0),
+            "val_loss": last.get("val_loss"),
+            "epochs": int(last.get("epoch") or 0),
+            "updates": [row["update"] for row in probes],
+            "old": [row.get("probe_old_val") for row in probes],
+            "new": [row.get("probe_cs_val") for row in probes],
+            "probe_sec": sum(float(row.get("probe_sec") or 0.0) for row in probes),
+        }
+    )
+
+def sort_key(run):
+    """vanilla first, then the ratio sweep in order of r, then the penalties."""
+
+    if run["steps"] == 0 and run["lam"] == 0:
+        group = 0
+    elif run["steps"] > 0:
+        group = 1
+    else:
+        group = 2
+    return group, run["r"], run["reg"] or ""
+
+
+runs.sort(key=sort_key)
+failures = []
+
+# ---- 曲线能不能相减：同一个 x 轴 + 同一个锚点 ----
+print("---- 可比性")
+axes = {tuple(run["updates"]) for run in runs}
+if len(axes) == 1:
+    print(f"x 轴一致：{len(runs[0]['updates'])} 个探针点，update "
+          f"{runs[0]['updates'][0]} -> {runs[0]['updates'][-1]}，八条臂逐点重合。")
+else:
+    failures.append(
+        "各臂的探针点对不齐，曲线不能逐点相减："
+        + ", ".join(f"{run['name']}={len(run['updates'])}点" for run in runs)
+    )
+anchors = {round(run["old"][0], 6) for run in runs if run["old"] and run["old"][0] is not None}
+if len(anchors) == 1:
+    print(f"锚点一致：每条臂 update 0 的 old_val 都是 {anchors.pop():.6f}"
+          "（LoRA 零初始化，起点就是基座模型）。")
+else:
+    failures.append(
+        f"各臂的 update 0 锚点不同 {sorted(anchors)}：打的不是同一批行或预算不同，"
+        "曲线不可比。查 --old_val_* 与 replay 的口径。"
+    )
+for run in runs:
+    if run["new_per_update"] != 64:
+        failures.append(f"{run['name']}: new_per_update={run['new_per_update']}，不是 64")
+    if run["epochs"] != want_epochs:
+        failures.append(f"{run['name']}: 只跑到 epoch {run['epochs']}，要求 {want_epochs}")
+
+# ---- 主表 ----
+vanillas = [run for run in runs if run["steps"] == 0 and run["lam"] == 0]
+# The baseline is the one sharing the sweep's micro-batch; a vanilla at another
+# batch is the throughput control, not the denominator.
+main_batch = max((run["batch"] for run in runs if run["steps"] > 0), default=None)
+vanilla = next((run for run in vanillas if run["batch"] == main_batch), None) or (
+    vanillas[0] if vanillas else None
+)
+print()
+print("---- 主表（old_val 越低 = 旧知识保得越好；new_val 越低 = 新任务学得越好）")
+header = (f"{'arm':<32}{'bs':>4}{'r':>7}{'w':>8}{'池覆盖':>9}{'old末':>10}{'old变化':>10}"
+          f"{'new末':>10}{'train_s':>9}{'vs van':>8}{'peak':>8}{'常驻':>7}")
+print(header)
+print("-" * len(header))
+for run in runs:
+    # Replay rows this arm ever drew = per-update draw x updates taken. The pool
+    # cursor carries across epochs, so this is the whole run's consumption.
+    consumed = run["replay_per_update"] * (run["updates"][-1] if run["updates"] else 0)
+    seen = f"{min(consumed / pool_rows, 1.0):.1%}" if consumed else "-"
+    speed = f"{run['train_sec'] / vanilla['train_sec']:.2f}x" if vanilla and vanilla["train_sec"] else "-"
+    label = run["name"].replace(os.environ["RUN_PREFIX"] + "_", "")[:31]
+    w_text = f"{run['w']:.4f}" if run["w"] is not None else "-"
+    print(
+        f"{label:<32}{run['batch']:>4}{run['r']:>7.4f}{w_text:>8}{seen:>9}"
+        f"{run['old'][-1]:>10.4f}{run['old'][-1] - run['old'][0]:>+10.4f}"
+        f"{run['new'][-1]:>10.4f}{run['train_sec']:>9.0f}{speed:>8}"
+        f"{run['peak']:>8.1f}{run['resident']:>7.1f}"
+    )
+
+# ---- 这一轮到底说明了什么 ----
+print()
+print("---- 读法")
+replay_runs = sorted((run for run in runs if run["steps"] > 0), key=lambda run: run["r"])
+penalties = [run for run in runs if run["lam"] > 0]
+if replay_runs and vanilla:
+    print(f"replay 从 r={replay_runs[0]['r']:.4f} 到 r={replay_runs[-1]['r']:.4f}，"
+          f"old_val 末点 {replay_runs[0]['old'][-1]:.4f} -> {replay_runs[-1]['old'][-1]:.4f}"
+          f"（vanilla 是 {vanilla['old'][-1]:.4f}）")
+for penalty in penalties:
+    target = penalty["old"][-1]
+    matched = [run for run in replay_runs if run["old"][-1] <= target]
+    cost = penalty["train_sec"] / vanilla["train_sec"] if vanilla and vanilla["train_sec"] else 0
+    if matched:
+        best = matched[0]
+        best_cost = best["train_sec"] / vanilla["train_sec"] if vanilla and vanilla["train_sec"] else 0
+        print(f"{penalty['reg']} (λ={penalty['lam']:g}, {cost:.2f}x) 的 old_val={target:.4f}，"
+              f"vanilla replay 要到 r={best['r']:.4f}（{best_cost:.2f}x）才追上。")
+    else:
+        top = replay_runs[-1] if replay_runs else None
+        if top:
+            top_cost = top["train_sec"] / vanilla["train_sec"] if vanilla and vanilla["train_sec"] else 0
+            print(f"{penalty['reg']} (λ={penalty['lam']:g}, {cost:.2f}x) 的 old_val={target:.4f}，"
+                  f"扫到的最大 r={top['r']:.4f}（{top_cost:.2f}x，old_val={top['old'][-1]:.4f}）"
+                  "仍未追上 —— 这正是要的结论，但要加一档更大的 r 才能给出下界。")
+# ---- batch 不同的臂：先把吞吐代价和方法代价拆开，再谈"谁更贵" ----
+controls = [run for run in vanillas if vanilla and run["batch"] != vanilla["batch"]]
+if controls and vanilla and vanilla["train_sec"]:
+    print()
+    print("---- batch 对照（EWC 被显存逼到小 batch，代价要拆开算）")
+    for control in controls:
+        batch_cost = control["train_sec"] / vanilla["train_sec"]
+        print(f"vanilla@bs{control['batch']} 相对 vanilla@bs{vanilla['batch']} = "
+              f"{batch_cost:.2f}x —— 这一段纯粹是小 batch 的吞吐损失，与方法无关。")
+        for run in runs:
+            if run["lam"] <= 0 or run["batch"] != control["batch"]:
+                continue
+            total = run["train_sec"] / vanilla["train_sec"]
+            own = run["train_sec"] / control["train_sec"]
+            print(f"  {run['reg']}: 总共 {total:.2f}x，扣掉 batch 那一段之后自身是 {own:.2f}x")
+            print(f"    报的时候两个数都要给：{total:.2f}x 是这台机器上的真实代价"
+                  f"（显存逼出来的小 batch 也是该方法的代价），{own:.2f}x 才是罚项本身。")
+        # 同样的行、同样的更新数，只有 micro-batch 的分组不同，所以两条 vanilla
+        # 曲线该重合。重合了，上面那条"曲线可比"的结论就是实测过的而不是推的。
+        gap = abs(control["old"][-1] - vanilla["old"][-1])
+        print(f"  两条 vanilla 的 old_val 末点相差 {gap:.4f} "
+              f"({control['old'][-1]:.4f} vs {vanilla['old'][-1]:.4f})")
+        if gap > 0.02:
+            print("    !! 差得比预期大。batch 2 与 batch 4 每次更新覆盖的是同一批 64 行，")
+            print("       只有 micro-batch 内的 token 归一化不同（实测偏差 <0.1%），")
+            print("       所以这两条本该几乎重合。差这么多说明还有别的变量。")
+        else:
+            print("    -> 重合。这就证明了 EWC 的 batch 2 不影响曲线的可比性。")
+
+print()
+print("!! 小 r 不只是「复习得少」，也是「见过的旧数据种类少」：上表的池覆盖列就是这个。"
+      "结论必须带上它，不能说成纯粹的复习强度效应。")
+print("!! r / w / 墙钟是三个口径：r=N_replay/N_new（也等于额外开销），w=r/(1+r) 是"
+      "replay 在梯度里的份额。r=1 时 w=0.5，「各一半」说的是 w。")
+print("!! batch 不同的臂之间，曲线可比而 train_sec / peak 不可比 —— 前者每次更新"
+      "覆盖同一批 64 行，后者混进了 GPU 利用率。上面那张对照表就是用来拆这一项的。")
+
+if failures:
+    print()
+    print("!! 汇总发现问题:")
+    for item in failures:
+        print(f"   - {item}")
+    raise SystemExit(1)
+print()
+print("跨臂检查通过。")
+PY
+SUMMARY_RC=$?
+set -e
+
+echo ""
+echo "========================================================================"
+echo "本轮结果"
+echo "========================================================================"
+echo "成功 ${#OK_ARMS[@]} 条:"
+for name in "${OK_ARMS[@]:-}"; do [[ -n "${name}" ]] && echo "  ${name}"; done
+if (( ${#FAILED_ARMS[@]} > 0 )); then
+  echo "失败 ${#FAILED_ARMS[@]} 条（直接重投本脚本即可补跑，成功的会被跳过）:"
+  for name in "${FAILED_ARMS[@]}"; do echo "  ${name}"; done
+fi
+echo ""
+echo "画图（登录节点）:"
+echo "  python -m onereplay.scripts.plot_replay_ratio_curves \\"
+echo "    --metrics_dir ${METRICS_DIR} --pattern '${RUN_PREFIX}_*' \\"
+echo "    --out_dir results_log/figs/ds_ratio --pool_rows ${EXPECT_POOL_ROWS}"
+echo ""
+echo "产物:"
+echo "  曲线/开销 : ${METRICS_DIR}/${RUN_PREFIX}_*.jsonl   (record_type=probe 是逐点数据)"
+echo "  训练日志  : ${TRAIN_LOG_DIR}/${RUN_PREFIX}_*.train.log"
+echo "  同池报告  : ${POOL_REPORT_FILE}"
+echo "Job finished at: $(date)"
+
+if (( ${#FAILED_ARMS[@]} > 0 )); then
+  exit 1
+fi
+exit "${SUMMARY_RC}"
