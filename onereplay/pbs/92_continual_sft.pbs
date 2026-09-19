@@ -273,7 +273,7 @@ MODEL_NAME="${MODEL_NAME:-Qwen2.5-1.5B-Instruct}"
 # 想调任何一个，就是四条臂一起重跑，否则它们不再可比。
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
-LR="${LR:-5e-5}"
+LR="${LR:-2e-4}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH="${BATCH:-8}"

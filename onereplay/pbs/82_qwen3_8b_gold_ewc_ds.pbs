@@ -3,7 +3,7 @@
 #PBS -N or_8b_ewc_ds
 #PBS -j oe
 #PBS -k oed
-#PBS -q auto
+#PBS -q autox
 #PBS -l select=1:ngpus=1
 #PBS -l walltime=24:00:00
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
@@ -372,7 +372,7 @@ esac
 SEED="${SEED:-1}"
 EPOCHS="${EPOCHS:-2}"
 LR="${LR:-2e-4}"                 # 74 号若因 lr=2e-4 崩溃回落 1e-4，本臂必须跟着回落
-BATCH="${BATCH:-4}"
+BATCH="${BATCH:-2}"
 ACCUM="${ACCUM:-64}"             # 每次更新 64 行新任务
 EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 74 号及其余各臂不可比
 MAXLEN="${MAXLEN:-1024}"
