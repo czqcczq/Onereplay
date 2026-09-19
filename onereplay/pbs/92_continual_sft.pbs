@@ -21,6 +21,25 @@
 #
 # 90 号产出 M_*（第一步），91 号在其上采出 C 和 F（第二步），本脚本是第三步。
 #
+# 链条接到第三段（起点不是 90 号的 specialist）
+# ---------------------------------------------
+# finance -> medical 跑完会留下四条臂 x 若干 λ 的一堆 checkpoint，接着训 law 时
+# "从哪个 finance2medical 模型开始"没有唯一答案，所以脚本不猜，用 SRC_CKPT 点名：
+#
+#   qsub -v SRC_DOMAIN=medical,NEW_DOMAIN=law,PRIOR_DOMAINS=finance,\
+#   SRC_CKPT=<上一段的 checkpoints>/onereplay_lam1000_lr2e-4_ep2_seed42,\
+#   COV_PATH=<新采的 C>,ARM=onereplay,LAMBDA=1000 onereplay/pbs/92_...
+#
+# 三件事跟着一起变，漏一件这一跑就是废的：
+#   - C/F 要用 91 号在**这个新起点**上重采（罚项锚的是 W_ref 那组权重）。默认的
+#     COV_PATH/FISHER_PATH 指向 M_${SRC_DOMAIN} 上那份，拿它来跑保护的是另一个
+#     模型的行为 —— Step 0 拿矩阵里记的 model_name 对表，对不上会停。
+#   - PRIOR_DOMAINS 列上更早的域，否则 finance 忘没忘没人报（见第 7 条）。
+#   - 产物目录自动改叫 results_continual_<起点名>2<新域>_<model>，不会和两段链的
+#     medical2law 撞在一起。CHAIN_TAG 可以覆盖这个名字。
+# SRC_DOMAIN 仍然填**被保护的域**（上例是 medical），replay 池、旧域 val、C/F 的
+# 采集语料都按它推导，这些和起点是哪个 checkpoint 无关。
+#
 # 1. 四条臂各是什么
 # -----------------
 #   vanilla    什么都不做，直接在新域上接着训。遗忘的**分母**：另外三臂救回多少
@@ -122,6 +141,11 @@
 #   val_loss      新域 <NEW_DOMAIN> 的 held-out —— "学会了吗"
 #   old_val_loss  旧域 <SRC_DOMAIN> 的固定切片 —— "忘了吗"
 #
+# 链条到第三段时这两条不够：finance -> medical -> law 里 val_loss 是 law、
+# old_val_loss 是 medical，finance 没人报。PRIOR_DOMAINS=finance 会多记一条
+# old_val_loss_finance，切法和 old_val 逐字相同，所以它和上一阶段（finance ->
+# medical）记的 old_val_loss 是同一批行，两段之间可以直接相减。多个域用逗号分隔。
+#
 # EVAL_BEFORE_TRAIN=1 时先有一条 record_type=baseline（起点就是 M_<SRC_DOMAIN>），
 # 之后每个 epoch 一条 record_type=epoch。读法是各自减掉 baseline：新域的差越负学得
 # 越多，旧域的差越接近 0 忘得越少。四条臂的两条 baseline 应当逐字相同。
@@ -142,10 +166,13 @@
 #
 # 8. 投递前要有
 # -------------
-#   1) 90 号 MODE=train 的 M_<SRC_DOMAIN> checkpoint
+#   1) 90 号 MODE=train 的 M_<SRC_DOMAIN> checkpoint（接第三段时改为 SRC_CKPT
+#      点名的那个上一段产物）
 #   2) 90 号 MODE=data 的 <NEW_DOMAIN> 数据集（save_to_disk）
-#   3) ARM=onereplay 要 91 号的 C；ARM=ewc 要 F；ARM=replay 要旧域的 jsonl
-#   4) 旧域的 jsonl（OLD_VAL=1 时四条臂都要，旧域 val 从它里面切）
+#   3) ARM=onereplay 要 91 号的 C；ARM=ewc 要 F；ARM=replay 要旧域的 jsonl。
+#      C/F 必须采自第 1 条那个 checkpoint 本身
+#   4) 旧域的 jsonl（OLD_VAL=1 时四条臂都要，旧域 val 从它里面切）；
+#      给了 PRIOR_DOMAINS 的话，那些域的 jsonl 也要在
 #   5) 三个域的 benchmark（Step 0 会预检并打印缺哪个）
 #
 # 先看计划：qsub -v ARM=onereplay,LAMBDA=1.5e-3,DRY_RUN=1 onereplay/pbs/92_...
@@ -169,6 +196,28 @@ else
   JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_cont_${JOBTAG}}"
   EXTRA_BIND=""
 fi
+
+# qsub -v 的变量名大小写敏感，而下面只读大写那个。传成小写时脚本根本看不见它：
+# 轻则报"必须给 λ"（错在名字，报错却指向缺参数），重则 src_domain 这种直接静默
+# 用掉默认值，把作业跑到另一个方向上还不吭声。必须在下面那批默认值落地之前查，
+# 否则 -z "${SRC_DOMAIN}" 永远为假，这段就成了死代码。
+_need_upper () {
+  if [[ -n "$2" && -z "$4" ]]; then
+    echo "变量名要全大写：收到的是 $1=$2，脚本读的是 $3。" >&2
+    exit 2
+  fi
+}
+_need_upper lambda     "${lambda:-}"     LAMBDA     "${LAMBDA:-}"
+_need_upper lambdas    "${lambdas:-}"    LAMBDAS    "${LAMBDAS:-}"
+_need_upper arm        "${arm:-}"        ARM        "${ARM:-}"
+_need_upper mode       "${mode:-}"       MODE       "${MODE:-}"
+_need_upper lr         "${lr:-}"         LR         "${LR:-}"
+_need_upper epochs     "${epochs:-}"     EPOCHS     "${EPOCHS:-}"
+_need_upper seed       "${seed:-}"       SEED       "${SEED:-}"
+_need_upper src_domain "${src_domain:-}" SRC_DOMAIN "${SRC_DOMAIN:-}"
+_need_upper new_domain "${new_domain:-}" NEW_DOMAIN "${NEW_DOMAIN:-}"
+_need_upper prior_domains "${prior_domains:-}" PRIOR_DOMAINS "${PRIOR_DOMAINS:-}"
+_need_upper src_ckpt   "${src_ckpt:-}"   SRC_CKPT   "${SRC_CKPT:-}"
 
 # ---- 这四样决定这次跑什么 ----
 SRC_DOMAIN="${SRC_DOMAIN:-medical}"   # 起点 specialist，也是被保护的域
@@ -209,7 +258,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR
     SRC_DOMAIN NEW_DOMAIN ARM MODE DRY_RUN SEED DO_EVAL
     LAMBDA LAMBDAS
-    SRC_RESULTS_ROOT SRC_CKPT_DIR SRC_CKPT_NAME
+    SRC_RESULTS_ROOT SRC_CKPT_DIR SRC_CKPT_NAME SRC_CKPT CHAIN_TAG
     POOL_SAMPLES SAMPLE_SEED COV_PATH FISHER_PATH
     REPLAY_JSONL REPLAY_PER_BATCH REPLAY_MAX_LEN
     NORM_BY_LAYERS REG_ONCE REG_IMPL MEASURE_ZERO
@@ -224,7 +273,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     TARGET_MODULES SYSTEM_PROMPT MAX_TRAIN_SAMPLES LOG_EVERY
-    EVAL_BEFORE_TRAIN OLD_VAL OLD_VAL_JSONL OLD_VAL_ROWS
+    EVAL_BEFORE_TRAIN OLD_VAL OLD_VAL_JSONL OLD_VAL_ROWS PRIOR_DOMAINS
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -357,16 +406,41 @@ STATS_DIR="${STATS_DIR:-${DATA_ROOT}/stats}"
 DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/${NEW_DOMAIN}_train}"
 NEW_STATS="${STATS_DIR}/${NEW_DOMAIN}_stats.json"
 
-# 起点 specialist = 90 号的 checkpoint，也是 91 号采 C/F 的那个对象，
-# 也是 regularizer 的 W_ref。三者必须是同一个目录。
+# 起点 = 本阶段的 W_ref，也必须是 91 号采 C/F 的那个对象。两者同源是方法的前提。
+#
+# 默认指向 90 号的 specialist，也就是两段链（M_src --[new]--> ?）的情形。链条走到
+# 第三段时起点是**上一段的产物**，而上一段有四条臂 x 若干 λ，好几个 checkpoint 都
+# 叫 "finance -> medical 的模型"，选哪个是实验设计的一部分，脚本不猜。这时给
+# SRC_CKPT 一个完整路径：
+#
+#   SRC_CKPT=${REPO_ROOT}/results_continual_finance2medical_${MODEL_NAME}/checkpoints/onereplay_lam1000_lr2e-4_ep2_seed42
+#
+# 给了它就必须同时给 COV_PATH/FISHER_PATH（onereplay/ewc 臂）：默认那两条路径指向
+# 91 号在 M_${SRC_DOMAIN} 上采的矩阵，而罚项锚定的是采集时那组权重。Step 0 会拿矩
+# 阵里记的 model_name 和这里对表，对不上直接停。
+SRC_CKPT="${SRC_CKPT:-}"
+SRC_CKPT_NAME_GIVEN="${SRC_CKPT_NAME:-}"
 SRC_RESULTS_ROOT="${SRC_RESULTS_ROOT:-${REPO_ROOT}/results_specialist_${SRC_DOMAIN}_${MODEL_NAME}}"
-SRC_CKPT_DIR="${SRC_CKPT_DIR:-${SRC_RESULTS_ROOT}/checkpoints}"
-SRC_CKPT_NAME="${SRC_CKPT_NAME:-specialist_${SRC_DOMAIN}_lr${LR}_seed${SEED}}"
+if [[ -n "${SRC_CKPT}" ]]; then
+  SRC_CKPT="${SRC_CKPT%/}"
+  SRC_CKPT_DIR="$(dirname "${SRC_CKPT}")"
+  SRC_CKPT_NAME="$(basename "${SRC_CKPT}")"
+else
+  SRC_CKPT_DIR="${SRC_CKPT_DIR:-${SRC_RESULTS_ROOT}/checkpoints}"
+  SRC_CKPT_NAME="${SRC_CKPT_NAME:-specialist_${SRC_DOMAIN}_lr${LR}_seed${SEED}}"
+fi
+# 起点是被点名的，还是脚本按默认规则拼出来的。下面几处的行为都要分这两种情况。
+SRC_EXPLICIT=0
+[[ -n "${SRC_CKPT}" || -n "${SRC_CKPT_NAME_GIVEN}" ]] && SRC_EXPLICIT=1
 
 # 名字里带的是 90 号训练时的 LR，而本阶段的 LR 不必与它相同，所以上面那行经常拼不
 # 中。拼不中就去 checkpoints/ 里找：只有一个候选就直接用它，有多个才停下来让人指定
 # ——"猜一个来用"在这里是最坏的结果，起点选错了整条实验都是错的，而且不会报错。
-if [[ ! -d "${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" && -d "${SRC_CKPT_DIR}" ]]; then
+#
+# 被点名的起点不走这条路：那种情况下路径打错了要当场报错，静默退回
+# specialist_${SRC_DOMAIN}_* 就是把"我要从第二段那个模型接着训"悄悄换成"从第一段
+# 重来一遍"，而两者都能跑完、都出数。
+if (( SRC_EXPLICIT == 0 )) && [[ ! -d "${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" && -d "${SRC_CKPT_DIR}" ]]; then
   SRC_CANDIDATES=()
   while IFS= read -r _dir; do
     [[ -n "${_dir}" ]] && SRC_CANDIDATES+=("$(basename "${_dir}")")
@@ -414,9 +488,26 @@ REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
 OLD_VAL="${OLD_VAL:-1}"
 OLD_VAL_JSONL="${OLD_VAL_JSONL:-${REPLAY_JSONL}}"
 OLD_VAL_ROWS="${OLD_VAL_ROWS:-${MAXVAL}}"
+# 链条超过两段时，上面两条 loss 盖不住更早的域：finance -> medical -> law 走到第
+# 三段，val_loss 是 law、old_val_loss 是 medical，finance 没人管。把它们逗号分隔
+# 列在这里，每个多出一列 old_val_loss_<域名>。切法与 old_val 逐字相同（同一个
+# shuffle、同一对偏移），所以这一列和上一阶段记的那个域的 old_val_loss 是同一批
+# 行，两段之间可以直接相减。
+PRIOR_DOMAINS="${PRIOR_DOMAINS:-}"
 
 # 本阶段的产物根，按"方向"分目录，四条臂共享（run 名里带臂名，不会撞）。
-RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_continual_${SRC_DOMAIN}2${NEW_DOMAIN}_${MODEL_NAME}}"
+#
+# 起点被点名时方向名要带上它：M_medical --[law]--> ? 和 (finance2medical 的某条臂)
+# --[law]--> ? 都是 "medical2law"，run 名又只带臂和 λ，同名会让后跑的那个覆盖先跑
+# 的 metrics 和 checkpoint。名字长但能一眼读出这一格是从哪来的。
+if (( SRC_EXPLICIT == 1 )); then
+  # "_to_" 而不是两段链那个 "2"：起点名基本都以 seed42 收尾，接上去会读成
+  # "seed422law"。
+  CHAIN_TAG="${CHAIN_TAG:-${SRC_CKPT_NAME}_to_${NEW_DOMAIN}}"
+else
+  CHAIN_TAG="${CHAIN_TAG:-${SRC_DOMAIN}2${NEW_DOMAIN}}"
+fi
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_continual_${CHAIN_TAG}_${MODEL_NAME}}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
 CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
 
@@ -592,6 +683,29 @@ if [[ "${OLD_VAL}" == "1" ]]; then
   )
 fi
 
+# 更早那些域的切片，复用上面同一套 pool_size/sample_seed/rows —— 这不是图省事，
+# 是这一列要能和上一阶段的 old_val_loss 相减的前提。域名校验放这里（纯字符串，
+# 早失败），文件在不在和 OLD_VAL_JSONL 一起在 Step 0 查。
+PRIOR_VAL_ARGS=(--prior_val_jsonl "")
+PRIOR_SPEC=""
+if [[ "${OLD_VAL}" == "1" && -n "${PRIOR_DOMAINS}" ]]; then
+  for _pd in ${PRIOR_DOMAINS//,/ }; do
+    if [[ "${_pd}" == "${SRC_DOMAIN}" ]]; then
+      echo "PRIOR_DOMAINS 里不能有 ${SRC_DOMAIN}：它是起点域，old_val_loss 就是它。" >&2
+      exit 2
+    fi
+    if [[ "${_pd}" == "${NEW_DOMAIN}" ]]; then
+      echo "PRIOR_DOMAINS 里不能有 ${NEW_DOMAIN}：它是本阶段在学的域，val_loss 就是它。" >&2
+      exit 2
+    fi
+    PRIOR_SPEC="${PRIOR_SPEC:+${PRIOR_SPEC},}${_pd}=${PROCESSED_DIR}/${_pd}_train.jsonl"
+  done
+  PRIOR_VAL_ARGS=(--prior_val_jsonl "${PRIOR_SPEC}")
+elif [[ -n "${PRIOR_DOMAINS}" ]]; then
+  echo "!! OLD_VAL=0，PRIOR_DOMAINS=${PRIOR_DOMAINS} 一并忽略：切片要的 pool_size"
+  echo "   和 sample_seed 就是 old_val 那一套，关掉一个等于两个都关。"
+fi
+
 # 四条臂的差异**全部**集中在这个函数里 —— 它上面的超参对四条臂逐字相同，
 # 下面的 train_one 对四条臂逐字相同。要判断两条臂到底差在哪，只看这里。
 # 定义放在 DRY_RUN 之前，这样 DRY_RUN=1 能把真实参数打出来核对。
@@ -654,7 +768,11 @@ echo "================================================================"
 echo " 第三阶段 continual : M_${SRC_DOMAIN} --[${NEW_DOMAIN}]--> ?"
 echo " ARM         : ${ARM}"
 echo " MODE        : ${MODE}"
+if (( SRC_EXPLICIT == 1 )); then
+echo " 起点 W_ref  : ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}（显式指定）"
+else
 echo " 起点 W_ref  : ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}"
+fi
 echo " 新域数据    : ${DATASET_DIR}"
 echo " 保护的域    : ${SRC_DOMAIN}"
 case "${ARM}" in
@@ -676,6 +794,7 @@ echo " 起点 val    : EVAL_BEFORE_TRAIN=${EVAL_BEFORE_TRAIN}（1 = 训练前先
 if [[ "${OLD_VAL}" == "1" ]]; then
 echo " 旧域 val    : ${OLD_VAL_ROWS} 行，取自 ${OLD_VAL_JSONL}"
 echo "               shuffle(${SAMPLE_SEED}) 第 ${POOL_SAMPLES} 行之后 —— 避开 replay 训的那批，四臂同一批行"
+[[ -n "${PRIOR_SPEC}" ]] && echo " 更早的域    : ${PRIOR_DOMAINS}（同样切法，各记一列 old_val_loss_<域名>）"
 else
 echo " 旧域 val    : OLD_VAL=0，不测 —— 这次只有 bench 能回答「忘了吗」"
 fi
@@ -694,8 +813,18 @@ echo "==== Step 0: 前置检查 ===="
 
 [[ -d "${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" ]] || {
   echo "找不到起点 checkpoint: ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}" >&2
-  echo "  它是 90 号的产物，先跑：" >&2
-  echo "    qsub -v DOMAIN=${SRC_DOMAIN},MODE=train onereplay/pbs/90_specialist_sft.pbs" >&2
+  if (( SRC_EXPLICIT == 1 )); then
+    echo "  这个起点是显式指定的，所以不会去 ${SRC_CKPT_DIR} 里另找一个顶替。" >&2
+    if [[ -d "${SRC_CKPT_DIR}" ]]; then
+      echo "  该目录下现有：" >&2
+      find "${SRC_CKPT_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '     %f\n' 2>/dev/null | sort >&2
+    else
+      echo "  上一级目录 ${SRC_CKPT_DIR} 也不存在。" >&2
+    fi
+  else
+    echo "  它是 90 号的产物，先跑：" >&2
+    echo "    qsub -v DOMAIN=${SRC_DOMAIN},MODE=train onereplay/pbs/90_specialist_sft.pbs" >&2
+  fi
   exit 1
 }
 echo "起点 checkpoint 在: ${SRC_CKPT_DIR}/${SRC_CKPT_NAME}"
@@ -744,22 +873,45 @@ PY
     echo "  能回答「忘了吗」。" >&2
     exit 1
   fi
+
+  # 更早那些域同理，一份缺了就整条链的那一列断掉。
+  if [[ -n "${PRIOR_SPEC}" ]]; then
+    for _item in ${PRIOR_SPEC//,/ }; do
+      if [[ ! -f "${_item#*=}" ]]; then
+        echo "找不到 ${_item%%=*} 的 jsonl（old_val_loss_${_item%%=*} 从它里面切）: ${_item#*=}" >&2
+        echo "  它是 90 号 MODE=data DOMAIN=${_item%%=*} 的产物。" >&2
+        exit 1
+      fi
+    done
+  fi
 fi
 
 # ---- 罚项臂：矩阵必须在，而且要和这次的 W_ref 同源 ----
+# 起点被点名时默认的 91 号命令是错的：它会去采 M_${SRC_DOMAIN}，而 W_ref 是别人。
+_cf_hint () {
+  local what="$1"
+  echo "  它是 91 号的产物，先跑：" >&2
+  if (( SRC_EXPLICIT == 1 )); then
+    echo "    qsub -v DOMAIN=${SRC_DOMAIN},WHAT=${what},DRY_RUN=0,\\" >&2
+    echo "    SRC_MODEL_DIR=${SRC_CKPT_DIR},SRC_MODEL_NAME=${SRC_CKPT_NAME},\\" >&2
+    echo "    SRC_TAG=<给这个起点起个短名> onereplay/pbs/91_collect_cf.pbs" >&2
+    echo "  语料仍是 ${SRC_DOMAIN} 的池（要保护的是它），换的只是采集对象。" >&2
+    echo "  SRC_TAG 进文件名，别和 M_${SRC_DOMAIN} 上那份撞。采完把路径传回来。" >&2
+  else
+    echo "    qsub -v DOMAIN=${SRC_DOMAIN},WHAT=${what},DRY_RUN=0 onereplay/pbs/91_collect_cf.pbs" >&2
+  fi
+}
 if [[ "${ARM}" == "onereplay" ]]; then
   [[ -f "${COV_PATH}" ]] || {
     echo "找不到 C: ${COV_PATH}" >&2
-    echo "  它是 91 号的产物，先跑：" >&2
-    echo "    qsub -v DOMAIN=${SRC_DOMAIN},WHAT=cov,DRY_RUN=0 onereplay/pbs/91_collect_cf.pbs" >&2
+    _cf_hint cov
     exit 1
   }
 fi
 if [[ "${ARM}" == "ewc" ]]; then
   [[ -f "${FISHER_PATH}" ]] || {
     echo "找不到 F: ${FISHER_PATH}" >&2
-    echo "  它是 91 号的产物，先跑：" >&2
-    echo "    qsub -v DOMAIN=${SRC_DOMAIN},WHAT=fisher,DRY_RUN=0 onereplay/pbs/91_collect_cf.pbs" >&2
+    _cf_hint fisher
     exit 1
   }
 fi
@@ -795,6 +947,19 @@ print(f"  采集口径  : max_len={meta.get('max_len')} pool_rows={meta.get('poo
 print(f"  pool 指纹 : {meta.get('pool_fingerprint')}")
 
 failures = []
+# 起点换了但矩阵没换，是这里唯一无法从任何输出上看出来的错法：层数、max_len、
+# system 全对得上，训练照跑、loss 照降，而罚项锚定的是另一组权重。链条走到第三段
+# 时这是默认会踩的 —— COV_PATH 的默认值指向 91 号在 M_<SRC_DOMAIN> 上采的那份。
+recorded_model = meta.get("model_name")
+src_name = os.path.basename(os.environ["SRC_CKPT"])
+print(f"  采集对象  : {recorded_model}")
+if recorded_model and recorded_model != src_name:
+    failures.append(
+        f"矩阵是在 {recorded_model!r} 上采的，本次 W_ref 是 {src_name!r}。罚项锚定"
+        "的是采集时那组权重，起点换了就要用 91 号在新起点上重采（SRC_MODEL_DIR/"
+        "SRC_MODEL_NAME 指到新起点，SRC_TAG 另起一个名字免得覆盖旧的那份），"
+        "再把 COV_PATH/FISHER_PATH 指过来。"
+    )
 if len(matrices) != expect:
     failures.append(
         f"层覆盖 {len(matrices)} != 期望 {expect}。regularizer 对缺矩阵的层是静默跳过的，"
@@ -944,6 +1109,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "    --batch_size ${BATCH} --accumulation_size ${ARM_ACCUM}"
     echo "    --eval_before_train ${EVAL_BEFORE_TRAIN}"
     echo "    ${OLD_VAL_ARGS[*]}"
+    echo "    ${PRIOR_VAL_ARGS[*]}"
     # arm_train_args 一行一个 token，成对打印才读得出 flag 和值的对应关系。
     _pair=()
     while IFS= read -r _item; do
@@ -989,6 +1155,7 @@ train_one () {
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --log_every "${LOG_EVERY}" \
     "${OLD_VAL_ARGS[@]}" \
+    "${PRIOR_VAL_ARGS[@]}" \
     "${arm_args[@]}" \
     --save 1 --save_path "${save_path}" \
     --metrics_path "${METRICS_DIR}/${run}.jsonl"

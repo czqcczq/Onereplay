@@ -220,6 +220,7 @@ class BaseTrainer:
         val_loader,
         extra_record: dict[str, Any] | None = None,
         old_val_loader=None,
+        prior_val_loaders=None,
     ) -> dict[str, Any]:
         """Score the validation splits before the first optimizer step.
 
@@ -252,6 +253,7 @@ class BaseTrainer:
             record["old_val_loss"] = self.evaluate_loss(old_val_loader)
             record["old_val_sec"] = time.time() - old_start
             message += f" old_val_loss={record['old_val_loss']:.6f}"
+        message += self._score_prior_vals(record, prior_val_loaders)
         if extra_record:
             record.update(extra_record)
         print(
@@ -261,6 +263,22 @@ class BaseTrainer:
         )
         self._append_jsonl(record)
         return record
+
+    def _score_prior_vals(self, record: dict[str, Any], prior_val_loaders) -> str:
+        """Add one old_val_loss_<label> per earlier domain; return the log text.
+
+        Their cost joins old_val_sec rather than eval_sec, so eval_sec keeps
+        measuring what it measured before any of this existed.
+        """
+
+        message = ""
+        for label, loader in prior_val_loaders or []:
+            start = time.time()
+            key = f"old_val_loss_{label}"
+            record[key] = self.evaluate_loss(loader)
+            record["old_val_sec"] = record.get("old_val_sec", 0.0) + (time.time() - start)
+            message += f" {key}={record[key]:.6f}"
+        return message
 
     def train_one_epoch(self, train_loader, epoch: int = 0) -> tuple[float, float]:
         """Train one epoch; return mean task_loss and mean replay_reg."""
@@ -413,6 +431,7 @@ class BaseTrainer:
         tokenizer=None,
         eval_before_train: int = 0,
         old_val_loader=None,
+        prior_val_loaders=None,
     ) -> list[dict[str, Any]]:
         """Run epochs, optionally evaluate and save the final adapter.
 
@@ -420,6 +439,10 @@ class BaseTrainer:
         knowing, scored on the same schedule as val_loader so one record
         answers both "did it learn the new task" and "did it keep the old one".
         None leaves the records exactly as they were before it existed.
+
+        prior_val_loaders carries the same thing for domains learned further
+        back, which a chain of three or more stages leaves unreported by the
+        two columns above. Each gets its own old_val_loss_<label>.
         """
 
         records: list[dict[str, Any]] = []
@@ -430,7 +453,9 @@ class BaseTrainer:
         self.run_probes(epoch=0)
         if eval_before_train and val_loader is not None:
             records.append(
-                self.evaluate_before_train(val_loader, extra_record, old_val_loader)
+                self.evaluate_before_train(
+                    val_loader, extra_record, old_val_loader, prior_val_loaders
+                )
             )
         for epoch in range(epochs):
             start_time = time.time()
@@ -465,6 +490,7 @@ class BaseTrainer:
                 old_start = time.time()
                 record["old_val_loss"] = self.evaluate_loss(old_val_loader)
                 record["old_val_sec"] = time.time() - old_start
+            self._score_prior_vals(record, prior_val_loaders)
             if self.probe_loaders:
                 # elapsed_sec is wall clock and still contains the probes;
                 # train_sec and sec_per_step already have them removed.

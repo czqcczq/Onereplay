@@ -37,7 +37,7 @@ from onereplay.core.regularizer import EWCRegularizer, ReplayRegularizer  # noqa
 from onereplay.data.chat import build_loader, build_opd_loader  # noqa: E402
 from onereplay.data.commonsense import load_and_prepare_dataset  # noqa: E402
 from onereplay.data.batch_mix import build_batch_mixed_loader  # noqa: E402
-from onereplay.data.old_val import build_old_val_loader  # noqa: E402
+from onereplay.data.old_val import build_old_val_loader, build_prior_val_loaders  # noqa: E402
 from onereplay.data.probe import build_probe_loaders  # noqa: E402
 from onereplay.data.replay import (  # noqa: E402
     build_replay_pools,
@@ -185,6 +185,36 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Rows to score; negative inherits --max_val_samples.",
+    )
+    parser.add_argument(
+        "--old_val_presliced",
+        type=int,
+        default=0,
+        help=(
+            "1 means --old_val_jsonl (and every --prior_val_jsonl path) already "
+            "holds only held-out rows, so they are read as-is instead of being "
+            "cut from behind the old-knowledge subset. Needed when the pool cut "
+            "is not 'shuffle(seed) then a prefix': a corpus sampled with "
+            "rng.sample or a stratified quota has no offset to point at, and "
+            "load_self_distilled_pool ignores --replay_pool_size, so the split "
+            "has to exist on disk for the replay arm to really skip those rows."
+        ),
+    )
+    # A chain of three or more stages leaves domains that are neither the new
+    # task nor the checkpoint's immediate predecessor. At medical -> law,
+    # finance was learned two stages back and val_loss/old_val_loss say nothing
+    # about it.
+    parser.add_argument(
+        "--prior_val_jsonl",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated label=path for domains learned before the one this "
+            "stage starts from. Each is cut the same way --old_val_jsonl is, so "
+            "it compares with what an earlier stage recorded for that domain, "
+            "and each lands in its own column old_val_loss_<label>. Empty "
+            "leaves the metrics records as they were."
+        ),
     )
 
     parser.add_argument(
@@ -742,13 +772,14 @@ def main() -> None:
         batch_size=args.eval_batch_size or args.batch_size,
         train=False,
     )
-    if args.old_val_jsonl and args.paradigm == "opd":
+    if (args.old_val_jsonl or args.prior_val_jsonl) and args.paradigm == "opd":
         # The retention number is the cross-entropy of the old domain's own
         # targets. OPD's prepare_batch throws those away and substitutes a
         # student rollout scored by the teacher, so what came back would not be
         # the quantity this claims to report.
         raise ValueError("--old_val_jsonl is not defined for --paradigm opd")
     old_val_loader = build_old_val_loader(args, tokenizer)
+    prior_val_loaders = build_prior_val_loaders(args, tokenizer)
 
     # The trainer counts micro-batches, so convert once here. Going through
     # accumulation_steps is what makes the interval mean the same amount of
@@ -920,6 +951,7 @@ def main() -> None:
             "old_val_jsonl": args.old_val_jsonl,
             "old_val_pool_size": args.old_val_pool_size,
             "old_val_sample_seed": args.old_val_sample_seed,
+            "prior_val_jsonl": args.prior_val_jsonl,
             # A loss curve only means something next to the schedule that
             # produced it, and "lr: 5e-5" alone no longer identifies a run now
             # that the same peak can be constant or cosine-decayed.
@@ -932,6 +964,7 @@ def main() -> None:
         save_path=args.save_path if args.save == 1 else "",
         tokenizer=tokenizer,
         old_val_loader=old_val_loader,
+        prior_val_loaders=prior_val_loaders,
     )
 
 

@@ -19,7 +19,7 @@
 #
 # 两个 run：
 #   base                              一步都没走的 Qwen2.5-1.5B-Instruct
-#   fin_vanilla_lr5e-5_ep2_seed42     在 finance 上全量 SFT，什么保护都不加
+#   fin_vanilla_lr2e-4_ep2_seed42     在 finance 上全量 SFT，什么保护都不加
 #
 # -----------------------------------------------------------------------------
 # 1. 为什么它必须先跑完
@@ -57,13 +57,25 @@
 # -----------------------------------------------------------------------------
 # 3. 训练超参必须与 95 号逐字相同
 # -------------------------------
-# lr 5e-5 / cosine / warmup 0.1 / epochs 2 / batch 8 / accum 64（行每更新）/
+# lr 2e-4 / cosine / warmup 0.1 / epochs 2 / batch 8 / accum 64（行每更新）/
 # maxlen 1216 / val_fraction 0.01 / max_val 200 / seed 42 / system 空 /
 # target_modules 七类 + lm_head。任何一项偏了，95 号的 d_van 里就混进了
 # "配置不同"这个第二变量。test_code/check_finance_line.py 会比对三份脚本。
 #
-# 这一段的值取自 90 号（同一个底座、同一个全量 SFT 口径），不是从 8B 那条
-# LoRA 线搬的 —— 那边是 lr 2e-4 配 LoRA，全量微调用那个步长会炸。
+# !! lr 2e-4 是刻意选大的，不是 90 号那条线的 5e-5
+# 90 号求的是"把这个域学好"，这条线求的是"把旧能力打坏到看得见"—— 没有足够的
+# 遗忘，95 号那三条臂就没有可救的东西，铺开 21 个 run 纯属浪费机时。全量微调
+# 用 2e-4 属于偏大的一档，代价要提前知道：
+#
+#   1) 可能直接塌。输出退化成复读或单字，val_loss 反而炸。这时 94 号的
+#      长度诊断（顶满 max_new_tokens 的比例）和 finance 的 parse_rate 会先露馅，
+#      比看 accuracy 早。
+#   2) 可能掉到地板。math500 / humaneval 本来就不高，vanilla 归零之后三条臂
+#      挤在一起分不开 —— 那时候该降 lr 或降 epochs 重跑，而不是继续往下铺。
+#
+# 所以 94 号先跑、并且只跑 base 与 vanilla，就是为了在铺开之前看到这两件事。
+# 真要回落，EPOCHS 和 LR 都编进了 run 名（fin_vanilla_lr<LR>_ep<EPOCHS>_seed42），
+# 换一档不会覆盖上一档的结果；但 95 号必须跟着改成同一个值，否则 d_van 不成立。
 #
 # !! vanilla 必须 --measure_replay_when_lambda_zero 0
 # 留 1 的话 C 仍会被加载并每步求值，白付 regularizer 的时间，而报出来的墙钟会
@@ -240,7 +252,8 @@ FIN_STATS="${STATS_DIR}/finance_stats.json"
 # 训练超参：与 95 号逐字相同，见文件头第 3 条。
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
-LR="${LR:-5e-5}"
+# 2e-4 是刻意选大的，见文件头第 3 条：这条线要的是一个够狠的遗忘分母。
+LR="${LR:-2e-4}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 # BATCH 是显存参数，ACCUM 才是"每次更新多少行"（accum_steps = ACCUM / BATCH）。

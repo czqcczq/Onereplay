@@ -16,9 +16,13 @@
 #   qsub -v DRY_RUN=0,WHAT=fisher onereplay/pbs/93_finance_gold_cf.pbs     # 只采 F
 #   qsub -v DRY_RUN=0,WHAT=fisher,DO_IF=1,DO_MATH=0,DO_CODE=0 <本脚本>      # 一次一个域
 #   qsub -v DRY_RUN=0,WHAT=none   onereplay/pbs/93_finance_gold_cf.pbs     # 只跑诊断
+#   qsub -v DRY_RUN=0,FORCE_PREP=1 <本脚本>                                 # 重切池/val
 #
-# 产物是 94/95 号的全部矩阵输入：三份 C（OneReplay 臂）和三份 F（EWC 臂）。
-# 本脚本只采集和诊断，不训练、不混合、不评测。
+# 产物是 95 号的全部旧知识输入：
+#   三份 C 与三份 F（if / math / code，单域臂）
+#   一份 C_mix 与一份 F_mix（0.5 math + 0.5 code，mix 臂）
+#   每个域一份池文件（C / F / replay 三者共用）和一份 val 切片（算 old_val_loss）
+# 本脚本只切分、采集、合成和诊断，不训练、不评测。
 #
 # -----------------------------------------------------------------------------
 # 这条线是什么：主实验的骨架换一个载体
@@ -78,6 +82,41 @@
 #
 #   因此 POOL_ROOT 指向 ${REPO_ROOT}/results（只读，1.7B 那批的产物），
 #   RESULTS_ROOT 指向本线自己的目录（只写）。别混。
+#
+# -----------------------------------------------------------------------------
+# !! 池与 val 切片：切分落到磁盘上，不靠传参
+#   95 号每个 epoch 会在被保护的那个域上算一条交叉熵（old_val_loss），它的前提
+#   是那批行**没有任何一条臂训过**。这件事靠传参做不到，两个原因：
+#
+#     1) data/replay.py 的 load_self_distilled_pool 不吃 --replay_pool_size，
+#        它整份读完（那个函数的前提是"池在上游已经切好了"）。所以 replay 臂
+#        没法靠一个 flag 排掉尾部那几百行。
+#     2) math 和 code 的池不是"shuffle 后取前 N"来的：prepare_opc_ccode 用的是
+#        rng.sample(deduped, 20000)，prepare_metamath_cmath 是按 source 加权、
+#        按 question 去重的分层抽样。"池后面那一段"这个概念在这两个域上不存在。
+#
+#   所以 Step 1 按 68/69 的源口径把每个域读出来，切成两个文件落盘：
+#       ${SPLIT_DIR}/<domain>_pool.jsonl      C / F / replay 三者共用
+#       ${SPLIT_DIR}/<domain>_val<N>.jsonl    末尾 OLD_VAL_ROWS 行，谁都不训
+#   之后所有下游一律读物化后的文件。谁训了哪些行于是变成 wc -l 能查的事，
+#   而不是关于两个 shuffle 能不能对上的推理。
+#
+#   代价：池比 68/69 少 OLD_VAL_ROWS 行（默认 500，math 约 1.9%、code 2.5%、
+#   if 2.5%）。C 和 F 都是均值（C 按 token、F 按样本），少这几百行只影响估计
+#   方差、不影响量级。报结果时把这个数写上。
+#
+#   物化还顺带消掉一个坑：新池不带 truncated 列，--replay_drop_truncated 传错
+#   也不会再悄悄丢掉 13% 的行。列名同时归一成 inputs / gold_targets，三个域
+#   之后的参数因此完全相同。
+#
+# -----------------------------------------------------------------------------
+# !! mix：一份矩阵同时保两个域（Step 4）
+#   0.5 C_math + 0.5 C_code 与 0.5 F_math + 0.5 F_code，各合成一份，给 95 号的
+#   DOMAIN=mix 用。replay 那一侧对应的是把两个池按 0.5/0.5 混进每个 micro-batch，
+#   由 95 号自己做。三条臂因此在 mix 上也是"同一批旧知识的三种用法"。
+#
+#   只在 math 与 code 之间混，if 进不来：它的 maxlen 是 512 而那两个是 1024，
+#   而 train.py 的 --replay_max_len 是全局唯一的，混进来必然有一个域的口径是错的。
 #
 # -----------------------------------------------------------------------------
 # !! C 和 F 必须同池，所以两段共用同一个 POOL_ARGS 数组
@@ -192,6 +231,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT POOL_ROOT FLAN_DIR DATASET_CACHE
     COV_DIR FISHER_DIR
     WHAT DO_IF DO_MATH DO_CODE DO_DIAG DRY_RUN FORCE
+    DO_PREP FORCE_PREP SPLIT_DIR OLD_VAL_ROWS
+    DO_MIX FORCE_MIX MIX_DOMAINS MIX_WEIGHTS MIX_COV MIX_FISHER
     TARGET_MODULES SYSTEM_PROMPT SEED SAMPLE_SEED GOLD_COLUMN DEBUG_EXAMPLES
     COV_ACCUM_DEVICE COV_USE_BF16 FISHER_DEVICE FISHER_USE_BF16 LOG_EVERY
     FLAN_SAMPLES IF_MAXLEN IF_COV_BATCH
@@ -312,6 +353,24 @@ CODE_MAXLEN="${CODE_MAXLEN:-1024}"
 CODE_COV_BATCH="${CODE_COV_BATCH:-16}"
 CODE_FILE="${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED}.jsonl"
 
+# ---- 池/val 切分，见文件头第 4 条 ----
+# 每个域从自己的池尾留出这么多行当 val，C / F / replay 三者都不碰它们。
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
+SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
+SPLIT_MANIFEST="${SPLIT_DIR}/manifest.json"
+DO_PREP="${DO_PREP:-1}"
+FORCE_PREP="${FORCE_PREP:-0}"
+
+# ---- mix：一份矩阵同时保两个域 ----
+DO_MIX="${DO_MIX:-1}"
+MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
+MIX_WEIGHTS="${MIX_WEIGHTS:-0.5,0.5}"
+# qsub -v 自己按逗号切参数，所以从命令行传的时候只能写成 math:code / 0.25:0.75。
+# 这里归一回逗号，95 号那边是同一行，两边的 MIX_TAG 才拼得出同一个文件名。
+MIX_DOMAINS="${MIX_DOMAINS//:/,}"
+MIX_WEIGHTS="${MIX_WEIGHTS//:/,}"
+FORCE_MIX="${FORCE_MIX:-0}"
+
 # ---- 产物。目录名里已经带了模型，文件名只区分域与池 ----
 # _all 指的是本文件头那套覆盖：七类 all-linear + lm_head。
 IF_COV="${IF_COV:-${COV_DIR}/cov_if_flan20k_all.pt}"
@@ -321,6 +380,12 @@ IF_FISHER="${IF_FISHER:-${FISHER_DIR}/fisher_if_flan20k_all.pt}"
 MATH_FISHER="${MATH_FISHER:-${FISHER_DIR}/fisher_math_metamath30k_gold_all.pt}"
 CODE_FISHER="${CODE_FISHER:-${FISHER_DIR}/fisher_code_opcedu20k_gold_all.pt}"
 
+# mix 的产物名把参与的域与权重都编进去，所以 0.5/0.5 与 0.25/0.75 是两个独立的
+# 文件，不会互相覆盖。95 号按同一个式子推导路径，两边必须一致。
+MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")-w$(printf '%s' "${MIX_WEIGHTS//,/-}")"
+MIX_COV="${MIX_COV:-${COV_DIR}/cov_${MIX_TAG}_gold_all.pt}"
+MIX_FISHER="${MIX_FISHER:-${FISHER_DIR}/fisher_${MIX_TAG}_gold_all.pt}"
+
 # 1.2 s/样本是 8B @ 512 token 的实测值。1.5B 权重小 5 倍、长度大约 2 倍，先按
 # 300 ms 估（比线性缩放保守）。只影响 Step 0 的耗时预警，估错不改变采集结果。
 ETA_MS_PER_EXAMPLE="${ETA_MS_PER_EXAMPLE:-300}"
@@ -329,12 +394,13 @@ WALLTIME_HOURS="${WALLTIME_HOURS:-24}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}" >&2; exit 1; }
 mkdir -p "${COV_DIR}" "${FISHER_DIR}" "${DATASET_CACHE}"
 
-# Step 0 / Step 3 的内嵌 Python 靠 os.environ 读这些值。上面的赋值只建普通 shell
+# Step 0 / Step 5 的内嵌 Python 靠 os.environ 读这些值。上面的赋值只建普通 shell
 # 变量 —— 只有经 qsub -v 传进来的那几个才碰巧已经在环境里，其余会让 python 抛
 # KeyError。全部显式 export，别依赖调用方传了什么。
 export MODEL_DIR MODEL_NAME TARGET_MODULES COV_DIR FISHER_DIR
-export WHAT DO_IF DO_MATH DO_CODE
+export WHAT DO_IF DO_MATH DO_CODE DO_MIX
 export IF_COV MATH_COV CODE_COV IF_FISHER MATH_FISHER CODE_FISHER
+export MIX_COV MIX_FISHER MIX_DOMAINS MIX_WEIGHTS
 export ETA_MS_PER_EXAMPLE WALLTIME_HOURS
 
 echo "========================================================================"
@@ -359,7 +425,15 @@ echo "             ${CODE_COV}"
 echo "             ${CODE_FISHER}"
 echo "  C        = bf16 ${COV_USE_BF16} / accum ${COV_ACCUM_DEVICE}"
 echo "  F        = bf16 ${FISHER_USE_BF16} / device ${FISHER_DEVICE} / batch 1（写死）"
-echo "  阶段     = if:${DO_IF} math:${DO_MATH} code:${DO_CODE} diag:${DO_DIAG}  DRY_RUN=${DRY_RUN}"
+echo "  切分     = 每域池尾留 ${OLD_VAL_ROWS} 行做 val（C/F/replay 都不碰）"
+echo "             ${SPLIT_DIR}"
+if [[ "${DO_MIX}" == "1" ]]; then
+echo "  mix      = ${MIX_DOMAINS} @ ${MIX_WEIGHTS}"
+echo "             ${MIX_COV}"
+echo "             ${MIX_FISHER}"
+fi
+echo "  阶段     = prep:${DO_PREP} if:${DO_IF} math:${DO_MATH} code:${DO_CODE}"
+echo "             mix:${DO_MIX} diag:${DO_DIAG}  DRY_RUN=${DRY_RUN}"
 echo "========================================================================"
 
 # ===========================================================================
@@ -485,10 +559,12 @@ if ! python -c "import sys; sys.exit(0 if float('${FREE_GIB}') >= float('${NEED_
 fi
 
 # ===========================================================================
-# 每个域的数据参数。**C 和 F 共用同一份**，见文件头 —— 这是两者同池的唯一保证，
-# Step 3 会用 pool_fingerprint 复核。改这里就是两条臂一起改。
+# 每个域的**源**语料参数，逐字等于 68/69 号。只有 Step 1 的物化用它。
+#
+# C / F / replay 并不直接读这些源：Step 1 先按这套口径把每个域读出来，切成
+# 「池」和「val」两个文件落盘，之后三条臂一律读物化后的池文件。见文件头第 4 条。
 # ===========================================================================
-pool_args_for () {
+source_args_for () {
   case "$1" in
     if)
       # FLAN 原始语料的 targets 就是 gold，不需要换列。
@@ -531,6 +607,30 @@ pool_args_for () {
   esac
 }
 
+# ===========================================================================
+# 物化后的池。**C 和 F 共用同一份**，95 号的 replay 臂读的也是这个文件 ——
+# 三者同池不再靠"两个 shuffle 应该一致"这种推理，靠的是它们打开同一个文件。
+# Step 5 仍会用 pool_fingerprint 复核 C 与 F。
+#
+# 三个域在这里的参数完全相同：物化时已经把列名归一成 inputs / gold_targets、
+# 行序已经定死、空行已经滤掉，所以这里 --max_samples 0 --sample_shuffle 0。
+# ===========================================================================
+pool_file_for () { printf '%s' "${SPLIT_DIR}/$1_pool.jsonl"; }
+val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
+
+pool_args_for () {
+  printf '%s\n' \
+    --data_files "$(pool_file_for "$1")" \
+    --dataset_split train \
+    --streaming 0 \
+    --input_column inputs \
+    --target_column gold_targets \
+    --require_target 1 \
+    --max_samples 0 \
+    --sample_shuffle 0 \
+    --sample_seed "${SAMPLE_SEED}"
+}
+
 maxlen_for () {
   case "$1" in
     if)   printf '%s' "${IF_MAXLEN}" ;;
@@ -568,23 +668,198 @@ ACTIVE_DOMAINS=()
 [[ "${DO_MATH}" == "1" ]] && ACTIVE_DOMAINS+=(math)
 [[ "${DO_CODE}" == "1" ]] && ACTIVE_DOMAINS+=(code)
 
-# ---- 行数与 F 的耗时预估。check_old_knowledge_pool 不加载模型，几秒的事 ----
-if [[ "${#ACTIVE_DOMAINS[@]}" -gt 0 && "${WHAT}" != "none" ]]; then
+# DRY_RUN 在切分之前退出：Step 1 会往磁盘写池和 val 两个文件，那是副作用，
+# 不该在"只看计划"的这一档里发生。上面 Step 0 的检查全是只读的。
+if [[ "${DRY_RUN}" == "1" ]]; then
   echo
-  echo "---- 各域行数与池指纹（F 的耗时正比于行数）----"
+  echo "DRY_RUN=1：以上为计划，不切分、不采集。确认后 qsub -v DRY_RUN=0,... "
+  for domain in "${ACTIVE_DOMAINS[@]}"; do
+    echo
+    echo "  ${domain}: maxlen $(maxlen_for "${domain}")  cov_batch $(cov_batch_for "${domain}")"
+    echo "    源语料参数（逐字等于 68/69 号）："
+    source_args_for "${domain}" | paste - - | sed 's/^/      /'
+    echo "    -> 池  $(pool_file_for "${domain}")        (C / F / replay 三者共用)"
+    echo "    -> val $(val_file_for "${domain}")   (末尾 ${OLD_VAL_ROWS} 行，谁都不训)"
+    echo "    C -> $(cov_path_for "${domain}")"
+    echo "    F -> $(fisher_path_for "${domain}")"
+  done
+  if [[ "${DO_MIX}" == "1" ]]; then
+    echo
+    echo "  mix (${MIX_DOMAINS} @ ${MIX_WEIGHTS}):"
+    echo "    C -> ${MIX_COV}"
+    echo "    F -> ${MIX_FISHER}"
+  fi
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 物化每个域的池与 val 切片
+#
+# 为什么要落盘，而不是靠传参把 val 那 500 行排除掉：
+#   data/replay.py 的 load_self_distilled_pool **不吃** --replay_pool_size，它
+#   整份读完（那个函数的前提是"池在上游已经切好了"）。所以 replay 臂靠传参是
+#   排不掉尾部那 500 行的，它照样会训到被拿来算 val loss 的行，而 val loss 的
+#   全部意义就是"没有任何一条臂训过这些行"。
+#
+#   更根本的一条：math 和 code 的池不是"shuffle 后取前 N"来的。
+#   prepare_opc_ccode 用的是 rng.sample(deduped, 20000)，prepare_metamath_cmath
+#   是按 source 加权、按 question 去重的分层抽样。所以"池后面那一段"这个概念在
+#   这两个域上根本不存在，--pool_offset 只会在池内偏移。
+#
+# 于是切分在这里做一次、落到磁盘上：谁训了哪些行变成 wc -l 能查的事，不再是
+# 关于两个 shuffle 能不能对上的推理。列名同时归一成 inputs / gold_targets，
+# 三个域之后的参数因此完全相同。
+#
+# 顺带消掉一个坑：物化后的池不带 truncated 列，--replay_drop_truncated 传错也
+# 不会再悄悄丢掉 13% 的行。
+# ===========================================================================
+if [[ "${DO_PREP}" == "1" && "${#ACTIVE_DOMAINS[@]}" -gt 0 ]]; then
+  echo
+  echo "==== Step 1: 物化池与 val 切片（每域留 ${OLD_VAL_ROWS} 行）===="
+  mkdir -p "${SPLIT_DIR}"
+  for domain in "${ACTIVE_DOMAINS[@]}"; do
+    pool_out="$(pool_file_for "${domain}")"
+    val_out="$(val_file_for "${domain}")"
+    if [[ -f "${pool_out}" && -f "${val_out}" && "${FORCE_PREP}" != "1" ]]; then
+      echo "  已存在，跳过 ${domain}（要重切传 FORCE_PREP=1）"
+      echo "    池  $(wc -l < "${pool_out}") 行  ${pool_out}"
+      echo "    val $(wc -l < "${val_out}") 行  ${val_out}"
+      continue
+    fi
+    src_args=()
+    while IFS= read -r item; do src_args+=("${item}"); done < <(source_args_for "${domain}")
+    python - "${src_args[@]}" \
+      --cache_dir "${DATASET_CACHE}" --label "${domain}" \
+      --val_rows "${OLD_VAL_ROWS}" \
+      --out_pool "${pool_out}" --out_val "${val_out}" \
+      --manifest "${SPLIT_MANIFEST}" <<'PY'
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from onereplay.data.old_knowledge import (
+    filter_incomplete_rows,
+    fingerprint_pool,
+    load_old_knowledge_dataset,
+)
+
+parser = argparse.ArgumentParser()
+# 与 collect_cov / collect_fisher 同名的那几个，好让 source_args_for 的输出
+# 原样喂进来：这一步必须和 68/69 号读到的是同一批行，多一个少一个都不行。
+parser.add_argument("--dataset_path", type=str, default="")
+parser.add_argument("--dataset_name", type=str, default="")
+parser.add_argument("--dataset_config", type=str, default="")
+parser.add_argument("--dataset_split", type=str, default="train")
+parser.add_argument("--data_files", type=str, default="")
+parser.add_argument("--cache_dir", type=str, default="")
+parser.add_argument("--streaming", type=int, default=0)
+parser.add_argument("--text_column", type=str, default="")
+parser.add_argument("--input_column", type=str, default="inputs")
+parser.add_argument("--target_column", type=str, default="targets")
+parser.add_argument("--require_target", type=int, default=0)
+parser.add_argument("--require_target_column", type=str, default="")
+parser.add_argument("--max_samples", type=int, default=0)
+parser.add_argument("--sample_shuffle", type=int, default=0)
+parser.add_argument("--sample_seed", type=int, default=1)
+parser.add_argument("--label", type=str, default="pool")
+parser.add_argument("--val_rows", type=int, required=True)
+parser.add_argument("--out_pool", type=str, required=True)
+parser.add_argument("--out_val", type=str, required=True)
+parser.add_argument("--manifest", type=str, default="")
+args = parser.parse_args()
+
+dataset = load_old_knowledge_dataset(args)
+before = len(dataset)
+if args.require_target == 1:
+    dataset = filter_incomplete_rows(dataset, args)
+# limit_dataset 的两步，手写在这里是因为下面还要按同一个顺序切第二刀。
+if args.sample_shuffle == 1:
+    dataset = dataset.shuffle(seed=args.sample_seed)
+if args.max_samples > 0:
+    dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+
+total = len(dataset)
+if total <= args.val_rows:
+    raise SystemExit(
+        f"{args.label}: 语料只有 {total} 行，留不出 {args.val_rows} 行 val。"
+        " 调小 OLD_VAL_ROWS，或确认语料路径对不对。"
+    )
+pool_rows = total - args.val_rows
+pool = dataset.select(range(pool_rows))
+val = dataset.select(range(pool_rows, total))
+
+# 池归一成 inputs / gold_targets：三个域之后的参数因此完全相同，95 号的
+# replay 臂也不再需要按域切换答案列。
+Path(args.out_pool).parent.mkdir(parents=True, exist_ok=True)
+with open(args.out_pool, "w", encoding="utf-8") as handle:
+    for row in pool:
+        handle.write(json.dumps({
+            "inputs": str(row[args.input_column] or "").strip(),
+            "gold_targets": str(row[args.target_column] or "").strip(),
+        }, ensure_ascii=False) + "\n")
+
+# val 用 question / response：那是 data/old_val.py 读的 schema。
+with open(args.out_val, "w", encoding="utf-8") as handle:
+    for row in val:
+        handle.write(json.dumps({
+            "question": str(row[args.input_column] or "").strip(),
+            "response": str(row[args.target_column] or "").strip(),
+        }, ensure_ascii=False) + "\n")
+
+pool_count, pool_fp = fingerprint_pool(pool, args)
+val_count, val_fp = fingerprint_pool(val, args)
+print(f"  {args.label}: 源 {before} 行 -> 口径内 {total} 行"
+      f" -> 池 {pool_rows} + val {args.val_rows}")
+print(f"    池  {args.out_pool}")
+print(f"        rows={pool_count} fingerprint={pool_fp}")
+print(f"    val {args.out_val}")
+print(f"        rows={val_count} fingerprint={val_fp}")
+
+if args.manifest:
+    path = Path(args.manifest)
+    payload = {}
+    if path.is_file():
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            # 半截文件不该让整轮切分失败，重写一份就是了。
+            payload = {}
+    payload[args.label] = {
+        "source_data_files": args.data_files,
+        "source_input_column": args.input_column,
+        "source_target_column": args.target_column,
+        "require_target": args.require_target,
+        "sample_shuffle": args.sample_shuffle,
+        "sample_seed": args.sample_seed,
+        "max_samples": args.max_samples,
+        "rows_in_scope": total,
+        "pool_rows": pool_rows,
+        "val_rows": val_count,
+        "pool_file": args.out_pool,
+        "val_file": args.out_val,
+        "pool_fingerprint": pool_fp,
+        "val_fingerprint": val_fp,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+PY
+  done
+  echo "  切分清单: ${SPLIT_MANIFEST}"
+  echo "  95 号按同一套规则推导这些路径，两边对不上时它的同池检查会拦下来。"
+fi
+
+# ---- F 的耗时预估。行数直接数物化后的池，不用再跑一次装载 ----
+if [[ "${#ACTIVE_DOMAINS[@]}" -gt 0 ]] \
+   && [[ "${WHAT}" == "fisher" || "${WHAT}" == "both" ]]; then
   TOTAL_ROWS=0
   for domain in "${ACTIVE_DOMAINS[@]}"; do
-    args=()
-    while IFS= read -r item; do args+=("${item}"); done < <(pool_args_for "${domain}")
-    FP_LINE="$(python -m onereplay.scripts.check_old_knowledge_pool \
-                 --cache_dir "${DATASET_CACHE}" --label "${domain}" \
-                 "${args[@]}" | tail -n 1)"
-    echo "  ${FP_LINE}"
-    ROWS="${FP_LINE##*rows=}"; ROWS="${ROWS%% *}"
+    pool_out="$(pool_file_for "${domain}")"
+    [[ -f "${pool_out}" ]] || continue
+    ROWS="$(wc -l < "${pool_out}" | tr -d ' ')"
     TOTAL_ROWS=$((TOTAL_ROWS + ROWS))
   done
-
-  if [[ "${WHAT}" == "fisher" || "${WHAT}" == "both" ]]; then
+  if (( TOTAL_ROWS > 0 )); then
     TOTAL_ROWS="${TOTAL_ROWS}" python - <<'PY'
 import os
 
@@ -601,22 +876,8 @@ PY
   fi
 fi
 
-if [[ "${DRY_RUN}" == "1" ]]; then
-  echo
-  echo "DRY_RUN=1：以上为计划，未采集任何东西。确认后 qsub -v DRY_RUN=0,... "
-  for domain in "${ACTIVE_DOMAINS[@]}"; do
-    echo
-    echo "  ${domain}: maxlen $(maxlen_for "${domain}")  cov_batch $(cov_batch_for "${domain}")"
-    echo "    C -> $(cov_path_for "${domain}")"
-    echo "    F -> $(fisher_path_for "${domain}")"
-    echo "    共用的数据参数（C 与 F 逐字相同）："
-    pool_args_for "${domain}" | paste - - | sed 's/^/      /'
-  done
-  exit 0
-fi
-
 # ===========================================================================
-# Step 1: 采 C
+# Step 2: 采 C
 # ===========================================================================
 collect_cov_one () {
   local domain="$1"
@@ -633,7 +894,7 @@ collect_cov_one () {
   while IFS= read -r item; do args+=("${item}"); done < <(pool_args_for "${domain}")
 
   echo
-  echo "==== Step 1: 采 C_${domain} -> ${out_path} ===="
+  echo "==== Step 2: 采 C_${domain} -> ${out_path} ===="
   python -m onereplay.scripts.collect_cov \
     --seed "${SEED}" \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
@@ -654,7 +915,7 @@ collect_cov_one () {
 }
 
 # ===========================================================================
-# Step 2: 采 F
+# Step 3: 采 F
 # ===========================================================================
 collect_fisher_one () {
   local domain="$1"
@@ -670,7 +931,7 @@ collect_fisher_one () {
   while IFS= read -r item; do args+=("${item}"); done < <(pool_args_for "${domain}")
 
   echo
-  echo "==== Step 2: 采 F_${domain} -> ${out_path} ===="
+  echo "==== Step 3: 采 F_${domain} -> ${out_path} ===="
   python -m onereplay.scripts.collect_fisher \
     --seed "${SEED}" \
     --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
@@ -697,7 +958,95 @@ for domain in "${ACTIVE_DOMAINS[@]}"; do
 done
 
 # ===========================================================================
-# Step 3: 诊断
+# Step 4: mix —— 一份矩阵同时保两个域
+#
+# 单域臂只证明了"C 采自哪个域，就保住哪个域"。真实的微调场景要保的不止一样
+# 东西，而 C 是线性可加的，那么 0.5 C_math + 0.5 C_code 这一份能不能同时保住
+# math 和 code？这一臂就是问这个。EWC 那边同理换成 F。
+#
+# !! mix 臂要报的是两侧分开的数，不是平均分
+# 它成立的条件是 math 与 code **都**不比对应的单域臂差得多。一侧保住、另一侧
+# 塌了，那就是"矩阵的容量不够，两个域在抢"，这个权衡本身才是结论 —— 平均成
+# 一个数会把它藏起来。95 号因此按域分别报 old_val_loss_math / old_val_loss_code，
+# 评测也取 math 与 code 两侧的并集。
+#
+# !! mix 的 λ 是另一把尺子
+# C_mix 的 tr(C) 是两份的加权平均，与任何一份单域 C 都不同，同一个 λ 压出来的
+# λR/task_loss 就不是一个量。老实按 95 号的 λ=0 标尺法对 mix 重新扫一遍。
+#
+# !! if 域进不了 mix
+# 三个域的 maxlen 不同（if 512、math/code 1024），而 replay 那一侧的
+# --replay_max_len 在 train.py 里是全局唯一的，混进来必然有一个域的口径是错的。
+# C/F 这一侧虽然只是矩阵相加、看不出这个冲突，但三条臂必须消费同一批旧知识，
+# 所以这里也只在 math 与 code 之间混。
+# ===========================================================================
+mix_inputs_for () {
+  local kind="$1" out="" d src
+  for d in ${MIX_DOMAINS//,/ }; do
+    if [[ "${kind}" == "cov" ]]; then src="$(cov_path_for "${d}")"; else src="$(fisher_path_for "${d}")"; fi
+    [[ -n "${src}" ]] || return 1
+    out="${out}${out:+,}${src}"
+  done
+  printf '%s' "${out}"
+}
+
+mix_one () {
+  local kind="$1" out_path="$2" module="$3"
+  local inputs missing=0 item
+  inputs="$(mix_inputs_for "${kind}")" || return 1
+
+  for item in ${inputs//,/ }; do
+    if [[ ! -f "${item}" ]]; then
+      echo "  缺 ${item}" >&2
+      missing=1
+    fi
+  done
+  if (( missing )); then
+    echo "  跳过 ${kind} mix：参与混合的单域矩阵还没采齐。" >&2
+    echo "  先把 ${MIX_DOMAINS} 两个域的这一类矩阵采完再重投（已有的会跳过）。" >&2
+    return 0
+  fi
+  if [[ -f "${out_path}" && "${FORCE_MIX}" != "1" ]]; then
+    echo "  已存在，跳过 ${kind} mix: ${out_path}（要重合成传 FORCE_MIX=1）"
+    return 0
+  fi
+
+  echo
+  echo "==== Step 4: 合成 ${kind} mix -> ${out_path} ===="
+  echo "  ${inputs}"
+  echo "  权重 ${MIX_WEIGHTS}"
+  # mix_fishers 还有一档 --equalize mean（按 mean(F) 归一后两域等贡献）。这里
+  # 走的是裸等系数，与 C 那边 0.5/0.5 的口径对应；两档的 λ 不通用，要另扫。
+  python -m "onereplay.${module}" \
+    --inputs "${inputs}" \
+    --weights "${MIX_WEIGHTS}" \
+    --output_path "${out_path}"
+  ls -lh "${out_path}"
+}
+
+if [[ "${DO_MIX}" == "1" ]]; then
+  for d in ${MIX_DOMAINS//,/ }; do
+    case "${d}" in
+      math|code) ;;
+      if)
+        echo "!! MIX_DOMAINS 里不能有 if：它的 maxlen 是 512 而 math/code 是 1024，" >&2
+        echo "   而 train.py 的 --replay_max_len 是全局唯一的，replay 那一侧必然有" >&2
+        echo "   一个域的口径是错的。见 Step 4 的说明。" >&2
+        exit 2
+        ;;
+      *) echo "!! MIX_DOMAINS 里的 '${d}' 不认识，只能是 math / code" >&2; exit 2 ;;
+    esac
+  done
+  if [[ "${WHAT}" == "cov" || "${WHAT}" == "both" ]]; then
+    mix_one cov "${MIX_COV}" mix_covariances
+  fi
+  if [[ "${WHAT}" == "fisher" || "${WHAT}" == "both" ]]; then
+    mix_one fisher "${MIX_FISHER}" mix_fishers
+  fi
+fi
+
+# ===========================================================================
+# Step 5: 诊断
 #   1) 层覆盖断言 —— regularizer 对缺矩阵的层是**静默跳过**的，拿一份少了层的 C
 #      去训，训练照跑 loss 照降，要到看结果时才发现方法被削掉一大半。
 #   2) lm_head 与其余层的量级对比 —— 它 tie 着 embed_tokens，见文件头。
@@ -708,7 +1057,7 @@ done
 # ===========================================================================
 if [[ "${DO_DIAG}" == "1" ]]; then
   echo
-  echo "==== Step 3: 诊断 ===="
+  echo "==== Step 5: 诊断 ===="
   python - <<'PY'
 import json, os
 
@@ -741,10 +1090,18 @@ active = [
     d for d, key in (("if", "DO_IF"), ("math", "DO_MATH"), ("code", "DO_CODE"))
     if os.environ.get(key, "0") == "1"
 ]
+# mix 的两份矩阵走同一套检查：层覆盖、量级、以及 C 与 F 是否同池。它们是相加
+# 出来的，所以指纹一致与否取决于两份输入是否同池，这里查一遍比事后猜省事。
+if os.environ.get("DO_MIX", "0") == "1":
+    active.append("mix")
 
 for domain in active:
-    cov_path = os.environ[f"{domain.upper()}_COV"]
-    fisher_path = os.environ[f"{domain.upper()}_FISHER"]
+    if domain == "mix":
+        cov_path = os.environ["MIX_COV"]
+        fisher_path = os.environ["MIX_FISHER"]
+    else:
+        cov_path = os.environ[f"{domain.upper()}_COV"]
+        fisher_path = os.environ[f"{domain.upper()}_FISHER"]
     fingerprints = {}
     print()
     print(f"================ {domain} ================")
@@ -755,8 +1112,16 @@ for domain in active:
         meta = payload.get("metadata", {})
         print(f"---- C: {cov_path}")
         print(f"     层数 {len(covs)} / 期望 {expect}")
-        print(f"     pool_rows={meta.get('pool_rows')} max_len={meta.get('max_len')}")
-        print(f"     supervision={meta.get('cov_supervision')} system={meta.get('system_prompt')!r}")
+        if meta.get("type") == "weighted_covariance_mix":
+            # 相加出来的矩阵没有自己的池：它的口径是两份输入的口径，所以报输入。
+            print(f"     inputs  = {meta.get('inputs')}")
+            print(f"     weights = {meta.get('weights')}")
+            for src in meta.get("source_metadata", []) or []:
+                print(f"       源: pool_rows={src.get('pool_rows')} max_len={src.get('max_len')}"
+                      f" supervision={src.get('cov_supervision')}")
+        else:
+            print(f"     pool_rows={meta.get('pool_rows')} max_len={meta.get('max_len')}")
+            print(f"     supervision={meta.get('cov_supervision')} system={meta.get('system_prompt')!r}")
         fingerprints["C"] = meta.get("pool_fingerprint")
         if len(covs) != expect:
             got = sorted({class_of(k) for k in covs})
@@ -804,8 +1169,12 @@ for domain in active:
         scale = meta.get("fisher_scale", {}) or {}
         print(f"---- F: {fisher_path}")
         print(f"     层数 {len(fishers)} / 期望 {expect}")
-        print(f"     样本数 {meta.get('num_examples')}  pool_rows={meta.get('pool_rows')}")
-        print(f"     max_len={meta.get('max_len')}")
+        if meta.get("inputs") and meta.get("weights") is not None:
+            print(f"     inputs  = {meta.get('inputs')}")
+            print(f"     weights = {meta.get('weights')}  mode={meta.get('mode')}")
+        else:
+            print(f"     样本数 {meta.get('num_examples')}  pool_rows={meta.get('pool_rows')}")
+            print(f"     max_len={meta.get('max_len')}")
         print(f"     mean(F)={scale.get('mean')}  max(F)={scale.get('max')}")
         fingerprints["F"] = meta.get("pool_fingerprint")
         if len(fishers) != expect:
@@ -828,12 +1197,18 @@ for domain in active:
     else:
         print(f"---- F: 未生成，跳过 ({fisher_path})")
 
-    if "C" in fingerprints and "F" in fingerprints:
-        if fingerprints["C"] != fingerprints["F"]:
-            print(f"     !! 池指纹不一致  C={fingerprints['C']}  F={fingerprints['F']}")
+    have = {k: v for k, v in fingerprints.items() if v}
+    if len(have) == 2:
+        if have["C"] != have["F"]:
+            print(f"     !! 池指纹不一致  C={have['C']}  F={have['F']}")
             failures.append(f"{domain}: C 与 F 的 pool_fingerprint 不等")
         else:
-            print(f"     C 与 F 同池: {fingerprints['C']}")
+            print(f"     C 与 F 同池: {have['C']}")
+    elif domain == "mix":
+        # 相加出来的矩阵没有自己的指纹。它的同池性由两份输入决定，而那两份
+        # 在上面各自的小节里已经查过了。这里说一句，免得这行空白被读成"没查"。
+        print("     mix 没有自己的池指纹（它是相加出来的）；同池性看上面 "
+              f"{os.environ.get('MIX_DOMAINS', '')} 各自那两节。")
     elif len(fingerprints) == 1:
         print("     只采了一半，另一半采完后重跑 WHAT=none 复核同池。")
 
@@ -856,6 +1231,9 @@ echo "========================================================================"
 echo "采集完成。产物："
 ls -lh "${COV_DIR}" "${FISHER_DIR}" 2>/dev/null || true
 echo
+echo "池与 val 切片（95 号的三条臂读前者，val loss 读后者）："
+ls -lh "${SPLIT_DIR}" 2>/dev/null || true
+echo
 echo "下一步："
 echo "  1) 没采的那一半接着投：WHAT=cov 或 WHAT=fisher（已有的会自动跳过）"
 echo "  2) 拿 collect_fisher 打印的 ms/example 校准 ETA_MS_PER_EXAMPLE 再投下一批"
@@ -865,4 +1243,6 @@ echo "       qsub -v DRY_RUN=0 onereplay/pbs/94_finance_probe.pbs"
 echo "  4) 再用 95 号扫 λ，每个域每个方法各一次（两条臂的尺度不通用）："
 echo "       qsub -v DRY_RUN=0,DOMAIN=if,ARM=onereplay,LAMBDAS=0:a:b:c onereplay/pbs/95_finance_arms.pbs"
 echo "       qsub -v DRY_RUN=0,DOMAIN=if,ARM=ewc,LAMBDAS=0:a:b:c       onereplay/pbs/95_finance_arms.pbs"
+echo "     mix 臂同理，它是第四个 DOMAIN（λ 要另扫，C_mix 的 tr(C) 与单域的不同）："
+echo "       qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDAS=0:a:b:c onereplay/pbs/95_finance_arms.pbs"
 echo "========================================================================"

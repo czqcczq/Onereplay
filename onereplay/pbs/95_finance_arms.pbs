@@ -21,6 +21,11 @@
 #     qsub -v DRY_RUN=0,DOMAIN=if,ARM=onereplay,LAMBDA=1.5e-3 onereplay/pbs/95_finance_arms.pbs
 #   replay 不吃 λ，定中心点之前就能投:
 #     qsub -v DRY_RUN=0,DOMAIN=if,ARM=replay onereplay/pbs/95_finance_arms.pbs
+#   mix 臂（0.5 math + 0.5 code，三条臂都有 mix 版，见第 8 条）:
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay onereplay/pbs/95_finance_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDAS=0:a:b:c onereplay/pbs/95_finance_arms.pbs
+#   换权重（run 名与矩阵文件名都会跟着变，不会覆盖等权那一版）:
+#     qsub -v DRY_RUN=0,DOMAIN=mix,MIX_WEIGHTS=0.25:0.75,ARM=onereplay,LAMBDA=... ...
 #   拆两次投（训练与评测分开）:
 #     qsub -v DRY_RUN=0,DOMAIN=if,ARM=replay,DO_EVAL=0 ...   然后   DO_TRAIN=0
 #   L2 对照臂（C 换成单位阵，隔离"协方差结构"与"任何收缩"）:
@@ -148,7 +153,58 @@
 # 解码预算、batch、OUT_DIR 与 94 号逐字相同，否则两者相减不是"忘了多少"。
 #
 # -----------------------------------------------------------------------------
-# 8. 投递前要有
+# 8. DOMAIN=mix：一份矩阵能不能同时保住两个域
+# -------------------------------------------
+# 单域臂只证明了"矩阵采自哪个域，就保住哪个域"。真实的微调场景要保的不止一样
+# 东西，而 C 和 F 都是线性可加的，那么各占一半的那一份能不能同时保住两个域？
+#
+#   onereplay  C_mix = 0.5 C_math + 0.5 C_code   （93 号 Step 4 合成）
+#   ewc        F_mix = 0.5 F_math + 0.5 F_code   （同上）
+#   replay     每个 micro-batch 里那 REPLAY_PER_BATCH 行按 0.5/0.5 在两个池之间
+#              分配，由 loader 的调度器逐 batch 落实，不是靠期望值凑
+#
+# 三条臂因此在 mix 上仍然是"同一批旧知识的三种用法"。
+#
+# !! 这一臂要报的是两侧分开的数，不是平均分
+# 它成立的条件是 math 与 code **都**不比对应的单域臂差得多。一侧保住、另一侧
+# 塌了，那就是"容量不够，两个域在抢"，这个权衡本身才是结论。所以 mix 的评测
+# 取两侧的并集，old_val 也按域分开报两条（见第 9 条）。
+#
+# !! λ 在 mix 下是另一把尺子
+# C_mix 的 tr(C) 是两份的加权平均，与任何一份单域 C 都不同，同一个 λ 压出来的
+# λR/task_loss 就不是一个量。老实对 mix 重新扫一遍。与单域臂对照时也一样：
+# 等强度（λR/task_loss 相当）才是公平对照，不是等 λ。
+#
+# !! if 进不了 mix
+# 它的 maxlen 是 512 而 math/code 是 1024，而 train.py 的 --replay_max_len 是
+# 全局唯一的，混进来必然有一个域的口径是错的，而且不会报错。
+#
+# -----------------------------------------------------------------------------
+# 9. 旧域 val loss：只随权重动的那个读数
+# -------------------------------------
+# bench 是"生成 -> 解析 -> 判分"三步的结果，前两步会因为和权重无关的原因跳：
+# 模型换一种说法、parser 不认了，读出来就是掉几十分。这条线上这件事尤其严重 ——
+# finance 把答案压成一个标签词，74 号在 8B 上实测 math500 掉的 39.2 个点里有
+# 34.3 个是不再输出 \boxed{}。
+#
+# 所以每个 epoch 还在被保护的域上打一条交叉熵，它只随权重动：
+#   record_type=baseline  训练前的裸底座（EVAL_BEFORE_TRAIN=1 时有）
+#   record_type=epoch     每轮之后
+#   列名                  old_val_loss_<domain>
+# 读法是减掉 baseline：差越接近 0 忘得越少。四条臂（含 94 号的 vanilla）打的是
+# 同一批行，所以这几个数之间直接可比。
+#
+# !! 那批行从哪来：93 号 Step 1 切好的，落在磁盘上
+# 每个域的池尾留 OLD_VAL_ROWS 行（默认 500），C / F / replay 三者都不碰。
+# 为什么必须落盘而不是传个参数：load_self_distilled_pool 不吃 --replay_pool_size，
+# 而 math/code 的池又不是"shuffle 后取前 N"来的（prepare 那一步用的是
+# rng.sample 和分层抽样），所以"池后面那一段"这个概念不存在。详见 93 号文件头。
+#
+# 本脚本一律走带标签的 --prior_val_jsonl，单域也是（一个条目），这样列名恒为
+# old_val_loss_<domain>，单域和 mix 的读法一致。
+#
+# -----------------------------------------------------------------------------
+# 10. 投递前要有
 # -------------
 #   1) 93 号的本域矩阵：ARM=onereplay 要 C，ARM=ewc 要 F，ARM=replay 要本域语料
 #      （replay 仍会读 C 的 metadata 证明同池，真没有就 SKIP_POOL_CHECK=1，
@@ -214,6 +270,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT POOL_ROOT FLAN_DIR
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE
     DOMAIN ARM LAMBDA LAMBDAS PROBE PROBE_STEPS MAX_STEPS SAVE
+    SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS MIX_WEIGHTS MIX_COV MIX_FISHER
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL SKIP_POOL_CHECK WITH_RETENTION
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     EVAL_BATCH TARGET_MODULES SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY
@@ -278,9 +335,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 cd "${REPO_ROOT}"
 
 case "${DOMAIN}" in
-  if|math|code) ;;
-  "") echo "必须指定 DOMAIN=if|math|code（被保护的域）" >&2; exit 2 ;;
-  *)  echo "DOMAIN 只能是 if / math / code，得到 '${DOMAIN}'" >&2; exit 2 ;;
+  if|math|code|mix) ;;
+  "") echo "必须指定 DOMAIN=if|math|code|mix（被保护的域）" >&2; exit 2 ;;
+  *)  echo "DOMAIN 只能是 if / math / code / mix，得到 '${DOMAIN}'" >&2; exit 2 ;;
 esac
 case "${ARM}" in
   onereplay|ewc|replay) ;;
@@ -316,7 +373,8 @@ CODE_VIEW_PREFIX="${CODE_VIEW_PREFIX:-opc_edu_ccode_20k}"
 # 训练超参：与 94 号逐字相同。改任何一个就是四条臂一起重跑。
 # =============================================================================
 EPOCHS="${EPOCHS:-2}"
-LR="${LR:-5e-5}"
+# 与 94 号同值。2e-4 对全量微调偏大，是为了造出足够的遗忘，见 94 号文件头第 3 条。
+LR="${LR:-2e-4}"
 LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BATCH="${BATCH:-8}"
@@ -379,40 +437,80 @@ IF_FISHER="${IF_FISHER:-${FISHER_DIR}/fisher_if_flan20k_all.pt}"
 MATH_FISHER="${MATH_FISHER:-${FISHER_DIR}/fisher_math_metamath30k_gold_all.pt}"
 CODE_FISHER="${CODE_FISHER:-${FISHER_DIR}/fisher_code_opcedu20k_gold_all.pt}"
 
+# 93 号 Step 1 物化出来的池与 val 切片。推导规则必须和那边逐字相同，
+# test_code/check_finance_line.py 会比对。
+SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
+# 每个 epoch 在被保护的域上打一条交叉熵。见文件头第 9 条。
+OLD_VAL="${OLD_VAL:-1}"
+
+# mix 臂：93 号 Step 4 合成的矩阵，文件名把参与的域与权重都编进去。
+MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
+MIX_WEIGHTS="${MIX_WEIGHTS:-0.5,0.5}"
+# qsub -v 自己按逗号切参数，所以从命令行传的时候只能写成 math:code / 0.25:0.75。
+# 这里归一回逗号，93 号那边是同一行，两边的 MIX_TAG 才拼得出同一个文件名。
+MIX_DOMAINS="${MIX_DOMAINS//:/,}"
+MIX_WEIGHTS="${MIX_WEIGHTS//:/,}"
+MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")-w$(printf '%s' "${MIX_WEIGHTS//,/-}")"
+MIX_COV="${MIX_COV:-${COV_DIR}/cov_${MIX_TAG}_gold_all.pt}"
+MIX_FISHER="${MIX_FISHER:-${FISHER_DIR}/fisher_${MIX_TAG}_gold_all.pt}"
+
+# 三条臂读的都是 93 号 Step 1 物化出来的池文件。列名已经归一成
+# inputs / gold_targets、行序已经定死、空行已经滤掉、尾部那 OLD_VAL_ROWS 行已经
+# 切走，所以这里三个域的参数除了 maxlen 之外完全相同。
+pool_file_for () { printf '%s' "${SPLIT_DIR}/$1_pool.jsonl"; }
+val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
+
+REPLAY_INPUT_COLUMN="inputs"
+REPLAY_TARGET_COLUMN="gold_targets"
+REPLAY_POOL_SIZE=0              # 文件本身就是池，不再二次切
+REPLAY_MIX_FILES=""
+REPLAY_MIX_WEIGHTS=""
+# 哪几个域的 val 切片要每个 epoch 打一次。单域一个，mix 两个（分开报，见第 9 条）。
+OLD_VAL_DOMAINS=""
+
 case "${DOMAIN}" in
   if)
     COV_PATH="${COV_PATH:-${IF_COV}}"
     FISHER_PATH="${FISHER_PATH:-${IF_FISHER}}"
-    # 原始 FLAN 分片：targets 本身就是 gold，走 --replay_data_files 这条
-    # shuffle(seed) + select(pool_size) 的路径，与 collect_cov 的 uniform 同两步。
-    REPLAY_DATA_FILES="${FLAN_DIR}/train/*.jsonl"
+    REPLAY_DATA_FILES="$(pool_file_for if)"
     REPLAY_FILE=""
-    REPLAY_TARGET_COLUMN="targets"
-    REPLAY_POOL_SIZE=20000      # = 93 号的 FLAN_SAMPLES
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-512}"   # = 93 号的 IF_MAXLEN
+    OLD_VAL_DOMAINS="if"
     ;;
   math)
     COV_PATH="${COV_PATH:-${MATH_COV}}"
     FISHER_PATH="${FISHER_PATH:-${MATH_FISHER}}"
-    # 自蒸馏 jsonl 自带 index 列，load_self_distilled_pool 按它排回池序，
-    # 不做第二次 shuffle。答案列换成 gold_targets。
-    REPLAY_DATA_FILES=""
-    REPLAY_FILE="${POOL_ROOT}/replay/${MATH_VIEW_PREFIX}_*_selfdistill_seed${REPLAY_SAMPLE_SEED}.jsonl"
-    REPLAY_TARGET_COLUMN="gold_targets"
-    REPLAY_POOL_SIZE=0          # 整份读完 = 93 号的 --max_samples 0
+    REPLAY_DATA_FILES="$(pool_file_for math)"
+    REPLAY_FILE=""
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
+    OLD_VAL_DOMAINS="math"
     ;;
   code)
     COV_PATH="${COV_PATH:-${CODE_COV}}"
     FISHER_PATH="${FISHER_PATH:-${CODE_FISHER}}"
+    REPLAY_DATA_FILES="$(pool_file_for code)"
+    REPLAY_FILE=""
+    REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
+    OLD_VAL_DOMAINS="code"
+    ;;
+  mix)
+    # 矩阵：93 号 Step 4 合成的那两份。replay：两个池按行份额混进每个
+    # micro-batch，由 loader 的调度器逐 batch 落实，不是靠期望值凑。
+    COV_PATH="${COV_PATH:-${MIX_COV}}"
+    FISHER_PATH="${FISHER_PATH:-${MIX_FISHER}}"
     REPLAY_DATA_FILES=""
-    REPLAY_FILE="${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${REPLAY_SAMPLE_SEED}.jsonl"
-    REPLAY_TARGET_COLUMN="gold_targets"
-    REPLAY_POOL_SIZE=0
+    REPLAY_FILE=""
+    for _d in ${MIX_DOMAINS//,/ }; do
+      REPLAY_MIX_FILES="${REPLAY_MIX_FILES}${REPLAY_MIX_FILES:+,}${_d}=$(pool_file_for "${_d}")"
+      OLD_VAL_DOMAINS="${OLD_VAL_DOMAINS}${OLD_VAL_DOMAINS:+ }${_d}"
+    done
+    REPLAY_MIX_WEIGHTS="${MIX_WEIGHTS}"
+    # math 与 code 的预算相同，所以 train.py 那个全局唯一的 --replay_max_len
+    # 对两个域都是对的。if 进不来正是因为它是 512，见文件头第 8 条。
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
     ;;
 esac
-REPLAY_INPUT_COLUMN="inputs"
 
 # =============================================================================
 # λ：onereplay / ewc 必须显式给，见第 2 条。
@@ -509,7 +607,11 @@ fi
 # 和 2-epoch 那条排在一个文件里，下游读最后一条就可能拿到错的。
 run_name_for () {
   local lam="$1"
-  local name="fin_${ARM}_${DOMAIN}"
+  # mix 的名字带上参与的域与权重：0.5/0.5 与 0.25/0.75 是两个独立的实验，
+  # 名字一样就会在 <metric>_summary.csv 里挤成同一行。
+  local tag="${DOMAIN}"
+  [[ "${DOMAIN}" == "mix" ]] && tag="${MIX_TAG}"
+  local name="fin_${ARM}_${tag}"
   [[ -n "${lam}" ]] && name="${name}_lam${lam}"
   [[ "${IDENTITY_COV}" == "1" ]] && name="${name}_idcov"
   name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
@@ -558,6 +660,9 @@ case "${DOMAIN}" in
   if)   DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
   math) DOMAIN_METRICS="ifeval gsm8k math500" ;;
   code) DOMAIN_METRICS="ifeval humaneval mbpp" ;;
+  # mix 保的是两个域，就必须两边都评。只评其中一边的话，"另一边被挤掉了"这个
+  # 最可能的失败模式根本不会出现在表里 —— 而那正是这一臂要回答的问题。
+  mix)  DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
 esac
 if [[ "${WITH_IFBENCH}" == "1" ]]; then
   DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
@@ -573,11 +678,20 @@ echo "  新任务   = ${DATASET_DIR}"
 case "${ARM}" in
   onereplay) echo "  C        = ${COV_PATH}   identity_cov=${IDENTITY_COV}" ;;
   ewc)       echo "  F        = ${FISHER_PATH}" ;;
-  replay)    echo "  replay 池 = ${REPLAY_FILE:-${REPLAY_DATA_FILES}}"
-             echo "             答案列 ${REPLAY_TARGET_COLUMN} / pool_size ${REPLAY_POOL_SIZE} /"
-             echo "             seed ${REPLAY_SAMPLE_SEED} / maxlen ${REPLAY_MAXLEN} /"
+  replay)    echo "  replay 池 = ${REPLAY_MIX_FILES:-${REPLAY_DATA_FILES}}"
+             [[ -n "${REPLAY_MIX_WEIGHTS}" ]] && echo "             行份额 ${REPLAY_MIX_WEIGHTS}"
+             echo "             答案列 ${REPLAY_TARGET_COLUMN} / maxlen ${REPLAY_MAXLEN} /"
              echo "             drop_truncated ${REPLAY_DROP_TRUNCATED}" ;;
 esac
+if [[ "${DOMAIN}" == "mix" ]]; then
+echo "  mix      = ${MIX_DOMAINS} @ ${MIX_WEIGHTS}   (矩阵与 replay 池两侧同一个比例)"
+fi
+if [[ "${OLD_VAL}" == "1" ]]; then
+echo "  旧域 val = ${OLD_VAL_ROWS} 行/域，域：${OLD_VAL_DOMAINS}"
+echo "             ${SPLIT_DIR}  （93 号切好的，四条臂打同一批行）"
+else
+echo "  旧域 val = OLD_VAL=0，不测 —— 这次只有 bench 能回答「忘了吗」"
+fi
 echo "  λ        = ${LAMBDA_LIST[*]:-（本臂不用）}"
 echo "  batch    = ${BATCH} x accum ${ACCUM_STEPS} = ${ARM_ACCUM} 行/update"
 if [[ "${ARM}" == "replay" ]]; then
@@ -643,6 +757,8 @@ case "${ARM}" in
       echo "找不到 C: ${COV_PATH}" >&2
       echo "  它是 93 号的产物，先跑：" >&2
       echo "    qsub -v DRY_RUN=0,WHAT=cov onereplay/pbs/93_finance_gold_cf.pbs" >&2
+      [[ "${DOMAIN}" == "mix" ]] && \
+        echo "  mix 的那份由 93 号 Step 4 合成，需要 ${MIX_DOMAINS} 两个域的单域 C 都先采完。" >&2
       exit 1
     }
     ;;
@@ -651,10 +767,29 @@ case "${ARM}" in
       echo "找不到 F: ${FISHER_PATH}" >&2
       echo "  它是 93 号的产物，先跑：" >&2
       echo "    qsub -v DRY_RUN=0,WHAT=fisher onereplay/pbs/93_finance_gold_cf.pbs" >&2
+      [[ "${DOMAIN}" == "mix" ]] && \
+        echo "  mix 的那份由 93 号 Step 4 合成，需要 ${MIX_DOMAINS} 两个域的单域 F 都先采完。" >&2
       exit 1
     }
     ;;
 esac
+
+# 池与 val 切片：93 号 Step 1 的产物。replay 臂离了池跑不了；另外两条臂不读池，
+# 但四条臂的 old_val 必须打同一批行，所以 val 切片对谁都是必需的。
+for _d in ${OLD_VAL_DOMAINS}; do
+  if [[ "${ARM}" == "replay" && ! -f "$(pool_file_for "${_d}")" ]]; then
+    echo "找不到池文件: $(pool_file_for "${_d}")" >&2
+    echo "  它是 93 号 Step 1 的产物（物化后的池，C / F / replay 三者共用）：" >&2
+    echo "    qsub -v DRY_RUN=0 onereplay/pbs/93_finance_gold_cf.pbs" >&2
+    exit 1
+  fi
+  if [[ "${OLD_VAL}" == "1" && ! -f "$(val_file_for "${_d}")" ]]; then
+    echo "找不到 val 切片: $(val_file_for "${_d}")" >&2
+    echo "  它是 93 号 Step 1 的产物。拿不到就 OLD_VAL=0，但那样这条线上'忘了吗'" >&2
+    echo "  就只剩 benchmark 能回答，而它会随解析口径抖。" >&2
+    exit 1
+  fi
+done
 
 # 94 号的分母在不在。缺了不拦训练，但要现在就说，否则跑完才发现表里只有本臂一列。
 # 扫描模式不评测，这一项与它无关。
@@ -716,10 +851,23 @@ is_fisher = "fishers" in payload
 matrices = payload["fishers"] if is_fisher else payload["covariances"]
 meta = payload.get("metadata", {})
 
+# mix 的矩阵是相加出来的，没有自己的池：它的采集口径写在每一份输入的
+# source_metadata 里。下面的 max_len / system 两项因此要逐份输入地查，
+# 否则 mix 臂会整段跳过这两道闸而看上去"通过了"。
+sources = meta.get("source_metadata") or []
+is_mix = bool(meta.get("inputs")) and bool(sources)
+
 print(f"  矩阵      : {path}")
 print(f"  层覆盖    : {len(matrices)} / 期望 {expect}")
-print(f"  采集口径  : max_len={meta.get('max_len')} pool_rows={meta.get('pool_rows')}")
-print(f"  pool 指纹 : {meta.get('pool_fingerprint')}")
+if is_mix:
+    print(f"  mix 输入  : {meta.get('inputs')}")
+    print(f"  mix 权重  : {meta.get('weights')}")
+    for src in sources:
+        print(f"    源: max_len={src.get('max_len')} pool_rows={src.get('pool_rows')}"
+              f" supervision={src.get('cov_supervision')}")
+else:
+    print(f"  采集口径  : max_len={meta.get('max_len')} pool_rows={meta.get('pool_rows')}")
+    print(f"  pool 指纹 : {meta.get('pool_fingerprint')}")
 
 failures = []
 if len(matrices) != expect:
@@ -736,14 +884,12 @@ cov_in = {
     "gate_proj": hidden, "up_proj": hidden, "down_proj": inter,
     "lm_head": hidden,
 }
+# C 存成 (in, in) 的方阵，F 存成 (out, in)，两者的最后一维都是输入维度，所以
+# 这一条对两种矩阵是同一个判据。
 bad_shape = []
 for name, mat in matrices.items():
     cls = name.rsplit(".", 1)[-1]
-    if cls not in cov_in:
-        continue
-    if not is_fisher and mat.shape[-1] != cov_in[cls]:
-        bad_shape.append(f"{name}: {tuple(mat.shape)} 的输入维度不是 {cov_in[cls]}")
-    if is_fisher and mat.shape[-1] != cov_in[cls]:
+    if cls in cov_in and mat.shape[-1] != cov_in[cls]:
         bad_shape.append(f"{name}: {tuple(mat.shape)} 的输入维度不是 {cov_in[cls]}")
 if bad_shape:
     failures.append("矩阵维度与本模型 config 对不上：" + "; ".join(bad_shape[:4]))
@@ -751,19 +897,23 @@ if bad_shape:
 # !! 这里**不**要求 max_len == 训练的 MAXLEN，见文件头第 5 条。要求的是它等于
 # 该域池的长度预算，也就是 replay 臂会用的那个值 —— 三条臂看到的旧知识长度必须
 # 相同，而新任务的 1216 与旧知识无关。
+# mix 下逐份输入地查：train.py 的 --replay_max_len 是全局唯一的，参与混合的
+# 每个域都得落在这一个值上，有一个不同就必然有一个域的口径是错的。
 want_len = int(os.environ["REPLAY_MAXLEN"])
-if meta.get("max_len") and int(meta["max_len"]) != want_len:
-    failures.append(
-        f"矩阵采集用 max_len={meta['max_len']}，本域池的预算是 {want_len}。"
-        "replay 臂会按后者截断，两条臂看到的旧知识长度就不同了。"
-    )
-
-recorded = meta.get("system_prompt", "<<<NO_SYSTEM_FIELD>>>")
-if recorded != "<<<NO_SYSTEM_FIELD>>>" and recorded.strip() != os.environ["SYSTEM_PROMPT"].strip():
-    failures.append(
-        f"矩阵采集时的 system 是 {recorded!r}，本次训练是 {os.environ['SYSTEM_PROMPT']!r}。"
-        "激活跟着 system 变，罚项保护的就不是这个模型的行为。"
-    )
+for scope in (sources if is_mix else [meta]):
+    tag = scope.get("data_files", "") if is_mix else "矩阵"
+    if scope.get("max_len") and int(scope["max_len"]) != want_len:
+        failures.append(
+            f"{tag} 采集用 max_len={scope['max_len']}，本次 replay 的预算是 {want_len}。"
+            "replay 臂会按后者截断，两条臂看到的旧知识长度就不同了。"
+        )
+    recorded = scope.get("system_prompt", "<<<NO_SYSTEM_FIELD>>>")
+    if recorded != "<<<NO_SYSTEM_FIELD>>>" and recorded.strip() != os.environ["SYSTEM_PROMPT"].strip():
+        failures.append(
+            f"{tag} 采集时的 system 是 {recorded!r}，本次训练是 "
+            f"{os.environ['SYSTEM_PROMPT']!r}。激活跟着 system 变，罚项保护的就不是"
+            "这个模型的行为。"
+        )
 
 # λ 的数量级参考：C 报 mean tr(C)/d，F 报 mean(F)。写进文件给扫描表的预测列用。
 if is_fisher:
@@ -795,8 +945,25 @@ if [[ "${ARM}" == "replay" ]]; then
   # （直接 import onereplay.data.replay 的函数，不复写一遍逻辑）把池建出来数行数，
   # 与 93 号写在 C metadata 里的 pool_rows 比。
   # 顺带的好处：json -> arrow 的转换会落进 ${DATASET_CACHE}，训练时直接命中缓存。
+  #
+  # mix 下逐池比：每个池要对上**它自己那个域**的单域 C。C_mix 是相加出来的，
+  # 没有 pool_rows，拿它比什么都比不出来。
+  MIX_COV_LIST=""
+  if [[ -n "${REPLAY_MIX_FILES}" ]]; then
+    for _d in ${MIX_DOMAINS//,/ }; do
+      case "${_d}" in
+        math) _src="${MATH_COV}" ;;
+        code) _src="${CODE_COV}" ;;
+        if)   _src="${IF_COV}" ;;
+        *)    echo "!! MIX_DOMAINS 里的 '${_d}' 不认识" >&2; exit 2 ;;
+      esac
+      MIX_COV_LIST="${MIX_COV_LIST}${MIX_COV_LIST:+,}${_src}"
+    done
+  fi
   DOMAIN="${DOMAIN}" COV_PATH="${COV_PATH}" SKIP_POOL_CHECK="${SKIP_POOL_CHECK}" \
-  REPLAY_FILE="${REPLAY_FILE}" REPLAY_DATA_FILES="${REPLAY_DATA_FILES}" \
+  MIX_COV_LIST="${MIX_COV_LIST}" \
+  REPLAY_MIX_FILES="${REPLAY_MIX_FILES}" REPLAY_MIX_WEIGHTS="${REPLAY_MIX_WEIGHTS}" \
+  REPLAY_DATA_FILES="${REPLAY_DATA_FILES}" \
   REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN}" REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN}" \
   REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE}" REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED}" \
   REPLAY_MAXLEN="${REPLAY_MAXLEN}" REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED}" \
@@ -811,6 +978,7 @@ import torch
 from onereplay.data.replay import (
     load_replay_pool,
     load_self_distilled_pool,
+    parse_replay_mix,
     replay_max_len,
     replay_target_flavor,
     to_sft_schema,
@@ -823,9 +991,9 @@ args = argparse.Namespace(
     replay_data_files=os.environ["REPLAY_DATA_FILES"],
     replay_split="train",
     replay_cache_dir=os.environ["DATASET_CACHE"],
-    replay_self_distill_file=os.environ["REPLAY_FILE"],
-    replay_mix_files="",
-    replay_mix_weights="",
+    replay_self_distill_file="",
+    replay_mix_files=os.environ["REPLAY_MIX_FILES"],
+    replay_mix_weights=os.environ["REPLAY_MIX_WEIGHTS"],
     replay_drop_truncated=int(os.environ["REPLAY_DROP_TRUNCATED"]),
     replay_input_column=os.environ["REPLAY_INPUT_COLUMN"],
     replay_target_column=os.environ["REPLAY_TARGET_COLUMN"],
@@ -836,58 +1004,74 @@ args = argparse.Namespace(
 )
 
 failures = []
+# 池清单走 train.py 自己的解析函数，不在这里另切一遍字符串 —— 那样解析出来的
+# 东西和训练实际消费的可以不一致，而这一步的全部意义就是证明两者一致。
+mix = parse_replay_mix(args)
+
 print(f"  域           = {os.environ['DOMAIN']}")
 print(f"  答案列       = {args.replay_target_column}   ({replay_target_flavor(args)})")
 print(f"  replay_max_len = {replay_max_len(args)}   (新任务仍是 {args.max_len})")
 
-if args.replay_self_distill_file:
-    pool = load_self_distilled_pool(args)
-    ordering = "文件序，按 index 列排回池序；不做第二次 shuffle"
+if mix:
+    specs = [(label, path, weight) for label, path, weight in mix]
+    cov_paths = [item for item in os.environ.get("MIX_COV_LIST", "").split(",") if item]
+    print(f"  池数         = {len(specs)}（行份额由 loader 逐 micro-batch 落实）")
 else:
-    pool = load_replay_pool(args)
-    raw_total = len(pool)
-    pool = pool.shuffle(seed=args.replay_sample_seed)
-    if args.replay_pool_size > 0:
-        pool = pool.select(range(min(args.replay_pool_size, len(pool))))
-    ordering = f"shuffle(seed={args.replay_sample_seed}) 后取前 {len(pool)} 行（原始 {raw_total}）"
+    specs = [("", args.replay_data_files, 1.0)]
+    cov_paths = [os.environ["COV_PATH"]]
 
-after_pool = len(pool)
-has_truncated = "truncated" in pool.column_names
-dataset = to_sft_schema(pool, args)
-rows = len(dataset)
 
-print(f"  行序         = {ordering}")
-print(f"  drop_truncated = {args.replay_drop_truncated}"
-      f"   (池里{'有' if has_truncated else '没有'} truncated 列)")
-print(f"  装配后行数   = {after_pool} -> to_sft_schema 过滤空行后 {rows}")
+def load_cov_meta(path):
+    """只读 C 的 metadata。整份有 9.85 GiB，能 mmap 就别整份读。"""
 
-if args.replay_drop_truncated == 1 and has_truncated:
-    failures.append(
-        "replay_drop_truncated=1 且池里有 truncated 列：那些行的 gold_targets 是完整的，"
-        "93 号采矩阵时也算了它们。丢掉它们等于 replay 训的行比 C 覆盖的少。传 0。"
-    )
-
-if os.environ["SKIP_POOL_CHECK"] == "1":
-    print("  SKIP_POOL_CHECK=1：不与 C 对表，本臂与 onereplay 是否同池没有证据。")
-else:
     try:
-        payload = torch.load(os.environ["COV_PATH"], map_location="cpu", mmap=True)
-    except (TypeError, RuntimeError, FileNotFoundError):
+        payload = torch.load(path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError):
         try:
-            payload = torch.load(os.environ["COV_PATH"], map_location="cpu")
+            payload = torch.load(path, map_location="cpu")
         except FileNotFoundError:
-            payload = {}
-    meta = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+            return {}
+    except FileNotFoundError:
+        return {}
+    return payload.get("metadata", {}) if isinstance(payload, dict) else {}
+
+
+def assemble(path):
+    """按 build_replay_dataset 的前半段装配一个池（后半段只是 tokenize）。"""
+
+    if mix:
+        # build_replay_pools 在 mix 下对每个池调 build_replay_dataset(
+        # self_distill_file=path)，走的就是这一条。物化后的池没有 index 列，
+        # 于是 load_self_distilled_pool 不排序，结果就是文件序。
+        pool = load_self_distilled_pool(args, path)
+        ordering = "文件序（物化后的池没有 index 列，不排序也不 shuffle）"
+    else:
+        pool = load_replay_pool(args)
+        raw_total = len(pool)
+        pool = pool.shuffle(seed=args.replay_sample_seed)
+        if args.replay_pool_size > 0:
+            pool = pool.select(range(min(args.replay_pool_size, len(pool))))
+        ordering = (
+            f"shuffle(seed={args.replay_sample_seed}) 后取 {len(pool)} 行"
+            f"（文件里就是 {raw_total} 行，pool_size={args.replay_pool_size} 不再二次切）"
+        )
+    return pool, ordering
+
+
+def check_against_cov(tag, cov_path, after_pool, rows):
+    """把一个池的行数与对应 C 的 pool_rows 对表。这是同池的唯一硬证据。"""
+
+    meta = load_cov_meta(cov_path)
     cov_rows = meta.get("pool_rows")
     cov_max_len = meta.get("max_len")
-    print(f"  C            = {os.environ['COV_PATH']}")
+    print(f"  C[{tag}]      = {cov_path}")
     print(f"    pool_rows        = {cov_rows}")
     print(f"    max_len          = {cov_max_len}")
     print(f"    target_column    = {meta.get('target_column')}")
 
     if cov_rows is None:
         failures.append(
-            f"{os.environ['COV_PATH']} 里没有 pool_rows，无法证明同池。先跑 93 号，"
+            f"{cov_path} 里没有 pool_rows，无法证明同池。先跑 93 号，"
             "或传 SKIP_POOL_CHECK=1（并在结果里注明没有同池证据）。"
         )
     elif int(cov_rows) == rows:
@@ -896,33 +1080,71 @@ else:
         # C 落在 replay 空行过滤**前**的行数上，说明两边取的是同一批行，差的只是
         # to_sft_schema 那道空行过滤。replay 非做不可：空 target 的行标签全是 -100，
         # 一个批次全是这种行就得到 NaN loss；collect_cov 不算 loss 所以留着了。
-        # 93 号只在 math/code 传了 --require_target 1，所以只有 if 域会走到这里。
+        # 93 号物化时已经滤过一遍空行，所以正常情况下走不到这个分支。
         blank = after_pool - rows
         share = blank / after_pool if after_pool else 0.0
         if share > 0.01:
             failures.append(
-                f"空行 {blank}/{after_pool}（{share:.2%}）超过 1%。行数差虽然能被空行过滤"
-                "解释，但这个比例本身说明答案列多半读错了。先人工确认那一列。"
+                f"{tag}: 空行 {blank}/{after_pool}（{share:.2%}）超过 1%。行数差虽然能被"
+                "空行过滤解释，但这个比例本身说明答案列多半读错了。先人工确认那一列。"
             )
         else:
             print(f"    -> C 的 pool_rows={cov_rows} 等于 replay 空行过滤前的行数。")
-            print(f"       两条臂取的是同一批 {after_pool} 行；差的 {blank} 行（{share:.2%}）是")
-            print("       inputs/targets 为空的行，replay 必须丢、collect_cov 不必丢。放行。")
-            print(f"       报告里写：replay 训 {rows} 行，C 额外吸收了那 {blank} 行的模板骨架。")
+            print(f"       两条臂取的是同一批 {after_pool} 行；差的 {blank} 行是空内容行。")
     else:
         failures.append(
-            f"池行数不一致：replay 会训 {rows} 行（空行过滤前 {after_pool}），C 是在 "
+            f"{tag}: 池行数不一致：replay 会训 {rows} 行（空行过滤前 {after_pool}），C 是在 "
             f"{cov_rows} 行上采的，对不上其中任何一个。两条臂消费的旧知识不同，比出来的"
-            "就不是「怎么用」而是「用了多少」。查 drop_truncated / pool_size / seed / 答案列。"
+            "就不是「怎么用」而是「用了多少」。先查 93 号有没有重切过池（FORCE_PREP）。"
         )
 
-    # fingerprint 故意不比：replay 侧按 index 排序，collect_cov 侧按文件序，
+    # fingerprint 故意不比：replay 侧可能 shuffle、collect_cov 侧按文件序，
     # fingerprint_pool 按迭代顺序哈希，同一批行也会得出不同值。行数才是可比的量。
     if cov_max_len is not None and int(cov_max_len) != replay_max_len(args):
         failures.append(
-            f"replay_max_len={replay_max_len(args)} 与 C 的 max_len={cov_max_len} 不等。"
+            f"{tag}: replay_max_len={replay_max_len(args)} 与 C 的 max_len={cov_max_len} 不等。"
             "训练截断保留末尾 token，长行会丢题干；两条臂看到的旧知识长度不同。"
         )
+
+
+total_rows = 0
+for index, (label, path, weight) in enumerate(specs):
+    tag = label or os.environ["DOMAIN"]
+    print()
+    print(f"  ---- 池 {tag}")
+    pool, ordering = assemble(path)
+    after_pool = len(pool)
+    has_truncated = "truncated" in pool.column_names
+    dataset = to_sft_schema(pool, args)
+    rows = len(dataset)
+    total_rows += rows
+
+    print(f"  语料         = {path}")
+    print(f"  行序         = {ordering}")
+    print(f"  drop_truncated = {args.replay_drop_truncated}"
+          f"   (池里{'有' if has_truncated else '没有'} truncated 列)")
+    print(f"  装配后行数   = {after_pool} -> to_sft_schema 过滤空行后 {rows}")
+    if mix:
+        print(f"  行份额       = {weight:.4f}")
+
+    if args.replay_drop_truncated == 1 and has_truncated:
+        failures.append(
+            f"{tag}: replay_drop_truncated=1 且池里有 truncated 列：那些行的 gold_targets"
+            " 是完整的，93 号采矩阵时也算了它们。丢掉它们等于 replay 训的行比 C 覆盖的少。"
+        )
+
+    if os.environ["SKIP_POOL_CHECK"] == "1":
+        print("  SKIP_POOL_CHECK=1：不与 C 对表，本臂与 onereplay 是否同池没有证据。")
+    elif index < len(cov_paths):
+        check_against_cov(tag, cov_paths[index], after_pool, rows)
+    else:
+        failures.append(f"{tag}: 没有对应的 C 路径可对表（MIX_COV_LIST 与池数不符）")
+
+if mix:
+    print()
+    print(f"  两个池合计 {total_rows} 行。replay 的消耗量不变（每 micro-batch 还是那几行），")
+    print("  但摊到了两个池上，所以每个池各自被过的遍数大约减半。与单域臂比'遍数'时")
+    print("  要带上这一点。")
 
 if failures:
     print()
@@ -939,6 +1161,34 @@ if [[ "${ARM}" == "replay" ]]; then
   echo "!! replay 臂的 micro-batch 数约为其他臂的两倍（每步只学"
   echo "   $((BATCH - ARM_REPLAY_PER_BATCH))/${BATCH} 行新任务），训练墙钟也约两倍。"
   echo "   这是要报出来的开销数字之一。walltime 不够就 DO_EVAL=0 先只训练。"
+fi
+
+# ===========================================================================
+# 旧域 val：每个 epoch 在被保护的域上打一条交叉熵。见文件头第 9 条。
+#
+# **不在** arm_train_args 里：它对三条臂（以及 94 号的 vanilla）必须逐字相同，
+# 四条臂必须打同一批行，否则这几个数之间没法比。
+#
+# 一律走带标签的 --prior_val_jsonl，单域也是（一个条目）。这样列名恒为
+# old_val_loss_<domain>，单域和 mix 的读法一致；mix 那边两个域各一列，正是它
+# 要回答的"是不是一侧保住了另一侧塌了"。
+#
+# --old_val_presliced 1：93 号 Step 1 已经把池和 val 切成两个文件落盘了，这里
+# 读的就是 val 那份，不再做 shuffle 和偏移。理由见 data/old_val.py 的文件头 ——
+# load_self_distilled_pool 不吃 --replay_pool_size，切分不落盘的话 replay 臂会
+# 训到被拿来算 val 的行。
+# ===========================================================================
+OLD_VAL_ARGS=()
+if [[ "${OLD_VAL}" == "1" ]]; then
+  _spec=""
+  for _d in ${OLD_VAL_DOMAINS}; do
+    _spec="${_spec}${_spec:+,}${_d}=$(val_file_for "${_d}")"
+  done
+  OLD_VAL_ARGS=(
+    --prior_val_jsonl "${_spec}"
+    --old_val_presliced 1
+    --old_val_rows "${OLD_VAL_ROWS}"
+  )
 fi
 
 # ===========================================================================
@@ -986,12 +1236,13 @@ arm_train_args () {
         --replay_max_len "${REPLAY_MAXLEN}" \
         --replay_drop_truncated "${REPLAY_DROP_TRUNCATED}" \
         --replay_cache_dir "${DATASET_CACHE}"
-      # 两条装配路径二选一。math/code 的池路径里带 *，所以这里只能用 printf 直接
-      # 写出去：放进命令替换会被 pathname expansion 提前展开成文件列表，train.py
-      # 收到的就不是那个 glob 了。
-      if [[ -n "${REPLAY_FILE}" ]]; then
-        # 自蒸馏 jsonl 自带 index 列，load_self_distilled_pool 按它排回池序。
-        printf '%s\n' --replay_self_distill_file "${REPLAY_FILE}"
+      # 单域一个池，mix 两个。mix 走 --replay_mix_files，每个 micro-batch 里那
+      # REPLAY_PER_BATCH 行按行份额在两个池之间分配，由 loader 的调度器逐 batch
+      # 落实，不是靠期望值凑。两者互斥：train.py 在同时给出时会直接报错。
+      if [[ -n "${REPLAY_MIX_FILES}" ]]; then
+        printf '%s\n' \
+          --replay_mix_files "${REPLAY_MIX_FILES}" \
+          --replay_mix_weights "${REPLAY_MIX_WEIGHTS}"
       else
         printf '%s\n' --replay_data_files "${REPLAY_DATA_FILES}"
       fi
@@ -1009,6 +1260,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "    --full_finetune 1 --model_dir ${MODEL_DIR} --model_name ${MODEL_NAME}"
     echo "    --dataset_path ${DATASET_DIR}"
     echo "    --batch_size ${BATCH} --accumulation_size ${ARM_ACCUM} --max_len ${MAXLEN}"
+    echo "    ${OLD_VAL_ARGS[*]:-（OLD_VAL=0，不测旧域 val）}"
     _pair=()
     while IFS= read -r _item; do
       _pair+=("${_item}")
@@ -1053,6 +1305,7 @@ train_one () {
     --target_modules "${TARGET_MODULES}" \
     --map_cache_dir "${RESULTS_ROOT}/map_cache/${run}" \
     --log_every "${LOG_EVERY}" \
+    ${OLD_VAL_ARGS[@]+"${OLD_VAL_ARGS[@]}"} \
     "${arm_args[@]}" \
     --save "${save}" --save_path "${CKPT_DIR}/${run}" \
     --metrics_path "${metrics_path}" 2>&1 | tee "${log_path}"
@@ -1539,21 +1792,48 @@ else:
     print("ret_* 三列是 '-'：没有保留率结果（WITH_RETENTION=0，或 base 在本 OUT_DIR 下还没评过）。")
 
 
-def last_epoch(path):
+def read_records(path):
     if not path or not os.path.isfile(path):
-        return {}
+        return []
     rows = []
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
-                row = json.loads(line)
-                if row.get("record_type") == "epoch":
-                    rows.append(row)
+                rows.append(json.loads(line))
+    return rows
+
+
+def last_epoch(path):
+    rows = [r for r in read_records(path) if r.get("record_type") == "epoch"]
+    return rows[-1] if rows else {}
+
+
+def baseline(path):
+    rows = [r for r in read_records(path) if r.get("record_type") == "baseline"]
     return rows[-1] if rows else {}
 
 
 ours_m = last_epoch(os.environ.get("RUN_METRICS"))
 van_m = last_epoch(os.environ.get("VANILLA_METRICS"))
+
+# 旧域交叉熵：只随权重动，不随生成和解析动。bench 掉分和这条对不上时，先信它，
+# 再回头查 parse_rate —— 这条线上新任务把答案压成一个词，解析失败是常态。
+ours_b = baseline(os.environ.get("RUN_METRICS"))
+old_keys = sorted(k for k in ours_m if k.startswith("old_val_loss"))
+if old_keys:
+    print()
+    print("旧域 val loss（起点 = 训练前的裸底座；差值越接近 0 忘得越少）:")
+    print(f"{'domain':<16}{'baseline':>12}{'final':>12}{'delta':>12}")
+    for key in old_keys:
+        start = ours_b.get(key)
+        final = ours_m.get(key)
+        delta = (final - start) if (start is not None and final is not None) else None
+        name = key.replace("old_val_loss_", "").replace("old_val_loss", "(single)")
+        print(f"{name:<16}" + cell(start, ".6f", 12) + cell(final, ".6f", 12)
+              + cell(delta, "+.6f", 12))
+    if len(old_keys) > 1:
+        print("  mix 臂要读的就是这两行分开的数：一侧保住、另一侧塌了，")
+        print("  才是「矩阵的容量不够，两个域在抢」这个结论。平均成一个数会把它藏起来。")
 print()
 print("新任务拟合与开销（全量微调下三条臂的额外内存是能逐项点名的）:")
 print(
