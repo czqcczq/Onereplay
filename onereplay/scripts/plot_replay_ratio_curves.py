@@ -48,9 +48,10 @@ import matplotlib  # noqa: E402
 matplotlib.use("Agg")  # login nodes have no display
 import matplotlib.pyplot as plt  # noqa: E402
 
-# The probe curve names train.py writes. cs_val is the new task's validation
-# split; the name predates DialogSum and is kept so older runs still parse.
-NEW_CURVE = "probe_cs_val"
+# The probe curve names train.py writes. Runs from before the rename wrote the
+# new-task curve as probe_cs_val, so both keys are accepted on read.
+NEW_CURVE = "probe_new_val"
+LEGACY_NEW_CURVE = "probe_cs_val"
 OLD_CURVE = "probe_old_val"
 
 
@@ -157,11 +158,12 @@ def load_run(path: Path) -> Run | None:
         run.loss_weight = run.ratio_r / (1 + run.ratio_r)
 
     for row in probes:
-        if OLD_CURVE not in row or NEW_CURVE not in row:
+        new_value = row.get(NEW_CURVE, row.get(LEGACY_NEW_CURVE))
+        if OLD_CURVE not in row or new_value is None:
             continue
         run.updates.append(int(row["update"]))
         run.old_curve.append(float(row[OLD_CURVE]))
-        run.new_curve.append(float(row[NEW_CURVE]))
+        run.new_curve.append(float(new_value))
     if not run.updates:
         print(f"skip {path.name}: probe records carry neither {OLD_CURVE} nor {NEW_CURVE}")
         return None

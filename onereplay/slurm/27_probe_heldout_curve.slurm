@@ -32,7 +32,7 @@ set -x
 # 【三条探针曲线，缺一不可】
 #   flan_heldout  replay 训练时碰不到的 FLAN 切片 -> 旧知识的泛化
 #   flan_inpool   从 replay 实际训练的池子里等距抽 1000 条 -> 旧知识的记忆
-#   cs_val        已有的 Commonsense 验证集 -> 新任务学得怎样
+#   new_val       新任务自己的验证集（这条线上是 Commonsense）-> 新任务学得怎样
 # 只看 held-out 一条是读不出结论的：曲线上升既可能是过拟合到池子，也可能是整个模型
 # 被新任务拽走。两条 FLAN 曲线之间的 gap 把这两种解释分开，而 gap 有意义的前提是
 # 两边用完全相同的 target 口径（都是 base 模型自己的答案）和完全相同的 tokenize。
@@ -91,7 +91,7 @@ set -x
 # 只跑 replay 那条:
 #   sbatch --array=0 onereplay/slurm/27_probe_heldout_curve.slurm
 # 先冒烟（约 15 分钟，确认探针点写得出来）:
-#   sbatch --array=0 --export=ALL,MAX_STEPS=600,PROBE_EVERY_UPDATES=4,EPOCHS=1,HELDOUT_SIZE=64,PROBE_HELDOUT_SIZE=32,PROBE_INPOOL_SIZE=32,PROBE_CS_VAL_SIZE=32 \
+#   sbatch --array=0 --export=ALL,MAX_STEPS=600,PROBE_EVERY_UPDATES=4,EPOCHS=1,HELDOUT_SIZE=64,PROBE_HELDOUT_SIZE=32,PROBE_INPOOL_SIZE=32,PROBE_NEW_VAL_SIZE=32 \
 #     onereplay/slurm/27_probe_heldout_curve.slurm
 # =============================================================================
 
@@ -180,7 +180,7 @@ PROBE_EVERY_UPDATES="${PROBE_EVERY_UPDATES:-64}"
 PROBE_HELDOUT_SIZE="${PROBE_HELDOUT_SIZE:-1000}"
 # 与 held-out 取同样的条数：两条曲线是要相减的，样本量不等会给两边不同的噪声。
 PROBE_INPOOL_SIZE="${PROBE_INPOOL_SIZE:-1000}"
-PROBE_CS_VAL_SIZE="${PROBE_CS_VAL_SIZE:-1000}"
+PROBE_NEW_VAL_SIZE="${PROBE_NEW_VAL_SIZE:-1000}"
 
 # ---- 取本次档位（zsh 数组 1-based，array 任务号 0-based）----
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
@@ -395,7 +395,7 @@ python -m onereplay.scripts.train --paradigm sft \
   --probe_inpool_file "${SELF_DISTILL_FILE}" \
   --probe_heldout_size "${PROBE_HELDOUT_SIZE}" \
   --probe_inpool_size "${PROBE_INPOOL_SIZE}" \
-  --probe_cs_val_size "${PROBE_CS_VAL_SIZE}" \
+  --probe_new_val_size "${PROBE_NEW_VAL_SIZE}" \
   --save "${SAVE}" --save_path "${RESULTS_ROOT}/adapters/${RUN}" \
   --metrics_path "${METRICS_PATH}"
 

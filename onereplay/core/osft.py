@@ -327,6 +327,7 @@ def build_osft_model(
             "The run would be indistinguishable from vanilla full fine-tuning. Pass "
             "--osft_target_patterns explicitly."
         )
+    _assert_no_tied_targets(model)
     _assert_token_ids_already_aligned(model, tokenizer)
     _report_decomposition(model, unfreeze_rank_ratio)
     # Recorded on the model so the base class name survives into the saved
@@ -350,6 +351,44 @@ def _install_save_pretrained(model: nn.Module) -> None:
         save_osft_checkpoint(model, str(save_directory))
 
     model.save_pretrained = save_pretrained
+
+
+def _assert_no_tied_targets(model: nn.Module) -> None:
+    """Refuse to decompose a weight that is tied to another parameter.
+
+    Live for the small Qwen2.5 and Qwen3 checkpoints, which set
+    tie_word_embeddings=true so that lm_head.weight *is* embed_tokens.weight.
+    Adding lm_head to --osft_target_patterns there would fail in two silent
+    stages: the decomposition pops lm_head.weight and replaces the module's
+    forward, so the output head and the input embedding stop being the same
+    tensor and drift apart during training; then save writes a reconstructed
+    lm_head.weight into a config that still says the weights are tied, and
+    from_pretrained re-ties on load and throws the trained head away. The
+    evaluated model would not be the trained one, with nothing in any log to say
+    so.
+
+    Upstream's own pattern tables never name lm_head, so this only triggers when
+    --osft_target_patterns asks for it. Matching the penalty arms' coverage is
+    not worth this failure mode; leave the head out and record the difference.
+    """
+
+    seen: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        seen.setdefault(parameter.data_ptr(), []).append(name)
+
+    named = dict(model.named_parameters(remove_duplicate=False))
+    for name, top_k in model.osft_config.items():
+        if top_k <= 0 or name not in named:
+            continue
+        aliases = [other for other in seen.get(named[name].data_ptr(), []) if other != name]
+        if aliases:
+            raise RuntimeError(
+                f"OSFT would decompose {name}, which shares storage with {aliases}. "
+                "Decomposing one side of a tied weight breaks the tie during training "
+                "and the saved checkpoint would be re-tied on load, discarding what was "
+                f"trained. Drop it from --osft_target_patterns (tie_word_embeddings="
+                f"{getattr(model.config, 'tie_word_embeddings', None)})."
+            )
 
 
 @contextlib.contextmanager

@@ -678,7 +678,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--probe_new_val_size",
+        # --probe_cs_val_size is what this flag was called while the only new
+        # task was Commonsense; kept so older pbs/slurm scripts still launch.
         "--probe_cs_val_size",
+        dest="probe_new_val_size",
         type=int,
         default=1000,
         help="Rows of the new task's validation split to probe; 0 skips that curve.",

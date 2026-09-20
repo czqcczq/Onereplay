@@ -18,7 +18,7 @@
 # 81/82/83 号各给了一个点（OneReplay / EWC / replay 2n2r），回答不了"多少"。
 # 本脚本把 replay 强度做成连续的自变量，在训练**过程中**同时记录两条 loss 曲线：
 #
-#     probe_cs_val    新任务（DialogSum 验证集）—— 学得怎么样
+#     probe_new_val   新任务（DialogSum 验证集）—— 学得怎么样
 #     probe_old_val   保护域（FLAN 池外切片）   —— 旧知识掉了多少
 #
 # 每 PROBE_EVERY_UPDATES 次参数更新打一个点，八条臂共用同一套探针。
@@ -867,7 +867,7 @@ OLD_VAL_ARGS=(
 PROBE_ARGS=(
   --probe_every_updates "${PROBE_EVERY_UPDATES}"
   --probe_old_val_size "${PROBE_OLD_VAL_SIZE}"
-  --probe_cs_val_size "${PROBE_NEW_VAL_SIZE}"
+  --probe_new_val_size "${PROBE_NEW_VAL_SIZE}"
   --probe_batch_size "${PROBE_BATCH}"
 )
 
@@ -1001,7 +1001,7 @@ train_one_arm () {
   assert_log "columns ${REPLAY_INPUT_COLUMN}/${REPLAY_TARGET_COLUMN}, max_len=${REPLAY_MAXLEN}" \
     "old_val 的列或 token 预算不对，打分的行与 replay 训的行不同形。"
   assert_log "probe old_val:" "没有保护域探针曲线"
-  assert_log "probe cs_val:" "没有新任务探针曲线"
+  assert_log "probe new_val:" "没有新任务探针曲线"
   assert_log "TARGET_MODULES=${TARGET_MODULES}" "LoRA 覆盖与 74 号不同"
   assert_log "MAX_LEN=${MAXLEN}" "新任务的 token 预算与 74 号不同"
   if [[ "${P_KIND}" == "vanilla" || "${P_KIND}" == "replay" ]]; then
@@ -1108,7 +1108,8 @@ for name in names:
             "epochs": int(last.get("epoch") or 0),
             "updates": [row["update"] for row in probes],
             "old": [row.get("probe_old_val") for row in probes],
-            "new": [row.get("probe_cs_val") for row in probes],
+            # probe_cs_val 是改名前的 key，留着是为了汇总能读旧 run 的 metrics。
+            "new": [row.get("probe_new_val", row.get("probe_cs_val")) for row in probes],
             "probe_sec": sum(float(row.get("probe_sec") or 0.0) for row in probes),
         }
     )

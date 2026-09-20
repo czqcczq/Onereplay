@@ -389,7 +389,8 @@ python -m onereplay.scripts.train --paradigm sft \
 
 Three curves land in the metrics JSONL as `record_type: probe` rows:
 `flan_heldout` (rows replay never trains on, so old-knowledge generalization),
-`flan_inpool` (rows it does, so memorization), and `cs_val`. Reading heldout
+`flan_inpool` (rows it does, so memorization), and `new_val` (the new task's own
+validation split; runs from before the rename write it as `cs_val`). Reading heldout
 alone is ambiguous — a rise could be overfitting to the pool or the new task
 dragging everything — and the gap between the two FLAN curves separates those.
 Run the same probes on a vanilla arm for the control: neither slice is in its

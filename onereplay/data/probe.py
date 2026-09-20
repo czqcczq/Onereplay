@@ -13,8 +13,8 @@ Four sets, all scored with the same forward pass the trainer uses:
                 how far the model has memorized those specific rows.
   old_val       The held-out slice data/old_val.py cuts from behind the
                 old-knowledge subset, on the corpus's own gold answers.
-  cs_val        The existing Commonsense validation split, so the new task is
-                on the same axis.
+  new_val       The new task's own validation split, so the task being learned
+                is on the same axis.
 
 Reading heldout alone is ambiguous: a rising curve could mean the model is
 overfitting the replay pool or simply that the new task is dragging everything.
@@ -185,10 +185,10 @@ def build_probe_loaders(args: argparse.Namespace, tokenizer, valid_dataset) -> d
             loaders["old_val"] = build_probe_loader(subset, tokenizer, batch_size)
             print(f"probe old_val: {len(subset)} rows of the held-out slice")
 
-    if args.probe_cs_val_size != 0 and valid_dataset is not None:
-        subset = _subsample(valid_dataset, args.probe_cs_val_size)
-        loaders["cs_val"] = build_probe_loader(subset, tokenizer, batch_size)
-        print(f"probe cs_val: {len(subset)} rows")
+    if args.probe_new_val_size != 0 and valid_dataset is not None:
+        subset = _subsample(valid_dataset, args.probe_new_val_size)
+        loaders["new_val"] = build_probe_loader(subset, tokenizer, batch_size)
+        print(f"probe new_val: {len(subset)} rows")
 
     if not loaders:
         raise ValueError(
