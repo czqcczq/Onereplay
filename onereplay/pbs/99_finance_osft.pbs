@@ -382,7 +382,10 @@ SAVE="${SAVE:-1}"
 # trainers/base.py 里是**每个 epoch** 的上限而不是整个 run 的，所以 EPOCHS 要
 # 钉成 1，否则时间翻倍而表里多出的那条 epoch 记录才是被读到的那条。
 PROBE="${PROBE:-0}"
-VANILLA_EPOCHS="${EPOCHS}"
+# 下面 PROBE 会把 EPOCHS 改成 1，但"这条线声明的 epochs"仍然是 profile 里那个值：
+# 94 号那条 vanilla 按**正式** epochs 命名，Step 0 的超参对表比的也是正式值。
+# 两处都读这一份，否则探针模式会去找一条不存在的 vanilla，并且被对表判成漂移。
+EPOCHS_DECLARED="${EPOCHS}"
 if [[ "${PROBE}" == "1" ]]; then
   PROBE_STEPS="${PROBE_STEPS:-4800}"
   MAX_STEPS="${PROBE_STEPS}"
@@ -406,7 +409,7 @@ run_name_for () {
   fi
   printf '%s' "${name}"
 }
-VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${VANILLA_EPOCHS}_seed${SEED}}"
+VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${EPOCHS_DECLARED}_seed${SEED}}"
 BASE_RUN="base"
 
 # =============================================================================
@@ -462,6 +465,7 @@ echo "             maxlen ${MAXLEN}"
 echo "             system '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system）"
 if [[ "${PROBE}" == "1" ]]; then
 echo "  模式     = 接入自检短跑，${MAX_STEPS} 步（约 $((MAX_STEPS * BATCH / ACCUM)) 次更新），不存 checkpoint、不评测"
+echo "             epochs 钉成 1（max_steps 是每 epoch 的上限），对表仍按正式值 ${EPOCHS_DECLARED}"
 echo "             URR=1.0 时这条曲线必须落在 ${VANILLA_RUN} 上"
 else
 echo "  模式     = 正式 run"
@@ -496,7 +500,7 @@ elif [[ -z "${PROFILE_SOURCE}" || ! -f "${PROFILE_SOURCE}" ]]; then
   echo "  !! 找不到对表来源 '${PROFILE_SOURCE}'，跳过超参对表。"
 else
   PROFILE_SOURCE="${PROFILE_SOURCE}" \
-  EPOCHS="${EPOCHS}" LR="${LR}" LR_SCHEDULER="${LR_SCHEDULER}" \
+  EPOCHS="${EPOCHS_DECLARED}" LR="${LR}" LR_SCHEDULER="${LR_SCHEDULER}" \
   WARMUP_RATIO="${WARMUP_RATIO}" BATCH="${BATCH}" ACCUM="${ACCUM}" \
   MAXLEN="${MAXLEN}" VAL_FRAC="${VAL_FRAC}" MAXVAL="${MAXVAL}" SEED="${SEED}" \
   MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES}" LOG_EVERY="${LOG_EVERY}" \
