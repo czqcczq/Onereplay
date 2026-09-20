@@ -26,6 +26,9 @@
 #   L2 对照臂（C 换成单位阵，隔离"协方差结构"与"任何收缩"）：
 #     qsub -v DRY_RUN=0,ARM=onereplay,LAMBDA=...,IDENTITY_COV=1 onereplay/pbs/99_trace_mix_arms.pbs
 #
+#   只补 base 那一列，不训练（base 不需要 checkpoint）：
+#     qsub -v DRY_RUN=0,ARM=vanilla,DO_TRAIN=0 onereplay/pbs/99_trace_mix_arms.pbs
+#
 # -----------------------------------------------------------------------------
 # 1. 这条线在问什么
 # -----------------
@@ -147,8 +150,10 @@
 # 都得知道自己在新任务上退了多少。这是判断 λ 选大了的唯一直接证据 —— 旧能力涨、
 # TRACE 掉，就是在拿新任务换旧能力，光看 d_van 会误判成保护效果。
 #
-# base 这一列直接用 97 号 MODE=base_eval 的产物（同一个 EVAL_ROOT、同一个基座、
-# 同一套解码参数），不重复评。缺了的话 Step 0 会提醒。
+# base 这一列由 DO_BASE=1（默认）负责，评的是没训过的裸基座。开着不花钱：eval_one
+# 跳过已有 summary.json 的指标，所以第一条臂把 base 评出来之后，后面几条臂投过来时
+# 这一步是空转。97 号 MODE=base_eval 评的是同一批指标、同一个 EVAL_ROOT、同一套解码
+# 参数，所以那边已经评过的话这里也会直接跳过，两条线的 base 是同一份。
 #
 # 解码预算与 batch 逐字照抄 97 号，改了两边就不能相减。
 #
@@ -169,8 +174,8 @@
 #      ARM=replay 要两个池（它仍会读 C_mix 的 source_metadata 证明同池，
 #      真没有就 SKIP_POOL_CHECK=1，但那样就没有同池的证据了）
 #   2) 97 号 MODE=data 的产物：data/processed/trace_mix_train
-#   3) 97 号 MODE=base_eval 的产物：EVAL_ROOT 里的 base（缺了只影响表格，不拦训练）
-#   4) 评测数据（缺哪个跳过哪个指标，只警告）
+#   3) 评测数据（缺哪个跳过哪个指标，只警告）
+# base 不是前置条件：DO_BASE=1（默认）会在 Step 2 里把它评出来，已经有了就跳过。
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
 # =============================================================================
 
@@ -226,7 +231,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT TRAIN_LOG_DIR
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE CF_ROOT
     ARM LAMBDA LAMBDAS IDENTITY_COV
-    DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL SKIP_POOL_CHECK WITH_RETENTION
+    DRY_RUN DO_TRAIN DO_EVAL DO_BASE FORCE_TRAIN FORCE_EVAL SKIP_POOL_CHECK WITH_RETENTION
     LIMIT DIAG_LEN PROBE PROBE_STEPS SAVE MAX_STEPS
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     EVAL_BATCH TARGET_MODULES SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY
@@ -379,6 +384,10 @@ REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-0}"
 DRY_RUN="${DRY_RUN:-1}"
 DO_TRAIN="${DO_TRAIN:-1}"
 DO_EVAL="${DO_EVAL:-1}"
+# base 那一列。默认开着，而且开着几乎不花钱：eval_one 会跳过已经有 summary.json 的
+# 指标，所以 base 评过之后再投别的臂时这一步是空转。没评过就顺手补上，省得为了一列
+# 数字回去投 97 号。
+DO_BASE="${DO_BASE:-1}"
 FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 SKIP_POOL_CHECK="${SKIP_POOL_CHECK:-0}"
@@ -529,7 +538,7 @@ fi
 echo "             maxlen ${MAXLEN} / replay_maxlen ${REPLAY_MAXLEN} seed ${SEED}"
 echo "  λ        = ${LAMBDA:-${LAMBDAS:-<不适用>}}  sweep=${SWEEP} probe=${PROBE}"
 echo "  eval root= ${EVAL_ROOT}   base run = ${BASE_RUN}"
-echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} DRY_RUN=${DRY_RUN}"
+echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} base:${DO_BASE} DRY_RUN=${DRY_RUN}"
 echo "========================================================================"
 
 # ===========================================================================
@@ -629,10 +638,14 @@ else
   OLD_VAL_ARGS=()
 fi
 
-# ---- base 那一列（97 号 MODE=base_eval 的产物）----
-if [[ ! -d "${EVAL_ROOT}/gsm8k/${BASE_RUN}" ]]; then
-  echo "!! ${EVAL_ROOT} 里没有 ${BASE_RUN} 的结果。训练照跑，但汇总表的 base 列会是 '-'。"
-  echo "   补: qsub -v DRY_RUN=0,CONFIG=fast,MODE=base_eval onereplay/pbs/97_trace_continual.pbs"
+# ---- base 那一列 ----
+if [[ -d "${EVAL_ROOT}/gsm8k/${BASE_RUN}" ]]; then
+  echo "base (${BASE_RUN}) 已有结果，Step 2 里会整段跳过"
+elif [[ "${DO_BASE}" == "1" ]]; then
+  echo "base (${BASE_RUN}) 还没评，Step 2 会先把它评出来（约 2-3 小时）"
+else
+  echo "!! ${EVAL_ROOT} 里没有 ${BASE_RUN} 的结果，而 DO_BASE=0。"
+  echo "   训练照跑，但汇总表的 base 列会是 '-'，retention 那两列也没有基准。"
 fi
 
 # ---- 期望层数：8 个模块类 x N 层（lm_head 只算一个）----
@@ -802,6 +815,9 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "将扫描 λ ∈ {${LAMBDAS//:/, }}，每点 ${MAX_STEPS} 步，不存 checkpoint 不评测。"
   else
     echo "run = $(run_name_for "${LAMBDA}")"
+    if [[ "${DO_BASE}" == "1" && ! -d "${EVAL_ROOT}/gsm8k/${BASE_RUN}" ]]; then
+      echo "并且会先评 base（${BASE_RUN}），因为 ${EVAL_ROOT} 里还没有它。"
+    fi
   fi
   echo "确认后 qsub -v DRY_RUN=0,ARM=${ARM},... ${SELF_PATH}"
   exit 0
@@ -1111,6 +1127,13 @@ eval_one () {
   [[ -n "${ckpt}" ]] && args+=(--adapter_path "${ckpt}")
   python -m onereplay.scripts.evaluate "${args[@]}"
 }
+
+# base 先评：它不需要 checkpoint，所以哪怕下面因为没有 checkpoint 就退出，这一列也
+# 已经落盘了。eval_one 对已有 summary.json 的指标整段跳过，所以后面几条臂再投时这里
+# 不会重复烧那两三个小时。
+if [[ "${DO_BASE}" == "1" ]]; then
+  eval_one "${BASE_RUN}" ""
+fi
 
 if [[ -d "${CKPT_DIR}/${RUN}" ]]; then
   eval_one "${RUN}" "${CKPT_DIR}/${RUN}"
