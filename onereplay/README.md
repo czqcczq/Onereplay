@@ -381,6 +381,67 @@ It pins the quota arithmetic, the sort direction, and the property the rewritten
 `index` exists for: `build_replay_dataset` sorts by index and may take a prefix,
 so the prefix has to stay balanced across pools and keep each pool's best rows.
 
+### The FAPM baseline: pruning the task vector after the fact
+
+FAPM (Forgetting-Aware Pruning) is the one baseline here that does not touch
+training. It takes a finished fine-tune's task vector, keeps only the entries
+that score highest under
+
+```text
+S = |dW| - mean(|W0|) * (|dW| / |W0|)
+```
+
+and zeroes the rest, so the evaluated model is `W0` plus a sparse version of
+what fine-tuning did. The score is `|dW|` discounted by how large the update is
+*relative* to the weight it sits on. That makes it a post-hoc arm rather than a
+training-time constraint, which is a different family from OneReplay, EWC and
+OSFT and should be labelled as one in the table; the upside for a reader is
+that it costs no training at all, and the upside for us is that it starts from
+the same vanilla checkpoint every other arm is compared against.
+
+```bash
+python -m onereplay.scripts.apply_fapm \
+  --model_dir models --model_name Qwen3-8B \
+  --adapter_path results/qwen3-8b/adapters/ds_vanilla_8b_r16all_lr2e-4_ep2_seed1 \
+  --keep_ratio 0.1 --save_path results/qwen3-8b/fapm_ckpt/<run>
+```
+
+`--keep_ratio` is the method's only hyperparameter and plays the role
+`--replay_lambda` and `--osft_unfreeze_rank_ratio` play for the others. The
+authors' value is 0.1.
+
+Two consequences of running it on a LoRA line rather than the paper's full
+fine-tuning, both of which belong in a table note:
+
+* **The scope is decided before FAPM sees anything.** A LoRA task vector is
+  nonzero only on `--target_modules`, so `embed_tokens`, the norms and
+  `lm_head` have `dW == 0` by construction. The update ends up constrained
+  twice, low-rank and then sparse.
+* **The output is a full checkpoint, not an adapter.** A pruned task vector is
+  no longer low-rank, so it cannot go back into a rank-`r` adapter. At 8B that
+  is ~16GB per keep ratio, which is why `103_ds_8b_fapm.pbs` deletes it after
+  evaluating and keeps only the manifest. `--save 0` computes the pruning and
+  writes the manifest alone, which is enough to see what a ratio does to the
+  task vector without paying for the disk.
+
+One departure from `baseline/FAPM/FAPM.py`, and it is narrow. Where `W0 == 0`
+their score is already `-inf` and the two agree; where `W0` and `dW` are both
+zero their expression is `nan`, `argsort(descending=True)` ranks `nan` first,
+and the budget is spent on coordinates that do not move. The limit is taken
+instead, and the manifest reports how many coordinates were affected.
+
+Before spending cluster time:
+
+```bash
+python -m onereplay.scripts.check_fapm --skip_model 1   # no GPU, no model
+python -m onereplay.scripts.check_fapm --model_name Qwen3-1.7B
+```
+
+The first three checks compare against a transcription of the authors' own five
+lines; the rest confirm that `--keep_ratio 1.0` reproduces the merged adapter,
+`0.0` reproduces the base model, and the written checkpoint comes back through
+`eval/runner.py`'s full-checkpoint branch.
+
 On-policy distillation against a frozen same-family teacher:
 
 ```bash

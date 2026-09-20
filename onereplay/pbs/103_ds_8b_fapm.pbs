@@ -1,0 +1,841 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_8b_fapm_ds
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# Qwen3-8B / DialogSum 线的 FAPM 臂（Forgetting-Aware Pruning）
+#
+#   qsub -v DRY_RUN=0 onereplay/pbs/103_ds_8b_fapm.pbs
+#   换修剪比例：  qsub -v DRY_RUN=0,KEEP_RATIO=0.25 ...
+#   只补评：      qsub -v DRY_RUN=0,DO_PRUNE=0 ...        （ckpt 还在时）
+#
+# 74 号给 base / vanilla 的分母，81 号 OneReplay、83 号 gold replay、101 号 OPR
+# 是同一张表里的其它臂。
+#
+# -----------------------------------------------------------------------------
+# 1. 本臂不训练
+# -------------
+# FAPM 是**训练后修剪**：它读 74 号那个 vanilla LoRA adapter 的 task vector，
+# 按 S = |dW| - mean(|W0|)*(|dW|/|W0|) 每个矩阵留分数最高的 KEEP_RATIO，其余
+# 置零后加回 W0。所以本脚本没有 train.py，也不需要 C / Fisher / replay 池，
+# 整条流水线是 修剪 -> 评测 -> 保留率 -> 打表。
+#
+# 这也意味着它和 81/83/101 不是同一类方法：那三条是训练期约束，本臂是事后处理。
+# 论文的 baseline 分类要把这件事写清楚，别直接并排当同类比。
+#
+# 好处是它几乎不要钱：没有训练，成本只有一次权重运算加一次评测。
+#
+# -----------------------------------------------------------------------------
+# 2. LoRA 带来的两处结构差异
+# --------------------------
+#   a) 修剪的作用域由 --target_modules 决定，不由 FAPM 决定。原文是全参微调，
+#      每个矩阵都有 dW；这条线上 embed_tokens、各 norm、lm_head 的 dW 恒为 0，
+#      FAPM 还没开始看就已经够不着它们了。更新因此是被约束了两次：先低秩，
+#      再稀疏。这一条要进论文的表注。
+#
+#   b) 输出必须是完整 checkpoint。修剪后的 dW 不再低秩，装不回一个 rank-16 的
+#      adapter，所以 Step 1 写出的是一份完整的 8B 权重（bf16 约 16GB），评测走
+#      eval/runner.py 的"全量 checkpoint"分支。评完默认删掉，KEEP_CKPT=1 保留。
+#
+# 预期管理：vanilla 本身就是 LoRA，而 LoRA 已经是相当强的抗遗忘手段，所以本臂
+# 能再救回来的空间比它在全参设定下小。这是读数时该有的预期，不是实现问题。
+#
+# -----------------------------------------------------------------------------
+# 3. 忠实性契约
+# -------------
+# 原样照搬（见 onereplay/scripts/apply_fapm.py 的文件头，那里逐行对照了上游的
+# baseline/FAPM/FAPM.py）：打分公式、lamda 系数固定 1.0、lamda 逐矩阵取
+# mean(|W0|)、预算 int(numel*ratio) 截断不四舍、无条件取满 top-k（分数为负也要）。
+#
+# 一处偏离：W0 恰为 0 且 dW 也为 0 的坐标，上游算出 nan 而 argsort 把 nan 排在
+# 最前，白占预算；这里按极限取 -inf 永不入选。manifest 里报这类坐标的个数，
+# 正常应该是 0。
+#
+# KEEP_RATIO 是本臂唯一的旋钮，占据 81 号 λ / 99 号 URR 的位置。默认 0.1 是
+# 原文的值。
+#
+# -----------------------------------------------------------------------------
+# 4. 磁盘
+# -------
+# 一个 keep 点一份 16GB 的 ckpt。Step 0 会在写之前查可用空间，不够直接退出，
+# 免得评测跑到一半因为写不下而死。扫多个 keep 点就分多次投递，别并发。
+#
+# -----------------------------------------------------------------------------
+# 5. 投递前要有
+#   1) ${MODEL_DIR}/Qwen3-8B
+#   2) 74 号的 vanilla adapter：${ADAPTERS}/${VANILLA_RUN}
+#   3) 74 号的 base 已评完（base 缺席时 ret_* 三列会是 '-'）
+#   4) IFBench 的依赖（不装只跳过这一个指标；见 73 号文件头）
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/103_ds_8b_fapm.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_dsfapm_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_dsfapm_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点，只负责起容器再把自己跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]]    || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_dsfapm_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DS_DATASET OUT_DIR DATASET_CACHE
+    MATH_DATA_DIR CODE_DATA_DIR
+    PROFILE_SOURCE SKIP_PROFILE_CHECK
+    KEEP_RATIO CKPT_ROOT KEEP_CKPT PRUNE_DEVICE
+    DRY_RUN DO_PRUNE DO_EVAL FORCE_PRUNE FORCE_EVAL WITH_RETENTION
+    SEED EPOCHS LR LORA_RANK LORA_ALPHA LORA_DROPOUT TARGET_MODULES RUN_TAG
+    MATH500_FILE GSM8K_FILE HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT
+    IFEVAL_INPUT IFBENCH_INPUT WITH_IFBENCH WITH_DIALOGSUM
+    DS_TEST_FILE DS_MAX_NEW_TOKENS DS_BATCH
+    DS_BERTSCORE BERTSCORE_MODEL BERTSCORE_LAYERS BERTSCORE_BATCH
+    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS IFBENCH_MAX_NEW_TOKENS
+    MATH_BATCH CODE_BATCH IFEVAL_BATCH IFBENCH_BATCH TIMEOUT LIMIT
+    VANILLA_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # 不能用 exec：会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+export NLTK_DATA="${NLTK_DATA}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# =============================================================================
+# 路径：与 74/81/83/101 号同一套
+# =============================================================================
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+DS_DATASET="${DS_DATASET:-${REPO_ROOT}/datasets/dialogsum_sft_hf}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+ADAPTERS="${RESULTS_ROOT}/adapters"
+# 修剪产物单独一个目录：adapters/ 里都是几百 MB 的 adapter，混进一份 16GB 的
+# 全量 checkpoint 会让那边的清理脚本和磁盘账都不好算。
+CKPT_ROOT="${CKPT_ROOT:-${RESULTS_ROOT}/fapm_ckpt}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# =============================================================================
+# 超参：这里一个都不用来训练，只用来拼出 vanilla 的 run 名和对表
+# =============================================================================
+SEED="${SEED:-1}"
+EPOCHS="${EPOCHS:-2}"
+LR="${LR:-2e-4}"
+LORA_RANK="${LORA_RANK:-16}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+PROFILE_SOURCE="${PROFILE_SOURCE:-${REPO_ROOT}/onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs}"
+
+# =============================================================================
+# FAPM 的旋钮
+# =============================================================================
+KEEP_RATIO="${KEEP_RATIO:-0.1}"
+PRUNE_DEVICE="${PRUNE_DEVICE:-auto}"
+KEEP_CKPT="${KEEP_CKPT:-0}"
+
+DRY_RUN="${DRY_RUN:-1}"
+DO_PRUNE="${DO_PRUNE:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_PRUNE="${FORCE_PRUNE:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+WITH_RETENTION="${WITH_RETENTION:-1}"
+SKIP_PROFILE_CHECK="${SKIP_PROFILE_CHECK:-0}"
+
+# run 名：81/83/101 号那套规则，把它们的方法旋钮换成 keep
+RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
+RUN="${RUN:-ds_fapm_8b_${RUN_TAG}_keep${KEEP_RATIO}_lr${LR}_ep${EPOCHS}_seed${SEED}}"
+VANILLA_RUN="${VANILLA_RUN:-ds_vanilla_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS}_seed${SEED}}"
+VANILLA_ADAPTER="${ADAPTERS}/${VANILLA_RUN}"
+FAPM_CKPT="${CKPT_ROOT}/${RUN}"
+MANIFEST="${FAPM_CKPT}/fapm_manifest.json"
+PRUNE_LOG="${RESULTS_ROOT}/train_logs/${RUN}.prune.log"
+
+# =============================================================================
+# 评测：74 号定的口径，与 81/83/101 号逐字相同
+# =============================================================================
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+HUMANEVAL_FILE="${HUMANEVAL_FILE:-${CODE_DATA_DIR}/humaneval_test.parquet}"
+MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"
+DS_TEST_FILE="${DS_TEST_FILE:-${DS_DATASET}_test.jsonl}"
+DS_MAX_NEW_TOKENS="${DS_MAX_NEW_TOKENS:-256}"
+DS_BATCH="${DS_BATCH:-32}"
+DS_BERTSCORE="${DS_BERTSCORE:-1}"
+BERTSCORE_MODEL="${BERTSCORE_MODEL:-${MODEL_DIR}/roberta-large}"
+BERTSCORE_LAYERS="${BERTSCORE_LAYERS:-17}"
+BERTSCORE_BATCH="${BERTSCORE_BATCH:-64}"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-4096}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-512}"
+IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-768}"
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-2048}"
+MATH_BATCH="${MATH_BATCH:-32}"
+CODE_BATCH="${CODE_BATCH:-64}"
+IFEVAL_BATCH="${IFEVAL_BATCH:-32}"
+IFBENCH_BATCH="${IFBENCH_BATCH:-16}"
+TIMEOUT="${TIMEOUT:-10}"
+LIMIT="${LIMIT:-0}"
+
+DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp"
+WITH_IFBENCH="${WITH_IFBENCH:-1}"
+[[ "${WITH_IFBENCH}" == "1" ]] && DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
+WITH_DIALOGSUM="${WITH_DIALOGSUM:-1}"
+[[ "${WITH_DIALOGSUM}" == "1" ]] && DOMAIN_METRICS="${DOMAIN_METRICS} dialogsum"
+if [[ "${DS_BERTSCORE}" == "1" && ! -d "${BERTSCORE_MODEL}" ]]; then
+  echo "warning: 缺 ${BERTSCORE_MODEL}，BERTScore 关闭，dialogsum 只打 ROUGE。"
+  DS_BERTSCORE=0
+fi
+
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}}"
+[[ "${LIMIT}" != "0" ]] && OUT_DIR="${OUT_DIR}_limit${LIMIT}"
+
+mkdir -p "${CKPT_ROOT}" "${RESULTS_ROOT}/metrics" "${OUT_DIR}" "${DATASET_CACHE}" \
+         "${RESULTS_ROOT}/train_logs"
+
+echo "========================================================================"
+echo "Qwen3-8B FAPM 臂（训练后修剪，不训练）"
+echo "  run      = ${RUN}"
+echo "  分母     = base / ${VANILLA_RUN}   (74 号产出)"
+echo "  对手     = 81 号 OneReplay / 83 号 gold replay / 101 号 OPR"
+echo "  task vec = ${VANILLA_ADAPTER}"
+echo "             LoRA r${LORA_RANK} alpha${LORA_ALPHA}，targets=${TARGET_MODULES}"
+echo "             dW 只存在于这些矩阵上，FAPM 够不着 embed / norm / lm_head"
+echo "  keep     = ${KEEP_RATIO}   (每个矩阵保留的 task vector 比例，原文 0.1)"
+echo "  打分     = S = |dW| - mean(|W0|) * (|dW| / |W0|)，lamda 系数固定 1.0"
+echo "  产物     = ${FAPM_CKPT}"
+echo "             完整 8B checkpoint（约 16GB），修剪后的 dW 装不回 adapter"
+echo "             评完$([[ "${KEEP_CKPT}" == "1" ]] && echo "保留（KEEP_CKPT=1）" || echo "删除（KEEP_CKPT=1 可保留）")"
+echo "  评测     = ${DOMAIN_METRICS}"
+echo "  阶段     = prune:${DO_PRUNE} eval:${DO_EVAL} DRY_RUN=${DRY_RUN}"
+echo "  OUT_DIR  = ${OUT_DIR}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 前置检查
+# ===========================================================================
+echo
+echo "==== Step 0: 前置检查 ===="
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}" >&2; exit 3; }
+[[ -d "${VANILLA_ADAPTER}" ]] || {
+  echo "缺 vanilla adapter: ${VANILLA_ADAPTER}" >&2
+  echo "  它是 74 号的产物，本臂修剪的就是它的 task vector。" >&2
+  echo "  名字对不上时检查 SEED / LR / EPOCHS / LORA_RANK 是否与 74 号一致。" >&2
+  exit 3; }
+[[ -f "${VANILLA_ADAPTER}/adapter_config.json" ]] || {
+  echo "${VANILLA_ADAPTER} 里没有 adapter_config.json，不是一个 LoRA run。" >&2
+  exit 3; }
+
+# ---- adapter 自身的 LoRA 配置对表 ----
+# 比 PBS 之间的字符串对表硬：这读的是 adapter 落盘时写下的事实，能抓住"脚本里
+# 写着 r16、实际训练时传的是别的"这种 PBS 对表看不见的情况。
+VANILLA_ADAPTER="${VANILLA_ADAPTER}" \
+LORA_RANK="${LORA_RANK}" LORA_ALPHA="${LORA_ALPHA}" TARGET_MODULES="${TARGET_MODULES}" \
+python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+config = json.loads(
+    (Path(os.environ["VANILLA_ADAPTER"]) / "adapter_config.json").read_text(encoding="utf-8")
+)
+problems = []
+if int(config.get("r", -1)) != int(os.environ["LORA_RANK"]):
+    problems.append(f"r: adapter {config.get('r')} vs 脚本 {os.environ['LORA_RANK']}")
+if int(config.get("lora_alpha", -1)) != int(os.environ["LORA_ALPHA"]):
+    problems.append(f"lora_alpha: adapter {config.get('lora_alpha')} vs 脚本 {os.environ['LORA_ALPHA']}")
+theirs = set(config.get("target_modules") or [])
+ours = set(os.environ["TARGET_MODULES"].split(","))
+if theirs != ours:
+    problems.append(f"target_modules: adapter {sorted(theirs)} vs 脚本 {sorted(ours)}")
+if problems:
+    print("!! adapter 的 LoRA 配置与本脚本不一致，run 名会说谎：")
+    for line in problems:
+        print(f"   - {line}")
+    sys.exit(1)
+print(f"  adapter 对表通过：r={config.get('r')} alpha={config.get('lora_alpha')} "
+      f"targets={len(theirs)} 个")
+# use_rslora / use_dora 不参与对表：dW 是从 PEFT 的 get_delta_weight 拿的，
+# 缩放口径由 adapter 自己的配置决定，这里只是把它记进日志。
+for flag in ("use_rslora", "use_dora"):
+    if config.get(flag):
+        print(f"  note: adapter 开了 {flag}=True，dW 的缩放按它算")
+PY
+
+# ---- 与 83 号的超参对表。训练相关的项这里用不上，留下的是决定 run 名的那些
+#      和评测口径。----
+if [[ "${SKIP_PROFILE_CHECK}" == "1" ]]; then
+  echo "  !! SKIP_PROFILE_CHECK=1：跳过与 ${PROFILE_SOURCE##*/} 的超参对表。"
+  echo "     本臂和同线其余各臂是否可比，现在没有任何东西在保证。"
+elif [[ ! -f "${PROFILE_SOURCE}" ]]; then
+  echo "  !! 找不到对表来源 '${PROFILE_SOURCE}'，跳过超参对表。"
+else
+  PROFILE_SOURCE="${PROFILE_SOURCE}" \
+  MODEL_NAME="${MODEL_NAME}" SEED="${SEED}" EPOCHS="${EPOCHS}" LR="${LR}" \
+  LORA_RANK="${LORA_RANK}" LORA_ALPHA="${LORA_ALPHA}" LORA_DROPOUT="${LORA_DROPOUT}" \
+  TARGET_MODULES="${TARGET_MODULES}" \
+  DS_MAX_NEW_TOKENS="${DS_MAX_NEW_TOKENS}" DS_BATCH="${DS_BATCH}" \
+  DS_BERTSCORE="${DS_BERTSCORE}" BERTSCORE_LAYERS="${BERTSCORE_LAYERS}" \
+  BERTSCORE_BATCH="${BERTSCORE_BATCH}" \
+  MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS}" CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS}" \
+  IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS}" IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS}" \
+  MATH_BATCH="${MATH_BATCH}" CODE_BATCH="${CODE_BATCH}" \
+  IFEVAL_BATCH="${IFEVAL_BATCH}" IFBENCH_BATCH="${IFBENCH_BATCH}" \
+  TIMEOUT="${TIMEOUT}" \
+  python - <<'PY'
+import os
+import re
+import sys
+
+# 训练那一半（BATCH / ACCUM / MAXLEN / VAL_FRAC / MAXVAL）不在表里：本臂不训练，
+# 它们对结果没有任何作用路径。留下的是"决定 vanilla run 叫什么名字"的那几项，
+# 和评测口径 —— 前者错了会去读别人的 adapter，后者错了分数不可比。
+NAMES = [
+    "MODEL_NAME", "SEED", "EPOCHS", "LR",
+    "LORA_RANK", "LORA_ALPHA", "LORA_DROPOUT", "TARGET_MODULES",
+    "DS_MAX_NEW_TOKENS", "DS_BATCH", "DS_BERTSCORE", "BERTSCORE_LAYERS",
+    "BERTSCORE_BATCH",
+    "MATH_MAX_NEW_TOKENS", "CODE_MAX_NEW_TOKENS", "IF_MAX_NEW_TOKENS",
+    "IFBENCH_MAX_NEW_TOKENS", "MATH_BATCH", "CODE_BATCH", "IFEVAL_BATCH",
+    "IFBENCH_BATCH", "TIMEOUT",
+]
+
+source = os.environ["PROFILE_SOURCE"]
+with open(source, encoding="utf-8") as handle:
+    text = handle.read()
+
+missing, mismatched, checked = [], [], []
+for name in NAMES:
+    match = re.search(
+        rf'^{name}="\$\{{{name}:-(.*?)\}}"', text, flags=re.MULTILINE
+    )
+    if match is None:
+        missing.append(name)
+        continue
+    theirs = match.group(1)
+    if "${" in theirs:
+        continue
+    ours = os.environ.get(name, "")
+    if ours != theirs:
+        mismatched.append((name, ours, theirs))
+    else:
+        checked.append(name)
+
+print(f"  超参对表：{os.path.basename(source)}，比中 {len(checked)} 项")
+if missing:
+    print(f"  !! 在对表来源里找不到这些名字，无法核对：{missing}")
+if mismatched:
+    print()
+    print("!! 超参与对表来源不一致。本臂和同线其余各臂不可比，而这种偏差事后")
+    print("   只会表现为一个解释不了的数字，不会报错：")
+    for name, ours, theirs in mismatched:
+        print(f"   - {name}: 本脚本 '{ours}'  vs  {os.path.basename(source)} '{theirs}'")
+    sys.exit(1)
+print("  超参对表通过")
+PY
+fi
+
+# ---- 磁盘。写到一半空间不够会在评测前把作业弄死，不如现在就退。----
+NEED_MB="$(du -sm "${MODEL_DIR}/${MODEL_NAME}" 2>/dev/null | cut -f1)"
+AVAIL_MB="$(df -Pm "${CKPT_ROOT}" | awk 'NR==2 {print $4}')"
+if [[ -n "${NEED_MB}" && -n "${AVAIL_MB}" ]]; then
+  echo "  磁盘：ckpt 约需 ${NEED_MB} MB，${CKPT_ROOT} 可用 ${AVAIL_MB} MB"
+  if [[ "${DO_PRUNE}" == "1" ]] && (( AVAIL_MB < NEED_MB + 5120 )); then
+    echo "!! 可用空间不足（要留 ${NEED_MB} MB + 5GB 余量）。" >&2
+    echo "   先清掉 ${CKPT_ROOT} 下别的 keep 点，或换一个 CKPT_ROOT。" >&2
+    exit 3
+  fi
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划，不修剪不评测。"
+  echo "  Step 1:"
+  echo "    apply_fapm --model_dir ${MODEL_DIR} --model_name ${MODEL_NAME} \\"
+  echo "      --adapter_path ${VANILLA_ADAPTER} \\"
+  echo "      --keep_ratio ${KEEP_RATIO} --device ${PRUNE_DEVICE} \\"
+  echo "      --save_path ${FAPM_CKPT}"
+  echo "  Step 2:"
+  echo "    evaluate --adapter_path ${FAPM_CKPT} --run_name ${RUN} \\"
+  echo "      --metrics ${DOMAIN_METRICS// /,} --out_dir ${OUT_DIR}"
+  echo "  没有 train.py，也没有 --cov_path / --fisher_path / --replay_*。"
+  echo "  先看一眼 10% 的预算会扔掉多少 task vector（不写 16GB 的 ckpt）："
+  echo "    python -m onereplay.scripts.apply_fapm --model_dir ${MODEL_DIR} \\"
+  echo "      --model_name ${MODEL_NAME} --adapter_path ${VANILLA_ADAPTER} \\"
+  echo "      --keep_ratio ${KEEP_RATIO} --save 0 --manifest_path /tmp/fapm.json"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 修剪 task vector，写出完整 checkpoint
+# ===========================================================================
+if [[ "${DO_PRUNE}" == "1" ]]; then
+  if [[ "${FORCE_PRUNE}" != "1" && -f "${FAPM_CKPT}/config.json" ]]; then
+    echo
+    echo "已存在 checkpoint，跳过修剪: ${FAPM_CKPT}"
+    echo "  要重做就传 FORCE_PRUNE=1，或换一个 KEEP_RATIO。"
+  else
+    [[ "${FORCE_PRUNE}" == "1" ]] && rm -rf "${FAPM_CKPT}"
+    echo
+    echo "==== prune ${RUN} (keep ${KEEP_RATIO}) ===="
+    python -m onereplay.scripts.apply_fapm \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${VANILLA_ADAPTER}" \
+      --keep_ratio "${KEEP_RATIO}" \
+      --device "${PRUNE_DEVICE}" \
+      --save 1 --save_path "${FAPM_CKPT}" 2>&1 | tee "${PRUNE_LOG}"
+
+    # ---- 修剪自检 ----
+    # 三件事要证明：产物是能被 eval 当全量 checkpoint 读的目录、它不是 adapter、
+    # 预算确实花在了会动的坐标上。前两件靠文件，第三件靠 manifest。
+    echo
+    echo "==== 修剪自检 ===="
+    [[ -f "${FAPM_CKPT}/config.json" ]] || {
+      echo "  !! ${FAPM_CKPT} 里没有 config.json，评测会把它当 base 加载。" >&2; exit 1; }
+    [[ -f "${FAPM_CKPT}/tokenizer_config.json" ]] || {
+      echo "  !! 没写出 tokenizer：全量 checkpoint 的评测分支是从 ckpt 目录读的。" >&2; exit 1; }
+    if [[ -f "${FAPM_CKPT}/adapter_config.json" ]]; then
+      echo "  !! 产物里有 adapter_config.json，评测会走 LoRA 分支而不是全量分支。" >&2
+      exit 1
+    fi
+    MANIFEST="${MANIFEST}" KEEP_RATIO="${KEEP_RATIO}" python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(os.environ["MANIFEST"]).read_text(encoding="utf-8"))
+totals = manifest["totals"]
+want = float(os.environ["KEEP_RATIO"])
+got = totals["kept_fraction"]
+# int() 截断，所以实际比例只会略低于 KEEP_RATIO，不会高。
+if not (want - 0.01 <= got <= want + 1e-9):
+    print(f"  !! 实际保留 {got:.4f}，与 keep_ratio {want} 对不上", file=sys.stderr)
+    sys.exit(1)
+print(f"  ok  {totals['matrices']} 个矩阵，保留 {totals['kept']:,}/{totals['numel']:,} "
+      f"({got:.4f})")
+print(f"      保住了 {totals['kept_energy']:.4f} 的 ||dW||^2")
+if totals["zero_base"]:
+    print(f"  note: {totals['zero_base']:,} 个坐标 W0 恰为 0，按 -inf 排除（见文件头第 3 条）")
+PY
+    echo "  checkpoint : ${FAPM_CKPT}"
+    echo "  manifest   : ${MANIFEST}"
+  fi
+else
+  echo
+  echo "DO_PRUNE=0：沿用已有的 checkpoint。"
+  [[ -f "${FAPM_CKPT}/config.json" ]] || {
+    echo "找不到 ${FAPM_CKPT}，需要先 DO_PRUNE=1（评完删了的话也是这个）" >&2; exit 3; }
+fi
+
+if [[ "${DO_EVAL}" != "1" ]]; then
+  echo
+  echo "DO_EVAL=0：跳过评测。补评（ckpt 还在时）："
+  echo "  qsub -v DRY_RUN=0,KEEP_RATIO=${KEEP_RATIO},DO_PRUNE=0 ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 2: 评测（与 83/101 号逐字相同的口径）
+# ===========================================================================
+ifbench_ready () {
+  python - <<'PY' >/dev/null 2>&1
+from ifbench import instructions_registry
+from onereplay.eval.metrics.ifbench import check_nltk_data
+
+assert len(instructions_registry.INSTRUCTION_DICT) >= 83
+check_nltk_data()
+PY
+}
+
+AVAIL=""
+for m in ${DOMAIN_METRICS}; do
+  case "${m}" in
+    ifeval)    [[ -f "${IFEVAL_INPUT}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 ifeval：缺 ${IFEVAL_INPUT}" ;;
+    gsm8k)     [[ -f "${GSM8K_FILE}"     ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 gsm8k：缺 ${GSM8K_FILE}" ;;
+    math500)   [[ -f "${MATH500_FILE}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 math500：缺 ${MATH500_FILE}" ;;
+    humaneval) [[ -f "${HUMANEVAL_FILE}" ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}" ;;
+    mbpp)      [[ -d "${MBPP_DIR}"       ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 mbpp：缺 ${MBPP_DIR}" ;;
+    dialogsum) [[ -f "${DS_TEST_FILE}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 dialogsum：缺 ${DS_TEST_FILE}" ;;
+    ifbench)
+      if ifbench_ready; then
+        AVAIL="${AVAIL} ${m}"
+      else
+        echo "跳过 ifbench：依赖没就绪。登录节点补齐后 DO_PRUNE=0 重投即可只补评。"
+      fi
+      ;;
+  esac
+done
+AVAIL="${AVAIL# }"
+[[ -n "${AVAIL}" ]] || { echo "要评的指标一个数据都没找到" >&2; exit 6; }
+
+pending_metrics () {
+  local name="$1"; shift
+  local out=""
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" == "1" || ! -f "${OUT_DIR}/${m}/${name}/summary.json" ]]; then
+      out="${out}${out:+,}${m}"
+    fi
+  done
+  echo "${out}"
+}
+
+# shellcheck disable=SC2086
+MP="$(pending_metrics "${RUN}" ${AVAIL})"
+if [[ -z "${MP}" ]]; then
+  echo "==== skip ${RUN}：所有指标都已有结果（FORCE_EVAL=1 可重评）===="
+else
+  echo
+  echo "==== eval ${RUN} (${MP}) ===="
+  # --adapter_path 指的是"训练输出目录"，runner.py 看目录里没有
+  # adapter_config.json 就把它当完整 checkpoint 自己加载。
+  ifbench_input_flag=()
+  [[ -n "${IFBENCH_INPUT}" ]] && ifbench_input_flag=(--ifbench_input "${IFBENCH_INPUT}")
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${FAPM_CKPT}" --run_name "${RUN}" \
+    --metrics "${MP}" --out_dir "${OUT_DIR}" --seed "${SEED}" \
+    --limit "${LIMIT}" \
+    --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}" \
+    --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}" \
+    --max_new_tokens "${IF_MAX_NEW_TOKENS}" \
+    --math_batch_size "${MATH_BATCH}" \
+    --code_batch_size "${CODE_BATCH}" \
+    --ifeval_batch_size "${IFEVAL_BATCH}" \
+    --math500_data_path "${MATH500_FILE}" \
+    --gsm8k_data_path "${GSM8K_FILE}" \
+    --humaneval_data_file "${HUMANEVAL_FILE}" \
+    --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}" \
+    --ifeval_input "${IFEVAL_INPUT}" \
+    --dialogsum_input "${DS_TEST_FILE}" \
+    --dialogsum_max_new_tokens "${DS_MAX_NEW_TOKENS}" \
+    --dialogsum_batch_size "${DS_BATCH}" \
+    --dialogsum_bertscore "${DS_BERTSCORE}" \
+    --dialogsum_bertscore_model "${BERTSCORE_MODEL}" \
+    --dialogsum_bertscore_layers "${BERTSCORE_LAYERS}" \
+    --dialogsum_bertscore_batch_size "${BERTSCORE_BATCH}" \
+    --ifbench_limit "${LIMIT}" \
+    --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}" \
+    --ifbench_batch_size "${IFBENCH_BATCH}" \
+    "${ifbench_input_flag[@]}" \
+    --timeout "${TIMEOUT}" \
+    --cache_dir "${TMPDIR}/hf_datasets"
+fi
+
+# ===========================================================================
+# Step 3: base 答对子集上的保留率（与 83/101 号逐字相同）
+# ===========================================================================
+RETENTION_JSON=""
+if [[ "${WITH_RETENTION}" == "1" ]]; then
+  # dialogsum 不进这张表：它没有逐题的对错，只有 ROUGE/BERTScore，"base 答对的
+  # 子集"对它没有定义。
+  RET_METRICS=""
+  for m in ${AVAIL}; do
+    case "${m}" in
+      dialogsum) ;;
+      *)         RET_METRICS="${RET_METRICS},${m}" ;;
+    esac
+  done
+  RET_METRICS="${RET_METRICS#,}"
+  if [[ -z "${RET_METRICS}" ]]; then
+    echo "note: 本轮只评了 dialogsum，没有可算保留率的指标，跳过。"
+  else
+    RETENTION_JSON="${OUT_DIR}/retention/${RUN}.json"
+    mkdir -p "$(dirname "${RETENTION_JSON}")"
+    echo
+    echo "==== Step 3: base 答对子集上的保留率 ===="
+    RET_RC=0
+    python -m onereplay.scripts.score_retention_subset \
+      --results_root "${OUT_DIR}" --metrics "${RET_METRICS}" \
+      --runs "base,${VANILLA_RUN},${RUN}" --baseline base \
+      --json_out "${RETENTION_JSON}" || RET_RC=$?
+    if (( RET_RC != 0 )); then
+      echo "warning: score_retention_subset 退出码 ${RET_RC}，主表的 ret_* 三列会是 '-'。"
+      echo "         最常见的原因是 base 在本 OUT_DIR 下还没评过（74 号的产物）。"
+    fi
+    [[ -s "${RETENTION_JSON}" ]] || RETENTION_JSON=""
+  fi
+fi
+
+# ===========================================================================
+# Step 4: 汇总 —— base / vanilla / 本臂并排
+# ===========================================================================
+echo
+echo "========================================================================"
+echo "结果汇总：FAPM   keep=${KEEP_RATIO}"
+echo "========================================================================"
+OUT_DIR="${OUT_DIR}" RUN_NAME="${RUN}" ARM_NAME="fapm" \
+VANILLA_NAME="${VANILLA_RUN}" METRIC_NAMES="${AVAIL}" \
+RETENTION_JSON="${RETENTION_JSON}" \
+MANIFEST="${MANIFEST}" \
+VANILLA_METRICS="${RESULTS_ROOT}/metrics/${VANILLA_RUN}.jsonl" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+out_dir = Path(os.environ["OUT_DIR"])
+run_name = os.environ["RUN_NAME"]
+vanilla_name = os.environ["VANILLA_NAME"]
+arm_name = os.environ["ARM_NAME"]
+metric_names = os.environ["METRIC_NAMES"].split()
+
+NEW_TASK = {"dialogsum"}
+SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
+# IFBench 例外：论文主报 prompt-level loose，73 号的表也是这个口径。
+# ret_* 三列按 strict 判分，所以 IFBench 这一行的分数列是 loose、保留率列是
+# strict，不能把两者相减来读。
+METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy", "dialogsum": "rougeL"}
+
+
+def read_score(metric, name):
+    path = out_dir / metric / name / "summary.json"
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    override = METRIC_SCORE_KEY.get(metric)
+    if override:
+        return payload.get(override)
+    for key in SCORE_KEYS:
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def cell(value, spec=".4f", width=10):
+    return f"{'-' if value is None else format(value, spec):>{width}}"
+
+
+retention = {}
+retention_path = os.environ.get("RETENTION_JSON", "")
+if retention_path and os.path.isfile(retention_path):
+    for record in json.loads(Path(retention_path).read_text(encoding="utf-8")):
+        retention[(record["metric"], record["run"])] = record
+
+
+def read_retention(metric, name):
+    record = retention.get((metric, name))
+    return None if record is None else record.get("accuracy_on_base_correct")
+
+
+print("保留（d_base 是遗忘量，d_van 才是本臂救回来多少 —— 后者是方法的效果）")
+print(
+    f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>12}"
+    f"{'d_base(pp)':>12}{'d_van(pp)':>11}{'ret_van':>10}{'ret_ours':>10}{'d_ret(pp)':>11}"
+)
+print("-" * 98)
+for metric in metric_names:
+    if metric in NEW_TASK:
+        continue
+    base = read_score(metric, "base")
+    van = read_score(metric, vanilla_name)
+    ours = read_score(metric, run_name)
+    d_base = (ours - base) * 100 if (base is not None and ours is not None) else None
+    d_van = (ours - van) * 100 if (van is not None and ours is not None) else None
+    ret_van = read_retention(metric, vanilla_name)
+    ret_ours = read_retention(metric, run_name)
+    d_ret = (
+        (ret_ours - ret_van) * 100
+        if (ret_van is not None and ret_ours is not None)
+        else None
+    )
+    print(
+        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", 12)
+        + cell(d_base, "+.2f", 12) + cell(d_van, "+.2f", 11)
+        + cell(ret_van) + cell(ret_ours) + cell(d_ret, "+.2f", 11)
+    )
+
+print()
+print("新任务（方向相反：这里掉了就是在拿 DialogSum 的性能换旧能力）")
+print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>12}{'d_van(pp)':>12}")
+print("-" * 56)
+for metric in metric_names:
+    if metric not in NEW_TASK:
+        continue
+    base = read_score(metric, "base")
+    van = read_score(metric, vanilla_name)
+    ours = read_score(metric, run_name)
+    d_van = (ours - van) * 100 if (van is not None and ours is not None) else None
+    print(
+        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", 12)
+        + cell(d_van, "+.2f", 12)
+    )
+
+if not retention:
+    print()
+    print("ret_* 三列是 '-'：没有保留率结果（WITH_RETENTION=0，或 base 还没评过）。")
+
+# 修剪的构成。这几个数确认这一跑确实是 FAPM，而且说明这个 keep 点到底扔掉了
+# 多少。d_van 要和 kept_energy 一起读：能量留得越少，本臂离 vanilla 越远、
+# 离 base 越近，两个方向的位移都会变大。
+manifest_path = os.environ.get("MANIFEST", "")
+if manifest_path and os.path.isfile(manifest_path):
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    totals = manifest["totals"]
+    layers = manifest["layers"]
+    energies = sorted(record["kept_energy"] for record in layers)
+    print()
+    print("FAPM 修剪的构成:")
+    print(f"  矩阵数       {totals['matrices']}   (= LoRA 的 target_modules 覆盖面)")
+    print(
+        f"  保留坐标     {totals['kept']:,} / {totals['numel']:,} "
+        f"({totals['kept_fraction']:.4f})"
+    )
+    print(f"  保留能量     {totals['kept_energy']:.4f} of ||dW||^2  <- 真正决定位移的是这个")
+    print(
+        f"  逐层能量     min {energies[0]:.4f} / median "
+        f"{energies[len(energies) // 2]:.4f} / max {energies[-1]:.4f}"
+    )
+    print(f"  W0=0 坐标    {totals['zero_base']:,}   (按 -inf 排除，正常是 0)")
+    print(f"  修剪耗时     {totals['seconds']:.0f}s   (本臂不训练，这就是全部训练侧开销)")
+
+
+def read_records(path):
+    if not path or not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def last_epoch(path):
+    rows = [r for r in read_records(path) if r.get("record_type") == "epoch"]
+    return rows[-1] if rows else {}
+
+
+# 本臂没有自己的 val_loss：它没跑过 DialogSum 的训练集。vanilla 那一行在这里是
+# 参照 —— 新任务学得怎么样由上面 dialogsum 那行的分数回答，不由 loss 回答。
+van_m = last_epoch(os.environ.get("VANILLA_METRICS"))
+if van_m:
+    print()
+    print("新任务拟合（vanilla 的训练侧数字，本臂继承它的权重，没有自己的 loss）:")
+    print(
+        f"  vanilla val_loss {van_m.get('val_loss', float('nan')):.6f}"
+        f"   train_sec {van_m.get('train_sec', 0):.0f}"
+    )
+PY
+
+# ===========================================================================
+# Step 5: 收掉 16GB
+# ===========================================================================
+if [[ "${KEEP_CKPT}" == "1" ]]; then
+  echo
+  echo "KEEP_CKPT=1：保留 ${FAPM_CKPT}"
+else
+  echo
+  echo "删除 checkpoint（KEEP_CKPT=1 可保留）: ${FAPM_CKPT}"
+  # manifest 留下：它是这一跑的证据，只有几十 KB。
+  if [[ -f "${MANIFEST}" ]]; then
+    mkdir -p "${CKPT_ROOT}/manifests"
+    cp -f "${MANIFEST}" "${CKPT_ROOT}/manifests/${RUN}.json"
+    echo "  manifest 另存到 ${CKPT_ROOT}/manifests/${RUN}.json"
+  fi
+  rm -rf --one-file-system "${FAPM_CKPT}"
+fi
+
+echo
+echo "========================================================================"
+echo "本臂完成: ${RUN}"
+echo "  换修剪比例："
+echo "    qsub -v DRY_RUN=0,KEEP_RATIO=0.25 ${SELF_PATH}"
+echo "  同一张表里的其他臂："
+echo "    qsub -v DRY_RUN=0,DOMAIN=mix,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/81_qwen3_8b_gold_onereplay_ds.pbs"
+echo "    qsub -v DRY_RUN=0,DOMAIN=mix ${REPO_ROOT}/onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs"
+echo "    qsub -v DRY_RUN=0,REWARD=sc ${REPO_ROOT}/onereplay/pbs/101_ds_8b_opr.pbs"
+echo "  本臂是训练后修剪，和上面三条不是同一类方法，表里要分开标。"
+echo "========================================================================"

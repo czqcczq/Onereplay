@@ -1,0 +1,477 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_mathdir
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=02:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: math_val500 的**方向检查** —— 投 96 号重跑之前的一道闸
+#
+# 只做前向，不训练、不生成、不评测。约 30-40 分钟。
+#
+# -----------------------------------------------------------------------------
+# !! 为什么要这一步
+#
+#   96 号那轮（DialogSum 线、保护域 if）跑完 8 小时，结论不能用，原因只有一个：
+#
+#       old_val 的锚点是 2.9218，vanilla 跑完是 1.9118 —— **掉了 1.01**。
+#
+#   保护域的 loss 不升反降，也就是这个探针上根本没有遗忘，"保留"二字无从谈起。
+#   根子在目标的来源：FLAN 的 targets 是语料自带的极短直答，基座 Qwen3-8B 从没被
+#   调成那样说话，所以起点 CE 高达 2.92；而 DialogSum 摘要也是短直答，一训就把这
+#   个风格失配抹掉了。那 1.01 是**格式适配**，不是知识。同一次 run 里 IFEval 从
+#   78.74% 掉到 63.96%，能力是实实在在丢了的 —— loss 和能力在这里是分家的。
+#
+#   换成 math gold 目标**大概率**不会重演：MetaMath 的解答是上百 token 的多步推理，
+#   基座与它的风格差距远没有 FLAN 短直答那么夸张，格式适配能赚到的那一块小得多；
+#   同期 MATH500 从 79.60% 掉到 58.60%，推理能力是真坏了，这会把 CE 推上去。
+#
+#   但"大概率"不是"一定"。两股力方向相反，谁大谁小是个经验问题。这个脚本就是
+#   花 40 分钟把它问掉，再决定要不要投那 6 小时。
+#
+# -----------------------------------------------------------------------------
+# !! 判据（跑完照着读）
+#
+#   CE(vanilla) > CE(base)  ->  方向对，有遗忘可测。去改 96 号的探针。
+#   CE(vanilla) ~ CE(base)  ->  这个域上 loss 层面看不到漂移，探针不灵敏。
+#   CE(vanilla) < CE(base)  ->  和 FLAN 同一个坑。gold 目标这条路在这个模型上
+#                               整体不通，只剩自蒸馏或 benchmark 两条路。
+#
+#   幅度也要看。第三章 CS 线上的参照：自蒸馏 FLAN 探针 0.1231 -> 0.4742（+285%），
+#   同期 IFEval 只掉 11.5pp。涨幅只有个位数百分比的话，探针虽然方向对，但分辨率
+#   未必够把各臂分开 —— 96 号那轮的噪声地板实测是 δ=0.0077（两条 vanilla 的间距）。
+#
+# -----------------------------------------------------------------------------
+# !! 顺带把端点结果白捡了
+#
+#   81/82/83 号的 SAVE 默认都是 1，所以 OneReplay / EWC / replay 的 adapter 大概率
+#   还在（96 号自己是 SAVE=0，它那九条臂没留）。多打几个 adapter 只是多几分钟前向，
+#   却能**不重训**就拿到 base / vanilla / OneReplay / EWC / replay 在 math 上的端点
+#   对比。Step 0 会把 adapters 目录里现有的列出来，照着挑，重投一次即可。
+#
+#   拿不到的只有"过程曲线"和 ratio 扫描 —— 那两样非重训不可。
+#
+# -----------------------------------------------------------------------------
+# !! 口径：与训练期探针逐字相同
+#   score_probe_ce 复用 build_self_distilled_probe / build_probe_loader /
+#   BaseTrainer.evaluate_probe 三件套，没有重写 loss：
+#     * 只对 assistant token 求 CE（prompt 段 label = -100）
+#     * **token 加权平均**而非 batch 平均（math 答案长度跨度大，batch 平均会让短
+#       答案主导，还会随 batch_size 漂移）
+#     * shuffle=False、左 padding
+#   所以打出来的数以后可以和 metrics jsonl 里的 probe_* 字段并排读。
+#
+#   函数名里的 self_distilled 只是历史包袱：load_self_distilled_pool 对列很宽容，
+#   index / truncated 都是可选的，普通的 {输入列, 目标列} jsonl 直接能喂。
+#
+# !! MAX_LEN
+#   截断的行只有答案前缀被打分。所有要互相比较的 run 必须用同一个值 —— 脚本会打
+#   rows_at_max_len，那个比例高就说明 2048 还不够，调大重跑（**所有** run 一起重跑）。
+#
+# -----------------------------------------------------------------------------
+# 投递:
+#   # 默认：base + 74 号的 vanilla，回答"到底会不会遗忘"
+#   qsub onereplay/pbs/102_math_val500_direction.pbs
+#
+#   # 看过 Step 0 的 adapter 清单之后，把端点一次打全
+#   qsub -v ADAPTERS='ds_vanilla_8b_r16all_lr2e-4_ep2_seed1,ds_onereplay_...,ds_ewc_...' \
+#        onereplay/pbs/102_math_val500_direction.pbs
+#
+#   # 只看语料长什么样、adapters 里有什么，不打分（约 1 分钟）
+#   qsub -v DRY_RUN=1 onereplay/pbs/102_math_val500_direction.pbs
+#
+#   # 换语料 / 换预算
+#   qsub -v PROBE_FILE=/path/to/other.jsonl,MAX_LEN=4096 onereplay/pbs/102_...pbs
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/102_math_val500_direction.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。起容器，然后把脚本自己在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT
+    PROBE_FILE PROBE_NAME INPUT_COLUMN TARGET_COLUMN
+    ADAPTERS BASE_NAME OUT_PATH PER_ROW_DIR
+    MAX_LEN BATCH ROW_BATCH PROBE_SIZE VERIFY
+    DRY_RUN KEEP_GOING
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python : $(which python)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+ADAPTER_DIR="${RESULTS_ROOT}/adapters"
+
+PROBE_FILE="${PROBE_FILE:-${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/pools/math_val500.jsonl}"
+PROBE_NAME="${PROBE_NAME:-mathval500}"
+OUT_PATH="${OUT_PATH:-${RESULTS_ROOT}/probe_ce/${PROBE_NAME}.jsonl}"
+PER_ROW_DIR="${PER_ROW_DIR:-${RESULTS_ROOT}/probe_ce/per_row}"
+
+MAX_LEN="${MAX_LEN:-2048}"
+BATCH="${BATCH:-8}"
+ROW_BATCH="${ROW_BATCH:-4}"
+PROBE_SIZE="${PROBE_SIZE:-0}"      # 0 = 整个语料（500 行本来就不多）
+VERIFY="${VERIFY:-1}"
+DRY_RUN="${DRY_RUN:-0}"
+KEEP_GOING="${KEEP_GOING:-1}"
+BASE_NAME="${BASE_NAME:-base}"
+
+# 74 号的 vanilla。这是方向检查唯一必需的 adapter。
+ADAPTERS="${ADAPTERS:-ds_vanilla_8b_r16all_lr2e-4_ep2_seed1}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -f "${PROBE_FILE}" ]] || { echo "缺探针语料: ${PROBE_FILE}"; exit 1; }
+mkdir -p "$(dirname "${OUT_PATH}")" "${PER_ROW_DIR}"
+
+echo "========================================================================"
+echo "math_val500 方向检查"
+echo "  语料   = ${PROBE_FILE}"
+echo "  模型   = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  预算   = max_len ${MAX_LEN} / batch ${BATCH} / row_batch ${ROW_BATCH}"
+echo "  输出   = ${OUT_PATH}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 语料长什么样 + adapters 目录里有什么
+#   列名先探出来，省得 40 分钟的作业在第 3 分钟死于 "missing column"。
+# ===========================================================================
+echo "==== Step 0: 语料与 adapter 清单 ===="
+COLUMN_REPORT="${TMPDIR}/probe_columns.txt"
+PROBE_FILE="${PROBE_FILE}" INPUT_COLUMN="${INPUT_COLUMN:-}" TARGET_COLUMN="${TARGET_COLUMN:-}" \
+python - <<'PY' 2>&1 | tee "${COLUMN_REPORT}"
+import json
+import os
+
+path = os.environ["PROBE_FILE"]
+rows = []
+with open(path, encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            rows.append(json.loads(line))
+print(f"行数 = {len(rows)}")
+if not rows:
+    raise SystemExit("!! 语料是空的")
+columns = list(rows[0].keys())
+print(f"列   = {columns}")
+
+# 目标列要挑对：训练侧只对 assistant 段求 CE，挑错列就是在给另一段文本打分。
+CANDIDATES = [
+    ("inputs", "targets"),
+    ("inputs", "gold_targets"),
+    ("question", "response"),
+    ("instruction", "output"),
+    ("query", "answer"),
+    ("problem", "solution"),
+    ("prompt", "completion"),
+]
+want_in = os.environ.get("INPUT_COLUMN") or ""
+want_out = os.environ.get("TARGET_COLUMN") or ""
+if want_in and want_out:
+    if want_in not in columns or want_out not in columns:
+        raise SystemExit(f"!! 指定的列 {want_in}/{want_out} 不在 {columns} 里")
+    picked = (want_in, want_out)
+    print(f"用指定的列: {picked[0]} / {picked[1]}")
+else:
+    picked = next((pair for pair in CANDIDATES
+                   if pair[0] in columns and pair[1] in columns), None)
+    if picked is None:
+        raise SystemExit(
+            f"!! 认不出输入/目标列，实有 {columns}。"
+            "传 INPUT_COLUMN=<列> TARGET_COLUMN=<列> 指定。"
+        )
+    print(f"自动识别的列: {picked[0]} / {picked[1]}")
+
+# 空行会被 to_sft_schema 丢掉（标签全 -100 会出 NaN），先报出来免得行数对不上。
+blank = sum(1 for row in rows
+            if not str(row.get(picked[0]) or "").strip()
+            or not str(row.get(picked[1]) or "").strip())
+print(f"空行 = {blank}（会被 to_sft_schema 滤掉，实际打分 {len(rows) - blank} 行）")
+
+lengths = sorted(len(str(row[picked[1]])) for row in rows)
+def q(p):
+    return lengths[min(int(p * len(lengths)), len(lengths) - 1)]
+print(f"目标字符数分位 P50={q(0.5)} P90={q(0.9)} P99={q(0.99)} max={lengths[-1]}")
+print("  （字符不是 token，粗看用；真正的截断比例看 Step 1 打的 rows_at_max_len）")
+print()
+print(f"PICK_INPUT={picked[0]}")
+print(f"PICK_TARGET={picked[1]}")
+PY
+
+parse_pick () {
+  local key="$1" value
+  value="$(grep -o "^${key}=.*" "${COLUMN_REPORT}" | tail -n 1 || true)"
+  printf '%s' "${value#"${key}="}"
+}
+INPUT_COLUMN="$(parse_pick PICK_INPUT)"
+TARGET_COLUMN="$(parse_pick PICK_TARGET)"
+[[ -n "${INPUT_COLUMN}" && -n "${TARGET_COLUMN}" ]] \
+  || { echo "!! 没解析出列名，停。"; exit 1; }
+
+echo ""
+echo "---- ${ADAPTER_DIR} 下现有的 adapter"
+if [[ -d "${ADAPTER_DIR}" ]]; then
+  ls -1 "${ADAPTER_DIR}" 2>/dev/null | sed 's/^/  /' || echo "  （空）"
+else
+  echo "  !! 目录不存在: ${ADAPTER_DIR}"
+fi
+echo ""
+echo "81/82/83 号的 SAVE 默认是 1，上面若有 OneReplay / EWC / replay 的条目，"
+echo "把它们加进 ADAPTERS 重投一次，就能不重训拿到 math 上的端点对比。"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo ""
+  echo "DRY_RUN=1：只看语料与清单，未打分。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 逐个 checkpoint 打分
+#   base 必须第一个 —— 它是后面所有数的分母。
+# ===========================================================================
+echo ""
+echo "==== Step 1: 打分（base 在前，它是分母）===="
+
+score_one () {
+  local run_name="$1" adapter_path="$2"
+  echo ""
+  echo "---- ${run_name}"
+  python -m onereplay.scripts.score_probe_ce \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter_path}" \
+    --run_name "${run_name}" \
+    --probes "${PROBE_NAME}=${PROBE_FILE}" \
+    --probe_size "${PROBE_SIZE}" \
+    --max_len "${MAX_LEN}" \
+    --batch_size "${BATCH}" --row_batch_size "${ROW_BATCH}" \
+    --replay_input_column "${INPUT_COLUMN}" \
+    --replay_target_column "${TARGET_COLUMN}" \
+    --map_cache_dir "${TMPDIR}/map_cache_${run_name}" \
+    --verify_aggregate "${VERIFY}" \
+    --per_row_dir "${PER_ROW_DIR}" \
+    --out "${OUT_PATH}"
+}
+
+# 追加写的 jsonl：本轮先挪走旧的，否则汇总会读到上一次不同 max_len 的数。
+if [[ -f "${OUT_PATH}" ]]; then
+  mv "${OUT_PATH}" "${OUT_PATH}.$(date +%Y%m%d_%H%M%S).bak"
+  echo "已备份上一次的 ${OUT_PATH}"
+fi
+
+OK_RUNS=()
+FAILED_RUNS=()
+if score_one "${BASE_NAME}" ""; then
+  OK_RUNS+=("${BASE_NAME}")
+else
+  echo "!! base 打分失败。后面的数没有分母，停。"
+  exit 1
+fi
+
+IFS=',' read -r -a _ADAPTER_SPECS <<< "${ADAPTERS}"
+for _spec in "${_ADAPTER_SPECS[@]}"; do
+  _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+  [[ -z "${_spec}" ]] && continue
+  # 绝对路径直接用，否则当作 ADAPTER_DIR 下的名字。
+  if [[ "${_spec}" == /* ]]; then
+    _path="${_spec}"
+    _name="$(basename "${_spec}")"
+  else
+    _path="${ADAPTER_DIR}/${_spec}"
+    _name="${_spec}"
+  fi
+  if [[ ! -d "${_path}" ]]; then
+    echo "!! 跳过 ${_name}：找不到 ${_path}（看 Step 0 的清单核对名字）"
+    FAILED_RUNS+=("${_name} (缺 adapter)")
+    continue
+  fi
+  if score_one "${_name}" "${_path}"; then
+    OK_RUNS+=("${_name}")
+  else
+    FAILED_RUNS+=("${_name} (打分失败)")
+    [[ "${KEEP_GOING}" == "1" ]] || { echo "!! KEEP_GOING=0，停。"; break; }
+  fi
+done
+
+# ===========================================================================
+# Step 2: 判据
+# ===========================================================================
+echo ""
+echo "========================================================================"
+echo "方向判据"
+echo "========================================================================"
+set +e
+OUT_PATH="${OUT_PATH}" PROBE_NAME="${PROBE_NAME}" BASE_NAME="${BASE_NAME}" \
+python - <<'PY'
+import json
+import os
+
+key = f"probe_{os.environ['PROBE_NAME']}"
+base_name = os.environ["BASE_NAME"]
+
+records = []
+with open(os.environ["OUT_PATH"], encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            records.append(json.loads(line))
+scored = [row for row in records if key in row]
+if not scored:
+    raise SystemExit("没有任何一行带上探针值，没什么可判的。")
+
+base = next((row for row in scored if row["run_name"] == base_name), None)
+if base is None:
+    raise SystemExit("找不到 base 那一行，没有分母。")
+anchor = base[key]
+
+cut = scored[0].get(f"{os.environ['PROBE_NAME']}_rows_at_max_len") or 0
+rows = scored[0].get(f"{os.environ['PROBE_NAME']}_rows") or 0
+tokens = scored[0].get(f"{os.environ['PROBE_NAME']}_supervised_tokens") or 0
+print(f"语料: {rows} 行 / {tokens} 个 supervised token / "
+      f"{cut} 行顶到 max_len={scored[0].get('max_len')}")
+if rows and cut / rows > 0.05:
+    print(f"  !! {cut / rows:.1%} 的行被截断，CE 只覆盖答案前缀。调大 MAX_LEN 重跑"
+          "（**所有** run 一起重跑，不然不可比）。")
+print()
+
+header = f"{'run':<44}{'CE':>10}{'vs base':>11}{'相对':>10}"
+print(header)
+print("-" * len(header))
+for row in scored:
+    value = row[key]
+    delta = value - anchor
+    rel = delta / anchor if anchor else 0.0
+    mark = "" if row["run_name"] == base_name else f"{delta:>+11.4f}{rel:>+9.1%}"
+    print(f"{row['run_name'][:43]:<44}{value:>10.4f}{mark}")
+
+print()
+vanillas = [row for row in scored if "vanilla" in row["run_name"].lower()]
+target = vanillas[0] if vanillas else next(
+    (row for row in scored if row["run_name"] != base_name), None
+)
+if target is None:
+    print("只打了 base，没有可判方向的 run。")
+    raise SystemExit(0)
+
+delta = target[key] - anchor
+rel = delta / anchor if anchor else 0.0
+print(f"判据看的是这一条: {target['run_name']}")
+print(f"  base {anchor:.4f} -> {target[key]:.4f}   ({delta:+.4f}, {rel:+.1%})")
+print()
+# 0.05 不是统计判据，是"够不够把各臂分开"的工程判据：96 号那轮实测的噪声地板是
+# δ=0.0077，臂间差要有几个 δ 才读得出来，而臂间差通常只是 vanilla 总漂移的一小截。
+if delta > 0.05:
+    print("  -> 方向对，而且幅度够。math 上有遗忘可测，去改 96 号的探针。")
+    print("     参照：96 号那轮的噪声地板 δ=0.0077（两条 vanilla 的间距），"
+          f"本次总漂移 {delta:.4f} 约 {delta / 0.0077:.0f}δ。")
+elif delta > 0:
+    print("  -> 方向对但幅度小。遗忘存在，可是各臂之间的差多半会淹在噪声里。")
+    print("     投之前先想清楚要怎么把分辨率提上去（更多行、多 seed，或换更敏感的目标）。")
+else:
+    print("  !! 方向反了，和 FLAN 同一个坑：训练让保护域的 loss 变**低**，")
+    print("     没有遗忘可言，'保留'解释不成立。别投那 6 小时。")
+    print("     gold 目标这条路在这个模型上整体不通，只剩自蒸馏或 benchmark 两条路。")
+PY
+SUMMARY_RC=$?
+set -e
+
+echo ""
+echo "成功 ${#OK_RUNS[@]} 个: ${OK_RUNS[*]:-}"
+if (( ${#FAILED_RUNS[@]} > 0 )); then
+  echo "失败 ${#FAILED_RUNS[@]} 个:"
+  for name in "${FAILED_RUNS[@]}"; do echo "  ${name}"; done
+fi
+echo ""
+echo "产物:"
+echo "  分数    : ${OUT_PATH}"
+echo "  逐行    : ${PER_ROW_DIR}/<run>__${PROBE_NAME}.jsonl"
+echo "            (误差棒: python -m onereplay.scripts.bootstrap_probe_ce --help)"
+echo "Job finished at: $(date)"
+
+exit "${SUMMARY_RC}"
