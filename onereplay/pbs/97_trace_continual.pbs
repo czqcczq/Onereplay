@@ -320,7 +320,7 @@ case "${CONFIG}" in
     # 每任务 1 epoch，lr 拉到 1e-4：这一档只为 Q2（通用能力崩塌）服务，
     # 便宜且足够狠。8 个 epoch 总量。
     EPOCHS_LIST="${EPOCHS_LIST:-1,1,1,1,1,1,1,1}"
-    LR="${LR:-1e-4}"
+    LR="${LR:-1e-5}"
     ;;
   official)
     EPOCHS_LIST="${EPOCHS_LIST:-5,3,7,5,3,5,5,7}"
