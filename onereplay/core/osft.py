@@ -286,7 +286,21 @@ def build_osft_model(
 
     base_cls = upstream["get_model_class_from_config"](model_path)
     osft_cls = osft_utils.create_osft_model_class(base_cls)
-    osft_kwargs = osft_utils._build_osft_kwargs(rank_ratio, patterns)
+
+    # rank_ratio and target_patterns go straight to their from_pretrained rather
+    # than through their _build_osft_kwargs helper, which drops the value when it
+    # is falsy:
+    #
+    #     if osft_rank_ratio:
+    #         osft_kwargs["rank_ratio"] = osft_rank_ratio
+    #
+    # rank_ratio 0.0 is exactly the "freeze nothing" setting -- our
+    # --osft_unfreeze_rank_ratio 1.0 control, and their own
+    # --osft-unfreeze-rank-ratio 1.0 -- so it would silently fall back to
+    # from_pretrained's default of 0.5 and half the model would stay frozen in
+    # the run that is supposed to reproduce vanilla. Passing the keyword
+    # directly uses the same public entry point with the value intact.
+    osft_kwargs = {"rank_ratio": rank_ratio, "target_patterns": patterns}
 
     load_kwargs: dict[str, Any] = {}
     if config is not None:
