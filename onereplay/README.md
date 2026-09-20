@@ -350,6 +350,27 @@ is generated once, from the base model, so OPR's regeneration at every task
 boundary -- the part that makes it *on-policy* in a sequence -- has nothing to
 act on. The method reduces cleanly, but the reduction is worth naming.
 
+Two lines carry this arm, and the pieces above are shared by both:
+`onereplay/pbs/100_finance_opr.pbs` (Qwen2.5-1.5B, finance, full fine-tuning)
+and `onereplay/pbs/101_ds_8b_opr.pbs` (Qwen3-8B, DialogSum, LoRA). The second
+differs from the first in three ways worth knowing, none of which touch the
+method:
+
+* **The candidates have to be regenerated per line.** On-policy means "produced
+  by the model that is about to be trained", so the 8B line cannot reuse the
+  1.7B self-distillation already sitting in `results/replay/`. It reads the same
+  rows out of those files -- `inputs` and `gold_targets` -- and writes fresh
+  `targets` with Qwen3-8B. Reusing the old `targets` would silently turn the arm
+  into "replay with another model's answers".
+* **`--accumulation_size` stays at the vanilla value on both lines.** The gold
+  replay arm on the 8B line doubles it to 128 because batch-level mixing takes
+  slots away from the new task; OPR appends rows instead, so 64 already gives
+  the 64 new-task rows per update that every arm on that line holds equal.
+* **The 8B line records no old-domain val loss**, matching arms 74, 81 and 83.
+  Its math and code pools are used whole and were built by stratified sampling
+  rather than a shuffle-and-take, so there is no held-out slice to score, and
+  neither vanilla nor the other arms recorded one to compare against.
+
 Before spending cluster time:
 
 ```bash
