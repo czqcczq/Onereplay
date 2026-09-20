@@ -14,7 +14,8 @@
 #   # 一次性：建数据（CPU 即可，登录节点跑更快）
 #   qsub -v DRY_RUN=0,MODE=data onereplay/pbs/97_trace_continual.pbs
 #
-#   # 配置 A（先跑）：每任务 1 epoch、lr 1e-4。一次投完，约 10 小时
+#   # 配置 A（先跑）：每任务 1 epoch、lr 1e-5。一次投完，约 10 小时
+#   # 想复现更狠的那一轮就显式传 LR=1e-4，产物名会自动分开
 #   qsub -v DRY_RUN=0,CONFIG=fast,MODE=all onereplay/pbs/97_trace_continual.pbs
 #
 #   # 想分开投也可以，三步的含义与 MODE=all 内部的顺序完全一致
@@ -43,8 +44,10 @@
 #
 # 两个问题不需要同一个配置回答，所以有两个 CONFIG：
 #
-#   CONFIG=fast      每任务 1 epoch、lr 1e-4。8 个阶段共 8 个 epoch。先跑这个，
-#                    它只为 Q2 服务 —— 便宜，而且 lr 拉到 1e-4 就是冲着打坏去的。
+#   CONFIG=fast      每任务 1 epoch、lr 1e-5。8 个阶段共 8 个 epoch。先跑这个，
+#                    它只为 Q2 服务 —— 便宜。lr 1e-4 那一轮已经跑过，太狠，掉分里
+#                    分不清是遗忘还是训崩，所以这一档改回和 official 同 lr，
+#                    只用 epoch 数区分。要跑别的 lr 直接传 LR=，产物名会跟着分开。
 #   CONFIG=official  官方 5,3,7,5,3,5,5,7、lr 1e-5，共 40 个 epoch。为 Q1 服务。
 #
 # fast 先跑的理由：它三小时就能回答"这个数据集到底能不能把 math/code 打坏"。
@@ -86,10 +89,22 @@
 # 顺序训练必须拿上一阶段的权重当基座，所以磁盘上至少要有一份"上一阶段"活着。
 # 两个槽位交替承载：奇数阶段写 slot_b，偶数阶段写 slot_a。
 #
-#   ${CKPT_DIR}/trace_${CONFIG}_slot_a/     交替承载，用完即删
-#   ${CKPT_DIR}/trace_${CONFIG}_slot_b/
-#   ${CKPT_DIR}/trace_${CONFIG}_final/      第 8 阶段 mv 过来，永久保留
-#   ${CKPT_DIR}/trace_${CONFIG}_state.json  断点续跑用
+# 所有产物名里的 ${TAG} = ${CONFIG}_lr${LR}，例如 fast_lr1e-5。带上 lr 是因为同一个
+# CONFIG 会用不同 lr 跑多次（fast 先跑过 1e-4），不带就会互相覆盖：
+#
+#   ${CKPT_DIR}/trace_${TAG}_slot_a/     交替承载，用完即删
+#   ${CKPT_DIR}/trace_${TAG}_slot_b/
+#   ${CKPT_DIR}/trace_${TAG}_final/      第 8 阶段 mv 过来，永久保留
+#   ${CKPT_DIR}/trace_${TAG}_state.json  断点续跑用
+#
+# 评测侧同一个 TAG：run_name 是 trace_${TAG}_stage<i>，所以
+# ${EVAL_ROOT}/<metric>/trace_${TAG}_stage<i>/、${METRICS_DIR}/trace_${TAG}_stage<i>.jsonl、
+# ${EVAL_ROOT}/trace_${TAG}_matrix.json 也都分得开。base 是例外，它没训过所以不带
+# TAG，所有配置共用同一份。
+#
+# !! 1e-4 那一轮是在加 lr 后缀之前跑的，落盘的名字还是 trace_fast_*。要让它能被
+# 新口径汇总，在 ${CKPT_DIR} 和 ${EVAL_ROOT} 下把 trace_fast_ 批量改成
+# trace_fast_lr1e-4_ 即可，改完用 --config fast_lr1e-4 汇总。
 #
 # !! 删除时机是**阶段 i+1 训练成功之后**，不是阶段 i 评测完就删
 # 阶段 i 的权重在阶段 i+1 训练期间仍是唯一的续训起点。提前删掉的话，job 在
@@ -116,7 +131,7 @@
 # START_STAGE 缺省就是 state.stage + 1，基座取 state.slot。job 死在第 6 阶段，
 # 原样重投一次就从第 6 阶段接着跑，前 5 阶段已落盘的 test 结果不受影响。
 #
-# 换 CONFIG 不会串：state 文件名带 CONFIG，槽位目录名也带。
+# 换 CONFIG 或换 lr 都不会串：state 文件名和槽位目录名都带 ${CONFIG}_lr${LR}。
 #
 # -----------------------------------------------------------------------------
 # 5. MODE 与时间预算
@@ -317,8 +332,8 @@ NUM_STAGES="${#TASK_KEYS[@]}"
 CONFIG="${CONFIG:-fast}"
 case "${CONFIG}" in
   fast)
-    # 每任务 1 epoch，lr 拉到 1e-4：这一档只为 Q2（通用能力崩塌）服务，
-    # 便宜且足够狠。8 个 epoch 总量。
+    # 每任务 1 epoch：这一档只为 Q2（通用能力崩塌）服务，8 个 epoch 总量。
+    # lr 与 official 同为 1e-5，两档之间只差 epoch 数。
     EPOCHS_LIST="${EPOCHS_LIST:-1,1,1,1,1,1,1,1}"
     LR="${LR:-1e-5}"
     ;;
@@ -406,10 +421,14 @@ DECODE_STOP_ON_IM_END="${DECODE_STOP_ON_IM_END:-0}"
 GENERAL_METRICS="ifeval gsm8k math500 humaneval mbpp"
 [[ "${WITH_IFBENCH}" == "1" ]] && GENERAL_METRICS="${GENERAL_METRICS} ifbench"
 
-SLOT_A="trace_${CONFIG}_slot_a"
-SLOT_B="trace_${CONFIG}_slot_b"
-FINAL_CKPT="trace_${CONFIG}_final"
-STATE_FILE="${CKPT_DIR}/trace_${CONFIG}_state.json"
+# 产物名带 lr：同一个 CONFIG 换过 lr（fast 跑过 1e-4，现在是 1e-5）不会互相覆盖。
+# 槽位、state、run_name、汇总 json 共用这一个后缀，缺一个就会串。
+RUN_TAG="${CONFIG}_lr${LR//[^A-Za-z0-9.+-]/_}"
+
+SLOT_A="trace_${RUN_TAG}_slot_a"
+SLOT_B="trace_${RUN_TAG}_slot_b"
+FINAL_CKPT="trace_${RUN_TAG}_final"
+STATE_FILE="${CKPT_DIR}/trace_${RUN_TAG}_state.json"
 
 mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${EVAL_ROOT}" "${TRAIN_LOG_DIR}"
 
@@ -423,6 +442,7 @@ echo "========================================================================"
 echo "TRACE 八任务顺序全量 SFT"
 echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
 echo "  CONFIG   = ${CONFIG}  epochs = ${EPOCHS_LIST}  lr = ${LR}"
+echo "  产物前缀 = trace_${RUN_TAG}_*（ckpt / run_name / state / 汇总都带 lr）"
 echo "  MODE     = ${MODE}  DRY_RUN=${DRY_RUN}  LIMIT=${LIMIT}"
 echo "  顺序     = ${TASK_DIRS[*]}"
 echo "  训练     = ${LR_SCHEDULER} warmup ${WARMUP_RATIO}"
@@ -682,16 +702,16 @@ run_final_eval () {
     [[ "${fatal}" == "1" ]] && return 1
     return 0
   fi
-  local final_run="trace_${CONFIG}_stage${NUM_STAGES}"
+  local final_run="trace_${RUN_TAG}_stage${NUM_STAGES}"
   # shellcheck disable=SC2086
   eval_one "${final_run}" "${CKPT_DIR}/${FINAL_CKPT}" ${AVAIL_GENERAL}
   echo
   echo "==== 汇总 ===="
   python -m onereplay.scripts.summarize_trace_matrix \
-    --eval_root "${EVAL_ROOT}" --config "${CONFIG}" \
+    --eval_root "${EVAL_ROOT}" --config "${RUN_TAG}" \
     --base_run base --num_stages "${NUM_STAGES}" \
     --general_metrics "${AVAIL_GENERAL// /,}" \
-    --json_out "${EVAL_ROOT}/trace_${CONFIG}_matrix.json" || true
+    --json_out "${EVAL_ROOT}/trace_${RUN_TAG}_matrix.json" || true
 }
 
 # ---------------------------------------------------------------------------
@@ -783,7 +803,7 @@ fi
 if [[ "${MODE}" == "final_eval" ]]; then
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo
-    echo "DRY_RUN=1：将用 ${CKPT_DIR}/${FINAL_CKPT} 评 trace_${CONFIG}_stage${NUM_STAGES}"
+    echo "DRY_RUN=1：将用 ${CKPT_DIR}/${FINAL_CKPT} 评 trace_${RUN_TAG}_stage${NUM_STAGES}"
     echo "           的 ${AVAIL_GENERAL}"
     exit 0
   fi
@@ -864,7 +884,7 @@ for (( STAGE = START_STAGE; STAGE <= END_STAGE; STAGE++ )); do
   TASK_DIR="${TASK_DIRS[$IDX]}"
   STAGE_EPOCHS="${EPOCHS[$IDX]}"
   DST_SLOT="$(slot_for_stage "${STAGE}")"
-  RUN="trace_${CONFIG}_stage${STAGE}"
+  RUN="trace_${RUN_TAG}_stage${STAGE}"
 
   if (( STAGE == 1 )); then
     SRC_PARENT="${MODEL_DIR}"
@@ -987,10 +1007,10 @@ echo "========================================================================"
 echo "遗忘矩阵（每行一个阶段，每列一个任务）"
 echo "========================================================================"
 python -m onereplay.scripts.summarize_trace_matrix \
-  --eval_root "${EVAL_ROOT}" --config "${CONFIG}" \
+  --eval_root "${EVAL_ROOT}" --config "${RUN_TAG}" \
   --base_run base --num_stages "${NUM_STAGES}" \
   --general_metrics "${AVAIL_GENERAL// /,}" \
-  --json_out "${EVAL_ROOT}/trace_${CONFIG}_matrix.json" || true
+  --json_out "${EVAL_ROOT}/trace_${RUN_TAG}_matrix.json" || true
 
 echo
 echo "========================================================================"
