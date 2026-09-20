@@ -340,7 +340,7 @@ val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
 # =============================================================================
 # 1 epoch x 40k 行 = 97 号 fast 那次的总训练量，也就是已经确认会崩的那一档。
 EPOCHS="${EPOCHS:-1}"
-LR="${LR:-1e-4}"
+LR="${LR:-1e-5}"
 LR_SCHEDULER="${LR_SCHEDULER:-constant}"
 WARMUP_RATIO="${WARMUP_RATIO:-0}"
 # BATCH 是显存参数，ACCUM 才是"每次更新多少行新任务"。replay 臂会按第 3 条自动提高。
