@@ -14,8 +14,9 @@
 #   qsub -v DRY_RUN=0,URR=0.25 onereplay/pbs/99_finance_osft.pbs
 #   qsub -v DRY_RUN=0,URR=0.1  onereplay/pbs/99_finance_osft.pbs
 #   qsub -v DRY_RUN=0,URR=0.5  onereplay/pbs/99_finance_osft.pbs
-#   接入自检（短跑，不存 checkpoint 不评测，见第 6 条）:
-#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1 onereplay/pbs/99_finance_osft.pbs
+#   接入自检：一对短跑，互相对照，见第 6 条。顺序无所谓，后跑的会打并排表。
+#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 onereplay/pbs/99_finance_osft.pbs
+#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1           onereplay/pbs/99_finance_osft.pbs
 #   拆两次投:
 #   qsub -v DRY_RUN=0,URR=0.25,DO_EVAL=0 ...   然后   DO_TRAIN=0
 #
@@ -85,13 +86,30 @@
 # --osft_target_patterns 决定，空值表示用上游按架构查表的默认值。
 #
 # -----------------------------------------------------------------------------
-# 6. 接入自检：URR=1.0 必须重现 94 号的 vanilla
-# --------------------------------------------
+# 6. 接入自检：URR=1.0 对 CONTROL=1，不是对 94 号
+# ----------------------------------------------
 # URR=1.0 时 top_k = floor(rank x 0) = 0，一个方向都不冻，OSFT 退化成普通全量
-# 微调。它的 loss 曲线必须落在 94 号 vanilla 上 —— 这是判断"接入有没有问题"最硬
-# 的一条端到端证据，而且 94 号已经跑过，对照是白送的。
+# 微调，所以它的曲线必须和"同样设置但不开 OSFT"的那一跑重合。
 #
-# 用 PROBE=1 短跑即可，不要当成实验点浪费一个完整作业。
+# !! 这个对照**不能**用 94 号的 vanilla
+# PROBE=1 会把 EPOCHS 钉成 1 并设 MAX_STEPS，而 train.py 的调度 horizon 是
+#   total_updates = ceil(min(len(loader), max_steps) / accum_steps) * epochs
+# 算出来的。于是 4800 步的 probe 会把整条 cosine 压缩进这 4800 步、末尾衰减到
+# lr=0，而 94 号的 vanilla 在同一个位置还在 2 epoch cosine 的一半上（lr≈4.7e-5），
+# 数据量也差一倍。两者从第一步之后就不在同一个实验里，val_loss 差多少都说明
+# 不了问题。
+#
+# 所以对照要用 CONTROL=1：完全相同的命令，只是不传 --osft，run 名加 _control
+# 后缀。URR=1.0 时两者理论上逐步一致（没有因子，就没有因子化前向的数值差）。
+#
+#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 onereplay/pbs/99_finance_osft.pbs
+#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1           onereplay/pbs/99_finance_osft.pbs
+#
+# 两条都跑完后，后跑的那条会自动把两边的 train_task_loss / val_loss 并排打出来。
+# 顺序无所谓。一条 probe 约 5 分钟。
+#
+# CONTROL=1 配非 1.0 的 URR 是允许的（它就是"本脚本设置下的 vanilla"），但那不是
+# 实验点 —— 正式 run 的 vanilla 分母仍然是 94 号。
 #
 # 代码层面的自检另有两个，投这个作业之前应该已经跑过：
 #   python test_code/check_osft_integration.py          （不需要 GPU 和 checkpoint）
@@ -169,7 +187,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE
     PROFILE PROFILE_SOURCE SKIP_PROFILE_CHECK
-    URR OSFT_TARGET_PATTERNS OSFT_UPCAST_DTYPE MINI_TRAINER_SRC
+    URR OSFT_TARGET_PATTERNS OSFT_UPCAST_DTYPE MINI_TRAINER_SRC CONTROL
     PROBE PROBE_STEPS MAX_STEPS SAVE
     SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL WITH_RETENTION
@@ -340,6 +358,14 @@ fi
 OSFT_TARGET_PATTERNS="${OSFT_TARGET_PATTERNS:-}"
 OSFT_UPCAST_DTYPE="${OSFT_UPCAST_DTYPE:-fp32}"
 
+# 同一条命令、同一套超参，只是不传 --osft。见文件头第 6 条：URR=1.0 的验收要和
+# 它比，不能和 94 号比，因为 PROBE 会把 cosine 压缩进 MAX_STEPS 步。
+CONTROL="${CONTROL:-0}"
+if [[ "${CONTROL}" != "0" && "${CONTROL}" != "1" ]]; then
+  echo "CONTROL 只能是 0 / 1，得到 '${CONTROL}'" >&2
+  exit 2
+fi
+
 # =============================================================================
 # 路径
 # =============================================================================
@@ -402,11 +428,15 @@ fi
 
 # run 名：EVAL_ROOT 与 94/95 号共用，所以必须自带臂名和 URR。见文件头第 3 条。
 run_name_for () {
-  local name="fin_osft_${MIX_TAG}_urr$1"
+  local urr="$1" control="${2:-${CONTROL}}"
+  local name="fin_osft_${MIX_TAG}_urr${urr}"
   name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
   if [[ "${PROBE}" == "1" || "${MAX_STEPS}" != "0" ]]; then
     name="${name}_probe${MAX_STEPS}"
   fi
+  # 后缀而不是前缀，这样一对 run 在目录列表和 <metric>_summary.csv 里紧挨着，
+  # 一眼看得出它们是同一组设置下开关 OSFT 的两跑。
+  [[ "${control}" == "1" ]] && name="${name}_control"
   printf '%s' "${name}"
 }
 VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${EPOCHS_DECLARED}_seed${SEED}}"
@@ -443,14 +473,23 @@ mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${EVAL_ROOT}" "${TRAIN_LOG_DIR}" "${DAT
 RUN="$(run_name_for "${URR}")"
 RUN_METRICS="${METRICS_DIR}/${RUN}.jsonl"
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
+# The same settings with the OSFT switch flipped. Only used to print a
+# side-by-side once both halves of the pair exist; nothing depends on it.
+PARTNER_RUN="$(run_name_for "${URR}" "$((1 - CONTROL))")"
+PARTNER_METRICS="${METRICS_DIR}/${PARTNER_RUN}.jsonl"
 
 echo "========================================================================"
 echo "finance 线 osft 臂：保护 ${MIX_TAG}（OSFT 没有保护域维度，这里只决定评什么）"
 echo "  profile  = ${PROFILE}"
 echo "  W_ref    = ${MODEL_DIR}/${MODEL_NAME}   (裸底座，与另外三条臂相同)"
 echo "  新任务   = ${DATASET_DIR}"
+if [[ "${CONTROL}" == "1" ]]; then
+echo "  CONTROL  = 1   **不开 OSFT**，同一套超参的对照跑。URR=${URR} 只进 run 名。"
+echo "             搭档 = ${PARTNER_RUN}"
+else
 echo "  URR      = ${URR}   (参与训练的奇异方向占比；1.0 = 退化成 vanilla)"
 echo "  覆盖     = ${OSFT_TARGET_PATTERNS:-（上游按架构查表：Qwen 是 7 个投影，不含 lm_head）}"
+fi
 echo "  旧知识   = 不消费。没有 C / F / replay 池，这是与另外三条臂的假设差异。"
 if [[ "${OLD_VAL}" == "1" ]]; then
 echo "  旧域 val = ${OLD_VAL_ROWS} 行/域，域：${OLD_VAL_DOMAINS}"
@@ -466,7 +505,9 @@ echo "             system '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 sy
 if [[ "${PROBE}" == "1" ]]; then
 echo "  模式     = 接入自检短跑，${MAX_STEPS} 步（约 $((MAX_STEPS * BATCH / ACCUM)) 次更新），不存 checkpoint、不评测"
 echo "             epochs 钉成 1（max_steps 是每 epoch 的上限），对表仍按正式值 ${EPOCHS_DECLARED}"
-echo "             URR=1.0 时这条曲线必须落在 ${VANILLA_RUN} 上"
+echo "             !! 对照是 ${PARTNER_RUN}，不是 ${VANILLA_RUN}"
+echo "                PROBE 把整条 cosine 压进 ${MAX_STEPS} 步、末尾 lr 归零，而 94 号"
+echo "                在同一位置还在 2-epoch cosine 的一半上，数据量也差一倍。"
 else
 echo "  模式     = 正式 run"
 fi
@@ -631,8 +672,13 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   echo "    --dataset_path ${DATASET_DIR}"
   echo "    --epochs ${EPOCHS} --lr ${LR} --lr_scheduler ${LR_SCHEDULER} --warmup_ratio ${WARMUP_RATIO}"
   echo "    --batch_size ${BATCH} --accumulation_size ${ACCUM} --max_len ${MAXLEN}"
-  echo "    --osft 1 --osft_unfreeze_rank_ratio ${URR}"
-  echo "    --osft_target_patterns '${OSFT_TARGET_PATTERNS}' --osft_upcast_dtype ${OSFT_UPCAST_DTYPE}"
+  if [[ "${CONTROL}" == "1" ]]; then
+    echo "    （CONTROL=1：不传 --osft，也不传 --osft_unfreeze_rank_ratio —— train.py"
+    echo "      在 --osft 0 时看到设过的 URR 会直接报错，那个检查是故意的）"
+  else
+    echo "    --osft 1 --osft_unfreeze_rank_ratio ${URR}"
+    echo "    --osft_target_patterns '${OSFT_TARGET_PATTERNS}' --osft_upcast_dtype ${OSFT_UPCAST_DTYPE}"
+  fi
   if [[ "${OLD_VAL}" == "1" ]]; then
     _spec=""
     for _d in ${OLD_VAL_DOMAINS}; do
@@ -680,8 +726,21 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
     mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
     echo
     echo "==== train ${RUN} ===="
-    echo "  URR=${URR}  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
-    echo "  启动时会先做一次 SVD 分解（${EXPECT_OSFT_MATRICES} 个矩阵），几分钟到十几分钟。"
+    if [[ "${CONTROL}" == "1" ]]; then
+      echo "  CONTROL=1：不开 OSFT  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
+      # 一个数组而不是复制整条命令：两条 run 只应该差这几个 flag，如果把命令写
+      # 两遍，以后改了一处忘了另一处，对照就悄悄失效了。
+      OSFT_ARGS=()
+    else
+      echo "  URR=${URR}  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
+      echo "  启动时会先做一次 SVD 分解（${EXPECT_OSFT_MATRICES} 个矩阵），几分钟到十几分钟。"
+      OSFT_ARGS=(
+        --osft 1
+        --osft_unfreeze_rank_ratio "${URR}"
+        --osft_target_patterns "${OSFT_TARGET_PATTERNS}"
+        --osft_upcast_dtype "${OSFT_UPCAST_DTYPE}"
+      )
+    fi
 
     python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
@@ -699,10 +758,7 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
       --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
       --log_every "${LOG_EVERY}" \
       ${OLD_VAL_ARGS[@]+"${OLD_VAL_ARGS[@]}"} \
-      --osft 1 \
-      --osft_unfreeze_rank_ratio "${URR}" \
-      --osft_target_patterns "${OSFT_TARGET_PATTERNS}" \
-      --osft_upcast_dtype "${OSFT_UPCAST_DTYPE}" \
+      ${OSFT_ARGS[@]+"${OSFT_ARGS[@]}"} \
       --save "${SAVE}" --save_path "${CKPT_DIR}/${RUN}" \
       --metrics_path "${RUN_METRICS}" 2>&1 | tee "${TRAIN_LOG}"
 
@@ -712,12 +768,17 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
     # 没匹配上，而那样的 run 和 vanilla 完全一样，却会被当成 OSFT 记进表里。
     echo
     echo "==== 训练自检 ===="
-    if python -c "import sys; sys.exit(0 if float('${URR}') >= 1.0 else 1)"; then
+    if [[ "${CONTROL}" == "1" ]]; then
+      if grep -qF -- "OSFT:" "${TRAIN_LOG}"; then
+        echo "  !! CONTROL=1 的日志里出现了 OSFT 的输出，说明 --osft 还是传进去了。" >&2
+        grep -F "OSFT:" "${TRAIN_LOG}" | head -n 3 >&2
+        echo "     这条对照没有对照作用。" >&2
+        exit 1
+      fi
+      echo "  ok  没有任何 OSFT 输出，这是一条纯全量微调的对照"
+    elif python -c "import sys; sys.exit(0 if float('${URR}') >= 1.0 else 1)"; then
       if grep -qF -- "OSFT: no matrix was decomposed" "${TRAIN_LOG}"; then
         echo "  ok  URR=1.0，没有冻结任何方向，这一跑等价于全量微调"
-        echo "  !! 现在去和 94 号的 vanilla 对曲线："
-        echo "     ${METRICS_DIR}/${VANILLA_RUN}.jsonl"
-        echo "     对不上就是接入有问题，其他 URR 的数字都不可信。"
       else
         echo "  !! URR=1.0 却仍有矩阵被分解。core/osft.py 绕开上游" >&2
         echo "     _build_osft_kwargs 的那段可能被改回去了（它把 0.0 当 falsy 丢掉）。" >&2
@@ -745,7 +806,80 @@ fi
 if [[ "${PROBE}" == "1" ]]; then
   echo
   echo "PROBE=1：短跑结束，不存 checkpoint、不评测。"
-  echo "  把这条的 train_task_loss 曲线和 ${VANILLA_RUN} 的前 $((MAX_STEPS * BATCH / ACCUM)) 次更新对一下。"
+  # 对照必须是 CONTROL 那一跑，不能是 94 号：PROBE 把整条 cosine 压缩进
+  # MAX_STEPS 步（lr 末尾归零），而 94 号在同一位置还在 2-epoch cosine 的一半
+  # 上，数据量也差一倍。详见文件头第 6 条。
+  if [[ -s "${PARTNER_METRICS}" ]]; then
+    echo
+    echo "==== URR=${URR} 的 OSFT / 对照 并排 ===="
+    A_NAME="${RUN}" A_METRICS="${RUN_METRICS}" \
+    B_NAME="${PARTNER_RUN}" B_METRICS="${PARTNER_METRICS}" \
+    python - <<'PY'
+import json
+import os
+
+
+def last_epoch(path):
+    best = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("record_type") == "epoch":
+                best = record
+    return best
+
+
+a = last_epoch(os.environ["A_METRICS"])
+b = last_epoch(os.environ["B_METRICS"])
+# lr_end and train_steps come first: if those two disagree the rest is not a
+# comparison at all, it is two different experiments.
+FIELDS = [
+    ("train_steps", ".0f"),
+    ("train_samples", ".0f"),
+    ("lr_end", ".3e"),
+    ("train_task_loss", ".6f"),
+    ("val_loss", ".6f"),
+    ("old_val_loss_math", ".6f"),
+    ("old_val_loss_code", ".6f"),
+    ("peak_memory_allocated_gb", ".4f"),
+    ("train_sec", ".0f"),
+]
+print(f"{'field':<28}{'this run':>16}{'partner':>16}{'delta':>16}")
+print("-" * 76)
+for field, spec in FIELDS:
+    left, right = a.get(field), b.get(field)
+    if left is None and right is None:
+        continue
+    delta = (
+        format(left - right, "+" + spec)
+        if isinstance(left, (int, float)) and isinstance(right, (int, float))
+        else "-"
+    )
+    print(
+        f"{field:<28}"
+        + f"{'-' if left is None else format(left, spec):>16}"
+        + f"{'-' if right is None else format(right, spec):>16}"
+        + f"{delta:>16}"
+    )
+print()
+if a.get("train_steps") != b.get("train_steps") or a.get("lr_end") != b.get("lr_end"):
+    print("!! train_steps 或 lr_end 不同：两跑的调度不一样，下面的 loss 不可比。")
+else:
+    print("URR=1.0 时两跑应该几乎重合：没有 SVD 因子，也就没有因子化前向的数值差，")
+    print("同一个 seed 下唯一的差别只是模型走了 OSFT 的加载路径。train_task_loss")
+    print("和 val_loss 差到小数点后三四位以外，就说明接入有问题。")
+PY
+  else
+    echo "  搭档还没跑：${PARTNER_METRICS}"
+    if [[ "${CONTROL}" == "1" ]]; then
+      echo "    qsub -v DRY_RUN=0,URR=${URR},PROBE=1 ${SELF_PATH}"
+    else
+      echo "    qsub -v DRY_RUN=0,URR=${URR},PROBE=1,CONTROL=1 ${SELF_PATH}"
+    fi
+    echo "  两条都跑完后，后跑的那条会自动打并排表。"
+  fi
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -753,7 +887,7 @@ fi
 if [[ "${DO_EVAL}" != "1" ]]; then
   echo
   echo "DO_EVAL=0：跳过评测。补评："
-  echo "  qsub -v DRY_RUN=0,URR=${URR},DO_TRAIN=0 ${SELF_PATH}"
+  echo "  qsub -v DRY_RUN=0,URR=${URR}$([[ "${CONTROL}" == "1" ]] && echo ",CONTROL=1"),DO_TRAIN=0 ${SELF_PATH}"
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -1102,4 +1236,7 @@ echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay ${REPO_ROOT}/onereplay/pbs/95_
 echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
 echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=ewc,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
 echo "  本臂换一个 URR 就改 URR=（建议 0.1 / 0.25 / 0.5），不需要扫描模式。"
+echo "  接入自检是一对短跑，和 94 号无关（见文件头第 6 条）："
+echo "    qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 ${SELF_PATH}"
+echo "    qsub -v DRY_RUN=0,URR=1.0,PROBE=1           ${SELF_PATH}"
 echo "========================================================================"

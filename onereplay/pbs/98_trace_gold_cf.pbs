@@ -17,13 +17,13 @@
 #   qsub -v DRY_RUN=0,WHAT=fisher onereplay/pbs/98_trace_gold_cf.pbs      # 只采 F
 #   qsub -v DRY_RUN=0,WHAT=fisher,DO_MATH=0 onereplay/pbs/98_trace_gold_cf.pbs  # 一次一个域
 #   qsub -v DRY_RUN=0,WHAT=none   onereplay/pbs/98_trace_gold_cf.pbs      # 只跑诊断
-#   qsub -v DRY_RUN=0,PRUNE_SINGLE=0 onereplay/pbs/98_trace_gold_cf.pbs   # 保留单域矩阵
+#   qsub -v DRY_RUN=0,PRUNE_SINGLE=1 onereplay/pbs/98_trace_gold_cf.pbs   # 合成后删掉单域矩阵
 #
 # 产物：
 #   两份池 + 两份 val 切片（math / code，C / F / replay 三者共用）
 #   C_mix = 0.5 C_math + 0.5 C_code
 #   F_mix = 0.5 F_math + 0.5 F_code
-#   单域 C/F 默认在合成并校验之后删除，见第 4 条
+#   单域 C/F 默认保留（PRUNE_SINGLE=1 才删），见第 4 条
 #
 # -----------------------------------------------------------------------------
 # 1. 这条线是什么，和 97 号什么关系
@@ -76,19 +76,22 @@
 #    就是裸 Llama-3.2-3B-Instruct（99 号从它起训）。
 #
 # -----------------------------------------------------------------------------
-# 4. 单域 C/F 合成之后删掉
-# ------------------------
-# 两域单独的 C+F 约 54 GB，只为产出 mix 那一份而存在 —— 本线只做 mix 保护，不跑
-# 单域对照臂。留着它们纯属占地方，所以 Step 5 在校验通过之后删。
+# 4. 单域 C/F 默认保留
+# --------------------
+# 两域单独的 C+F 约 54 GB，加上 mix 那一份合计约 80 GB，全都留在盘上。
 #
-# 校验不是走过场：删之前要确认 mix 文件存在、层数与本模型 config 对得上、并且
-# source_metadata 里两个域的 pool_fingerprint 都在。mix_covariances 和
-# mix_fishers 都会把每个输入的**完整 metadata** 原样存进 source_metadata（含
-# pool_rows / pool_fingerprint / max_len / system_prompt），所以 99 号的同池检查
-# 改读 mix 文件就行，不依赖单域文件还在。
+# 本线眼下只做 mix 保护，所以这 54 GB 暂时用不上。但它们是补单域对照臂（只保 math
+# 或只保 code）的唯一凭据，重采两域要五六个小时，而删掉只省磁盘 —— 这笔账在磁盘
+# 还够的时候不划算，所以默认留着。
 #
-# 代价说清楚：以后想补单域对照臂（只保 math 或只保 code）必须重采，两域约 5 小时。
-# 真要留就 PRUNE_SINGLE=0。
+# 确认以后不再需要单域臂、而且磁盘紧张时，传 PRUNE_SINGLE=1 让 Step 5 删掉它们。
+# 那一步不是无条件删：要先确认 mix 文件存在、层数与本模型 config 对得上、并且
+# source_metadata 里两个域的 pool_fingerprint 都在。任一不过就一个都不删 ——
+# 删掉唯一副本换一次五六小时的重采，是这条线里唯一不可逆的操作。
+#
+# 删了也不影响 99 号的同池检查：mix_covariances 和 mix_fishers 都会把每个输入的
+# **完整 metadata** 原样存进 source_metadata（含 pool_rows / pool_fingerprint /
+# max_len / system_prompt），99 号读的就是那里，不依赖单域文件还在。
 #
 # -----------------------------------------------------------------------------
 # 5. C 和 F 必须同池
@@ -295,8 +298,8 @@ DO_PREP="${DO_PREP:-1}"
 FORCE_PREP="${FORCE_PREP:-0}"
 DO_MIX="${DO_MIX:-1}"
 FORCE_MIX="${FORCE_MIX:-0}"
-# 见文件头第 4 条。默认删，因为本线只做 mix 保护。
-PRUNE_SINGLE="${PRUNE_SINGLE:-1}"
+# 见文件头第 4 条。默认保留：单域矩阵是补单域对照臂的唯一凭据，重采要五六个小时。
+PRUNE_SINGLE="${PRUNE_SINGLE:-0}"
 
 ETA_MS_PER_EXAMPLE="${ETA_MS_PER_EXAMPLE:-500}"
 WALLTIME_HOURS="${WALLTIME_HOURS:-24}"
@@ -405,7 +408,7 @@ echo "  池 / val = ${SPLIT_DIR}  （每域末尾 ${OLD_VAL_ROWS} 行留作 val�
 echo "  targets  = ${TARGET_MODULES}"
 echo "  maxlen   = math ${MATH_MAXLEN} / code ${CODE_MAXLEN}   （不是新任务的 2048）"
 echo "  mix      = ${MIX_DOMAINS} @ ${MIX_WEIGHTS} -> ${MIX_TAG}"
-echo "  合成后删单域 = ${PRUNE_SINGLE}"
+echo "  合成后删单域 = ${PRUNE_SINGLE}   （0 = 保留，默认）"
 echo "  system   = '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system）"
 echo "========================================================================"
 
@@ -520,8 +523,10 @@ if (( AVAIL_GIB > 0 && AVAIL_GIB < NEED_INT + DISK_HEADROOM_GIB )); then
 fi
 
 if [[ "${PRUNE_SINGLE}" == "1" && "${DO_MIX}" == "1" ]]; then
-  echo "注意：合成 mix 之后会删掉单域 C/F（PRUNE_SINGLE=1）。"
-  echo "      以后要补单域对照臂得重采；要留就传 PRUNE_SINGLE=0。"
+  echo "注意：PRUNE_SINGLE=1，合成 mix 之后会删掉单域 C/F。"
+  echo "      以后要补单域对照臂得重采（两域五六小时）。不确定就别传这个。"
+else
+  echo "单域 C/F 会保留（PRUNE_SINGLE=0）：两域加 mix 合计约 ${NEED_GIB} GiB 常驻。"
 fi
 
 # DRY_RUN 在切分之前退出：Step 1 会往磁盘写池和 val，那是副作用，不该在
@@ -807,11 +812,14 @@ if [[ "${DO_MIX}" == "1" ]]; then
 fi
 
 # ===========================================================================
-# Step 5: 校验 mix，然后删掉单域 C/F
+# Step 5: 校验 mix，然后删掉单域 C/F（只在 PRUNE_SINGLE=1 时）
 #
-# 见文件头第 4 条。删之前必须确认 mix 真的成了：层数对得上本模型 config，而且
-# source_metadata 里每个域的 pool_fingerprint 都在 —— 那是 99 号删掉单域文件之后
-# 唯一能证明"C/F/replay 同池"的东西。
+# 见文件头第 4 条。默认不走这一段：单域矩阵留着，等确认不再需要单域对照臂、而且
+# 磁盘紧张时再传 PRUNE_SINGLE=1。
+#
+# 删之前必须确认 mix 真的成了：层数对得上本模型 config，而且 source_metadata 里
+# 每个域的 pool_fingerprint 都在 —— 那是单域文件没了之后唯一能证明
+# "C/F/replay 同池"的东西。
 # ===========================================================================
 if [[ "${PRUNE_SINGLE}" == "1" && "${DO_MIX}" == "1" ]]; then
   echo

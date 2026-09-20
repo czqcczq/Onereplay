@@ -244,9 +244,27 @@ python -m onereplay.scripts.check_osft \
   --osft_unfreeze_rank_ratio 0.25
 ```
 
-The end-to-end guard is a training run at `--osft_unfreeze_rank_ratio 1.0`: it
-freezes nothing, so its loss curve has to land on the vanilla arm's. If it does
-not, the integration is wrong and no other OSFT number is trustworthy.
+The end-to-end guard is a pair of short runs at
+`--osft_unfreeze_rank_ratio 1.0`, which freezes nothing and so has to behave
+like plain full fine-tuning:
+
+```bash
+qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 onereplay/pbs/99_finance_osft.pbs
+qsub -v DRY_RUN=0,URR=1.0,PROBE=1           onereplay/pbs/99_finance_osft.pbs
+```
+
+`CONTROL=1` runs the identical command with the OSFT flags removed. Whichever
+finishes second prints the two side by side; `train_task_loss` and `val_loss`
+should agree to several decimals, because with nothing decomposed there are no
+SVD factors and therefore no factored-forward arithmetic to differ.
+
+The control has to be that run and **not** the 94 arm's vanilla. `PROBE=1`
+pins `epochs` to 1 and sets `max_steps`, and the LR horizon is
+`ceil(min(len(loader), max_steps) / accum_steps) * epochs`, so the probe
+compresses the whole cosine into its 4800 steps and ends at `lr=0` while
+vanilla is still halfway down a two-epoch cosine at `lr≈4.7e-5`, on twice the
+data. The two stop being the same experiment after the first step, so any
+difference in `val_loss` between them means nothing.
 
 ### The OPR baseline: on-policy replay with a filtered buffer
 

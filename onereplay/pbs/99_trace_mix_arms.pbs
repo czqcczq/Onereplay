@@ -99,10 +99,11 @@
 # 同一个文件。Step 1 按 replay 的**真实装配路径**把池建出来数行数，和 C 记录的
 # pool_rows 比，不等就退出。
 #
-# !! 98 号默认会在合成 mix 之后删掉单域 C/F（PRUNE_SINGLE=1），所以这里的同池检查
-# 读的是 **mix 文件的 metadata.source_metadata**，不是单域文件。mix_covariances 和
-# mix_fishers 都把每个输入的完整 metadata 原样存了进去，pool_rows / pool_fingerprint
-# / max_len / system_prompt 全都在，证据链没断。
+# !! 这里的同池检查读的是 **mix 文件的 metadata.source_metadata**，不是单域 C/F。
+# 98 号默认保留单域矩阵，但它也支持 PRUNE_SINGLE=1 把它们删掉，所以这条检查不能
+# 依赖它们还在。mix_covariances 和 mix_fishers 都把每个输入的完整 metadata 原样存
+# 了进去，pool_rows / pool_fingerprint / max_len / system_prompt 全都在，两种情况下
+# 证据链都不断。
 #
 # !! --replay_drop_truncated 必须是 0（默认是 1）
 # 物化后的池不带 truncated 列，传 1 在这里是空操作；但万一以后换了带该列的池，
@@ -698,7 +699,7 @@ if os.environ["MAT_KIND"] == "cov":
             problems.append(f"{name} 维度 {matrix.shape[0]} != intermediate {inter}")
             break
 
-# 98 号删掉单域矩阵之后，同池的证据全在这里。
+# 同池的证据全在这里，这样 98 号有没有删掉单域矩阵都不影响。
 sources = metadata.get("source_metadata", [])
 want_maxlen = int(os.environ["REPLAY_MAXLEN"])
 want_system = os.environ["SYSTEM_PROMPT"]
