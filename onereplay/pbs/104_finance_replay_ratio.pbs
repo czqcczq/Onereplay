@@ -314,6 +314,14 @@ OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
 MATH_VAL="${SPLIT_DIR}/math_val${OLD_VAL_ROWS}.jsonl"
 REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN:-inputs}"
 REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-gold_targets}"
+# !! val 文件与池文件是**两种 schema**，这不是错配
+#   93 号 Step 1 把池物化成 {inputs, gold_targets}，而 val 切片留的是
+#   prepare_* 那一套 {question, response}。train.py 两条路各读各的：replay 走
+#   --replay_*_column，old_val 走 --old_val_*_column（默认恰好就是 question /
+#   response，见 data/old_val.py）。95 号一直靠这个默认在跑。
+#   这里写死成显式参数，免得哪天默认变了、或者有人照着池的列名去改 val 的。
+OLD_VAL_INPUT_COLUMN="${OLD_VAL_INPUT_COLUMN:-question}"
+OLD_VAL_TARGET_COLUMN="${OLD_VAL_TARGET_COLUMN:-response}"
 REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-0}"        # 文件本身就是池，不再二次切
 REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"    # = 93 号采 C/F 的 --sample_seed
 REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"           # = 95 号 DOMAIN=math 的预算
@@ -565,6 +573,7 @@ df -h "${CKPT_DIR}" 2>/dev/null || true
 echo ""
 echo "==== Step 1: 池与 val 切片检查（四条臂共用）===="
 export MATH_POOL MATH_VAL REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN
+export OLD_VAL_INPUT_COLUMN OLD_VAL_TARGET_COLUMN
 export REPLAY_DROP_TRUNCATED DATASET_CACHE COV_PATH SKIP_POOL_CHECK OVERLAP_ABORT_RATIO
 POOL_REPORT_FILE="${TMPDIR}/pool_preflight_fin_ratio.txt"
 
@@ -578,58 +587,82 @@ from onereplay.data.replay import load_self_distilled_pool, to_sft_schema
 
 failures = []
 abort_ratio = float(os.environ["OVERLAP_ABORT_RATIO"])
-input_column = os.environ["REPLAY_INPUT_COLUMN"]
-target_column = os.environ["REPLAY_TARGET_COLUMN"]
+# !! 两个文件是两种 schema，这是设计如此不是错配。93 号把池物化成
+#    {inputs, gold_targets}，val 切片留的是 {question, response}。train.py 两条路
+#    各读各的（--replay_*_column vs --old_val_*_column），所以这里也必须分开校验 ——
+#    拿池的列名去查 val 文件，报出来的是一个不存在的问题。
+pool_in = os.environ["REPLAY_INPUT_COLUMN"]
+pool_out = os.environ["REPLAY_TARGET_COLUMN"]
+val_in = os.environ["OLD_VAL_INPUT_COLUMN"]
+val_out = os.environ["OLD_VAL_TARGET_COLUMN"]
 
 loader_args = argparse.Namespace(
     replay_cache_dir=os.environ["DATASET_CACHE"],
     replay_drop_truncated=int(os.environ["REPLAY_DROP_TRUNCATED"]),
-    replay_input_column=input_column,
-    replay_target_column=target_column,
-)
-schema_args = argparse.Namespace(
-    replay_input_column=input_column,
-    replay_target_column=target_column,
+    replay_input_column=pool_in,
+    replay_target_column=pool_out,
 )
 
 # 走 replay 臂真正会用的装配路径，不复写一遍逻辑。
 pool = load_self_distilled_pool(loader_args, os.environ["MATH_POOL"])
 val = load_self_distilled_pool(loader_args, os.environ["MATH_VAL"])
 print(f"池文件   = {os.environ['MATH_POOL']}")
-print(f"  列       = {pool.column_names}")
+print(f"  列       = {pool.column_names}   (replay 读 {pool_in}/{pool_out})")
 print(f"  行数     = {len(pool)}")
 print(f"val 文件 = {os.environ['MATH_VAL']}")
-print(f"  列       = {val.column_names}")
+print(f"  列       = {val.column_names}   (old_val 读 {val_in}/{val_out})")
 print(f"  行数     = {len(val)}")
 
-for name, dataset in (("池", pool), ("val", val)):
-    missing = [c for c in (input_column, target_column) if c not in dataset.column_names]
+for name, dataset, want_in, want_out, flags in (
+    ("池", pool, pool_in, pool_out, "REPLAY_INPUT_COLUMN / REPLAY_TARGET_COLUMN"),
+    ("val", val, val_in, val_out, "OLD_VAL_INPUT_COLUMN / OLD_VAL_TARGET_COLUMN"),
+):
+    missing = [c for c in (want_in, want_out) if c not in dataset.column_names]
     if missing:
         failures.append(
-            f"{name}文件缺列 {missing}；实有 {dataset.column_names}。"
-            "REPLAY_INPUT_COLUMN / REPLAY_TARGET_COLUMN 传错了。"
+            f"{name}文件缺列 {missing}；实有 {dataset.column_names}。{flags} 传错了。"
         )
 if failures:
     for item in failures:
         print(f"!! {item}")
     raise SystemExit(1)
 
-pool_usable = len(to_sft_schema(pool, schema_args))
-val_usable = len(to_sft_schema(val, schema_args))
+pool_usable = len(to_sft_schema(pool, argparse.Namespace(
+    replay_input_column=pool_in, replay_target_column=pool_out)))
+val_usable = len(to_sft_schema(val, argparse.Namespace(
+    replay_input_column=val_in, replay_target_column=val_out)))
 print(f"池装配后   = {len(pool)} -> 滤空行后 {pool_usable}")
 print(f"val 装配后 = {len(val)} -> 滤空行后 {val_usable}")
 
-# ---- prompt 文本的交集比例 ----
-# 93 号按行切开，所以行号一定不重叠；但语料自身可能有重复 prompt。判据是比例，
-# 不是 0。接近 100% 就说明两个文件根本不是从同一次切分里出来的。
-pool_prompts = set(pool[input_column])
-val_prompts = list(val[input_column])
-overlap = sum(1 for prompt in val_prompts if prompt in pool_prompts)
-ratio = overlap / max(len(val_prompts), 1)
+# ---- prompt 文本的交集 ----
+# 93 号按行切开，行号一定不重叠；这里查的是文本。两个文件 schema 不同，池的
+# inputs 可能带渲染过的模板而 val 的 question 是原始题干，所以精确匹配可能天然
+# 为 0 —— 那不是"证明了不重叠"，只是这个比法没意义。所以精确匹配落空时再做一次
+# 包含关系抽查，并且把"哪种比法生效了"打出来，不让一个空洞的 0% 冒充证据。
+pool_prompts = set(pool[pool_in])
+val_prompts = list(val[val_in])
+exact = sum(1 for prompt in val_prompts if prompt in pool_prompts)
+ratio = exact / max(len(val_prompts), 1)
 print(f"池内不同 prompt = {len(pool_prompts)} / {len(pool)}"
       f"  (语料自身重复率 {1 - len(pool_prompts) / max(len(pool), 1):.2%})")
-print(f"val 与池的 prompt 文本交集 = {overlap}/{len(val_prompts)}  ({ratio:.2%})")
-if ratio >= abort_ratio:
+print(f"val 与池的精确文本交集 = {exact}/{len(val_prompts)}  ({ratio:.2%})")
+
+if exact == 0:
+    # 抽 100 行做包含关系：池的 inputs 若把题干包在模板里，精确匹配必然落空，
+    # 但题干本身仍应能在池里被找到 —— 找不到才说明两边真是不同的行。
+    haystack = "\n".join(pool_prompts)
+    sample = val_prompts[:: max(len(val_prompts) // 100, 1)][:100]
+    contained = sum(1 for prompt in sample if prompt.strip() and prompt.strip() in haystack)
+    print(f"  精确匹配为 0，改做包含关系抽查: {contained}/{len(sample)} 命中")
+    if contained > len(sample) * abort_ratio:
+        failures.append(
+            f"抽查的 {len(sample)} 行里有 {contained} 行的题干出现在池内文本中，"
+            f"超过 {abort_ratio:.0%}：val 的行可能没真正从池里切走，replay 会训到"
+            "用来打分的题。查 93 号 Step 1 的切分是不是被覆盖过。"
+        )
+    else:
+        print(f"  -> 低于 {abort_ratio:.0%}。两个文件确实是不同的行。")
+elif ratio >= abort_ratio:
     failures.append(
         f"交集 {ratio:.2%} 超过 {abort_ratio:.0%}：val 基本就是池本身，replay 会训到"
         "用来打分的行。查 93 号 Step 1 的切分是不是被覆盖过。"
@@ -718,7 +751,13 @@ if [[ "${OLD_VAL}" == "1" ]]; then
     --prior_val_jsonl "math=${MATH_VAL}"
     --old_val_presliced 1
     --old_val_rows "${OLD_VAL_ROWS}"
+    --old_val_input_column "${OLD_VAL_INPUT_COLUMN}"
+    --old_val_target_column "${OLD_VAL_TARGET_COLUMN}"
   )
+  # 不传 --old_val_max_len：它默认 0 = 沿用 --max_len 1216，而 95 号那三条臂
+  # 就是这么打的。传 REPLAY_MAXLEN 会换掉截断预算，新臂的 old_val_loss_math
+  # 就和已训好的三条不可比了。真正权威的数是 102 号在 max_len 2048 下打的
+  # （实测 0% 截断），这里的 epoch 级数字只用来看形状。
 fi
 
 arm_train_args () {
