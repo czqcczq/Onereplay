@@ -624,6 +624,35 @@ def max_frozen_subspace_leak(model: nn.Module) -> float:
     return worst
 
 
+def _model_float_dtype(model: nn.Module) -> torch.dtype:
+    """The dtype the model's floating-point parameters are actually in."""
+
+    for parameter in model.parameters():
+        if parameter.is_floating_point():
+            return parameter.dtype
+    return torch.bfloat16
+
+
+def _config_dtype_key(config_dict: dict[str, Any]) -> str:
+    """Whichever key this transformers version stores the checkpoint dtype under.
+
+    4.x writes ``torch_dtype``; 5.x renamed it to ``dtype``. Guessing wrong
+    leaves a key that from_pretrained ignores, and the checkpoint would load at
+    the default dtype instead of the one it was trained in. Prefer whatever
+    ``config.to_dict()`` already emitted, and only fall back to a version test
+    when it emitted neither.
+    """
+
+    if "dtype" in config_dict:
+        return "dtype"
+    if "torch_dtype" in config_dict:
+        return "torch_dtype"
+    import transformers
+
+    major = int(str(transformers.__version__).split(".", 1)[0])
+    return "dtype" if major >= 5 else "torch_dtype"
+
+
 def save_osft_checkpoint(
     model: nn.Module,
     save_path: str,
@@ -649,7 +678,10 @@ def save_osft_checkpoint(
 
     state_dict = model.prepare_state_dict_for_save(model.state_dict())
 
-    target_dtype = save_dtype or getattr(model.config, "torch_dtype", None) or torch.bfloat16
+    # Read the dtype off the parameters rather than off the config. transformers
+    # renamed the config field from torch_dtype to dtype at 5.0, so either name
+    # may be absent, and what we want to write is what was actually trained.
+    target_dtype = save_dtype or _model_float_dtype(model)
     cpu = torch.device("cpu")
     state_dict = {
         key: (value.to(dtype=target_dtype, device=cpu) if value.is_floating_point() else value.to(cpu))
@@ -683,7 +715,9 @@ def save_osft_checkpoint(
     base_name = getattr(model, "_onereplay_base_class_name", None)
     if base_name:
         config_dict["architectures"] = [base_name]
-    config_dict["torch_dtype"] = str(target_dtype).replace("torch.", "")
+    # Write back under whichever key this transformers version already used, so
+    # the checkpoint is read the same way it would be for any other arm.
+    config_dict[_config_dtype_key(config_dict)] = str(target_dtype).replace("torch.", "")
     with open(directory / "config.json", "w", encoding="utf-8") as handle:
         json.dump(config_dict, handle, indent=2, sort_keys=True)
 
