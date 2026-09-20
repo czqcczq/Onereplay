@@ -41,7 +41,11 @@ from onereplay.data.batch_mix import (  # noqa: E402
     build_batch_mixed_loader,
     build_step_mixed_loader,
 )
-from onereplay.data.old_val import build_old_val_loader, build_prior_val_loaders  # noqa: E402
+from onereplay.data.old_val import (  # noqa: E402
+    build_old_val_dataset,
+    build_old_val_loader,
+    build_prior_val_loaders,
+)
 from onereplay.data.probe import build_probe_loaders  # noqa: E402
 from onereplay.data.replay import (  # noqa: E402
     build_replay_pools,
@@ -489,6 +493,18 @@ def parse_args() -> argparse.Namespace:
             "new-task rows per update, which every arm must hold equal."
         ),
     )
+    parser.add_argument(
+        "--replay_rows",
+        type=int,
+        default=0,
+        help=(
+            "Absolute number of replay rows to append, overriding --replay_ratio. "
+            "Data-level mixing only. The OPR baseline needs it: its buffer is built "
+            "offline to a fixed size and every row of it is meant to be trained on, "
+            "whereas a ratio is recomputed here against the post-split training set "
+            "and would ask for a count the buffer does not hold. 0 keeps the ratio."
+        ),
+    )
     parser.add_argument("--replay_dataset_path", type=str, default="")
     parser.add_argument(
         "--replay_data_files",
@@ -843,7 +859,12 @@ def validate_osft_args(args: argparse.Namespace) -> None:
             "--osft 1 with --replay_lambda > 0 would apply the subspace constraint and a "
             "DeltaW penalty at once, which is neither baseline. Run them as separate arms."
         )
-    if args.replay_ratio > 0 or args.replay_per_batch > 0 or args.replay_steps_per_update > 0:
+    if (
+        args.replay_ratio > 0
+        or args.replay_rows > 0
+        or args.replay_per_batch > 0
+        or args.replay_steps_per_update > 0
+    ):
         raise ValueError(
             "--osft 1 with replay mixing enabled would be an OSFT+replay combination, not "
             "the OSFT baseline. Run them as separate arms."
@@ -924,7 +945,10 @@ def main() -> None:
     schemes = [
         name
         for name, enabled in (
-            ("--replay_ratio (data-level)", args.replay_ratio > 0),
+            (
+                "--replay_ratio/--replay_rows (data-level)",
+                args.replay_ratio > 0 or args.replay_rows > 0,
+            ),
             ("--replay_per_batch (batch-level)", args.replay_per_batch > 0),
             ("--replay_steps_per_update (step-level)", args.replay_steps_per_update > 0),
         )
@@ -957,7 +981,7 @@ def main() -> None:
             "--replay_per_batch / --replay_steps_per_update are not defined for --paradigm opd"
         )
 
-    if args.replay_ratio > 0:
+    if args.replay_ratio > 0 or args.replay_rows > 0:
         # Validation stays pure new-task so val_loss remains comparable with
         # the vanilla and OneReplay runs.
         train_dataset = mix_replay_into_train(args, tokenizer, train_dataset)
@@ -1046,7 +1070,12 @@ def main() -> None:
         # student rollout scored by the teacher, so what came back would not be
         # the quantity this claims to report.
         raise ValueError("--old_val_jsonl is not defined for --paradigm opd")
-    old_val_loader = build_old_val_loader(args, tokenizer)
+    # Tokenized once and handed to both readers: the epoch-level loader below and
+    # the step-level probe further down. Two calls would write the same
+    # old_val_tokenized.arrow twice and the second write would invalidate the
+    # first reader's memory map.
+    old_val_dataset = build_old_val_dataset(args, tokenizer)
+    old_val_loader = build_old_val_loader(args, tokenizer, dataset=old_val_dataset)
     prior_val_loaders = build_prior_val_loaders(args, tokenizer)
 
     # The trainer counts micro-batches, so convert once here. Going through
@@ -1065,7 +1094,9 @@ def main() -> None:
             f"probing every {args.probe_every_updates} updates "
             f"= {args.probe_every} micro-batches (accum_steps={accumulation_steps})"
         )
-    probe_loaders = build_probe_loaders(args, tokenizer, valid_dataset)
+    probe_loaders = build_probe_loaders(
+        args, tokenizer, valid_dataset, old_val_dataset=old_val_dataset
+    )
 
     optimizer = torch.optim.Adam(
         filter(lambda parameter: parameter.requires_grad, model.parameters()),

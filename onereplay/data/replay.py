@@ -353,7 +353,16 @@ def mix_replay_into_train(args: argparse.Namespace, tokenizer, train_dataset):
     baseline is meant to expose.
     """
 
-    num_replay = int(round(args.replay_ratio * len(train_dataset)))
+    # An absolute count when one is given. OPR fixes its buffer size up front
+    # (int(dataset_size * rho)) and then trains on all of it, so a ratio
+    # recomputed here against the post-split training set would ask for a
+    # different number of rows than the buffer actually holds.
+    requested_rows = int(getattr(args, "replay_rows", 0) or 0)
+    if requested_rows > 0:
+        num_replay = requested_rows
+        print(f"replay_rows={num_replay}: using an absolute count, --replay_ratio ignored")
+    else:
+        num_replay = int(round(args.replay_ratio * len(train_dataset)))
     if num_replay <= 0:
         print(f"replay_ratio={args.replay_ratio} rounds to 0 samples; training stays vanilla")
         return train_dataset
@@ -371,9 +380,10 @@ def mix_replay_into_train(args: argparse.Namespace, tokenizer, train_dataset):
 
     mixed = concatenate_datasets([train_dataset, replay_dataset]).shuffle(seed=args.seed)
     flavor = replay_target_flavor(args)
+    requested = f"rows={requested_rows}" if requested_rows > 0 else f"ratio={args.replay_ratio}"
     print(
         f"{flavor} replay: {len(train_dataset)} new-task + {len(replay_dataset)} replay "
-        f"= {len(mixed)} rows (ratio={args.replay_ratio}, "
+        f"= {len(mixed)} rows ({requested}, "
         f"actual={len(replay_dataset) / max(len(train_dataset), 1):.4f})"
     )
     return mixed

@@ -137,12 +137,22 @@ def build_self_distilled_probe(
     )
 
 
-def build_probe_loaders(args: argparse.Namespace, tokenizer, valid_dataset) -> dict[str, DataLoader]:
+def build_probe_loaders(
+    args: argparse.Namespace,
+    tokenizer,
+    valid_dataset,
+    old_val_dataset=None,
+) -> dict[str, DataLoader]:
     """Assemble every probe the flags ask for, keyed by curve name.
 
     Returns an empty dict when --probe_every is 0, which is the switch that
     keeps this whole path out of the production runs whose timings are
     reported.
+
+    old_val_dataset is the slice the epoch-level loader is already holding. It
+    must be reused rather than rebuilt: both calls map into the same
+    old_val_tokenized.arrow, and rewriting it pulls the file out from under that
+    loader's memory map (see build_old_val_loader).
     """
 
     if args.probe_every <= 0:
@@ -179,7 +189,11 @@ def build_probe_loaders(args: argparse.Namespace, tokenizer, valid_dataset) -> d
     # returns None when --old_val_jsonl is unset, so a line that does not use it
     # is untouched.
     if args.probe_old_val_size != 0:
-        old_val = build_old_val_dataset(args, tokenizer)
+        old_val = (
+            old_val_dataset
+            if old_val_dataset is not None
+            else build_old_val_dataset(args, tokenizer)
+        )
         if old_val is not None:
             subset = _subsample(old_val, args.probe_old_val_size)
             loaders["old_val"] = build_probe_loader(subset, tokenizer, batch_size)

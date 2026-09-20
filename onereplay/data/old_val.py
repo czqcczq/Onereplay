@@ -196,10 +196,12 @@ def _slice_loader(
     tokenizer,
     cache_name: str,
     label: str,
+    dataset=None,
 ):
     """Epoch-level loader over one domain's held-out slice."""
 
-    dataset = _slice_dataset(corpus_path, args, tokenizer, cache_name, label)
+    if dataset is None:
+        dataset = _slice_dataset(corpus_path, args, tokenizer, cache_name, label)
     batch_size = args.eval_batch_size or args.batch_size
     print(f"{label}: epoch-level loader at batch size {batch_size}")
     return build_loader(dataset, tokenizer, batch_size=batch_size, train=False)
@@ -218,13 +220,26 @@ def build_old_val_dataset(args: argparse.Namespace, tokenizer):
     return _slice_dataset(corpus_path, args, tokenizer, "old_val_tokenized.arrow", "old val")
 
 
-def build_old_val_loader(args: argparse.Namespace, tokenizer):
-    """Loader over the old domain's held-out slice, or None when disabled."""
+def build_old_val_loader(args: argparse.Namespace, tokenizer, dataset=None):
+    """Loader over the old domain's held-out slice, or None when disabled.
+
+    dataset is what build_old_val_dataset already returned. It has to be passed
+    whenever both routes are alive in one process -- the epoch-level loader here
+    and the step-level probe -- because both map into the same
+    old_val_tokenized.arrow with load_from_cache_file=False. The second map
+    renames a freshly written file over that path, so the first dataset is left
+    memory-mapped onto an inode nothing links to any more, and the next page it
+    has to fault in kills the process with SIGBUS instead of raising. That read
+    is the end-of-epoch old_val_loss, i.e. after the last training step of the
+    run, which is the most expensive place to lose a job.
+    """
 
     corpus_path = str(getattr(args, "old_val_jsonl", "") or "")
     if not corpus_path:
         return None
-    return _slice_loader(corpus_path, args, tokenizer, "old_val_tokenized.arrow", "old val")
+    return _slice_loader(
+        corpus_path, args, tokenizer, "old_val_tokenized.arrow", "old val", dataset=dataset
+    )
 
 
 def build_prior_val_loaders(args: argparse.Namespace, tokenizer):

@@ -24,6 +24,13 @@ inside --max_len. A row whose answer would not fit is written back with an
 empty target and truncated=1; training drops those rows rather than learning
 "never emit a stop token" from a cut-off answer.
 
+The same machinery produces the candidate pool for the OPR baseline, which
+needs three things this script did not originally do: sampling instead of greedy
+decoding, keeping a cut-off answer instead of blanking it, and recording the
+per-row mean log-probability that OPR-SC ranks by. Those are --temperature,
+--keep_truncated_text and --record_logprob; every default leaves the behavior
+the existing self-distilled corpora were generated with untouched.
+
 Usage: python -m onereplay.scripts.generate_replay_targets [args]
 """
 
@@ -141,6 +148,59 @@ def parse_args() -> argparse.Namespace:
             "the chat template strips <think> back out."
         ),
     )
+    # --- OPR baseline knobs. Every default reproduces the behavior this script
+    # --- had before they existed, so the self-distilled pools already on disk
+    # --- stay reproducible byte for byte.
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help=(
+            "0 keeps greedy decoding (do_sample=False), which is what the "
+            "self-distilled replay corpora were generated with. A positive value "
+            "samples at that temperature; the OPR baseline uses 0.1, matching both "
+            "of its generate_opr_*.py scripts."
+        ),
+    )
+    parser.add_argument(
+        "--keep_truncated_text",
+        type=int,
+        default=0,
+        help=(
+            "0 blanks the target of an answer that hit the budget without emitting "
+            "a stop token, so the loader drops the row rather than teaching the "
+            "model never to end its turn. 1 keeps the cut-off text and only marks "
+            "truncated=1, which is what OPR does -- it filters candidate length "
+            "before generating and never re-checks afterwards. Pair it with "
+            "--replay_drop_truncated 0 at training time or the row is dropped anyway."
+        ),
+    )
+    parser.add_argument(
+        "--record_logprob",
+        type=int,
+        default=0,
+        help=(
+            "1 writes avg_logprob per row: the mean log-probability of the tokens "
+            "the model actually generated, including the stop token. This is the "
+            "score OPR-SC ranks by (their tools/generate_opr_sc.py averages vLLM's "
+            "logprobs the same way). Costs one float tensor per decoding step, so "
+            "lower --batch_size if the extra few GiB do not fit."
+        ),
+    )
+    parser.add_argument(
+        "--logprob_source",
+        type=str,
+        choices=["raw", "sampling"],
+        default="raw",
+        help=(
+            "Which distribution avg_logprob is read off. raw uses the unmodified "
+            "logits, so the score is the model's own confidence and does not move "
+            "when --temperature does. sampling uses the temperature-warped "
+            "distribution the token was actually drawn from, which is closer to "
+            "what vLLM hands OPR. The two rank rows differently, so the choice is "
+            "printed at startup and belongs in the run's notes."
+        ),
+    )
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument(
         "--resume",
@@ -204,6 +264,7 @@ def summarize(output_path: Path) -> None:
     truncated = 0
     empty = 0
     target_tokens = 0
+    logprobs: list[float] = []
     with output_path.open(encoding="utf-8") as file:
         for line in file:
             line = line.strip()
@@ -211,25 +272,61 @@ def summarize(output_path: Path) -> None:
                 continue
             record = json.loads(line)
             total += 1
-            if record.get("truncated"):
-                truncated += 1
-            elif not record.get("targets", "").strip():
+            if "avg_logprob" in record:
+                logprobs.append(float(record["avg_logprob"]))
+            # An empty target is unusable whatever the flags say: to_sft_schema
+            # filters it. A non-empty truncated target only survives when
+            # training passes --replay_drop_truncated 0, so it gets its own line
+            # rather than being folded into either bucket.
+            if not record.get("targets", "").strip():
                 empty += 1
+            elif record.get("truncated"):
+                truncated += 1
+                target_tokens += int(record.get("target_tokens", 0))
             else:
                 usable += 1
                 target_tokens += int(record.get("target_tokens", 0))
     print(
-        f"generated rows      : {total}\n"
-        f"usable for training : {usable}\n"
-        f"dropped (truncated) : {truncated}\n"
-        f"dropped (empty)     : {empty}\n"
-        f"mean answer tokens  : {target_tokens / max(usable, 1):.1f}"
+        f"generated rows        : {total}\n"
+        f"usable for training   : {usable}\n"
+        f"kept but truncated    : {truncated}   (needs --replay_drop_truncated 0)\n"
+        f"dropped (empty)       : {empty}\n"
+        f"mean answer tokens    : {target_tokens / max(usable + truncated, 1):.1f}"
     )
+    if logprobs:
+        ordered = sorted(logprobs)
+        print(
+            f"avg_logprob           : min {ordered[0]:.4f} / "
+            f"median {ordered[len(ordered) // 2]:.4f} / max {ordered[-1]:.4f} "
+            f"over {len(ordered)} rows"
+        )
     if usable < total * 0.8:
         print(
             "warning: more than 20% of the pool is unusable; raise --max_len or "
             "--max_new_tokens, or generate a larger --pool_size"
         )
+
+
+def per_token_logprobs(outputs, generated: torch.Tensor, source: str) -> torch.Tensor:
+    """Log-probability of each token the model emitted, shaped (batch, steps).
+
+    Formed one decoding step at a time. Stacking the whole tuple first would
+    materialize steps x batch x vocab floats, which on a 150k-token vocabulary
+    is tens of gigabytes for a single batch.
+
+    source="raw" reads the untouched logits, so the score measures the model's
+    confidence and is unaffected by --temperature. source="sampling" reads the
+    warped distribution the token was actually drawn from, which is the closer
+    analogue of what vLLM reports to OPR. They rank rows differently once the
+    temperature is not 1, which is why the caller has to choose.
+    """
+
+    per_step = outputs.logits if source == "raw" else outputs.scores
+    columns = []
+    for step, step_values in enumerate(per_step):
+        log_probs = torch.log_softmax(step_values.float(), dim=-1)
+        columns.append(log_probs.gather(-1, generated[:, step : step + 1]))
+    return torch.cat(columns, dim=1)
 
 
 def generate_targets(args: argparse.Namespace) -> None:
@@ -282,22 +379,28 @@ def generate_targets(args: argparse.Namespace) -> None:
         )
     }
 
-    def write(sink, index: int, target: str, truncated: bool, answer_tokens: int) -> None:
-        sink.write(
-            json.dumps(
-                {
-                    "index": index,
-                    "inputs": instructions[index],
-                    "targets": target,
-                    "gold_targets": gold[index],
-                    "truncated": truncated,
-                    "prompt_tokens": prompt_tokens[index],
-                    "target_tokens": answer_tokens,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
+    def write(
+        sink,
+        index: int,
+        target: str,
+        truncated: bool,
+        answer_tokens: int,
+        avg_logprob: float | None = None,
+    ) -> None:
+        record = {
+            "index": index,
+            "inputs": instructions[index],
+            "targets": target,
+            "gold_targets": gold[index],
+            "truncated": truncated,
+            "prompt_tokens": prompt_tokens[index],
+            "target_tokens": answer_tokens,
+        }
+        # Only present when asked for, so a file generated without
+        # --record_logprob keeps the schema every earlier reader expects.
+        if avg_logprob is not None:
+            record["avg_logprob"] = avg_logprob
+        sink.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # A prompt this long leaves no room for an answer inside the training
     # budget. Filtering it here rather than at batch time also keeps a handful
@@ -316,6 +419,25 @@ def generate_targets(args: argparse.Namespace) -> None:
     eos_token_id = tokenizer.eos_token_id
     num_batches = (len(order) + args.batch_size - 1) // args.batch_size
     start_time = time.time()
+
+    if args.temperature > 0:
+        sampling_kwargs = {"do_sample": True, "temperature": args.temperature}
+        print(f"decoding: sampling at temperature {args.temperature}")
+    else:
+        sampling_kwargs = {"do_sample": False}
+        print("decoding: greedy")
+    if args.record_logprob == 1:
+        # output_logits carries the unprocessed logits, output_scores the ones the
+        # sampler actually drew from. Ask for both so --logprob_source can pick
+        # without a second pass.
+        scoring_kwargs = {
+            "return_dict_in_generate": True,
+            "output_scores": True,
+            "output_logits": True,
+        }
+        print(f"recording avg_logprob from the {args.logprob_source} distribution")
+    else:
+        scoring_kwargs = {}
 
     with output_path.open("a", encoding="utf-8") as sink:
         for index in over_long:
@@ -336,24 +458,43 @@ def generate_targets(args: argparse.Namespace) -> None:
             )
 
             with torch.no_grad():
-                output_ids = model.generate(
+                outputs = model.generate(
                     **encoded,
                     max_new_tokens=budget,
-                    do_sample=False,
+                    **sampling_kwargs,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=eos_token_id,
+                    **scoring_kwargs,
                 )
-            generated = output_ids[:, encoded["input_ids"].shape[1] :]
+            sequences = outputs.sequences if args.record_logprob == 1 else outputs
+            generated = sequences[:, encoded["input_ids"].shape[1] :]
+            token_logprobs = (
+                per_token_logprobs(outputs, generated, args.logprob_source)
+                if args.record_logprob == 1
+                else None
+            )
 
-            for index, ids in zip(chunk, generated):
+            for row, (index, ids) in enumerate(zip(chunk, generated)):
                 token_ids = ids.tolist()
-                # No stop token means the answer ran into the budget. Training
-                # on it would teach the model not to end its turn, so drop the
-                # text and let the loader filter the row out.
+                # No stop token means the answer ran into the budget.
                 stopped = eos_token_id in token_ids
                 answer_tokens = token_ids.index(eos_token_id) if stopped else len(token_ids)
                 text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-                write(sink, index, text if stopped else "", not stopped, answer_tokens)
+                # Training on a cut-off answer teaches the model never to end its
+                # turn, so by default the text is dropped and the loader filters
+                # the row. --keep_truncated_text 1 keeps it, which is OPR's
+                # behavior: it caps candidate length before generating and never
+                # re-checks the output.
+                keep = stopped or args.keep_truncated_text == 1
+                avg_logprob = None
+                if token_logprobs is not None:
+                    # vLLM returns one logprob per token it emitted, and it stops
+                    # after the stop token, so the stop token is included. Match
+                    # that span rather than averaging over the padding beyond it.
+                    span = answer_tokens + 1 if stopped else len(token_ids)
+                    span = max(min(span, token_logprobs.shape[1]), 1)
+                    avg_logprob = float(token_logprobs[row, :span].mean())
+                write(sink, index, text if keep else "", not stopped, answer_tokens, avg_logprob)
             sink.flush()
 
             if args.log_every > 0 and batch_number % args.log_every == 0:
