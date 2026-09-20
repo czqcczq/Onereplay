@@ -1,0 +1,1057 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_finratio
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: finance 线 —— replay ratio 扫描（96 号的重构版）
+#
+# 一次投递跑完四条 replay 臂，回答一个问题：
+#
+#     保护域的 val loss 随 replay 比例怎么变，以及要付多少额外开销。
+#
+# 只训练、只存 checkpoint。**不做评测、不打中间探针**，分数与 CE 都是事后用
+# 102 号一次打完（见末尾的交接命令）。
+#
+# -----------------------------------------------------------------------------
+# !! 为什么不是 96 号那一版，而要重构
+#
+#   96 号跑在 DialogSum / Qwen3-8B / 保护域 if 上，八小时跑完结论不能用：
+#   保护域的 gold CE **不升反降**，vanilla 从 base 的 2.9218 掉到 1.9118。
+#   102 号后来把这件事量遍了：
+#
+#       线 / 基座                  语料          base -> vanilla        判据
+#       DialogSum / Qwen3-8B      FLAN gold     2.9218 -> 1.9118  -34.6%  作废
+#       DialogSum / Qwen3-8B      math gold     0.6769 -> 0.3865  -42.9%  作废
+#       DialogSum / Qwen3-8B      code gold     1.0030 -> 0.4683  -53.3%  作废
+#       finance   / Qwen2.5-1.5B  math gold     0.2892 -> 0.3133  +8.3%   方向对
+#       finance   / Qwen2.5-1.5B  code gold     0.5973 -> 0.5887  -1.4%   没信号
+#
+#   机制：CE(gold) 问的是"多会预测这个语料的参考答案"，而任何指令 SFT 都会让
+#   模型进入"按数据集口吻直接作答"的通用模式，在**任何** SFT 语料的 gold 答案上
+#   把 CE 压下去。Qwen3-8B 的默认风格离简短 gold 答案很远，那块增益（0.29-1.01）
+#   远大于能力损失带来的上升，所以三个域全反。Qwen2.5-1.5B-**Instruct** 已经指令
+#   微调过，这块增益早就入账，混淆项基本消失，剩下的才是真实漂移。
+#
+#   所以这条线换成 finance / 1.5B / 保护 math，这是唯一方向正确的组合。
+#
+# -----------------------------------------------------------------------------
+# !! 量程很薄，这是本实验最大的风险
+#
+#   vanilla 的总漂移只有 +0.0241（配对 bootstrap 95% 区间 [0.0221, 0.0262]，
+#   p<1e-4）。测量本身很精确 —— 500 行 13.7 万 token，抽样误差 ±0.0021 —— 但
+#   **四条臂要在 0.0241 这个量程里分开**。
+#
+#   96 号那轮各臂之间的差是 vanilla 总漂移的 1-30%，同样的比例套过来是
+#   0.0002-0.007，而借来的噪声地板 δ=0.0077（8B 线上 bs4 与 bs2 两条 vanilla
+#   末点的间距）就在这个量级。
+#
+#   δ 是借的，两个方向都不可靠：噪声若是**绝对**的，四条臂读不出来；若随漂移量
+#   **按比例**缩放（8B 线上 δ/总漂移 = 0.76%），对应到这里是 0.0002，绰绰有余。
+#   要定这件事只有一个办法：跑一条 micro-batch 不同的 vanilla 对照，在**本线**上
+#   量 δ 而不是借。ARMS 里加 'vanilla@4' 就是它（默认不开，见下）。
+#
+# -----------------------------------------------------------------------------
+# !! step 级编排，不是 95 号的 batch 级 —— 两个理由
+#
+#   95 号用 --replay_per_batch，replay 行从 batch_size 里**切**出来。拿它扫 ratio
+#   有两个硬伤：
+#
+#   1) 比例被整除条件锁死。ARM_ACCUM = ACCUM*BATCH/new_per_batch 必须整除，
+#      即 new_per_batch 要整除 ACCUM*BATCH = 512，于是 new_per_batch ∈ {1,2,4,8}，
+#      r ∈ {7, 3, 1, 0}。**r < 1 一档都取不到**，扫描无从谈起。
+#
+#   2) 行份额 != loss 权重。同一个 micro-batch 里两个语料共用一次 token 平均，
+#      各自占多少梯度取决于答案长度。CS 线实测 50.00% 的行份额携带 93.16% 的
+#      supervised token。自变量本来就是"比例"的实验，这一点是致命的。
+#      （95 号那条 4n4r 臂的真实 w 印在它自己的 train.log 里，grep
+#        "share of supervised tokens" 就能看到。）
+#
+#   step 级（--replay_steps_per_update）一个 window 里 NEW_STEPS 个 micro-batch
+#   全是新任务、R 个全是 replay，各自按自己的 token 平均，window 再等权相加，
+#   所以累积梯度精确等于
+#
+#       (1 - w) * L_new + w * L_replay ,   w = R / (NEW_STEPS + R)
+#
+#   与答案长度无关。这正是"把两个数据集按比例混成一个"想表达的东西。
+#
+# -----------------------------------------------------------------------------
+# !! ACCUM 的算法：train.py 是**减**不是加
+#
+#   train.py 的 step 级路径：
+#       window_steps = accumulation_size // batch_size
+#       new_steps    = window_steps - replay_steps_per_update
+#   它从 accumulation_size 里减掉 R，不是在外面加。所以要守住"每次更新 64 行
+#   新任务"，ACCUM 必须**跟着 R 抬**：
+#
+#       R    ACCUM=(8+R)*8   window   new_steps   r=R/8    w=R/(8+R)   开销
+#       1    72              9        8           0.125    0.1111      1.125x
+#       2    80              10       8           0.250    0.2000      1.25x
+#       4    96              12       8           0.500    0.3333      1.50x
+#       8    128             16       8           1.000    0.5000      2.00x
+#
+#   这四档就是 8:1 / 4:1 / 2:1 / 1:1。开销倍数 = 1 + r，96 号实测过它准到 1-3%
+#   （8B 线 r=1.0 预期 2.00x、实测 1.936x）。
+#
+#   !! 每次更新的新任务行数恒为 64，这是整个扫描以及"复用已训好的臂"的前提
+#   94/95 号的 vanilla / EWC / OneReplay 是 BATCH 8 x ACCUM_STEPS 8 = 64 行/update。
+#   本脚本四条臂也是 8 steps x 8 rows = 64。一致，所以它们可以并排比，
+#   **那三条臂不需要重训**。
+#
+#   顺带：R=8 的 window 是 16 个 micro-batch x 8 行，与 95 号那条 4n4r 臂
+#   （ARM_ACCUM=128，16 个 micro-batch x 8 行）计算量完全相同，只是 loss 平均
+#   方式不同。所以 4n4r 的 train_sec 就是 r=1.0 这档的开销预测。
+#
+# -----------------------------------------------------------------------------
+# !! 不打中间探针，分数事后算
+#
+#   训练期探针 (--probe_every_updates) **不写逐行数据**，而配对 bootstrap 要它。
+#   score_probe_ce 写。所以流程是：这里只训练 + SAVE=1，训完用 102 号把所有臂
+#   一次打完，再拿 per_row 跑 bootstrap_probe_ce。锚点不缺 —— base = 0.2892 已经
+#   用同一套管线量过。
+#
+#   epoch 级的 --prior_val_jsonl 保留（OLD_VAL=1，默认开）。它只有 500 行 x 2
+#   epoch，代价可以忽略，换来的是**新臂的 metrics 里有 old_val_loss_math，与已经
+#   训好的那三条臂的 metrics 同字段可比**，不必等 102 号跑完就能看个大概。
+#   注意它是 batch 平均，102 号是 token 加权，两个数不会逐位相等，别混用。
+#
+# -----------------------------------------------------------------------------
+# !! 磁盘：四个全参 checkpoint
+#   1.5B bf16 单份约 3.1 GB，四条臂约 12.5 GB（含 optimizer state 会更多）。
+#   打完分就可以删。Step 0 会打一次 df。
+#
+# -----------------------------------------------------------------------------
+# 投递前要有的东西
+#   1) ${MODEL_DIR}/Qwen2.5-1.5B-Instruct
+#   2) ${DATASET_DIR} = data/processed/finance_train        （94 号的 prepare 产出）
+#   3) ${SPLIT_DIR}/math_pool.jsonl 与 math_val500.jsonl    （93 号 Step 1 产出）
+#   4) 94 号的 vanilla checkpoint（只用来做成本分母，可选）
+#
+# 投递:
+#   # 先看计划（DRY_RUN=1 是默认）—— 会把四条臂的编排算术全列出来
+#   qsub onereplay/pbs/104_finance_replay_ratio.pbs
+#
+#   # 一次跑完四条臂
+#   qsub -v DRY_RUN=0 onereplay/pbs/104_finance_replay_ratio.pbs
+#
+#   # 只跑其中几条。语法 kind[:R][@batch]
+#   qsub -v DRY_RUN=0,ARMS='replay:1,replay:8' onereplay/pbs/104_finance_replay_ratio.pbs
+#
+#   # 补一条本线的噪声地板对照（强烈建议，见上面"量程很薄"）
+#   qsub -v DRY_RUN=0,ARMS='vanilla@4' onereplay/pbs/104_finance_replay_ratio.pbs
+#
+#   # 冒烟（约 20 min，四条臂各跑 6 次更新，确认编排与保存写得出来）
+#   qsub -v DRY_RUN=0,PROBE=1 onereplay/pbs/104_finance_replay_ratio.pbs
+#
+#   # 补跑挂掉的那条：直接重投，已完成的臂会被跳过（FORCE_TRAIN=1 可强制重跑）
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/104_finance_replay_ratio.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT DATA_ROOT PROCESSED_DIR DATASET_DIR
+    SPLIT_DIR DATASET_CACHE MAP_CACHE_ROOT CKPT_DIR METRICS_DIR
+    DRY_RUN PROBE ALLOW_DRIFT SKIP_POOL_CHECK FORCE_TRAIN KEEP_GOING
+    ARMS ARM REPLAY_STEPS
+    COV_PATH MATH_COV OLD_VAL OLD_VAL_ROWS OVERLAP_ABORT_RATIO
+    REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN REPLAY_POOL_SIZE
+    REPLAY_SAMPLE_SEED REPLAY_MAXLEN REPLAY_DROP_TRUNCATED
+    SEED EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH NEW_PER_UPDATE
+    MAXLEN VAL_FRAC MAXVAL EVAL_BATCH TARGET_MODULES SYSTEM_PROMPT
+    SAVE MAX_STEPS RUN_PREFIX VANILLA_RUN LOG_EVERY EVAL_BEFORE_TRAIN
+    MAX_TRAIN_SAMPLES MEASURE_ZERO
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的检查与训练。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+
+# ---- 项目路径：与 95 号逐字相同 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen2.5-1.5B-Instruct}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_finance_${MODEL_NAME}}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+TRAIN_LOG_DIR="${RESULTS_ROOT}/train_logs"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
+DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/finance_train}"
+SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
+COV_DIR="${RESULTS_ROOT}/cov"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+# tokenize 后的 arrow 落在节点本地盘。共享文件系统上的 mmap 对"文件在映射期间被
+# 换掉"只给 SIGBUS 不报错，一次就是一条臂。放本地盘还顺带快一截。
+MAP_CACHE_ROOT="${MAP_CACHE_ROOT:-${TMPDIR}/map_cache}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"   # 1 = 已完成的臂也重跑
+KEEP_GOING="${KEEP_GOING:-1}"     # 1 = 某条臂失败时继续跑后面的
+PROBE="${PROBE:-0}"               # 1 = 每条臂只跑 6 次更新，看编排
+ALLOW_DRIFT="${ALLOW_DRIFT:-0}"
+SKIP_POOL_CHECK="${SKIP_POOL_CHECK:-0}"
+
+# ---- 训练超参：与 94/95 号逐字一致 ----
+SEED="${SEED:-42}"
+EPOCHS="${EPOCHS:-2}"
+LR="${LR:-8e-5}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+BATCH="${BATCH:-8}"
+NEW_PER_UPDATE="${NEW_PER_UPDATE:-64}"   # 四条臂与已训好三条臂共同的不变量
+MAXLEN="${MAXLEN:-1216}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-200}"
+EVAL_BATCH="${EVAL_BATCH:-${BATCH}}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-0}"
+LOG_EVERY="${LOG_EVERY:-500}"
+EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-1}"
+SAVE="${SAVE:-1}"                # 必须存：分数是事后用 102 号打的
+MAX_STEPS="${MAX_STEPS:-0}"
+
+# ---- replay：每一项都与 93 号物化该池时、以及 95 号消费它时逐字对应 ----
+MATH_POOL="${SPLIT_DIR}/math_pool.jsonl"
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
+MATH_VAL="${SPLIT_DIR}/math_val${OLD_VAL_ROWS}.jsonl"
+REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN:-inputs}"
+REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-gold_targets}"
+REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-0}"        # 文件本身就是池，不再二次切
+REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"    # = 93 号采 C/F 的 --sample_seed
+REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"           # = 95 号 DOMAIN=math 的预算
+REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED:-0}"
+# replay 臂必须是 0：留 1 的话 C 仍会被加载并每步求值，白付时间，而报出来的墙钟
+# 会被拿去和 onereplay 比。单传 --cov_path "" 挡不住，见 95 号文件头。
+MEASURE_ZERO="${MEASURE_ZERO:-0}"
+MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_all.pt}"
+COV_PATH="${COV_PATH:-${MATH_COV}}"   # 只用来对表同池，本脚本不加载它训练
+
+# ---- epoch 级的保护域 val：保留，理由见文件头 ----
+OLD_VAL="${OLD_VAL:-1}"
+OVERLAP_ABORT_RATIO="${OVERLAP_ABORT_RATIO:-0.25}"
+
+if [[ "${PROBE}" == "1" ]]; then
+  SAVE=0
+  EPOCHS=1
+  MAX_STEPS=6
+  LOG_EVERY=1
+  echo "PROBE=1：每条臂 6 次更新、EPOCHS=1、不存 checkpoint"
+fi
+
+RUN_PREFIX="${RUN_PREFIX:-fin_replay_math}"
+# 94 号的 vanilla，成本分母。
+VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${EPOCHS}_seed${SEED}}"
+
+# ===========================================================================
+# 要跑哪些臂
+#   ARMS 用逗号分隔。语法 kind[:R][@batch]
+#     R     只有 replay 吃，是每次更新里纯 replay 的 micro-batch 数
+#     batch 覆盖该臂的 micro-batch（NEW_STEPS 跟着配平，每次更新仍是 64 行新任务）
+#
+#   vanilla@4 不在默认网格里，但强烈建议单独补一条：它是**本线**的噪声地板 δ。
+#   batch 4 与 batch 8 每次更新覆盖的是同一批 64 行（DataLoader 的排列与
+#   batch_size 无关），所以它与 94 号的 vanilla 本该重合，差多少就是 δ。
+#   没有它，所有"谁比谁低"的声明都只能引用 8B 线上借来的 0.0077。
+# ===========================================================================
+DEFAULT_ARMS="replay:1,replay:2,replay:4,replay:8"
+ARMS="${ARMS:-}"
+if [[ -z "${ARMS}" ]]; then
+  if [[ -n "${ARM:-}" ]]; then
+    ARMS="${ARM}"
+    if [[ "${ARM}" == "replay" && -n "${REPLAY_STEPS:-}" ]]; then
+      ARMS="replay:${REPLAY_STEPS}"
+    fi
+  else
+    ARMS="${DEFAULT_ARMS}"
+  fi
+fi
+
+ARM_KINDS=()
+ARM_RSTEPS=()
+ARM_BATCHES=()
+IFS=',' read -r -a _ARM_SPECS <<< "${ARMS}"
+for _spec in "${_ARM_SPECS[@]}"; do
+  _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+  [[ -z "${_spec}" ]] && continue
+  # @batch 先摘掉，再拆 :R —— 反过来的话 "replay:2@4" 的 R 会带上 "@4"。
+  _batch=0
+  if [[ "${_spec}" == *@* ]]; then
+    _batch="${_spec##*@}"
+    _spec="${_spec%@*}"
+    if ! [[ "${_batch}" =~ ^[0-9]+$ ]] || (( _batch <= 0 )); then
+      echo "!! '${_spec}@${_batch}' 的 batch 非法，@ 后面要是正整数"
+      exit 1
+    fi
+  fi
+  _kind="${_spec%%:*}"
+  _rsteps=0
+  if [[ "${_spec}" == *:* ]]; then
+    _rsteps="${_spec#*:}"
+  fi
+  case "${_kind}" in
+    vanilla)
+      if (( _rsteps != 0 )); then
+        echo "!! '${_spec}'：只有 replay 臂吃冒号后面的 R。"
+        exit 1
+      fi
+      ;;
+    replay)
+      if ! [[ "${_rsteps}" =~ ^[0-9]+$ ]] || (( _rsteps <= 0 )); then
+        echo "!! '${_spec}' 缺少或非法的 R。写法是 replay:<每次更新的纯 replay micro-batch 数>，"
+        echo "   例如 replay:2。网格: 1 / 2 / 4 / 8 -> r = 0.125 / 0.25 / 0.5 / 1.0"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "!! ARMS 里的 '${_spec}' 不认识。本脚本只训 replay 扫描和 vanilla 对照；"
+      echo "   EWC / OneReplay 用 95 号，它们已经训好了，不必重训。"
+      exit 1
+      ;;
+  esac
+  ARM_KINDS+=("${_kind}")
+  ARM_RSTEPS+=("${_rsteps}")
+  ARM_BATCHES+=("${_batch}")
+done
+if (( ${#ARM_KINDS[@]} == 0 )); then
+  echo "!! ARMS='${ARMS}' 解析不出任何臂"; exit 1
+fi
+
+# ---- 按臂解析 batch 与编排 ----
+# !! train.py 的 step 级路径是 new_steps = accumulation_size/batch_size - R，
+#    它从 window 里**减**掉 R。所以 ACCUM 要按 (NEW_STEPS + R) * BATCH 抬上去，
+#    这样 new_steps 才恰好是 NEW_STEPS，每次更新仍是 NEW_PER_UPDATE 行新任务。
+plan_arm () {
+  P_KIND="$1"
+  P_RSTEPS="$2"
+  local override="${3:-0}"
+  P_DEFAULT_BATCH="${BATCH}"
+  if (( override > 0 )); then
+    P_BATCH="${override}"
+  else
+    P_BATCH="${P_DEFAULT_BATCH}"
+  fi
+  if (( NEW_PER_UPDATE % P_BATCH != 0 )); then
+    echo "!! ${P_KIND}: NEW_PER_UPDATE=${NEW_PER_UPDATE} 不能被 batch ${P_BATCH} 整除，"
+    echo "   凑不出整数个新任务 micro-batch。"
+    return 1
+  fi
+  P_NEW_STEPS=$(( NEW_PER_UPDATE / P_BATCH ))
+  P_WINDOW=$(( P_NEW_STEPS + P_RSTEPS ))
+  P_ACCUM=$(( P_WINDOW * P_BATCH ))
+  P_REPLAY_PER_UPDATE=$(( P_RSTEPS * P_BATCH ))
+  case "${P_KIND}" in
+    vanilla) P_TAG="fin_vanilla_step" ;;
+    replay)  P_TAG="${RUN_PREFIX}_${P_NEW_STEPS}n${P_RSTEPS}r_step" ;;
+  esac
+  if [[ "${P_KIND}" == "replay" ]]; then
+    P_LABEL="replay:${P_RSTEPS}"
+  else
+    P_LABEL="${P_KIND}"
+  fi
+  # batch 只有偏离默认值时才进标签和 run 名，否则 vanilla@8 与 vanilla@4 会同名。
+  if (( P_BATCH != P_DEFAULT_BATCH )); then
+    P_LABEL="${P_LABEL}@${P_BATCH}"
+    P_TAG="${P_TAG}_b${P_BATCH}"
+  fi
+  P_RUN="${P_TAG}_lr${LR}_ep${EPOCHS}_seed${SEED}"
+  [[ "${PROBE}" == "1" ]] && P_RUN="${P_RUN}_smoke"
+  P_METRICS="${METRICS_DIR}/${P_RUN}.jsonl"
+  P_LOG="${TRAIN_LOG_DIR}/${P_RUN}.train.log"
+  P_MAP_CACHE="${MAP_CACHE_ROOT}/${P_RUN}"
+  P_CKPT="${CKPT_DIR}/${P_RUN}"
+  # awk 而不是 python：这两个数要进 banner 和末尾的汇总，而还没进 venv 的 python
+  # 会返回空串而不是报错，留下一个没人注意的空列。awk 每个镜像都有，R=0 时
+  # 也能给出 0.0000，不用特判。
+  P_R="$(awk -v a="${P_RSTEPS}" -v b="${P_NEW_STEPS}" 'BEGIN{printf "%.4f", a/b}')"
+  P_W="$(awk -v a="${P_RSTEPS}" -v b="${P_WINDOW}" 'BEGIN{printf "%.4f", a/b}')"
+  if [[ -z "${P_R}" || -z "${P_W}" ]]; then
+    echo "!! ${P_KIND}: 算不出 r / w（awk 没跑起来？）"
+    return 1
+  fi
+  return 0
+}
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${DATASET_DIR}" ]] || { echo "缺 finance 训练集: ${DATASET_DIR}（94 号的 prepare 产出）"; exit 1; }
+mkdir -p "${METRICS_DIR}" "${DATASET_CACHE}" "${TRAIN_LOG_DIR}" "${CKPT_DIR}"
+
+set +x
+echo "========================================================================"
+echo "finance replay ratio 扫描：${#ARM_KINDS[@]} 条臂，一次投递跑完"
+echo "  本作业只训练 + 存 checkpoint，不评测、不打中间探针"
+echo "  基座     = ${MODEL_DIR}/${MODEL_NAME}   （全参微调）"
+echo "  新任务   = ${DATASET_DIR}"
+echo "  保护域   = math，池 ${MATH_POOL}"
+echo "  池列     = ${REPLAY_INPUT_COLUMN}/${REPLAY_TARGET_COLUMN} @ max_len ${REPLAY_MAXLEN}"
+echo "  old_val  = ${MATH_VAL}（${OLD_VAL_ROWS} 行，93 号已切走，池里没有）"
+echo "  训练     = lr ${LR} ${LR_SCHEDULER} warmup ${WARMUP_RATIO} epochs ${EPOCHS} seed ${SEED}"
+echo "             maxlen ${MAXLEN} / 每次更新 ${NEW_PER_UPDATE} 行新任务"
+echo "  阶段     = DRY_RUN=${DRY_RUN} PROBE=${PROBE} FORCE_TRAIN=${FORCE_TRAIN} KEEP_GOING=${KEEP_GOING}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 逐臂的编排算术 + 与 94/95 号的对齐检查
+# ===========================================================================
+echo "==== Step 0: 编排算术与对齐检查 ===="
+printf '%-14s %6s %8s %6s %7s %7s %8s %9s %9s %s\n' \
+  arm batch new_st R window ACCUM r w 开销 run
+for _i in "${!ARM_KINDS[@]}"; do
+  plan_arm "${ARM_KINDS[$_i]}" "${ARM_RSTEPS[$_i]}" "${ARM_BATCHES[$_i]}" || exit 1
+  _cost="$(awk -v r="${P_R}" 'BEGIN{printf "%.3fx", 1 + r}')"
+  printf '%-14s %6s %8s %6s %7s %7s %8s %9s %9s %s\n' \
+    "${P_LABEL}" "${P_BATCH}" "${P_NEW_STEPS}" "${P_RSTEPS}" \
+    "${P_WINDOW}" "${P_ACCUM}" "${P_R}" "${P_W}" "${_cost}" "${P_RUN}"
+  # 这是整个扫描的不变量，也是"复用已训好的三条臂"的前提。
+  if (( P_NEW_STEPS * P_BATCH != NEW_PER_UPDATE )); then
+    echo "!! ${P_KIND}: 每次更新的新任务行数 ${P_NEW_STEPS}x${P_BATCH} != ${NEW_PER_UPDATE}"; exit 1
+  fi
+  if (( P_ACCUM % P_BATCH != 0 )); then
+    echo "!! ${P_KIND}: ACCUM=${P_ACCUM} 不能被 batch ${P_BATCH} 整除"; exit 1
+  fi
+  # train.py 会自己算 new_steps = ACCUM/BATCH - R；这里先替它算一遍，
+  # 对不上就是本脚本的 ACCUM 推导错了，而不是等 6 小时后看日志。
+  if (( P_ACCUM / P_BATCH - P_RSTEPS != P_NEW_STEPS )); then
+    echo "!! ${P_KIND}: train.py 会得到 new_steps=$(( P_ACCUM / P_BATCH - P_RSTEPS ))，"
+    echo "   本脚本要的是 ${P_NEW_STEPS}。ACCUM 推导错了。"; exit 1
+  fi
+done
+echo "每条臂每次更新都是 ${NEW_PER_UPDATE} 行新任务 —— 与 94/95 号那三条臂相同，可以并排比。"
+
+# 94/95 号钉下来的值。ACCUM 不在其中：它按 R 变，要守的是 NEW_PER_UPDATE。
+DRIFT=()
+[[ "${MODEL_NAME}"   == "Qwen2.5-1.5B-Instruct" ]] || DRIFT+=("model=${MODEL_NAME}（95 号: Qwen2.5-1.5B-Instruct）")
+[[ "${LR}"           == "8e-5" ]] || DRIFT+=("lr=${LR}（95 号: 8e-5）")
+[[ "${LR_SCHEDULER}" == "cosine" ]] || DRIFT+=("lr_scheduler=${LR_SCHEDULER}（95 号: cosine）")
+[[ "${WARMUP_RATIO}" == "0.1" ]] || DRIFT+=("warmup_ratio=${WARMUP_RATIO}（95 号: 0.1）")
+[[ "${BATCH}"        == "8"    ]] || DRIFT+=("batch_size=${BATCH}（95 号: 8）")
+[[ "${MAXLEN}"       == "1216" ]] || DRIFT+=("max_len=${MAXLEN}（95 号: 1216）")
+[[ "${VAL_FRAC}"     == "0.01" ]] || DRIFT+=("val_fraction=${VAL_FRAC}（95 号: 0.01）")
+[[ "${MAXVAL}"       == "200"  ]] || DRIFT+=("max_val_samples=${MAXVAL}（95 号: 200）")
+[[ "${SEED}"         == "42"   ]] || DRIFT+=("seed=${SEED}（95 号: 42）")
+[[ "${NEW_PER_UPDATE}" == "64" ]] || DRIFT+=("new_per_update=${NEW_PER_UPDATE}（94/95 号: 64）")
+[[ "${REPLAY_MAXLEN}" == "1024" ]] || DRIFT+=("replay max_len=${REPLAY_MAXLEN}（95 号 DOMAIN=math: 1024）")
+[[ "${REPLAY_TARGET_COLUMN}" == "gold_targets" ]] || DRIFT+=("replay 目标列=${REPLAY_TARGET_COLUMN}（95 号: gold_targets）")
+[[ "${TARGET_MODULES}" == "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj,lm_head" ]] \
+  || DRIFT+=("target_modules=${TARGET_MODULES}（95 号: 七类 + lm_head）")
+if [[ "${PROBE}" != "1" ]]; then
+  [[ "${EPOCHS}"    == "2" ]] || DRIFT+=("epochs=${EPOCHS}（94/95 号: 2）")
+  [[ "${MAX_STEPS}" == "0" ]] || DRIFT+=("max_steps=${MAX_STEPS}（正式 run 应为 0）")
+  [[ "${SAVE}"      == "1" ]] || DRIFT+=("save=${SAVE}（必须为 1，分数是事后用 102 号打的）")
+fi
+if (( ${#DRIFT[@]} > 0 )); then
+  echo "与 94/95 号不一致的项:"
+  for item in "${DRIFT[@]}"; do echo "  - ${item}"; done
+  if [[ "${ALLOW_DRIFT}" != "1" ]]; then
+    echo "!! 这些偏差会让新臂与已训好的 vanilla / EWC / OneReplay 不可比。"
+    echo "   确实要改就传 ALLOW_DRIFT=1，并把偏差写进结果表。停。"
+    exit 1
+  fi
+  echo "ALLOW_DRIFT=1：继续，但上面每一条都要写进结果表。"
+else
+  echo "训练超参与 94/95 号逐字一致。"
+fi
+
+echo ""
+echo "checkpoint 落在 ${CKPT_DIR}，1.5B 全参单份约 3.1 GB。当前磁盘:"
+df -h "${CKPT_DIR}" 2>/dev/null || true
+
+# ===========================================================================
+# Step 1: 池与 val 切片的检查（只做一次，四条臂共用）
+#
+#   93 号 Step 1 已经把池和 val 切成两个文件落盘，本脚本只读。要证的是：
+#   1) 两个文件的 prompt 文本交集比例 —— 行号不重叠推不出文本不重叠
+#   2) 池的可用行数与 C 的 metadata 对得上 —— 这是 replay 臂与 OneReplay 臂
+#      同池的唯一证据，不然比出来的不是"怎么用旧知识"而是"用了多少"
+# ===========================================================================
+echo ""
+echo "==== Step 1: 池与 val 切片检查（四条臂共用）===="
+export MATH_POOL MATH_VAL REPLAY_INPUT_COLUMN REPLAY_TARGET_COLUMN
+export REPLAY_DROP_TRUNCATED DATASET_CACHE COV_PATH SKIP_POOL_CHECK OVERLAP_ABORT_RATIO
+POOL_REPORT_FILE="${TMPDIR}/pool_preflight_fin_ratio.txt"
+
+if ! python - <<'PY' 2>&1 | tee "${POOL_REPORT_FILE}"; then
+import argparse
+import os
+
+import torch
+
+from onereplay.data.replay import load_self_distilled_pool, to_sft_schema
+
+failures = []
+abort_ratio = float(os.environ["OVERLAP_ABORT_RATIO"])
+input_column = os.environ["REPLAY_INPUT_COLUMN"]
+target_column = os.environ["REPLAY_TARGET_COLUMN"]
+
+loader_args = argparse.Namespace(
+    replay_cache_dir=os.environ["DATASET_CACHE"],
+    replay_drop_truncated=int(os.environ["REPLAY_DROP_TRUNCATED"]),
+    replay_input_column=input_column,
+    replay_target_column=target_column,
+)
+schema_args = argparse.Namespace(
+    replay_input_column=input_column,
+    replay_target_column=target_column,
+)
+
+# 走 replay 臂真正会用的装配路径，不复写一遍逻辑。
+pool = load_self_distilled_pool(loader_args, os.environ["MATH_POOL"])
+val = load_self_distilled_pool(loader_args, os.environ["MATH_VAL"])
+print(f"池文件   = {os.environ['MATH_POOL']}")
+print(f"  列       = {pool.column_names}")
+print(f"  行数     = {len(pool)}")
+print(f"val 文件 = {os.environ['MATH_VAL']}")
+print(f"  列       = {val.column_names}")
+print(f"  行数     = {len(val)}")
+
+for name, dataset in (("池", pool), ("val", val)):
+    missing = [c for c in (input_column, target_column) if c not in dataset.column_names]
+    if missing:
+        failures.append(
+            f"{name}文件缺列 {missing}；实有 {dataset.column_names}。"
+            "REPLAY_INPUT_COLUMN / REPLAY_TARGET_COLUMN 传错了。"
+        )
+if failures:
+    for item in failures:
+        print(f"!! {item}")
+    raise SystemExit(1)
+
+pool_usable = len(to_sft_schema(pool, schema_args))
+val_usable = len(to_sft_schema(val, schema_args))
+print(f"池装配后   = {len(pool)} -> 滤空行后 {pool_usable}")
+print(f"val 装配后 = {len(val)} -> 滤空行后 {val_usable}")
+
+# ---- prompt 文本的交集比例 ----
+# 93 号按行切开，所以行号一定不重叠；但语料自身可能有重复 prompt。判据是比例，
+# 不是 0。接近 100% 就说明两个文件根本不是从同一次切分里出来的。
+pool_prompts = set(pool[input_column])
+val_prompts = list(val[input_column])
+overlap = sum(1 for prompt in val_prompts if prompt in pool_prompts)
+ratio = overlap / max(len(val_prompts), 1)
+print(f"池内不同 prompt = {len(pool_prompts)} / {len(pool)}"
+      f"  (语料自身重复率 {1 - len(pool_prompts) / max(len(pool), 1):.2%})")
+print(f"val 与池的 prompt 文本交集 = {overlap}/{len(val_prompts)}  ({ratio:.2%})")
+if ratio >= abort_ratio:
+    failures.append(
+        f"交集 {ratio:.2%} 超过 {abort_ratio:.0%}：val 基本就是池本身，replay 会训到"
+        "用来打分的行。查 93 号 Step 1 的切分是不是被覆盖过。"
+    )
+else:
+    print(f"  -> 低于 {abort_ratio:.0%} 的判据。把这个百分比写进报告。")
+
+blank_share = 1 - val_usable / max(len(val), 1)
+if blank_share > 0.01:
+    failures.append(f"val 的空行占 {blank_share:.2%}，超过 1%：多半是答案列读错了。")
+
+# ---- 同池参照：C 的 pool_rows 就该是这个池的行数 ----
+if os.environ["SKIP_POOL_CHECK"] == "1":
+    print("SKIP_POOL_CHECK=1：不与 C 对表，replay 臂与 OneReplay 臂是否同池没有证据。")
+elif not os.path.isfile(os.environ["COV_PATH"]):
+    print(f"note: 没有 {os.environ['COV_PATH']}，跳过同池对表。")
+else:
+    cov_path = os.environ["COV_PATH"]
+    try:
+        payload = torch.load(cov_path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError):
+        payload = torch.load(cov_path, map_location="cpu")
+    meta = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    cov_rows = meta.get("pool_rows")
+    cov_max_len = meta.get("max_len")
+    print(f"C              = {cov_path}")
+    print(f"  pool_rows        = {cov_rows}   (本脚本的池可用 {pool_usable})")
+    print(f"  max_len          = {cov_max_len}")
+    print(f"  pool_fingerprint = {meta.get('pool_fingerprint')}")
+    if cov_rows is None:
+        print("  note: metadata 里没有 pool_rows，这份 C 来自更早的脚本，无从对表。")
+    elif int(cov_rows) in (pool_usable, len(pool)):
+        print(f"  -> 行数一致，replay 臂与 OneReplay 臂同池。")
+    else:
+        failures.append(
+            f"C 是在 {cov_rows} 行上采的，本脚本的池是 {len(pool)} 行（可用 {pool_usable}）。"
+            "两条臂消费的旧知识不同，比出来的就不是「怎么用旧知识」而是「用了多少」。"
+        )
+    if cov_max_len is not None and int(cov_max_len) != int(os.environ.get("REPLAY_MAXLEN", 1024)):
+        print(f"  note: C 的 max_len={cov_max_len}，replay 用的是 "
+              f"{os.environ.get('REPLAY_MAXLEN')}。训练截断保留末尾 token。")
+
+print()
+if failures:
+    print("!! Step 1 未通过:")
+    for item in failures:
+        print(f"   - {item}")
+    raise SystemExit(1)
+print(f"EXPECT_POOL_ROWS={pool_usable}")
+print(f"EXPECT_VAL_ROWS={val_usable}")
+print("池与 val 切片检查通过。")
+PY
+  echo "!! Step 1 未通过，不进入训练。"
+  exit 1
+fi
+
+parse_expect () {
+  local key="$1" value
+  value="$(grep -o "^${key}=[0-9]*" "${POOL_REPORT_FILE}" | tail -n 1 || true)"
+  printf '%s' "${value#"${key}="}"
+}
+EXPECT_POOL_ROWS="$(parse_expect EXPECT_POOL_ROWS)"
+EXPECT_VAL_ROWS="$(parse_expect EXPECT_VAL_ROWS)"
+if [[ -z "${EXPECT_POOL_ROWS}" || -z "${EXPECT_VAL_ROWS}" ]]; then
+  echo "!! 没解析到 EXPECT_POOL_ROWS / EXPECT_VAL_ROWS，训练后的断言会失效。停。"
+  exit 1
+fi
+echo "训练后要核对: replay 池 ${EXPECT_POOL_ROWS} 行，old_val ${EXPECT_VAL_ROWS} 行"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo ""
+  echo "DRY_RUN=1：以上为计划与前置检查，未训练。"
+  echo "确认无误后把 DRY_RUN=0 加进去重投即可。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# 逐臂训练
+# ===========================================================================
+OLD_VAL_ARGS=()
+if [[ "${OLD_VAL}" == "1" ]]; then
+  # 与 95 号逐字相同：93 号已经把 val 切成独立文件，presliced=1 表示不再
+  # shuffle、不再取偏移，读的就是这一份。
+  OLD_VAL_ARGS=(
+    --prior_val_jsonl "math=${MATH_VAL}"
+    --old_val_presliced 1
+    --old_val_rows "${OLD_VAL_ROWS}"
+  )
+fi
+
+arm_train_args () {
+  case "${P_KIND}" in
+    vanilla)
+      printf '%s\n' --replay_lambda 0 --measure_replay_when_lambda_zero 0 --cov_path ""
+      ;;
+    replay)
+      printf '%s\n' \
+        --replay_lambda 0 \
+        --measure_replay_when_lambda_zero "${MEASURE_ZERO}" \
+        --cov_path "" \
+        --replay_steps_per_update "${P_RSTEPS}" \
+        --replay_data_files "${MATH_POOL}" \
+        --replay_input_column "${REPLAY_INPUT_COLUMN}" \
+        --replay_target_column "${REPLAY_TARGET_COLUMN}" \
+        --replay_pool_size "${REPLAY_POOL_SIZE}" \
+        --replay_sample_seed "${REPLAY_SAMPLE_SEED}" \
+        --replay_max_len "${REPLAY_MAXLEN}" \
+        --replay_drop_truncated "${REPLAY_DROP_TRUNCATED}" \
+        --replay_cache_dir "${DATASET_CACHE}"
+      ;;
+  esac
+}
+
+# 这条臂是不是已经跑完了。metrics 是追加写的，所以判据是"有 EPOCHS 条 epoch
+# 记录"而不是"文件存在" —— 半截的文件要重跑。
+arm_is_done () {
+  [[ -f "${P_METRICS}" ]] || return 1
+  RUN_METRICS="${P_METRICS}" WANT_EPOCHS="${EPOCHS}" python - <<'PY'
+import json
+import os
+import sys
+
+count = 0
+with open(os.environ["RUN_METRICS"], encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip() and json.loads(line).get("record_type") == "epoch":
+            count += 1
+sys.exit(0 if count >= int(os.environ["WANT_EPOCHS"]) else 1)
+PY
+}
+
+train_one_arm () {
+  local rc=0
+  echo ""
+  echo "########################################################################"
+  echo "# 臂 ${ARM_INDEX}/${#ARM_KINDS[@]}: ${P_LABEL}   r=${P_R}  w=${P_W}"
+  echo "#   run    = ${P_RUN}"
+  echo "#   编排   = window ${P_WINDOW} 步 (${P_NEW_STEPS} new + ${P_RSTEPS} replay) x batch ${P_BATCH}"
+  echo "#   ACCUM  = ${P_ACCUM}，每次更新 ${NEW_PER_UPDATE} 新任务 + ${P_REPLAY_PER_UPDATE} replay"
+  echo "########################################################################"
+
+  if [[ "${FORCE_TRAIN}" != "1" ]] && arm_is_done; then
+    echo "跳过：${P_METRICS} 已有 ${EPOCHS} 条 epoch 记录（FORCE_TRAIN=1 可重跑）"
+    return 0
+  fi
+  # 追加写的 jsonl：半截的文件先挪走，否则两次的记录会串在一起。
+  if [[ -f "${P_METRICS}" ]]; then
+    mv "${P_METRICS}" "${P_METRICS}.$(date +%Y%m%d_%H%M%S).bak"
+    echo "已把上一次未跑完的 ${P_METRICS} 改名备份"
+  fi
+
+  # 一行一个 token。`--cov_path ""` 那个空串也要保留成一个独立参数，
+  # printf 给它留了自己的一行，read 就会读到空字符串。
+  local arm_args=()
+  while IFS= read -r item; do arm_args+=("${item}"); done < <(arm_train_args)
+  mkdir -p "${P_MAP_CACHE}"
+
+  set -x
+  python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+    --system_prompt "${SYSTEM_PROMPT}" \
+    --dataset_path "${DATASET_DIR}" \
+    --epochs "${EPOCHS}" --lr "${LR}" \
+    --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
+    --batch_size "${P_BATCH}" --accumulation_size "${P_ACCUM}" \
+    --max_len "${MAXLEN}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+    --eval_batch_size "${EVAL_BATCH}" \
+    --eval_before_train "${EVAL_BEFORE_TRAIN}" \
+    --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+    --max_steps "${MAX_STEPS}" \
+    --target_modules "${TARGET_MODULES}" \
+    --map_cache_dir "${P_MAP_CACHE}" \
+    --log_every "${LOG_EVERY}" \
+    ${OLD_VAL_ARGS[@]+"${OLD_VAL_ARGS[@]}"} \
+    "${arm_args[@]}" \
+    --save "${SAVE}" --save_path "${P_CKPT}" \
+    --metrics_path "${P_METRICS}" 2>&1 | tee "${P_LOG}"
+  rc=$?
+  set +x
+  # 成功失败都删：下一次跑一定会重写（load_from_cache_file=False），留着只占本地盘。
+  if [[ "${P_MAP_CACHE}" == */map_cache/* ]]; then
+    rm -rf --one-file-system "${P_MAP_CACHE}" || true
+  fi
+  if (( rc != 0 )); then
+    echo "!! ${P_RUN} 训练退出码 ${rc}"
+    return "${rc}"
+  fi
+
+  # ---- 这条臂的日志自检 ----
+  # 分两档：编排类的对不上就是这条臂作废（fatal），其余只警告 —— banner 的措辞
+  # 跨版本变过，为一句话把已经训完存好的 checkpoint 判死不划算。
+  local log_fatal=()
+  local log_warn=()
+  if [[ "${P_KIND}" == "replay" ]]; then
+    # train.py step 级路径自己打的那一行，逐字对上才说明 window 切法与计划相同。
+    local want_accum_line="of which ${NEW_PER_UPDATE} are new-task rows (${P_NEW_STEPS} steps) and ${P_REPLAY_PER_UPDATE} are replay (${P_RSTEPS} steps)"
+    grep -qF -- "${want_accum_line}" "${P_LOG}" \
+      || log_fatal+=("找不到 '${want_accum_line}'   <- 实际编排与计划不符，x 轴错位。")
+    # step_mix 的 describe()：这是"w 与答案长度无关"的现场证据。
+    grep -qF -- "replay's share of the accumulated gradient = ${P_W}" "${P_LOG}" \
+      || log_fatal+=("日志里的 w 不是 ${P_W}   <- 梯度里的 replay 份额与计划不符。")
+    grep -qF -- "covariance matrices from" "${P_LOG}" \
+      && log_fatal+=("日志里出现了 'covariance matrices from'   <- C 被加载了，开销数字作废。")
+    grep -qF -- "regularizer covers" "${P_LOG}" \
+      && log_fatal+=("日志里出现了 'regularizer covers'   <- 这条臂不该有罚项。")
+  fi
+  if [[ "${OLD_VAL}" == "1" ]]; then
+    grep -q "old_val" "${P_LOG}" || log_warn+=("日志里没看到 old_val 相关输出")
+  fi
+  if [[ "${SAVE}" == "1" && ! -d "${P_CKPT}" ]]; then
+    log_fatal+=("SAVE=1 但没有 ${P_CKPT}   <- 事后用 102 号打分时会找不到这条臂。")
+  fi
+  if (( ${#log_warn[@]} > 0 )); then
+    echo "note: ${P_RUN} 有几项没核到（不影响可比性）:"
+    for item in "${log_warn[@]}"; do echo "   - ${item}"; done
+  fi
+  if (( ${#log_fatal[@]} > 0 )); then
+    echo "!! ${P_RUN} 日志自检失败:"
+    for item in "${log_fatal[@]}"; do echo "   - ${item}"; done
+    return 1
+  fi
+  echo "${P_RUN}: 日志自检通过。"
+  return 0
+}
+
+OK_ARMS=()
+FAILED_ARMS=()
+ARM_INDEX=0
+for _i in "${!ARM_KINDS[@]}"; do
+  ARM_INDEX=$(( _i + 1 ))
+  plan_arm "${ARM_KINDS[$_i]}" "${ARM_RSTEPS[$_i]}" "${ARM_BATCHES[$_i]}" || exit 1
+  if train_one_arm; then
+    OK_ARMS+=("${P_RUN}")
+  else
+    FAILED_ARMS+=("${P_LABEL} (${P_RUN})")
+    if [[ "${KEEP_GOING}" != "1" ]]; then
+      echo "!! KEEP_GOING=0，就此停止。"
+      break
+    fi
+    echo "!! 这条臂失败了，继续跑后面的（KEEP_GOING=0 可改成立即停止）。"
+  fi
+done
+
+# ===========================================================================
+# 跨臂汇总：开销 + epoch 级的保护域 loss
+#   真正的结论要等 102 号打完 token 加权的 CE，这里只是先看一眼形状与开销。
+# ===========================================================================
+set +x
+echo ""
+echo "========================================================================"
+echo "跨臂汇总（开销与 epoch 级 old_val；正式数字见 102 号）"
+echo "========================================================================"
+set +e
+METRICS_DIR="${METRICS_DIR}" POOL_ROWS="${EXPECT_POOL_ROWS}" \
+WANT_EPOCHS="${EPOCHS}" \
+RUN_LIST="$(IFS=$'\n'; printf '%s' "${OK_ARMS[*]:-}")" \
+VANILLA_METRICS="${METRICS_DIR}/${VANILLA_RUN}.jsonl" VANILLA_NAME="${VANILLA_RUN}" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+
+def load(path):
+    rows = []
+    if not path or not os.path.isfile(path):
+        return rows
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def summarize(name, records):
+    epochs = [row for row in records if row.get("record_type") == "epoch"]
+    if not epochs:
+        return None
+    last = epochs[-1]
+    return {
+        "name": name,
+        "r": float(last.get("replay_ratio_r") or 0.0),
+        "w": last.get("replay_loss_weight"),
+        "batch": last.get("batch_size"),
+        "accum": last.get("accumulation_size"),
+        "new_per_update": last.get("new_per_update"),
+        "replay_per_update": int(last.get("replay_per_update") or 0),
+        "train_sec": sum(float(row.get("train_sec") or 0.0) for row in epochs),
+        "peak": max(float(row.get("peak_memory_gb") or 0.0) for row in epochs),
+        "val_loss": last.get("val_loss"),
+        "old_val": last.get("old_val_loss_math", last.get("old_val_loss")),
+        "epochs": int(last.get("epoch") or 0),
+        "updates": int(last.get("global_step") or 0),
+    }
+
+
+metrics_dir = Path(os.environ["METRICS_DIR"])
+names = [name for name in os.environ.get("RUN_LIST", "").split("\n") if name.strip()]
+if not names:
+    raise SystemExit("这一轮没有跑成功的臂，没什么可汇总的。")
+
+pool_rows = int(os.environ["POOL_ROWS"])
+want_epochs = int(os.environ["WANT_EPOCHS"])
+
+runs = []
+for name in names:
+    row = summarize(name, load(metrics_dir / f"{name}.jsonl"))
+    if row is None:
+        print(f"note: {name} 缺 epoch 记录，跳过")
+        continue
+    runs.append(row)
+runs.sort(key=lambda run: (run["r"], run["name"]))
+
+vanilla = summarize(os.environ["VANILLA_NAME"], load(os.environ["VANILLA_METRICS"]))
+if vanilla is None:
+    print(f"note: 找不到 94 号 vanilla 的 metrics（{os.environ['VANILLA_METRICS']}），")
+    print("      开销列没有分母。它不影响本轮训练，补上再跑一次汇总即可。")
+
+failures = []
+print()
+header = (f"{'arm':<34}{'bs':>4}{'r':>8}{'w':>8}{'accum':>7}{'池覆盖':>9}"
+          f"{'new_val':>10}{'old_val':>10}{'train_s':>9}{'vs van':>8}{'peak':>8}")
+print(header)
+print("-" * len(header))
+
+
+def cell(value, fmt, width):
+    if value is None:
+        return f"{'-':>{width}}"
+    return f"{value:>{width}{fmt}}"
+
+
+rows_to_print = ([vanilla] if vanilla else []) + runs
+for run in rows_to_print:
+    consumed = run["replay_per_update"] * run["updates"]
+    seen = f"{min(consumed / pool_rows, 1.0):.1%}" if consumed and pool_rows else "-"
+    speed = (
+        f"{run['train_sec'] / vanilla['train_sec']:.2f}x"
+        if vanilla and vanilla["train_sec"]
+        else "-"
+    )
+    w_text = f"{run['w']:.4f}" if run["w"] is not None else "-"
+    print(
+        f"{run['name'][:33]:<34}{run['batch']:>4}{run['r']:>8.4f}{w_text:>8}"
+        f"{run['accum']:>7}{seen:>9}"
+        + cell(run["val_loss"], ".4f", 10)
+        + cell(run["old_val"], ".4f", 10)
+        + f"{run['train_sec']:>9.0f}{speed:>8}{run['peak']:>8.1f}"
+    )
+    if run is not vanilla:
+        if run["new_per_update"] != 64:
+            failures.append(f"{run['name']}: new_per_update={run['new_per_update']}，不是 64")
+        if run["epochs"] != want_epochs:
+            failures.append(f"{run['name']}: 只跑到 epoch {run['epochs']}，要求 {want_epochs}")
+
+print()
+print("---- 读法")
+print("!! old_val 这一列是 **epoch 级、batch 平均** 的，只用来看形状。正式数字是")
+print("   102 号打的 token 加权 CE，两者不会逐位相等，别混用，更别混在一张表里。")
+print("!! 量程很薄：vanilla 在 math gold 上相对 base 的总漂移只有 +0.0241，")
+print("   四条臂要在这个区间里分开。臂间差小于本线实测的 δ 就不能声明。")
+print("!! r / w / 墙钟是三个口径：r=N_replay/N_new（也等于额外开销倍数 1+r），")
+print("   w=r/(1+r) 是 replay 在梯度里的份额。r=1 时 w=0.5，「各一半」说的是 w。")
+print("!! 池覆盖：小 r 不只是「复习得少」，也是「见过的旧数据种类少」。固定 epoch")
+print("   预算下这两件事绑在一起，是 replay 的真实处境，但不能说成纯复习强度效应。")
+
+if failures:
+    print()
+    print("!! 汇总发现问题:")
+    for item in failures:
+        print(f"   - {item}")
+    raise SystemExit(1)
+print()
+print("跨臂检查通过。")
+PY
+SUMMARY_RC=$?
+set -e
+
+echo ""
+echo "========================================================================"
+echo "本轮结果"
+echo "========================================================================"
+echo "成功 ${#OK_ARMS[@]} 条:"
+for name in "${OK_ARMS[@]:-}"; do [[ -n "${name}" ]] && echo "  ${name}"; done
+if (( ${#FAILED_ARMS[@]} > 0 )); then
+  echo "失败 ${#FAILED_ARMS[@]} 条（直接重投本脚本即可补跑，成功的会被跳过）:"
+  for name in "${FAILED_ARMS[@]}"; do echo "  ${name}"; done
+fi
+
+# ---- 交接给 102 号：正式的 token 加权 CE + 逐行数据 ----
+ADAPTER_LIST="$(IFS=,; printf '%s' "${OK_ARMS[*]:-}")"
+echo ""
+echo "========================================================================"
+echo "下一步：用 102 号把所有臂打一遍（含已训好的 vanilla / EWC / OneReplay）"
+echo "========================================================================"
+cat <<EOF
+qsub -v MODEL_NAME=${MODEL_NAME},\\
+RESULTS_ROOT=${RESULTS_ROOT},\\
+ADAPTER_DIR=${CKPT_DIR},\\
+PROBES=mathgold=${MATH_VAL},\\
+ADAPTERS='${VANILLA_RUN},${ADAPTER_LIST}<,已训好的 ewc / onereplay run 名>' \\
+     onereplay/pbs/102_math_val500_direction.pbs
+
+打完之后跑配对 bootstrap（登录节点，纯 CPU）:
+  python -m onereplay.scripts.bootstrap_probe_ce \\
+    --per_row_dir ${RESULTS_ROOT}/probe_ce/per_row \\
+    --base base --vanilla ${VANILLA_RUN} \\
+    --compare ${ADAPTER_LIST}
+  （--vanilla 给上之后才会出「消除的遗忘」那一列）
+EOF
+
+echo ""
+echo "产物:"
+echo "  checkpoint : ${CKPT_DIR}/<run>          （102 号打完分就可以删，每份约 3.1 GB）"
+echo "  metrics    : ${METRICS_DIR}/<run>.jsonl"
+echo "  训练日志   : ${TRAIN_LOG_DIR}/<run>.train.log"
+echo "  同池报告   : ${POOL_REPORT_FILE}"
+echo "Job finished at: $(date)"
+
+if (( ${#FAILED_ARMS[@]} > 0 )); then
+  exit 1
+fi
+exit "${SUMMARY_RC}"
