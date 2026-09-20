@@ -240,7 +240,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME DS_DATASET RESULTS_ROOT FLAN_DIR
-    DATASET_CACHE
+    DATASET_CACHE MAP_CACHE_ROOT
     DRY_RUN PROBE ALLOW_DRIFT SKIP_POOL_CHECK FORCE_TRAIN KEEP_GOING
     ARMS ARM REPLAY_STEPS
     ONEREPLAY_LAMBDA EWC_LAMBDA COV_PATH FISHER_PATH
@@ -313,6 +313,14 @@ FISHER_DIR="${RESULTS_ROOT}/fisher"
 ADAPTERS="${RESULTS_ROOT}/adapters"
 METRICS_DIR="${RESULTS_ROOT}/metrics"
 TRAIN_LOG_DIR="${RESULTS_ROOT}/train_logs"
+# tokenize 后的 arrow 落在这里。默认是节点本地盘（${TMPDIR}，见文件头的 JOB_TMPDIR），
+# 不是 /scratch —— 训练全程 mmap 着这些文件，而共享文件系统上的 mmap 对"文件在映射
+# 期间被换掉"只会给 SIGBUS 不会报错，一次就是一条臂。放本地盘还顺带快一截。
+# train.py 传的是 load_from_cache_file=False，所以它纯粹是临时文件：每条臂重写一次，
+# 跑完就删，作业结束时外层的 cleanup trap 连整个 ${TMPDIR} 一起收走。
+# 注意节点没有 /local_ssd/${SCRATCH_USER} 时 JOB_TMPDIR 会退回 /scratch，这时它又落回
+# 共享文件系统上 —— 那条路径靠的是 train.py 不再重写 old_val 的 arrow（双写已修）。
+MAP_CACHE_ROOT="${MAP_CACHE_ROOT:-${TMPDIR}/map_cache}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
 
 # ---- 阶段开关 ----
@@ -517,6 +525,7 @@ plan_arm () {
   [[ "${PROBE}" == "1" ]] && P_RUN="${P_RUN}_smoke"
   P_METRICS="${METRICS_DIR}/${P_RUN}.jsonl"
   P_LOG="${TRAIN_LOG_DIR}/${P_RUN}.train.log"
+  P_MAP_CACHE="${MAP_CACHE_ROOT}/${P_RUN}"
   # awk, not python: these two numbers go into the run's banner and into the
   # comparison at the end, and a python that is not on PATH yet would hand back
   # an empty string instead of failing, leaving a blank column nobody notices.
@@ -950,7 +959,7 @@ train_one_arm () {
   # 参数，printf 给它留了自己的一行，read 就会读到空字符串。
   local arm_args=()
   while IFS= read -r item; do arm_args+=("${item}"); done < <(arm_train_args)
-  mkdir -p "${RESULTS_ROOT}/map_cache/${P_RUN}"
+  mkdir -p "${P_MAP_CACHE}"
 
   set -x
   python -m onereplay.scripts.train --paradigm sft \
@@ -962,7 +971,7 @@ train_one_arm () {
     --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
     --lora_rank "${LORA_RANK}" --lora_alpha "${LORA_ALPHA}" --lora_dropout "${LORA_DROPOUT}" \
     --target_modules "${TARGET_MODULES}" \
-    --map_cache_dir "${RESULTS_ROOT}/map_cache/${P_RUN}" \
+    --map_cache_dir "${P_MAP_CACHE}" \
     --max_steps "${MAX_STEPS}" --log_every "${LOG_EVERY}" \
     --eval_before_train 1 \
     "${arm_args[@]}" \
@@ -972,6 +981,11 @@ train_one_arm () {
     --metrics_path "${P_METRICS}" 2>&1 | tee "${P_LOG}"
   rc=$?
   set +x
+  # 成功失败都删：下一次跑一定会重写（load_from_cache_file=False），留着只是占本地盘。
+  # 路径判据是防止 MAP_CACHE_ROOT 被覆写成别的东西时 rm 到不该动的地方。
+  if [[ "${P_MAP_CACHE}" == */map_cache/* ]]; then
+    rm -rf --one-file-system "${P_MAP_CACHE}" || true
+  fi
   if (( rc != 0 )); then
     echo "!! ${P_RUN} 训练退出码 ${rc}"
     return "${rc}"

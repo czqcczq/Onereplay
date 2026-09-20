@@ -36,7 +36,8 @@ onereplay/
 ├── eval/         runner.py  generation.py  metrics/           one model load, many metrics
 ├── scripts/      collect_cov.py  collect_fisher.py  generate_replay_targets.py
 │                 train.py  evaluate.py  check_old_knowledge_pool.py
-│                 compare_cov_scale.py  check_osft.py         the only CLI entry points
+│                 compare_cov_scale.py  check_osft.py
+│                 build_opr_buffer.py                         the only CLI entry points
 ├── legacy/       archived single-purpose scripts, not on the active path
 ├── slurm/        01..27 cluster jobs
 ├── pbs/          01..33 the same jobs for the PBS + Singularity cluster
@@ -246,6 +247,100 @@ python -m onereplay.scripts.check_osft \
 The end-to-end guard is a training run at `--osft_unfreeze_rank_ratio 1.0`: it
 freezes nothing, so its loss curve has to land on the vanilla arm's. If it does
 not, the integration is wrong and no other OSFT number is trustworthy.
+
+### The OPR baseline: on-policy replay with a filtered buffer
+
+OPR (On-Policy Replay, arXiv:2605.29495) is a replay-family baseline and sits
+next to the `replay` arm rather than next to the penalties. It differs from
+plain replay in exactly two places. The rehearsal rows carry the model's *own*
+answers instead of the corpus's gold ones, and only the highest-scoring slice
+of them is kept. Everything else -- data-level concatenation, appending rather
+than substituting -- is what `--replay_ratio` already did.
+
+Two scoring variants, both provided by the authors:
+
+* **OPR-SC** ranks by self-confidence, the mean log-probability of the answer
+  the model generated. No gold answer is involved, so it transfers to any
+  protection pool unchanged. This is the variant reproduced with no
+  substitutions at all.
+* **OPR-RU** ranks by a rule-based correctness score against the gold answer.
+
+Three stages, driven by `onereplay/pbs/100_finance_opr.pbs`:
+
+```bash
+# 1. Generate candidates with the model that is about to be trained.
+python -m onereplay.scripts.generate_replay_targets \
+  --data_files <pool>/math_pool.jsonl --input_column inputs \
+  --target_column gold_targets --pool_size 0 \
+  --max_len 1024 --max_new_tokens 512 \
+  --temperature 0.1 --keep_truncated_text 1 --record_logprob 1 \
+  --output_path <opr>/gen_sc_math.jsonl
+
+# 2. Score and keep the top-k.
+python -m onereplay.scripts.build_opr_buffer --reward sc --buffer_size 766 \
+  --pool math=<opr>/gen_sc_math.jsonl --pool code=<opr>/gen_sc_code.jsonl \
+  --output_path <opr>/buffer_sc.jsonl
+
+# 3. Train on the new task with the buffer appended.
+python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+  --dataset_path /path/to/finance_train \
+  --replay_rows 766 --replay_self_distill_file <opr>/buffer_sc.jsonl \
+  --replay_target_column targets --replay_drop_truncated 0 \
+  --replay_max_len 1024
+```
+
+`--replay_rows` exists for this arm. OPR sizes its buffer offline as
+`int(dataset_size * rho)` and trains on all of it, whereas `--replay_ratio` is
+recomputed inside train.py against the post-split training set and would ask
+for a count the buffer does not hold.
+
+Carried over unchanged: data-level concatenation then shuffle, rho = 0.01,
+buffer size = `int(rho * new-task rows)`, candidates drawn from the old
+domain's training pool, `temperature=0.1` sampling, the descending sort and the
+`int(buffer_size / n_pools)` quota, generated answers replacing gold ones, and
+`--accumulation_size` left at its vanilla value because appended rows do not
+take batch slots. SC and RU each generate their own candidates, which is how
+the authors' two scripts work; the price is that the SC-versus-RU difference
+carries sampling noise.
+
+Three departures, all of which belong in a table note:
+
+* **Generation length.** Their code is `if task_id in [0, 1]: max_tokens=1 else
+  512`, a switch for TRACE's two single-letter classification tasks. A
+  single-transition setting has `task_id == 0` throughout, so copying it
+  literally truncates every answer to one token. The 512 branch is used as a
+  ceiling and the real budget is derived from `--max_len`, which preserves the
+  invariant their 2048/512 pair satisfies by coincidence: the answer always
+  fits inside the training budget. Copying the constant would break it here,
+  because the math and code pools are budgeted at 1024 and training-side
+  truncation keeps the tail, so an over-long answer would lose its opening.
+* **OPR-RU's scorers.** Their five functions are dispatched by TRACE task index
+  and none applies to a math or code pool. Their principle is to score with the
+  benchmark's own metric -- edit similarity for Py150 line completion,
+  last-number match for NumGLUE -- so this becomes final-answer equivalence for
+  MetaMath and testcase execution for OPC. Transplanting their `fuzz.ratio`
+  onto instruction-style code would be the unfaithful choice, since two correct
+  solutions need not resemble each other.
+* **The log-probability convention.** Theirs comes from vLLM, which reports the
+  temperature-warped distribution. The default here reads the raw logits so the
+  score is the model's confidence and does not move with `--temperature`; pass
+  `LOGPROB_SOURCE=sampling` for the other convention. The choice is printed at
+  generation time.
+
+One limitation to state rather than hide: with a single transition the buffer
+is generated once, from the base model, so OPR's regeneration at every task
+boundary -- the part that makes it *on-policy* in a sequence -- has nothing to
+act on. The method reduces cleanly, but the reduction is worth naming.
+
+Before spending cluster time:
+
+```bash
+python test_code/check_opr_selection.py   # no GPU, no model, no corpus
+```
+
+It pins the quota arithmetic, the sort direction, and the property the rewritten
+`index` exists for: `build_replay_dataset` sorts by index and may take a prefix,
+so the prefix has to stay balanced across pools and keep each pool's best rows.
 
 On-policy distillation against a frozen same-family teacher:
 

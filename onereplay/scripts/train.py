@@ -1239,6 +1239,10 @@ def main() -> None:
             # means the same thing across runs that used the same value here.
             "eval_batch_size": args.eval_batch_size or args.batch_size,
             "replay_ratio": args.replay_ratio,
+            # Absolute row count when the arm sets one; 0 means the ratio above
+            # decided the volume. OPR's buffer is sized offline, so this is the
+            # field that identifies how much rehearsal that arm actually saw.
+            "replay_rows": args.replay_rows,
             "replay_per_batch": args.replay_per_batch,
             "replay_steps_per_update": args.replay_steps_per_update,
             # train_samples counts replay rows too, so record the split needed

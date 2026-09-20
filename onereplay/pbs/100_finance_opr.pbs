@@ -1,0 +1,1093 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N fin_opr
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# finance 线的第五条臂：OPR（On-Policy Replay），只做 mix（math + code）
+#
+#   qsub -v DRY_RUN=0,REWARD=sc onereplay/pbs/100_finance_opr.pbs
+#   qsub -v DRY_RUN=0,REWARD=ru onereplay/pbs/100_finance_opr.pbs
+#   拆两次投（生成很慢，可以先只做前两步）:
+#   qsub -v DRY_RUN=0,REWARD=sc,DO_TRAIN=0,DO_EVAL=0 ...   然后   DO_GENERATE=0
+#
+# -----------------------------------------------------------------------------
+# 1. 这条臂和 replay 臂差在哪
+# --------------------------
+# OPR 也是回放，也是数据级的，和 95 号 replay 臂的区别只有两条：
+#   a) 回放行的答案是**模型自己生成的**，不是语料的 gold；
+#   b) 生成出来的候选先打分，只有最高分的那一小撮进 buffer。
+# 除此之外的一切 —— 怎么混、混多少 —— 都是普通数据级回放。
+#
+# 但两条臂的操作点相差很远：replay 臂是批级 50%，OPR 的 ρ 默认 0.01。两者是
+# 同一根轴上的两个点，别直接并排读，要放到 replay ratio 曲线上去比。本臂首要
+# 的对照是 94 号的 vanilla。
+#
+# -----------------------------------------------------------------------------
+# 2. 忠实性契约：哪些照搬，哪些被迫改
+# ----------------------------------
+# 原样照搬：数据级回放（concatenate + shuffle，追加不替换）、ρ=0.01、
+# buffer 行数 = int(ρ x 新任务行数)、候选池 = 旧域训练池、temperature=0.1 采样、
+# 各池降序排序后取 int(buffer_size / 池数)、训练目标用生成答案替换 gold、
+# ACCUM 保持 64（追加行不占 batch 名额）、SC 与 RU 各自独立生成一次。
+#
+# 三处偏离，每一处都要出现在论文的表注里：
+#
+#   a) 生成长度。他们写死 `if task_id in [0,1]: max_tokens=1 else 512`，那个
+#      分支是给 C-STANCE / FOMC 两个单字母答案任务开的；单阶段设定下 task_id
+#      恒为 0，逐字照抄会把每条生成截成一个 token。这里走 else 分支的 512 当
+#      天花板，实际预算由 generate_replay_targets.py 从 --max_len 反推，保住
+#      "生成答案必定完整落在训练预算内"这个他们靠 2048/512 巧合满足的不变量。
+#      我们的 math/code 池预算是 1024，照抄 512 会在长 prompt 上破坏它 ——
+#      训练侧截断保留末尾，答案开头会被切掉。
+#
+#   b) OPR-RU 的打分器。他们按 TRACE 任务下标分派的 5 个函数无一对应 math /
+#      code。按他们"用该 benchmark 自己的指标"的原则译为：math 比最终答案是否
+#      等价，code 跑 OPC 的 testcase。照抄 Py150 的 fuzz.ratio 才是不忠实的。
+#
+#   c) avg_logprob 的口径。他们的分数来自 vLLM 的 logprobs（温度变换后的分布）。
+#      这里默认用原始 logits 的 log_softmax，让分数是"模型的置信度"而不随
+#      --temperature 漂移。改口径传 LOGPROB_SOURCE=sampling。
+#
+# 另外：单阶段设定下只生成一次，OPR 在多任务序列里"每到任务边界用当前模型重新
+# 生成"的 on-policy 特性用不上。方法约化是干净的，但这个限制要讲。
+#
+# -----------------------------------------------------------------------------
+# 3. !! 超参按 profile 走
+# ----------------------
+# 与 99 号同一套机制：finance 这组值在下面的 PROFILE 块里，每个都标了出处，
+# Step 0 会和 95 号脚本的默认值逐项对表，不等就退出。换实验线新增 profile，
+# 不要改 finance 那组数。
+#
+# -----------------------------------------------------------------------------
+# 4. buffer 行数为什么要用 --replay_rows 而不是 --replay_ratio
+# ------------------------------------------------------------
+# OPR 的 buffer 是离线定好大小的（int(dataset_size * rho)），然后整份拿去训练。
+# 而 --replay_ratio 会在 train.py 里对**划分完 val 之后**的训练集重算一遍行数，
+# 得到的数和 buffer 实际行数对不上：多了会 ValueError，少了会静默只用一部分。
+#
+# 所以 Step 0 先数出新任务的原始行数（对应他们的 dataset_size=5000，那也是
+# 划分前的文件行数），算出 BUFFER_SIZE = int(ρ x N)，建 buffer 时用它，训练时
+# 用 --replay_rows 精确消费。Step 3 会核对训练日志里的实际行数。
+#
+# 注意 int() 不是 round()：照他们的写法截断。
+#
+# -----------------------------------------------------------------------------
+# 5. 投递前要有
+# ------------
+#   1) 93 号 Step 1 物化出来的 math / code 池与 val 切片（池用来生成候选，
+#      val 用来每个 epoch 打旧域交叉熵）。**不需要** C 或 F。
+#   2) 94 号的 base 与 vanilla 已评完（base 缺席时 ret_* 三列会是 '-'）
+#   3) ${DATASET_DIR} = data/processed/finance_train
+#   4) REWARD=ru 还需要 OPC 的 view jsonl 和原始 parquet（跑 testcase 用）
+#   5) 评测数据（缺哪个跳过哪个指标，只警告）
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/100_finance_opr.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_finopr_${JOBTAG}}"
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+else
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_finopr_${JOBTAG}}"
+  EXTRA_BIND=""
+fi
+
+# =============================================================================
+# 外层：裸计算节点，只负责起容器再把自己跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}"; exit 1; }
+  [[ -f "${IMAGE}" ]]    || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_finopr_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
+    MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT
+    DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE
+    PROFILE PROFILE_SOURCE SKIP_PROFILE_CHECK
+    REWARD RHO BUFFER_SIZE GEN_BATCH GEN_MAX_NEW TEMPERATURE LOGPROB_SOURCE
+    OPR_DIR CODE_VIEW_FILE CODE_OPC_PATH CODE_TIMEOUT
+    DO_GENERATE FORCE_GENERATE
+    PROBE PROBE_STEPS MAX_STEPS SAVE
+    SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS REPLAY_MAXLEN
+    DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL WITH_RETENTION
+    EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
+    EVAL_BATCH SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY EVAL_BEFORE_TRAIN
+    BENCH_ROOT FPB_DATA FIQASA_DATA TFNS_DATA
+    MATH_DATA_DIR CODE_DATA_DIR MATH500_FILE GSM8K_FILE
+    HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT IFBENCH_INPUT WITH_IFBENCH
+    FINANCE_MAX_NEW FINANCE_BATCH LIMIT
+    MATH_MAX_NEW_TOKENS CODE_MAX_NEW_TOKENS IF_MAX_NEW_TOKENS IFBENCH_MAX_NEW_TOKENS
+    MATH_BATCH CODE_BATCH IFEVAL_BATCH IFBENCH_BATCH
+    DECODE_STOP_ON_IM_END VANILLA_RUN
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  # 不能用 exec：会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+export NLTK_DATA="${NLTK_DATA}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+# =============================================================================
+# 超参 profile。见文件头第 3 条。与 99 号是同一份表。
+# =============================================================================
+PROFILE="${PROFILE:-finance}"
+
+case "${PROFILE}" in
+  finance)
+    # ---- 训练：来自 95 号 L375-392，与 94 号的 vanilla 逐字相同 ----
+    PROFILE_MODEL_NAME="Qwen2.5-1.5B-Instruct"   # W_ref，裸底座，也是生成候选的模型
+    PROFILE_DATASET_SUBDIR="finance_train"
+    PROFILE_EPOCHS="2"
+    PROFILE_LR="8e-5"
+    PROFILE_LR_SCHEDULER="cosine"
+    PROFILE_WARMUP_RATIO="0.1"
+    PROFILE_BATCH="8"
+    PROFILE_ACCUM="64"                           # OPR 追加行，不占 batch 名额
+    PROFILE_MAXLEN="1216"
+    PROFILE_VAL_FRAC="0.01"
+    PROFILE_MAXVAL="200"
+    PROFILE_SEED="42"
+    PROFILE_MAX_TRAIN_SAMPLES="0"
+    PROFILE_LOG_EVERY="500"
+    PROFILE_EVAL_BEFORE_TRAIN="1"
+    PROFILE_SYSTEM_PROMPT=""
+    PROFILE_OLD_VAL_ROWS="500"
+    # 旧知识池的长度预算。math 与 code 相同，所以 train.py 那个全局唯一的
+    # --replay_max_len 对两个域都是对的（95 号 L511 同理）。
+    PROFILE_REPLAY_MAXLEN="1024"
+    # ---- 评测：来自 95 号 L644-656 ----
+    PROFILE_FINANCE_MAX_NEW="128"
+    PROFILE_FINANCE_BATCH="128"
+    PROFILE_MATH_MAX_NEW_TOKENS="4096"
+    PROFILE_CODE_MAX_NEW_TOKENS="512"
+    PROFILE_IF_MAX_NEW_TOKENS="768"
+    PROFILE_IFBENCH_MAX_NEW_TOKENS="2048"
+    PROFILE_MATH_BATCH="32"
+    PROFILE_CODE_BATCH="64"
+    PROFILE_IFEVAL_BATCH="32"
+    PROFILE_IFBENCH_BATCH="16"
+    PROFILE_DECODE_STOP_ON_IM_END="1"
+    PROFILE_SOURCE="${PROFILE_SOURCE:-${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs}"
+    ;;
+  *)
+    echo "未知 PROFILE='${PROFILE}'。现有：finance。" >&2
+    echo "  新实验线请在本文件的 case 里加一个分支，把那条线的超参连同出处写进去。" >&2
+    exit 2
+    ;;
+esac
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-${PROFILE_MODEL_NAME}}"
+EPOCHS="${EPOCHS:-${PROFILE_EPOCHS}}"
+LR="${LR:-${PROFILE_LR}}"
+LR_SCHEDULER="${LR_SCHEDULER:-${PROFILE_LR_SCHEDULER}}"
+WARMUP_RATIO="${WARMUP_RATIO:-${PROFILE_WARMUP_RATIO}}"
+BATCH="${BATCH:-${PROFILE_BATCH}}"
+ACCUM="${ACCUM:-${PROFILE_ACCUM}}"
+MAXLEN="${MAXLEN:-${PROFILE_MAXLEN}}"
+VAL_FRAC="${VAL_FRAC:-${PROFILE_VAL_FRAC}}"
+MAXVAL="${MAXVAL:-${PROFILE_MAXVAL}}"
+EVAL_BATCH="${EVAL_BATCH:-${BATCH}}"
+SEED="${SEED:-${PROFILE_SEED}}"
+MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-${PROFILE_MAX_TRAIN_SAMPLES}}"
+LOG_EVERY="${LOG_EVERY:-${PROFILE_LOG_EVERY}}"
+EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-${PROFILE_EVAL_BEFORE_TRAIN}}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-${PROFILE_SYSTEM_PROMPT}}"
+OLD_VAL_ROWS="${OLD_VAL_ROWS:-${PROFILE_OLD_VAL_ROWS}}"
+REPLAY_MAXLEN="${REPLAY_MAXLEN:-${PROFILE_REPLAY_MAXLEN}}"
+
+FINANCE_MAX_NEW="${FINANCE_MAX_NEW:-${PROFILE_FINANCE_MAX_NEW}}"
+FINANCE_BATCH="${FINANCE_BATCH:-${PROFILE_FINANCE_BATCH}}"
+MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS:-${PROFILE_MATH_MAX_NEW_TOKENS}}"
+CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS:-${PROFILE_CODE_MAX_NEW_TOKENS}}"
+IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS:-${PROFILE_IF_MAX_NEW_TOKENS}}"
+IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS:-${PROFILE_IFBENCH_MAX_NEW_TOKENS}}"
+MATH_BATCH="${MATH_BATCH:-${PROFILE_MATH_BATCH}}"
+CODE_BATCH="${CODE_BATCH:-${PROFILE_CODE_BATCH}}"
+IFEVAL_BATCH="${IFEVAL_BATCH:-${PROFILE_IFEVAL_BATCH}}"
+IFBENCH_BATCH="${IFBENCH_BATCH:-${PROFILE_IFBENCH_BATCH}}"
+DECODE_STOP_ON_IM_END="${DECODE_STOP_ON_IM_END:-${PROFILE_DECODE_STOP_ON_IM_END}}"
+
+# =============================================================================
+# OPR 的旋钮
+# =============================================================================
+REWARD="${REWARD:-}"
+case "${REWARD}" in
+  sc|ru) ;;
+  "") echo "必须指定 REWARD=sc|ru（OPR 的两个打分变体，见文件头第 2 条）" >&2
+      echo "  sc  模型对自己答案的平均 logprob，不需要 gold，零替换" >&2
+      echo "  ru  规则打分：math 比最终答案、code 跑 testcase（打分器是替换过的）" >&2
+      echo "    qsub -v DRY_RUN=0,REWARD=sc ${SELF_PATH}" >&2
+      exit 2 ;;
+  *)  echo "REWARD 只能是 sc / ru，得到 '${REWARD}'" >&2; exit 2 ;;
+esac
+
+# 他们 argparse 的默认值，也是 README 的例子。
+RHO="${RHO:-0.01}"
+# 生成配置。GEN_MAX_NEW 是天花板，实际预算由 generate_replay_targets 从
+# --max_len 反推，见文件头第 2 条 a。
+TEMPERATURE="${TEMPERATURE:-0.1}"
+GEN_MAX_NEW="${GEN_MAX_NEW:-512}"
+GEN_BATCH="${GEN_BATCH:-16}"
+LOGPROB_SOURCE="${LOGPROB_SOURCE:-raw}"
+
+# =============================================================================
+# 路径
+# =============================================================================
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_finance_${MODEL_NAME}}"
+METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
+CKPT_DIR="${CKPT_DIR:-${RESULTS_ROOT}/checkpoints}"
+EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/results_finance_eval}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+TRAIN_LOG_DIR="${RESULTS_ROOT}/train_logs"
+OPR_DIR="${OPR_DIR:-${RESULTS_ROOT}/opr}"
+
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
+PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
+DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/${PROFILE_DATASET_SUBDIR}}"
+
+# 93 号 Step 1 的产物：池用来生成候选，val 用来打旧域交叉熵。
+SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
+OLD_VAL="${OLD_VAL:-1}"
+pool_file_for () { printf '%s' "${SPLIT_DIR}/$1_pool.jsonl"; }
+val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
+
+MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
+MIX_DOMAINS="${MIX_DOMAINS//:/,}"
+# 不带 -w：OPR 的 buffer 在各池之间是等分的（int(buffer_size / 池数)），没有
+# 可调的域间比例，名字里带权重会误导读表的人。
+MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")"
+OLD_VAL_DOMAINS="${MIX_DOMAINS//,/ }"
+
+# REWARD=ru 的 code 打分要跑 testcase，需要这两份。
+CODE_VIEW_FILE="${CODE_VIEW_FILE:-${PROCESSED_DIR}/opc_edu_ccode_20k.jsonl}"
+CODE_OPC_PATH="${CODE_OPC_PATH:-${DATA_ROOT}/raw/opc/educational_instruct.parquet}"
+CODE_TIMEOUT="${CODE_TIMEOUT:-3.0}"
+
+DRY_RUN="${DRY_RUN:-1}"
+DO_GENERATE="${DO_GENERATE:-1}"
+DO_TRAIN="${DO_TRAIN:-1}"
+DO_EVAL="${DO_EVAL:-1}"
+FORCE_GENERATE="${FORCE_GENERATE:-0}"
+FORCE_TRAIN="${FORCE_TRAIN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+WITH_RETENTION="${WITH_RETENTION:-1}"
+SKIP_PROFILE_CHECK="${SKIP_PROFILE_CHECK:-0}"
+MAX_STEPS="${MAX_STEPS:-0}"
+SAVE="${SAVE:-1}"
+
+PROBE="${PROBE:-0}"
+VANILLA_EPOCHS="${EPOCHS}"
+if [[ "${PROBE}" == "1" ]]; then
+  PROBE_STEPS="${PROBE_STEPS:-4800}"
+  MAX_STEPS="${PROBE_STEPS}"
+  SAVE=0
+  DO_EVAL=0
+  EPOCHS=1
+fi
+
+ACCUM_STEPS=$((ACCUM / BATCH))
+if (( ACCUM_STEPS * BATCH != ACCUM )); then
+  echo "!! ACCUM=${ACCUM} 不是 BATCH=${BATCH} 的整数倍。" >&2
+  exit 2
+fi
+
+run_name_for () {
+  local name="fin_opr-${REWARD}_${MIX_TAG}_rho$1"
+  name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
+  if [[ "${PROBE}" == "1" || "${MAX_STEPS}" != "0" ]]; then
+    name="${name}_probe${MAX_STEPS}"
+  fi
+  printf '%s' "${name}"
+}
+VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${VANILLA_EPOCHS}_seed${SEED}}"
+BASE_RUN="base"
+RUN="$(run_name_for "${RHO}")"
+RUN_METRICS="${METRICS_DIR}/${RUN}.jsonl"
+TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
+
+# 生成产物按 REWARD 分开：SC 与 RU 各自独立生成一次，这是他们的做法（两个脚本
+# 各跑各的），代价是两者的差值里含采样噪声。
+gen_file_for () { printf '%s' "${OPR_DIR}/gen_${REWARD}_$1.jsonl"; }
+BUFFER_FILE="${OPR_DIR}/buffer_${REWARD}_${MIX_TAG}_rho${RHO}.jsonl"
+SCORES_FILE="${OPR_DIR}/scores_${REWARD}_${MIX_TAG}.json"
+
+# =============================================================================
+# 评测配置：与 94/95/99 号逐字相同。
+# =============================================================================
+BENCH_ROOT="${BENCH_ROOT:-${REPO_ROOT}/datasets/bench}"
+FPB_DATA="${FPB_DATA:-${BENCH_ROOT}/fpb/test.jsonl}"
+FIQASA_DATA="${FIQASA_DATA:-${BENCH_ROOT}/fiqasa/test.jsonl}"
+TFNS_DATA="${TFNS_DATA:-${BENCH_ROOT}/tfns/test.jsonl}"
+MATH_DATA_DIR="${MATH_DATA_DIR:-${REPO_ROOT}/datasets/math}"
+CODE_DATA_DIR="${CODE_DATA_DIR:-${REPO_ROOT}/datasets/code}"
+MATH500_FILE="${MATH500_FILE:-${MATH_DATA_DIR}/math500_test.jsonl}"
+GSM8K_FILE="${GSM8K_FILE:-${MATH_DATA_DIR}/gsm8k_test.jsonl}"
+HUMANEVAL_FILE="${HUMANEVAL_FILE:-${CODE_DATA_DIR}/humaneval_test.parquet}"
+MBPP_DIR="${MBPP_DIR:-${CODE_DATA_DIR}/mbpp_full}"
+MBPP_SPLIT="${MBPP_SPLIT:-test}"
+IFEVAL_INPUT="${IFEVAL_INPUT:-${REPO_ROOT}/onereplay/third_party/instruction_following_eval/data/input_data.jsonl}"
+IFBENCH_INPUT="${IFBENCH_INPUT:-}"
+WITH_IFBENCH="${WITH_IFBENCH:-1}"
+LIMIT="${LIMIT:-0}"
+
+DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp"
+if [[ "${WITH_IFBENCH}" == "1" ]]; then
+  DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
+fi
+DOMAIN_METRICS="${DOMAIN_METRICS} fpb fiqasa tfns"
+
+mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${EVAL_ROOT}" "${TRAIN_LOG_DIR}" \
+         "${DATASET_CACHE}" "${OPR_DIR}"
+
+echo "========================================================================"
+echo "finance 线 opr-${REWARD} 臂：保护 ${MIX_TAG}"
+echo "  profile  = ${PROFILE}"
+echo "  W_ref    = ${MODEL_DIR}/${MODEL_NAME}   (裸底座，也是生成候选的 on-policy 模型)"
+echo "  新任务   = ${DATASET_DIR}"
+echo "  ρ        = ${RHO}   (回放行数占新任务的比例，他们的默认值)"
+echo "  打分     = ${REWARD}$([[ "${REWARD}" == "sc" ]] && echo "（平均 logprob，来源 ${LOGPROB_SOURCE}）" || echo "（math 最终答案 / code testcase，打分器是替换过的）")"
+echo "  生成     = temperature ${TEMPERATURE}, max_new ≤ ${GEN_MAX_NEW}, 预算从 max_len ${REPLAY_MAXLEN} 反推"
+echo "             截断的答案保留（OPR 行为），训练侧 --replay_drop_truncated 0"
+echo "  候选池   = $(for d in ${OLD_VAL_DOMAINS}; do printf '%s ' "$(pool_file_for "${d}")"; done)"
+if [[ "${OLD_VAL}" == "1" ]]; then
+echo "  旧域 val = ${OLD_VAL_ROWS} 行/域，域：${OLD_VAL_DOMAINS}（与另外几条臂同一批行）"
+fi
+echo "  batch    = ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM} 行/update（与 vanilla 相同）"
+echo "  训练     = lr ${LR} ${LR_SCHEDULER} warmup ${WARMUP_RATIO} epochs ${EPOCHS} seed ${SEED}"
+echo "             maxlen ${MAXLEN}，replay maxlen ${REPLAY_MAXLEN}"
+echo "  run      = ${RUN}"
+echo "  评测     = ${DOMAIN_METRICS}"
+echo "  分母     = ${BASE_RUN} / ${VANILLA_RUN}"
+echo "  阶段     = generate:${DO_GENERATE} train:${DO_TRAIN} eval:${DO_EVAL} DRY_RUN=${DRY_RUN}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 前置检查 + 算出 buffer 行数
+# ===========================================================================
+echo
+echo "==== Step 0: 前置检查 ===="
+
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "找不到模型: ${MODEL_DIR}/${MODEL_NAME}" >&2; exit 3; }
+[[ -d "${DATASET_DIR}" ]] || { echo "找不到新任务数据: ${DATASET_DIR}" >&2; exit 3; }
+for _d in ${OLD_VAL_DOMAINS}; do
+  _p="$(pool_file_for "${_d}")"
+  [[ -f "${_p}" ]] || { echo "找不到 ${_d} 池: ${_p}（93 号 Step 1 的产物）" >&2; exit 3; }
+  if [[ "${OLD_VAL}" == "1" ]]; then
+    _v="$(val_file_for "${_d}")"
+    [[ -f "${_v}" ]] || { echo "找不到 ${_d} 的 val 切片: ${_v}" >&2; exit 3; }
+  fi
+done
+if [[ "${REWARD}" == "ru" ]]; then
+  [[ -f "${CODE_VIEW_FILE}" ]] || { echo "REWARD=ru 需要 OPC view: ${CODE_VIEW_FILE}" >&2; exit 3; }
+  [[ -f "${CODE_OPC_PATH}" ]]  || { echo "REWARD=ru 需要 OPC parquet: ${CODE_OPC_PATH}" >&2; exit 3; }
+fi
+
+# ---- 超参对表。与 99 号同一段，见文件头第 3 条。----
+if [[ "${SKIP_PROFILE_CHECK}" == "1" ]]; then
+  echo "  !! SKIP_PROFILE_CHECK=1：跳过与 ${PROFILE_SOURCE##*/} 的超参对表。"
+  echo "     这条臂和另外几条是否可比，现在没有任何东西在保证。"
+elif [[ -z "${PROFILE_SOURCE}" || ! -f "${PROFILE_SOURCE}" ]]; then
+  echo "  !! 找不到对表来源 '${PROFILE_SOURCE}'，跳过超参对表。"
+else
+  PROFILE_SOURCE="${PROFILE_SOURCE}" \
+  EPOCHS="${EPOCHS}" LR="${LR}" LR_SCHEDULER="${LR_SCHEDULER}" \
+  WARMUP_RATIO="${WARMUP_RATIO}" BATCH="${BATCH}" ACCUM="${ACCUM}" \
+  MAXLEN="${MAXLEN}" VAL_FRAC="${VAL_FRAC}" MAXVAL="${MAXVAL}" SEED="${SEED}" \
+  MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES}" LOG_EVERY="${LOG_EVERY}" \
+  EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN}" MODEL_NAME="${MODEL_NAME}" \
+  OLD_VAL_ROWS="${OLD_VAL_ROWS}" REPLAY_MAXLEN="${REPLAY_MAXLEN}" \
+  FINANCE_MAX_NEW="${FINANCE_MAX_NEW}" FINANCE_BATCH="${FINANCE_BATCH}" \
+  MATH_MAX_NEW_TOKENS="${MATH_MAX_NEW_TOKENS}" CODE_MAX_NEW_TOKENS="${CODE_MAX_NEW_TOKENS}" \
+  IF_MAX_NEW_TOKENS="${IF_MAX_NEW_TOKENS}" IFBENCH_MAX_NEW_TOKENS="${IFBENCH_MAX_NEW_TOKENS}" \
+  MATH_BATCH="${MATH_BATCH}" CODE_BATCH="${CODE_BATCH}" \
+  IFEVAL_BATCH="${IFEVAL_BATCH}" IFBENCH_BATCH="${IFBENCH_BATCH}" \
+  DECODE_STOP_ON_IM_END="${DECODE_STOP_ON_IM_END}" \
+  python - <<'PY'
+import os
+import re
+import sys
+
+NAMES = [
+    "MODEL_NAME", "EPOCHS", "LR", "LR_SCHEDULER", "WARMUP_RATIO", "BATCH",
+    "ACCUM", "MAXLEN", "VAL_FRAC", "MAXVAL", "SEED", "MAX_TRAIN_SAMPLES",
+    "LOG_EVERY", "EVAL_BEFORE_TRAIN", "OLD_VAL_ROWS", "REPLAY_MAXLEN",
+    "FINANCE_MAX_NEW", "FINANCE_BATCH", "MATH_MAX_NEW_TOKENS",
+    "CODE_MAX_NEW_TOKENS", "IF_MAX_NEW_TOKENS", "IFBENCH_MAX_NEW_TOKENS",
+    "MATH_BATCH", "CODE_BATCH", "IFEVAL_BATCH", "IFBENCH_BATCH",
+    "DECODE_STOP_ON_IM_END",
+]
+
+source = os.environ["PROFILE_SOURCE"]
+with open(source, encoding="utf-8") as handle:
+    text = handle.read()
+
+missing, mismatched, checked = [], [], []
+for name in NAMES:
+    match = re.search(
+        rf'^{name}="\$\{{{name}:-(.*?)\}}"\s*$', text, flags=re.MULTILINE
+    )
+    if match is None:
+        missing.append(name)
+        continue
+    theirs = match.group(1)
+    if "${" in theirs:
+        continue
+    ours = os.environ.get(name, "")
+    if ours != theirs:
+        mismatched.append((name, ours, theirs))
+    else:
+        checked.append(name)
+
+print(f"  超参对表：{os.path.basename(source)}，比中 {len(checked)} 项")
+if missing:
+    print(f"  !! 在对表来源里找不到这些名字，无法核对：{missing}")
+if mismatched:
+    print()
+    print("!! 超参与对表来源不一致。这条臂和另外几条不可比，而这种偏差事后")
+    print("   只会表现为一个解释不了的数字，不会报错：")
+    for name, ours, theirs in mismatched:
+        print(f"   - {name}: 本脚本 '{ours}'  vs  {os.path.basename(source)} '{theirs}'")
+    print()
+    print("   要么改回来，要么在本文件里新增一个 PROFILE 分支。")
+    sys.exit(1)
+print("  超参对表通过")
+PY
+fi
+
+# ---- buffer 行数。见文件头第 4 条。----
+# 数的是**划分 val 之前**的行数，对应他们的 dataset_size=5000（那也是 train.json
+# 的行数，ms-swift 之后才切 val）。int() 不是 round()，照他们的写法。
+TRAIN_ROWS="$(DATASET_DIR="${DATASET_DIR}" python - <<'PY'
+import os
+
+from datasets import load_from_disk
+
+data = load_from_disk(os.environ["DATASET_DIR"])
+data = data["train"] if "train" in data else data
+print(len(data))
+PY
+)"
+NUM_POOLS="$(printf '%s\n' ${OLD_VAL_DOMAINS} | wc -l | tr -d ' ')"
+BUFFER_SIZE="${BUFFER_SIZE:-$(python -c "print(int(${TRAIN_ROWS} * ${RHO}))")}"
+# 各池等分后向下取整，所以实际写出的行数可能比 BUFFER_SIZE 少几行 —— 他们的
+# 除法就是这样，保留。
+BUFFER_ROWS_EXPECTED="$(python -c "print(int(${BUFFER_SIZE} / ${NUM_POOLS}) * ${NUM_POOLS})")"
+echo "  新任务 ${TRAIN_ROWS} 行（划分 val 前）"
+echo "  buffer = int(${TRAIN_ROWS} x ${RHO}) = ${BUFFER_SIZE}，${NUM_POOLS} 个池等分"
+echo "  实际写出 ${BUFFER_ROWS_EXPECTED} 行（int(${BUFFER_SIZE}/${NUM_POOLS}) x ${NUM_POOLS}）"
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划，不生成不训练不评测。"
+  echo "  Step 1 每个域一次："
+  for _d in ${OLD_VAL_DOMAINS}; do
+    echo "    generate_replay_targets --data_files $(pool_file_for "${_d}") \\"
+    echo "      --input_column inputs --target_column gold_targets --pool_size 0 \\"
+    echo "      --max_len ${REPLAY_MAXLEN} --max_new_tokens ${GEN_MAX_NEW} \\"
+    echo "      --temperature ${TEMPERATURE} --keep_truncated_text 1 \\"
+    echo "      --record_logprob 1 --logprob_source ${LOGPROB_SOURCE} \\"
+    echo "      --output_path $(gen_file_for "${_d}")"
+  done
+  echo "  Step 2:"
+  echo "    build_opr_buffer --reward ${REWARD} --buffer_size ${BUFFER_SIZE} \\"
+  for _d in ${OLD_VAL_DOMAINS}; do
+    echo "      --pool ${_d}=$(gen_file_for "${_d}") \\"
+  done
+  echo "      --output_path ${BUFFER_FILE}"
+  echo "  Step 3 train.py 关键参数："
+  echo "    --full_finetune 1 --replay_rows ${BUFFER_ROWS_EXPECTED}"
+  echo "    --replay_self_distill_file ${BUFFER_FILE}"
+  echo "    --replay_target_column targets --replay_drop_truncated 0"
+  echo "    --replay_max_len ${REPLAY_MAXLEN}"
+  echo "  没有 --cov_path / --fisher_path / --replay_per_batch：这是数据级回放，"
+  echo "  ACCUM 保持 ${ACCUM}，与 vanilla 每次更新的新任务行数相同。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 用 on-policy 模型生成候选答案
+#
+# 这就是 OPR 的"on-policy"：答案由**即将开始训练的那个模型**产生。单阶段设定
+# 下它就是裸底座，所以只生成一次（多任务序列里他们每到边界重新生成一次）。
+# ===========================================================================
+if [[ "${DO_GENERATE}" == "1" ]]; then
+  for _d in ${OLD_VAL_DOMAINS}; do
+    _out="$(gen_file_for "${_d}")"
+    if [[ "${FORCE_GENERATE}" == "1" ]]; then
+      rm -f "${_out}"
+    fi
+    echo
+    echo "==== generate ${_d} -> ${_out} ===="
+    python -m onereplay.scripts.generate_replay_targets \
+      --seed "${SEED}" \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --data_files "$(pool_file_for "${_d}")" \
+      --input_column inputs --target_column gold_targets \
+      --pool_size 0 --sample_seed 1 \
+      --batch_size "${GEN_BATCH}" \
+      --max_len "${REPLAY_MAXLEN}" --max_new_tokens "${GEN_MAX_NEW}" \
+      --temperature "${TEMPERATURE}" \
+      --keep_truncated_text 1 \
+      --record_logprob 1 --logprob_source "${LOGPROB_SOURCE}" \
+      --cache_dir "${DATASET_CACHE}" \
+      --output_path "${_out}" \
+      --resume 1
+  done
+else
+  echo
+  echo "DO_GENERATE=0：沿用已有的候选文件。"
+  for _d in ${OLD_VAL_DOMAINS}; do
+    _out="$(gen_file_for "${_d}")"
+    [[ -f "${_out}" ]] || { echo "找不到 ${_out}，需要先 DO_GENERATE=1" >&2; exit 3; }
+  done
+fi
+
+# ===========================================================================
+# Step 2: 打分 + top-k，写出 buffer
+# ===========================================================================
+echo
+echo "==== build buffer (${REWARD}) ===="
+BUILD_ARGS=(
+  --reward "${REWARD}"
+  --buffer_size "${BUFFER_SIZE}"
+  --output_path "${BUFFER_FILE}"
+  --scores_out "${SCORES_FILE}"
+)
+for _d in ${OLD_VAL_DOMAINS}; do
+  BUILD_ARGS+=(--pool "${_d}=$(gen_file_for "${_d}")")
+done
+if [[ "${REWARD}" == "ru" ]]; then
+  BUILD_ARGS+=(
+    --code_view_file "${CODE_VIEW_FILE}"
+    --code_opc_path "${CODE_OPC_PATH}"
+    --code_timeout "${CODE_TIMEOUT}"
+  )
+fi
+python -m onereplay.scripts.build_opr_buffer "${BUILD_ARGS[@]}"
+
+BUFFER_ROWS="$(wc -l < "${BUFFER_FILE}" | tr -d ' ')"
+if [[ "${BUFFER_ROWS}" != "${BUFFER_ROWS_EXPECTED}" ]]; then
+  echo "!! buffer 写出 ${BUFFER_ROWS} 行，期望 ${BUFFER_ROWS_EXPECTED} 行。" >&2
+  echo "   配额算术和 Step 0 对不上，后面 --replay_rows 会要错数量。" >&2
+  exit 1
+fi
+echo "  ok  buffer ${BUFFER_ROWS} 行，与 Step 0 的配额算术一致"
+
+# ===========================================================================
+# 旧域 val：与 95 号 L1181-1192 逐字相同，四条臂必须打同一批行。
+# ===========================================================================
+OLD_VAL_ARGS=()
+if [[ "${OLD_VAL}" == "1" ]]; then
+  _spec=""
+  for _d in ${OLD_VAL_DOMAINS}; do
+    _spec="${_spec}${_spec:+,}${_d}=$(val_file_for "${_d}")"
+  done
+  OLD_VAL_ARGS=(
+    --prior_val_jsonl "${_spec}"
+    --old_val_presliced 1
+    --old_val_rows "${OLD_VAL_ROWS}"
+  )
+fi
+
+# ===========================================================================
+# Step 3: 训练
+# ===========================================================================
+if [[ "${DO_TRAIN}" == "1" ]]; then
+  if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${CKPT_DIR}/${RUN}" ]]; then
+    echo
+    echo "已存在 checkpoint，跳过训练: ${CKPT_DIR}/${RUN}"
+    echo "  要重训就传 FORCE_TRAIN=1，或换一个 SEED。"
+  else
+    mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
+    echo
+    echo "==== train ${RUN} ===="
+    echo "  ρ=${RHO}  buffer ${BUFFER_ROWS} 行  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
+
+    python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+      --system_prompt "${SYSTEM_PROMPT}" \
+      --dataset_path "${DATASET_DIR}" \
+      --epochs "${EPOCHS}" --lr "${LR}" \
+      --lr_scheduler "${LR_SCHEDULER}" --warmup_ratio "${WARMUP_RATIO}" \
+      --batch_size "${BATCH}" --accumulation_size "${ACCUM}" \
+      --max_len "${MAXLEN}" \
+      --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" \
+      --eval_batch_size "${EVAL_BATCH}" \
+      --eval_before_train "${EVAL_BEFORE_TRAIN}" \
+      --max_train_samples "${MAX_TRAIN_SAMPLES}" \
+      --max_steps "${MAX_STEPS}" \
+      --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
+      --log_every "${LOG_EVERY}" \
+      ${OLD_VAL_ARGS[@]+"${OLD_VAL_ARGS[@]}"} \
+      --replay_rows "${BUFFER_ROWS}" \
+      --replay_self_distill_file "${BUFFER_FILE}" \
+      --replay_input_column inputs \
+      --replay_target_column targets \
+      --replay_drop_truncated 0 \
+      --replay_max_len "${REPLAY_MAXLEN}" \
+      --replay_cache_dir "${DATASET_CACHE}" \
+      --measure_replay_when_lambda_zero 0 \
+      --cov_path "" \
+      --replay_lambda 0 \
+      --save "${SAVE}" --save_path "${CKPT_DIR}/${RUN}" \
+      --metrics_path "${RUN_METRICS}" 2>&1 | tee "${TRAIN_LOG}"
+
+    # ---- 训练自检 ----
+    # 对应 95 号的 assert_coverage。这条臂没有罚项，要证明的是"buffer 整份都
+    # 进去了"：数量不对就说明 --replay_rows 和文件行数脱节，而日志里那一行是
+    # 唯一能证明的地方。
+    echo
+    echo "==== 训练自检 ===="
+    if grep -qE -- "replay: [0-9]+ new-task \+ ${BUFFER_ROWS} replay" "${TRAIN_LOG}"; then
+      echo "  ok  ${BUFFER_ROWS} 行 buffer 全部混入"
+      grep -E -- "replay: [0-9]+ new-task \+" "${TRAIN_LOG}" | head -n 1
+    else
+      echo "  !! 日志里没有 '... new-task + ${BUFFER_ROWS} replay'。" >&2
+      grep -E -- "replay: [0-9]+ new-task \+" "${TRAIN_LOG}" | head -n 1 || true
+      echo "     混进去的行数和 buffer 对不上，这个 run 不可用。" >&2
+      exit 1
+    fi
+    if ! grep -qF -- "self-distilled replay" "${TRAIN_LOG}"; then
+      echo "  !! 日志没说 replay 是 self-distilled：训练目标可能用了 gold 列，" >&2
+      echo "     那样这条臂就退化成普通 replay，不是 OPR。" >&2
+      exit 1
+    fi
+    if grep -qE -- "(covariance|Fisher) matrices from" "${TRAIN_LOG}"; then
+      echo "  !! 日志里出现了矩阵加载：这条臂不该有任何 regularizer。" >&2
+      exit 1
+    fi
+
+    echo "  checkpoint : ${CKPT_DIR}/${RUN}"
+    echo "  metrics    : ${RUN_METRICS}"
+  fi
+fi
+
+if [[ "${PROBE}" == "1" ]]; then
+  echo
+  echo "PROBE=1：短跑结束，不存 checkpoint、不评测。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+if [[ "${DO_EVAL}" != "1" ]]; then
+  echo
+  echo "DO_EVAL=0：跳过评测。补评："
+  echo "  qsub -v DRY_RUN=0,REWARD=${REWARD},DO_GENERATE=0,DO_TRAIN=0 ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 4: 评测（与 95 号 Step 3 逐字相同）
+# ===========================================================================
+ifbench_ready () {
+  python - <<'PY' >/dev/null 2>&1
+from ifbench import instructions_registry
+from onereplay.eval.metrics.ifbench import check_nltk_data
+
+assert len(instructions_registry.INSTRUCTION_DICT) >= 83
+check_nltk_data()
+PY
+}
+
+AVAIL=""
+for m in ${DOMAIN_METRICS}; do
+  case "${m}" in
+    fpb)       [[ -f "${FPB_DATA}"       ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 fpb：缺 ${FPB_DATA}" ;;
+    fiqasa)    [[ -f "${FIQASA_DATA}"    ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 fiqasa：缺 ${FIQASA_DATA}" ;;
+    tfns)      [[ -f "${TFNS_DATA}"      ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 tfns：缺 ${TFNS_DATA}" ;;
+    ifeval)    [[ -f "${IFEVAL_INPUT}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 ifeval：缺 ${IFEVAL_INPUT}" ;;
+    gsm8k)     [[ -f "${GSM8K_FILE}"     ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 gsm8k：缺 ${GSM8K_FILE}" ;;
+    math500)   [[ -f "${MATH500_FILE}"   ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 math500：缺 ${MATH500_FILE}" ;;
+    humaneval) [[ -f "${HUMANEVAL_FILE}" ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 humaneval：缺 ${HUMANEVAL_FILE}" ;;
+    mbpp)      [[ -d "${MBPP_DIR}"       ]] && AVAIL="${AVAIL} ${m}" || echo "跳过 mbpp：缺 ${MBPP_DIR}" ;;
+    ifbench)
+      if ifbench_ready; then
+        AVAIL="${AVAIL} ${m}"
+      else
+        echo "跳过 ifbench：依赖没就绪。在登录节点补齐后 DO_GENERATE=0 DO_TRAIN=0 重投即可只补评。"
+      fi
+      ;;
+  esac
+done
+AVAIL="${AVAIL# }"
+if [[ -z "${AVAIL}" ]]; then
+  echo "要评的指标一个数据都没找到，跳过评测" >&2
+  exit 6
+fi
+
+pending_metrics () {
+  local name="$1"; shift
+  local out=""
+  for m in "$@"; do
+    if [[ "${FORCE_EVAL}" == "1" || ! -f "${EVAL_ROOT}/${m}/${name}/summary.json" ]]; then
+      out="${out}${out:+,}${m}"
+    fi
+  done
+  echo "${out}"
+}
+
+if [[ ! -d "${CKPT_DIR}/${RUN}" ]]; then
+  echo "找不到 checkpoint: ${CKPT_DIR}/${RUN}" >&2
+  echo "  先跑 DO_TRAIN=1，或检查 REWARD / RHO 是否与训练时一致。" >&2
+  exit 4
+fi
+
+# shellcheck disable=SC2086
+MP="$(pending_metrics "${RUN}" ${AVAIL})"
+if [[ -z "${MP}" ]]; then
+  echo "==== skip ${RUN}：所有指标都已有结果（FORCE_EVAL=1 可重评）===="
+else
+  echo
+  echo "==== eval ${RUN} (${MP}) ===="
+  EVAL_ARGS=(
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}"
+    --adapter_path "${CKPT_DIR}/${RUN}" --run_name "${RUN}"
+    --out_dir "${EVAL_ROOT}" --metrics "${MP}" --seed "${SEED}"
+    --system_prompt "${SYSTEM_PROMPT}"
+    --decode_stop_on_im_end "${DECODE_STOP_ON_IM_END}"
+    --limit "${LIMIT}"
+    --fpb_data_path "${FPB_DATA}"
+    --fiqasa_data_path "${FIQASA_DATA}"
+    --tfns_data_path "${TFNS_DATA}"
+    --finance_max_new_tokens "${FINANCE_MAX_NEW}"
+    --finance_batch_size "${FINANCE_BATCH}"
+    --math500_data_path "${MATH500_FILE}"
+    --gsm8k_data_path "${GSM8K_FILE}"
+    --math_max_new_tokens "${MATH_MAX_NEW_TOKENS}"
+    --math_batch_size "${MATH_BATCH}"
+    --humaneval_data_file "${HUMANEVAL_FILE}"
+    --mbpp_dataset_path "${MBPP_DIR}" --dataset_split "${MBPP_SPLIT}"
+    --code_max_new_tokens "${CODE_MAX_NEW_TOKENS}"
+    --code_batch_size "${CODE_BATCH}"
+    --timeout "${CODE_TIMEOUT}"
+    --ifeval_input "${IFEVAL_INPUT}"
+    --ifeval_batch_size "${IFEVAL_BATCH}"
+    --max_new_tokens "${IF_MAX_NEW_TOKENS}"
+    --ifbench_limit "${LIMIT}"
+    --ifbench_max_new_tokens "${IFBENCH_MAX_NEW_TOKENS}"
+    --ifbench_batch_size "${IFBENCH_BATCH}"
+  )
+  [[ -n "${IFBENCH_INPUT}" ]] && EVAL_ARGS+=(--ifbench_input "${IFBENCH_INPUT}")
+  python -m onereplay.scripts.evaluate "${EVAL_ARGS[@]}"
+fi
+
+# ===========================================================================
+# Step 5: base 答对子集上的保留率（与 95 号 Step 4 逐字相同）
+# ===========================================================================
+RETENTION_JSON=""
+if [[ "${WITH_RETENTION}" == "1" ]]; then
+  RET_METRICS="${AVAIL// /,}"
+  RETENTION_JSON="${EVAL_ROOT}/retention/${RUN}.json"
+  mkdir -p "$(dirname "${RETENTION_JSON}")"
+  echo
+  echo "==== Step 5: base 答对子集上的保留率 ===="
+  RET_RC=0
+  python -m onereplay.scripts.score_retention_subset \
+    --results_root "${EVAL_ROOT}" --metrics "${RET_METRICS}" \
+    --runs "${BASE_RUN},${VANILLA_RUN},${RUN}" --baseline "${BASE_RUN}" \
+    --json_out "${RETENTION_JSON}" || RET_RC=$?
+  if (( RET_RC != 0 )); then
+    echo "warning: score_retention_subset 退出码 ${RET_RC}，主表的 ret_* 三列会是 '-'。"
+    echo "         最常见的原因是 base 在本 OUT_DIR 下还没评过（94 号还没跑）。"
+  fi
+  [[ -s "${RETENTION_JSON}" ]] || RETENTION_JSON=""
+fi
+
+# ===========================================================================
+# Step 6: 汇总 —— base / vanilla / 本臂并排（与 95 号 Step 5 同一套表）
+# ===========================================================================
+echo
+echo "========================================================================"
+echo "结果汇总：opr-${REWARD} 保护 ${MIX_TAG}   ρ=${RHO}"
+echo "========================================================================"
+OUT_DIR="${EVAL_ROOT}" RUN_NAME="${RUN}" ARM_NAME="opr-${REWARD}" \
+BASE_NAME="${BASE_RUN}" VANILLA_NAME="${VANILLA_RUN}" \
+METRIC_NAMES="${AVAIL}" RETENTION_JSON="${RETENTION_JSON}" \
+RUN_METRICS="${RUN_METRICS}" VANILLA_METRICS="${METRICS_DIR}/${VANILLA_RUN}.jsonl" \
+BUFFER_FILE="${BUFFER_FILE}" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+out_dir = Path(os.environ["OUT_DIR"])
+run_name = os.environ["RUN_NAME"]
+base_name = os.environ["BASE_NAME"]
+vanilla_name = os.environ["VANILLA_NAME"]
+arm_name = os.environ["ARM_NAME"]
+metric_names = os.environ["METRIC_NAMES"].split()
+
+NEW_TASK = {"fpb", "fiqasa", "tfns"}
+SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
+METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy"}
+
+
+def read_score(metric, name):
+    path = out_dir / metric / name / "summary.json"
+    if not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    override = METRIC_SCORE_KEY.get(metric)
+    if override:
+        return payload.get(override)
+    for key in SCORE_KEYS:
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def cell(value, spec=".4f", width=10):
+    return f"{'-' if value is None else format(value, spec):>{width}}"
+
+
+retention = {}
+retention_path = os.environ.get("RETENTION_JSON", "")
+if retention_path and os.path.isfile(retention_path):
+    for record in json.loads(Path(retention_path).read_text(encoding="utf-8")):
+        retention[(record["metric"], record["run"])] = record
+
+
+def read_retention(metric, name):
+    record = retention.get((metric, name))
+    return None if record is None else record.get("accuracy_on_base_correct")
+
+
+print("保留（d_base 是遗忘量，d_van 才是本臂救回来多少 —— 后者是方法的效果）")
+print(
+    f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>11}"
+    f"{'d_base(pp)':>12}{'d_van(pp)':>11}{'ret_van':>10}{'ret_ours':>10}{'d_ret(pp)':>11}"
+)
+print("-" * 97)
+for metric in metric_names:
+    if metric in NEW_TASK:
+        continue
+    base = read_score(metric, base_name)
+    van = read_score(metric, vanilla_name)
+    ours = read_score(metric, run_name)
+    d_base = (ours - base) * 100 if (base is not None and ours is not None) else None
+    d_van = (ours - van) * 100 if (van is not None and ours is not None) else None
+    ret_van = read_retention(metric, vanilla_name)
+    ret_ours = read_retention(metric, run_name)
+    d_ret = (
+        (ret_ours - ret_van) * 100
+        if (ret_van is not None and ret_ours is not None)
+        else None
+    )
+    print(
+        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", 11)
+        + cell(d_base, "+.2f", 12) + cell(d_van, "+.2f", 11)
+        + cell(ret_van) + cell(ret_ours) + cell(d_ret, "+.2f", 11)
+    )
+
+print()
+print("新任务（方向相反：这里掉了就是在拿 finance 的性能换旧能力）")
+print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>11}{'d_van(pp)':>12}")
+print("-" * 55)
+for metric in metric_names:
+    if metric not in NEW_TASK:
+        continue
+    base = read_score(metric, base_name)
+    van = read_score(metric, vanilla_name)
+    ours = read_score(metric, run_name)
+    d_van = (ours - van) * 100 if (van is not None and ours is not None) else None
+    print(
+        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", 11)
+        + cell(d_van, "+.2f", 12)
+    )
+
+if retention:
+    print()
+    print("ret_* = base 答对的题里这个 run 还答对的比例（1.0 = 一道没丢），d_ret = 本臂 - vanilla。")
+else:
+    print()
+    print("ret_* 三列是 '-'：没有保留率结果（WITH_RETENTION=0，或 base 还没评过）。")
+
+
+def read_records(path):
+    if not path or not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                rows.append(json.loads(line))
+    return rows
+
+
+def last_epoch(path):
+    rows = [r for r in read_records(path) if r.get("record_type") == "epoch"]
+    return rows[-1] if rows else {}
+
+
+def baseline(path):
+    rows = [r for r in read_records(path) if r.get("record_type") == "baseline"]
+    return rows[-1] if rows else {}
+
+
+ours_m = last_epoch(os.environ.get("RUN_METRICS"))
+van_m = last_epoch(os.environ.get("VANILLA_METRICS"))
+ours_b = baseline(os.environ.get("RUN_METRICS"))
+van_b = baseline(os.environ.get("VANILLA_METRICS"))
+
+old_keys = sorted(k for k in ours_m if k.startswith("old_val_loss"))
+if old_keys:
+    print()
+    print("旧域 val loss（Δ 是相对各自训练前的起点；正数 = 忘了，越小越好）:")
+    print(f"{'domain':<12}{'baseline':>12}{'van_Δ':>12}{'ours_Δ':>12}{'救回':>12}")
+    for key in old_keys:
+        start = ours_b.get(key)
+        final = ours_m.get(key)
+        d_ours = (final - start) if (start is not None and final is not None) else None
+        v_start, v_final = van_b.get(key), van_m.get(key)
+        d_van = (v_final - v_start) if (v_start is not None and v_final is not None) else None
+        saved = (d_van - d_ours) if (d_van is not None and d_ours is not None) else None
+        name = key.replace("old_val_loss_", "").replace("old_val_loss", "(single)")
+        print(
+            f"{name:<12}" + cell(start, ".6f", 12) + cell(d_van, "+.6f", 12)
+            + cell(d_ours, "+.6f", 12) + cell(saved, "+.6f", 12)
+        )
+    if len(old_keys) > 1:
+        print("  mix 要读的就是这两行分开的数：一侧保住、另一侧塌了，才是「buffer 容量不够，")
+        print("  两个域在抢」这个结论。平均成一个数会把它藏起来。")
+
+# buffer 的构成。这几个数确认这一跑确实是 OPR：回放答案来自模型自己，而且
+# 经过了质量筛选。分数分布还说明筛选到底筛掉了什么。
+buffer_path = os.environ.get("BUFFER_FILE", "")
+if buffer_path and os.path.isfile(buffer_path):
+    from collections import Counter
+
+    scores = []
+    pools = Counter()
+    truncated = 0
+    for row in read_records(buffer_path):
+        scores.append(float(row.get("opr_score", 0.0)))
+        pools[row.get("opr_pool", "?")] += 1
+        truncated += int(bool(row.get("truncated")))
+    if scores:
+        ordered = sorted(scores)
+        print()
+        print("OPR buffer 的构成:")
+        print(f"  行数         {len(scores)}   按池 {dict(pools)}")
+        print(
+            f"  分数         min {ordered[0]:.4f} / median "
+            f"{ordered[len(ordered) // 2]:.4f} / max {ordered[-1]:.4f}"
+        )
+        print(f"  其中截断     {truncated}   (OPR 不丢截断，训练侧也没丢)")
+
+print()
+print("新任务拟合与开销:")
+print(f"{'':<14}{'val_loss':>12}{'train_sec':>12}{'peak_mem_GB':>13}{'replay_rows':>13}")
+for label, row in (("vanilla", van_m), (arm_name, ours_m)):
+    print(
+        f"{label:<14}"
+        + cell(row.get("val_loss"), ".6f", 12)
+        + cell(row.get("train_sec"), ".0f", 12)
+        + cell(row.get("peak_memory_gb"), ".2f", 13)
+        + cell(row.get("replay_rows"), ".0f", 13)
+    )
+if ours_m.get("val_loss") and van_m.get("val_loss"):
+    delta = ours_m["val_loss"] - van_m["val_loss"]
+    print(f"val_loss 差值 = {delta:+.6f}")
+    if delta <= 0:
+        print("  <= 0：新任务没被本臂拖慢，上面的 d_van 可以直接当保护效果读。")
+    else:
+        print("  > 0：新任务学得更差了，d_van 里有一部分是'少学了'而不是'保住了'。")
+if ours_m.get("train_sec") and van_m.get("train_sec"):
+    print(f"墙钟比 = {ours_m['train_sec'] / van_m['train_sec']:.2f}x vanilla")
+    print("  数据级回放只把 epoch 拉长 ρ 倍，所以这个数应该非常接近 1 —— 这正是")
+    print("  OPR 相对批级 replay 臂（约 2x）要报的效率优势。生成的那一次性开销")
+    print("  不在这个数里，要单独报。")
+PY
+
+echo
+echo "========================================================================"
+echo "本臂完成: ${RUN}"
+echo "  另一个打分变体："
+echo "    qsub -v DRY_RUN=0,REWARD=$([[ "${REWARD}" == "sc" ]] && echo ru || echo sc) ${SELF_PATH}"
+echo "  同一张表里的另外几条（95 号 DOMAIN=mix，以及 99 号的 OSFT）："
+echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "    qsub -v DRY_RUN=0,URR=0.25 ${REPO_ROOT}/onereplay/pbs/99_finance_osft.pbs"
+echo "  换 ρ 就改 RHO=（它和 replay 臂的批级比例是同一根轴上的两个点，"
+echo "  用 plot_replay_ratio_curves.py 把它们画在一起比单点对比信息量大）。"
+echo "========================================================================"
