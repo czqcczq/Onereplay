@@ -11,20 +11,26 @@
 # =============================================================================
 # TRACE-as-one-pool 线第二步：四条臂（vanilla / onereplay / ewc / replay）
 #
-# 一次投递 = 一条臂 x 一个 λ。保护域固定是 mix（0.5 math + 0.5 code）。
+# 一次投递 = 一条臂 x 一个保护域 x 一个 λ。
+# DOMAIN 取 if / math / code / mix，默认 mix（0.5 math + 0.5 code）。
 #
-#   不吃 λ 的两条，现在就能投：
+#   vanilla 与保护域无关（它什么都不保护），所以不吃 DOMAIN，整条线只跑一次：
 #     qsub -v DRY_RUN=0,ARM=vanilla onereplay/pbs/99_trace_mix_arms.pbs
-#     qsub -v DRY_RUN=0,ARM=replay  onereplay/pbs/99_trace_mix_arms.pbs
+#
+#   replay 吃 DOMAIN 不吃 λ：
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay  onereplay/pbs/99_trace_mix_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=math,ARM=replay onereplay/pbs/99_trace_mix_arms.pbs
 #
 #   吃 λ 的两条，先扫量级（一个作业跑完整个网格，不评测不存 checkpoint）：
-#     qsub -v DRY_RUN=0,ARM=onereplay,LAMBDAS=0:1e-4:1e-3:1e-2 onereplay/pbs/99_trace_mix_arms.pbs
-#     qsub -v DRY_RUN=0,ARM=ewc,LAMBDAS=0:1:1e2:1e4            onereplay/pbs/99_trace_mix_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDAS=0:1e-4:1e-3:1e-2 onereplay/pbs/99_trace_mix_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=ewc,LAMBDAS=0:1:1e2:1e4            onereplay/pbs/99_trace_mix_arms.pbs
 #   再照扫描表挑中心点，扫 0.5x / 1x / 2x 各投一次正式 run：
-#     qsub -v DRY_RUN=0,ARM=onereplay,LAMBDA=1.5e-3 onereplay/pbs/99_trace_mix_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDA=1.5e-3 onereplay/pbs/99_trace_mix_arms.pbs
+#
+#   !! λ 不跨域通用，每个 DOMAIN 都要自己扫一遍，见第 2 条。
 #
 #   L2 对照臂（C 换成单位阵，隔离"协方差结构"与"任何收缩"）：
-#     qsub -v DRY_RUN=0,ARM=onereplay,LAMBDA=...,IDENTITY_COV=1 onereplay/pbs/99_trace_mix_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDA=...,IDENTITY_COV=1 onereplay/pbs/99_trace_mix_arms.pbs
 #
 #   只补 base 那一列，不训练（base 不需要 checkpoint）：
 #     qsub -v DRY_RUN=0,ARM=vanilla,DO_TRAIN=0 onereplay/pbs/99_trace_mix_arms.pbs
@@ -41,11 +47,15 @@
 # 遗忘量就变了，而三条臂救回多少全是相对它算的。
 #
 #   vanilla    不加任何保护。**遗忘的分母**，另外三条臂救回多少只有和它比才有意义。
-#   onereplay  罚 tr(ΔW C ΔWᵀ)，C_mix 来自 98 号。本方法。
-#   ewc        罚 Σ F_ij ΔW_ij²，F_mix 来自 98 号。对照：同一批旧知识、同一个
+#   onereplay  罚 tr(ΔW C ΔWᵀ)，C 来自 98 号。本方法。
+#   ewc        罚 Σ F_ij ΔW_ij²，F 来自 98 号。对照：同一批旧知识、同一个
 #              W_ref，只换加权矩阵。
-#   replay     不罚 ΔW，改为每个 micro-batch 掺一半旧域真实数据（math/code 各半）。
+#   replay     不罚 ΔW，改为每个 micro-batch 掺一半旧域真实数据。
 #              对照：同一批旧知识，换成"重新训一遍"而不是"压成矩阵"。
+#
+# 三条保护臂的 C / F / replay 池都跟着 DOMAIN 走：DOMAIN=math 就是 C_math +
+# math_pool，DOMAIN=mix 就是 C_mix + 两个池按 MIX_WEIGHTS 混。vanilla 不吃
+# DOMAIN，它是所有域共用的那一条分母。
 #
 # 四臂共享的东西必须逐字相同，否则比较里会混进第二个变量：W_ref（裸
 # Llama-3.2-3B-Instruct）、新任务数据、LR / scheduler / warmup / MAXLEN /
@@ -69,8 +79,20 @@
 # --measure_replay_when_lambda_zero 1，train.py 在 λ=0 时根本不会加载矩阵、也就
 # 不会测 R。而且 λ=0 就是 vanilla，那是 ARM=vanilla 的事。
 #
-# !! mix 是另一把尺子。C_mix 的 tr(C) 是两份的加权平均，与任何单域 C 都不同，
-# 同一个 λ 压出来的 λR/task_loss 不是一个量。
+# !! 每个 DOMAIN 是一把独立的尺子。C_mix 的 tr(C) 是两份的加权平均，与任何单域
+# C 都不同；C_if 采在 512 token 的 FLAN 上，与 1024 的 math/code 更不是一回事。
+# 同一个 λ 在不同域压出来的 λR/task_loss 不是一个量，四个域要各扫各的。
+#
+# -----------------------------------------------------------------------------
+# 2b. !! DOMAIN=if 的前提：98 号得先 DO_IF=1 采过
+# ----------------------------------------------
+# 98 号默认只采 math / code（DO_IF=0），因为 if 不进 mix。跑 DOMAIN=if 之前先：
+#     qsub -v DRY_RUN=0,DO_IF=1,DO_MATH=0,DO_CODE=0,DO_MIX=0 onereplay/pbs/98_trace_gold_cf.pbs
+# finance 线（93 号）那份 cov_if_flan20k_all.pt 搬不过来：它采在 Qwen2.5-1.5B 上，
+# hidden 1536 对不上本线的 3072，Step 1 的维度自检会直接拦住。
+#
+# if 的 REPLAY_MAXLEN 是 512（= 98 号的 IF_MAXLEN），不是 math/code 的 1024。
+# 脚本按 DOMAIN 自动取，别手动覆盖成 1024 —— Step 1 会拿它和 C 的 max_len 对表。
 #
 # -----------------------------------------------------------------------------
 # 3. !! replay 臂的 ACCUM 必须翻倍，否则它学的新任务比别人少一半
@@ -102,11 +124,13 @@
 # 同一个文件。Step 1 按 replay 的**真实装配路径**把池建出来数行数，和 C 记录的
 # pool_rows 比，不等就退出。
 #
-# !! 这里的同池检查读的是 **mix 文件的 metadata.source_metadata**，不是单域 C/F。
-# 98 号默认保留单域矩阵，但它也支持 PRUNE_SINGLE=1 把它们删掉，所以这条检查不能
-# 依赖它们还在。mix_covariances 和 mix_fishers 都把每个输入的完整 metadata 原样存
-# 了进去，pool_rows / pool_fingerprint / max_len / system_prompt 全都在，两种情况下
-# 证据链都不断。
+# !! pool_rows 记在哪，两种域不一样：
+#   单域（if/math/code）  该域 C 文件的 metadata 顶层
+#   mix                   C_mix 的 metadata.source_metadata，一个输入一条
+# mix 走 source_metadata 是因为 98 号支持 PRUNE_SINGLE=1 删掉单域矩阵，这条检查
+# 不能依赖它们还在。mix_covariances 和 mix_fishers 都把每个输入的完整 metadata 原
+# 样存了进去，pool_rows / pool_fingerprint / max_len / system_prompt 全都在。
+# 反过来，单域臂本来就要那份单域 C 才跑得起来，所以读顶层没有额外依赖。
 #
 # !! --replay_drop_truncated 必须是 0（默认是 1）
 # 物化后的池不带 truncated 列，传 1 在这里是空操作；但万一以后换了带该列的池，
@@ -115,13 +139,14 @@
 # -----------------------------------------------------------------------------
 # 5. !! replay_max_len 跟着 C 走，不跟着新任务走
 # ----------------------------------------------
-# 新任务是 MAXLEN=2048（97 号建 trace_mix 池时的预算），两个旧池是 1024。这**不是**
-# 要对齐的两个数：train.py 的 --replay_max_len 只管 replay 行，--max_len 只管新任务
-# 行，互不影响。
+# 新任务是 MAXLEN=2048（97 号建 trace_mix 池时的预算），math/code 池是 1024、if 池
+# 是 512。这**不是**要对齐的几个数：train.py 的 --replay_max_len 只管 replay 行，
+# --max_len 只管新任务行，互不影响。
 #
 # 要对齐的是 replay_max_len 与 C 的 max_len：训练侧截断保留末尾 token（丢问题、留
-# 答案），replay 若卡得比 C 低，它保护的旧知识就严格少于罚项编码的那一份。Step 1
-# 拿 mix 的 source_metadata 对表，不等就退出。
+# 答案），replay 若卡得比 C 低，它保护的旧知识就严格少于罚项编码的那一份。所以
+# REPLAY_MAXLEN 由 DOMAIN 决定（if 512 / 其余 1024），Step 1 拿 C 的 metadata 对表，
+# 不等就退出。
 #
 # -----------------------------------------------------------------------------
 # 6. 最容易静默失败的地方：矩阵的层覆盖
@@ -137,7 +162,7 @@
 # -----------------------------------------------------------------------------
 # 7. 评测：旧能力 + 新任务两侧都要
 # --------------------------------
-#   旧能力（方向：别掉）  gsm8k math500 humaneval mbpp  —— 本线保护的就是这四个
+#   旧能力（方向：别掉）  gsm8k math500 humaneval mbpp  —— math / code 两侧
 #                         ifeval ifbench                 —— 指令跟随，见下
 #   新任务（方向：别掉太多）TRACE 八个 test
 #
@@ -145,6 +170,12 @@
 # 了"和"不知道该用什么格式答题"。IFEval 的 25 类约束是公开的，"IFEval 没掉"有可能
 # 只是记住了那 25 类模板；IFBench 换了 58 类训练时没见过的约束，两个一起看才能
 # 区分"能力保住了"和"模板记住了"。
+#
+# !! 这六个指标**每个 DOMAIN 都全评**，不按保护域裁剪。这条线要回答的正是"只保
+# math 会不会连带保住 code"和"mix 比单域强多少"，把 code 那两个指标从 DOMAIN=math
+# 的表里砍掉，最该被看见的失败模式就不会出现在结果里。代价是每条臂多两三个小时
+# 评测。确实只想要本域那几个数时传 NARROW_EVAL=1，它按 95 号的口径裁：
+#   if 全评 / math 只评 ifeval+gsm8k+math500 / code 只评 ifeval+humaneval+mbpp。
 #
 # TRACE 八个 test 是**新任务**这一侧：所有臂都在同一批 TRACE 数据上训，所以每条臂
 # 都得知道自己在新任务上退了多少。这是判断 λ 选大了的唯一直接证据 —— 旧能力涨、
@@ -164,15 +195,16 @@
 # 每个 epoch 还在被保护的两个域上打一条交叉熵，它只随权重动：
 #   record_type=baseline  训练前的裸底座（EVAL_BEFORE_TRAIN=1 时有）
 #   record_type=epoch     每轮之后
-#   列名                  old_val_loss_math / old_val_loss_code
+#   列名                  old_val_loss_<域>，mix 下两个域分开报
 # 走的是 98 号切出来的 val 文件，那 500 行谁都没训过。
+# 打哪几个域跟着 DOMAIN 走，vanilla 打 mix 的两个（它是所有域的分母）。
 #
 # -----------------------------------------------------------------------------
 # 9. 投递前要有
 # -------------
-#   1) 98 号的 mix 矩阵：ARM=onereplay 要 C_mix，ARM=ewc 要 F_mix，
-#      ARM=replay 要两个池（它仍会读 C_mix 的 source_metadata 证明同池，
-#      真没有就 SKIP_POOL_CHECK=1，但那样就没有同池的证据了）
+#   1) 98 号在本 DOMAIN 上的产物：ARM=onereplay 要该域的 C，ARM=ewc 要该域的 F，
+#      ARM=replay 要该域的池（它仍会读同域 C 的 metadata 证明同池，真没有就
+#      SKIP_POOL_CHECK=1，但那样就没有同池的证据了）。DOMAIN=if 见第 2b 条。
 #   2) 97 号 MODE=data 的产物：data/processed/trace_mix_train
 #   3) 评测数据（缺哪个跳过哪个指标，只警告）
 # base 不是前置条件：DO_BASE=1（默认）会在 Step 2 里把它评出来，已经有了就跳过。
@@ -230,14 +262,16 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR NLTK_DATA
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT TRAIN_LOG_DIR
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE CF_ROOT
-    ARM LAMBDA LAMBDAS IDENTITY_COV
+    ARM DOMAIN LAMBDA LAMBDAS IDENTITY_COV
     DRY_RUN DO_TRAIN DO_EVAL DO_BASE FORCE_TRAIN FORCE_EVAL SKIP_POOL_CHECK WITH_RETENTION
+    NARROW_EVAL
     LIMIT DIAG_LEN PROBE PROBE_STEPS SAVE MAX_STEPS
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     EVAL_BATCH TARGET_MODULES SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY
     EVAL_BEFORE_TRAIN NORM_BY_LAYERS REG_ONCE REG_IMPL MEASURE_ZERO
     REPLAY_PER_BATCH REPLAY_SAMPLE_SEED REPLAY_DROP_TRUNCATED REPLAY_MAXLEN
     SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS MIX_WEIGHTS MIX_COV MIX_FISHER
+    FLAN_SAMPLES IF_COV MATH_COV CODE_COV IF_FISHER MATH_FISHER CODE_FISHER
     MATH_DATA_DIR CODE_DATA_DIR MATH500_FILE GSM8K_FILE
     HUMANEVAL_FILE MBPP_DIR MBPP_SPLIT IFEVAL_INPUT IFBENCH_INPUT WITH_IFBENCH
     WITH_TRACE_EVAL TRACE_BATCH TRACE_LIMIT
@@ -299,6 +333,19 @@ case "${ARM}" in
   *) echo "ARM 必须是 vanilla|onereplay|ewc|replay，当前 '${ARM}'" >&2; exit 2 ;;
 esac
 
+# 被保护的域。默认 mix，这样加 DOMAIN 之前投过的命令行为逐字不变。
+DOMAIN="${DOMAIN:-mix}"
+case "${DOMAIN}" in
+  if|math|code|mix) ;;
+  *) echo "DOMAIN 必须是 if|math|code|mix，当前 '${DOMAIN}'" >&2; exit 2 ;;
+esac
+# vanilla 什么都不保护，它是所有域共用的那条分母。给它传 DOMAIN 只会在 run 名里
+# 多出一个不存在的区分，让 <metric>_summary.csv 里出现几条其实一模一样的行。
+if [[ "${ARM}" == "vanilla" && "${DOMAIN}" != "mix" ]]; then
+  echo "ARM=vanilla 不吃 DOMAIN（它不加保护），忽略 DOMAIN=${DOMAIN}"
+  DOMAIN=mix
+fi
+
 # ---- 模型 ----
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-Llama-3.2-3B-Instruct}"
@@ -328,6 +375,14 @@ SPLIT_DIR="${SPLIT_DIR:-${CF_ROOT}/pools}"
 OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
 OLD_VAL="${OLD_VAL:-1}"
 
+# 单域矩阵。文件名逐字等于 98 号，目录由 CF_ROOT 决定。
+IF_COV="${IF_COV:-${COV_DIR}/cov_if_flan20k_all.pt}"
+MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_all.pt}"
+CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_all.pt}"
+IF_FISHER="${IF_FISHER:-${FISHER_DIR}/fisher_if_flan20k_all.pt}"
+MATH_FISHER="${MATH_FISHER:-${FISHER_DIR}/fisher_math_metamath30k_gold_all.pt}"
+CODE_FISHER="${CODE_FISHER:-${FISHER_DIR}/fisher_code_opcedu20k_gold_all.pt}"
+
 MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
 MIX_WEIGHTS="${MIX_WEIGHTS:-0.5,0.5}"
 MIX_DOMAINS="${MIX_DOMAINS//:/,}"
@@ -335,6 +390,21 @@ MIX_WEIGHTS="${MIX_WEIGHTS//:/,}"
 MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")-w$(printf '%s' "${MIX_WEIGHTS//,/-}")"
 MIX_COV="${MIX_COV:-${COV_DIR}/cov_${MIX_TAG}_gold_all.pt}"
 MIX_FISHER="${MIX_FISHER:-${FISHER_DIR}/fisher_${MIX_TAG}_gold_all.pt}"
+
+cov_path_for () {
+  case "$1" in
+    if)   printf '%s' "${IF_COV}" ;;
+    math) printf '%s' "${MATH_COV}" ;;
+    code) printf '%s' "${CODE_COV}" ;;
+  esac
+}
+fisher_path_for () {
+  case "$1" in
+    if)   printf '%s' "${IF_FISHER}" ;;
+    math) printf '%s' "${MATH_FISHER}" ;;
+    code) printf '%s' "${CODE_FISHER}" ;;
+  esac
+}
 
 # 与 98 号逐字相同的推导规则。两边对不上时下面的同池检查会拦住。
 pool_file_for () { printf '%s' "${SPLIT_DIR}/$1_pool.jsonl"; }
@@ -375,8 +445,13 @@ REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
 REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
 # 必须 0，见文件头第 4 条。
 REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED:-0}"
-# 跟着 C 的 max_len 走，不是新任务的 MAXLEN，见文件头第 5 条。
-REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
+# 跟着本域 C 的 max_len 走，不是新任务的 MAXLEN，见文件头第 5 条。
+# if 的池采在 512 上（98 号的 IF_MAXLEN），math/code/mix 是 1024。
+if [[ "${DOMAIN}" == "if" ]]; then
+  REPLAY_MAXLEN="${REPLAY_MAXLEN:-512}"
+else
+  REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
+fi
 REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN:-inputs}"
 REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN:-gold_targets}"
 REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE:-0}"
@@ -392,6 +467,8 @@ FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_EVAL="${FORCE_EVAL:-0}"
 SKIP_POOL_CHECK="${SKIP_POOL_CHECK:-0}"
 WITH_RETENTION="${WITH_RETENTION:-1}"
+# 0（默认）= 每个域都评全套旧能力，跨域可比；1 = 只评本域那几个，见文件头第 7 条。
+NARROW_EVAL="${NARROW_EVAL:-0}"
 LIMIT="${LIMIT:-0}"
 DIAG_LEN="${DIAG_LEN:-1}"
 SAVE="${SAVE:-1}"
@@ -430,7 +507,8 @@ else
     fi
   elif [[ -z "${LAMBDA}" ]]; then
     echo "ARM=${ARM} 必须给 LAMBDA（单点）或 LAMBDAS（扫描）。" >&2
-    echo "  先扫: qsub -v DRY_RUN=0,ARM=${ARM},LAMBDAS=0:1e-4:1e-3:1e-2 ${SELF_PATH}" >&2
+    echo "  先扫: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=${ARM},LAMBDAS=0:1e-4:1e-3:1e-2 ${SELF_PATH}" >&2
+    echo "  换了 DOMAIN 就要重扫：${DOMAIN} 的 tr(C) 与别的域不是一个量级。" >&2
     exit 2
   elif [[ "${LAMBDA}" == "0" ]]; then
     echo "单点模式不接受 LAMBDA=0：那就是 vanilla，投 ARM=vanilla。" >&2
@@ -442,15 +520,34 @@ fi
 # =============================================================================
 # 臂相关的路径与 batch 算术
 # =============================================================================
-COV_PATH="${COV_PATH:-${MIX_COV}}"
-FISHER_PATH="${FISHER_PATH:-${MIX_FISHER}}"
+# PROTECT_DOMAINS 是"本臂实际碰的那几个域"：单域一个，mix 是 MIX_DOMAINS 展开。
+# 池检查、旧域 val、replay 装配三处都读它，这样单域和 mix 只在这里分一次岔。
 REPLAY_MIX_FILES=""
-OLD_VAL_DOMAINS=""
-for _d in ${MIX_DOMAINS//,/ }; do
-  REPLAY_MIX_FILES="${REPLAY_MIX_FILES}${REPLAY_MIX_FILES:+,}${_d}=$(pool_file_for "${_d}")"
-  OLD_VAL_DOMAINS="${OLD_VAL_DOMAINS}${OLD_VAL_DOMAINS:+ }${_d}"
-done
-REPLAY_MIX_WEIGHTS="${MIX_WEIGHTS}"
+REPLAY_MIX_WEIGHTS=""
+REPLAY_DATA_FILES=""
+PROTECT_DOMAINS=""
+case "${DOMAIN}" in
+  mix)
+    COV_PATH="${COV_PATH:-${MIX_COV}}"
+    FISHER_PATH="${FISHER_PATH:-${MIX_FISHER}}"
+    # replay：两个池按行份额混进每个 micro-batch，由 loader 的调度器逐 batch
+    # 落实，不是靠期望值凑。
+    for _d in ${MIX_DOMAINS//,/ }; do
+      REPLAY_MIX_FILES="${REPLAY_MIX_FILES}${REPLAY_MIX_FILES:+,}${_d}=$(pool_file_for "${_d}")"
+      PROTECT_DOMAINS="${PROTECT_DOMAINS}${PROTECT_DOMAINS:+ }${_d}"
+    done
+    REPLAY_MIX_WEIGHTS="${MIX_WEIGHTS}"
+    ;;
+  *)
+    COV_PATH="${COV_PATH:-$(cov_path_for "${DOMAIN}")}"
+    FISHER_PATH="${FISHER_PATH:-$(fisher_path_for "${DOMAIN}")}"
+    REPLAY_DATA_FILES="$(pool_file_for "${DOMAIN}")"
+    PROTECT_DOMAINS="${DOMAIN}"
+    ;;
+esac
+# vanilla 被上面钉成了 DOMAIN=mix，所以它走 mix 那一支：不保护任何域，但
+# old_val 的两列照打 —— 它是所有域共用的分母，没有它就没有"掉了多少"的基准。
+OLD_VAL_DOMAINS="${PROTECT_DOMAINS}"
 
 ARM_ACCUM="${ACCUM}"
 ARM_REPLAY_PER_BATCH=0
@@ -480,8 +577,12 @@ fi
 # 那条排在一个文件里，下游读最后一条就可能拿到错的。
 run_name_for () {
   local lam="$1"
+  # mix 的名字带上参与的域与权重：0.5/0.5 与 0.25/0.75 是两个独立的实验，名字
+  # 一样就会在 <metric>_summary.csv 里挤成同一行。单域直接用域名。
+  local tag="${DOMAIN}"
+  [[ "${DOMAIN}" == "mix" ]] && tag="${MIX_TAG}"
   local name="tmix_${ARM}"
-  [[ "${ARM}" != "vanilla" ]] && name="${name}_${MIX_TAG}"
+  [[ "${ARM}" != "vanilla" ]] && name="${name}_${tag}"
   [[ -n "${lam}" ]] && name="${name}_lam${lam}"
   [[ "${IDENTITY_COV}" == "1" ]] && name="${name}_idcov"
   name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
@@ -526,10 +627,16 @@ TRACE_KEYS=(cstance fomc meetingbank py150 scienceqa numglue_cm numglue_ds 20min
 mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${EVAL_ROOT}" "${TRAIN_LOG_DIR}" "${DATASET_CACHE}"
 
 echo "========================================================================"
-echo "TRACE-mix 线 第二步：${ARM} 臂"
+echo "TRACE-mix 线 第二步：${ARM} 臂，保护 ${DOMAIN}"
 echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
 echo "  新任务   = ${DATASET_DIR}   （TRACE 八部分合一，一口气训）"
-echo "  保护域   = mix (${MIX_DOMAINS} @ ${MIX_WEIGHTS}) -> ${MIX_TAG}"
+if [[ "${ARM}" == "vanilla" ]]; then
+  echo "  保护域   = <无>   （vanilla 是所有域共用的分母）"
+elif [[ "${DOMAIN}" == "mix" ]]; then
+  echo "  保护域   = mix (${MIX_DOMAINS} @ ${MIX_WEIGHTS}) -> ${MIX_TAG}"
+else
+  echo "  保护域   = ${DOMAIN}   （单域；λ 与 mix 不通用，要另扫）"
+fi
 echo "  训练     = lr ${LR} ${LR_SCHEDULER} warmup ${WARMUP_RATIO} epochs ${EPOCHS}"
 echo "             batch ${BATCH} x accum ${ACCUM_STEPS} = ${NEW_PER_UPDATE} 行新任务/update"
 if [[ "${ARM}" == "replay" ]]; then
@@ -586,27 +693,37 @@ else
 fi
 
 # ---- 本臂要用到的 98 号产物 ----
+# 98 号默认只采 math / code；if 那份要显式 DO_IF=1 才有。这两条提示分开写，
+# 否则 DOMAIN=if 缺文件时按上面那条投过去，采出来的还是 math/code。
+cf_hint () {
+  if [[ "${DOMAIN}" == "if" ]]; then
+    echo "  98 号默认不采 if（DO_IF=0）。先跑：" >&2
+    echo "    qsub -v DRY_RUN=0,DO_IF=1,DO_MATH=0,DO_CODE=0,DO_MIX=0 onereplay/pbs/98_trace_gold_cf.pbs" >&2
+  else
+    echo "  先跑 qsub -v DRY_RUN=0 onereplay/pbs/98_trace_gold_cf.pbs" >&2
+  fi
+}
 case "${ARM}" in
   onereplay)
     [[ -f "${COV_PATH}" ]] || {
-      echo "缺 C_mix: ${COV_PATH}" >&2
-      echo "  先跑 qsub -v DRY_RUN=0 onereplay/pbs/98_trace_gold_cf.pbs" >&2
+      echo "缺 C_${DOMAIN}: ${COV_PATH}" >&2
+      cf_hint
       exit 1
     }
-    echo "C_mix: ${COV_PATH}"
+    echo "C_${DOMAIN}: ${COV_PATH}"
     ;;
   ewc)
     [[ -f "${FISHER_PATH}" ]] || {
-      echo "缺 F_mix: ${FISHER_PATH}" >&2
-      echo "  先跑 qsub -v DRY_RUN=0 onereplay/pbs/98_trace_gold_cf.pbs" >&2
+      echo "缺 F_${DOMAIN}: ${FISHER_PATH}" >&2
+      cf_hint
       exit 1
     }
-    echo "F_mix: ${FISHER_PATH}"
+    echo "F_${DOMAIN}: ${FISHER_PATH}"
     ;;
   replay)
-    for _d in ${MIX_DOMAINS//,/ }; do
+    for _d in ${PROTECT_DOMAINS}; do
       _f="$(pool_file_for "${_d}")"
-      [[ -f "${_f}" ]] || { echo "缺 replay 池: ${_f}" >&2; exit 1; }
+      [[ -f "${_f}" ]] || { echo "缺 replay 池: ${_f}" >&2; cf_hint; exit 1; }
       echo "replay 池 ${_d}: ${_f}  ($(wc -l < "${_f}") 行)"
     done
     ;;
@@ -639,7 +756,9 @@ else
 fi
 
 # ---- base 那一列 ----
-if [[ -d "${EVAL_ROOT}/gsm8k/${BASE_RUN}" ]]; then
+# 用 ifeval 探在不在，不用 gsm8k：NARROW_EVAL=1 且 DOMAIN=code 时 gsm8k 根本不评，
+# 拿它当哨兵会年年判成"base 还没评"。ifeval 每个域都评。
+if [[ -d "${EVAL_ROOT}/ifeval/${BASE_RUN}" ]]; then
   echo "base (${BASE_RUN}) 已有结果，Step 2 里会整段跳过"
 elif [[ "${DO_BASE}" == "1" ]]; then
   echo "base (${BASE_RUN}) 还没评，Step 2 会先把它评出来（约 2-3 小时）"
@@ -677,7 +796,7 @@ if [[ "${ARM}" == "onereplay" || "${ARM}" == "ewc" ]]; then
   if [[ "${ARM}" == "onereplay" ]]; then MAT_PATH="${COV_PATH}"; MAT_KIND=cov; else MAT_PATH="${FISHER_PATH}"; MAT_KIND=fisher; fi
   MAT_PATH="${MAT_PATH}" MAT_KIND="${MAT_KIND}" EXPECT_LAYERS="${EXPECT_LAYERS}" \
   MODEL_PATH="${MODEL_DIR}/${MODEL_NAME}" REPLAY_MAXLEN="${REPLAY_MAXLEN}" \
-  SYSTEM_PROMPT="${SYSTEM_PROMPT}" python - <<'PY'
+  DOMAIN="${DOMAIN}" SYSTEM_PROMPT="${SYSTEM_PROMPT}" python - <<'PY'
 import json
 import os
 import sys
@@ -712,22 +831,37 @@ if os.environ["MAT_KIND"] == "cov":
             problems.append(f"{name} 维度 {matrix.shape[0]} != intermediate {inter}")
             break
 
-# 同池的证据全在这里，这样 98 号有没有删掉单域矩阵都不影响。
-sources = metadata.get("source_metadata", [])
+# 采集口径写在哪，单域和 mix 不一样：mix 是相加出来的，没有自己的池，每份输入
+# 的完整 metadata 原样存在 source_metadata 里。单域就是 metadata 顶层。
+# 这里把两种情况归一成 scopes 再逐份查，否则 mix 会整段跳过下面两道闸而看上去
+# "通过了"，或者单域会因为没有 source_metadata 被误判成不是 98 号的产物。
+sources = metadata.get("source_metadata") or []
+is_mix = os.environ["DOMAIN"] == "mix"
+if is_mix:
+    if not sources:
+        problems.append("没有 source_metadata：这不是 98 号合成的 mix 文件？")
+    scopes = list(enumerate(sources))
+else:
+    if sources:
+        problems.append(
+            f"DOMAIN={os.environ['DOMAIN']} 却拿到了带 source_metadata 的 mix 文件；"
+            "单域臂要的是 98 号采的那份单域矩阵"
+        )
+    scopes = [(0, metadata)]
+
 want_maxlen = int(os.environ["REPLAY_MAXLEN"])
 want_system = os.environ["SYSTEM_PROMPT"]
-if not sources:
-    problems.append("没有 source_metadata：这不是 98 号合成的 mix 文件？")
-for index, source in enumerate(sources):
-    got = source.get("max_len")
+for index, scope in scopes:
+    label = f"source[{index}]" if is_mix else "采集口径"
+    got = scope.get("max_len")
     if got is not None and int(got) != want_maxlen:
         problems.append(
-            f"source[{index}] 的 max_len={got}，而 REPLAY_MAXLEN={want_maxlen}；"
+            f"{label}: max_len={got}，而 REPLAY_MAXLEN={want_maxlen}；"
             "replay 保护的旧知识会少于罚项编码的那一份"
         )
-    got_system = source.get("system_prompt")
+    got_system = scope.get("system_prompt")
     if got_system is not None and got_system != want_system:
-        problems.append(f"source[{index}] 的 system_prompt={got_system!r} != {want_system!r}")
+        problems.append(f"{label}: system_prompt={got_system!r} != {want_system!r}")
 
 if problems:
     print(f"!! {path}", file=sys.stderr)
@@ -737,11 +871,12 @@ if problems:
 
 print(f"  {path}")
 print(f"    层数 {len(matrices)}（期望 {expect}）  type={metadata.get('type')}")
-for index, source in enumerate(sources):
+for index, scope in scopes:
+    label = f"source[{index}]" if is_mix else "采集口径"
     print(
-        f"    source[{index}]: pool_rows={source.get('pool_rows')} "
-        f"max_len={source.get('max_len')} "
-        f"fingerprint={str(source.get('pool_fingerprint'))[:16]}"
+        f"    {label}: pool_rows={scope.get('pool_rows')} "
+        f"max_len={scope.get('max_len')} "
+        f"fingerprint={str(scope.get('pool_fingerprint'))[:16]}"
     )
 
 scales = []
@@ -762,41 +897,56 @@ if scales:
 PY
 fi
 
-# replay 臂：池行数必须与 C 记录的 pool_rows 相等
+# replay 臂：池行数必须与 C 记录的 pool_rows 相等。
+# 每个被保护的域比一次：mix 从 C_mix 的 source_metadata 逐份取，单域从该域 C 的
+# metadata 顶层取。下面把"域 -> 拿来对表的 C 文件"拼成一张表传进去。
 if [[ "${ARM}" == "replay" && "${SKIP_POOL_CHECK}" != "1" ]]; then
   echo
   echo "==== Step 1: replay 同池检查 ===="
-  if [[ ! -f "${MIX_COV}" ]]; then
-    echo "!! 找不到 ${MIX_COV}，没法证明 replay 和 C/F 同池。" >&2
+  if [[ "${DOMAIN}" == "mix" ]]; then
+    POOL_CHECK_COV="${MIX_COV}"
+  else
+    POOL_CHECK_COV="$(cov_path_for "${DOMAIN}")"
+  fi
+  if [[ ! -f "${POOL_CHECK_COV}" ]]; then
+    echo "!! 找不到 ${POOL_CHECK_COV}，没法证明 replay 和 C/F 同池。" >&2
     echo "   要硬跑就 SKIP_POOL_CHECK=1，但结果里不能声称同池。" >&2
     exit 1
   fi
-  MIX_COV="${MIX_COV}" MIX_DOMAINS="${MIX_DOMAINS}" SPLIT_DIR="${SPLIT_DIR}" python - <<'PY'
+  POOL_CHECK_COV="${POOL_CHECK_COV}" POOL_CHECK_DOMAINS="${PROTECT_DOMAINS}" \
+  IS_MIX="$([[ "${DOMAIN}" == "mix" ]] && echo 1 || echo 0)" \
+  SPLIT_DIR="${SPLIT_DIR}" python - <<'PY'
 import os
 import sys
 from pathlib import Path
 
 import torch
 
-payload = torch.load(os.environ["MIX_COV"], map_location="cpu", mmap=True)
-sources = payload.get("metadata", {}).get("source_metadata", [])
-domains = [d.strip() for d in os.environ["MIX_DOMAINS"].split(",") if d.strip()]
-if len(sources) != len(domains):
-    print(f"!! source_metadata 有 {len(sources)} 条，域有 {len(domains)} 个", file=sys.stderr)
-    raise SystemExit(1)
+payload = torch.load(os.environ["POOL_CHECK_COV"], map_location="cpu", mmap=True)
+metadata = payload.get("metadata", {})
+domains = os.environ["POOL_CHECK_DOMAINS"].split()
+
+if os.environ["IS_MIX"] == "1":
+    records = metadata.get("source_metadata") or []
+    if len(records) != len(domains):
+        print(f"!! source_metadata 有 {len(records)} 条，域有 {len(domains)} 个", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    # 单域 C 就一份口径，记在顶层。
+    records = [metadata]
 
 split_dir = Path(os.environ["SPLIT_DIR"])
 problems = []
-for domain, source in zip(domains, sources):
+for domain, record in zip(domains, records):
     pool = split_dir / f"{domain}_pool.jsonl"
     if not pool.is_file():
         problems.append(f"{domain}: 池不存在 {pool}")
         continue
     with pool.open(encoding="utf-8") as handle:
         rows = sum(1 for line in handle if line.strip())
-    recorded = source.get("pool_rows")
+    recorded = record.get("pool_rows")
     if recorded is None:
-        problems.append(f"{domain}: C 的 source_metadata 没有 pool_rows")
+        problems.append(f"{domain}: C 的 metadata 里没有 pool_rows")
     elif int(recorded) != rows:
         problems.append(f"{domain}: 池 {rows} 行，但 C 记录的是 {recorded} 行 —— 不是同一批")
     else:
@@ -815,11 +965,11 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "将扫描 λ ∈ {${LAMBDAS//:/, }}，每点 ${MAX_STEPS} 步，不存 checkpoint 不评测。"
   else
     echo "run = $(run_name_for "${LAMBDA}")"
-    if [[ "${DO_BASE}" == "1" && ! -d "${EVAL_ROOT}/gsm8k/${BASE_RUN}" ]]; then
+    if [[ "${DO_BASE}" == "1" && ! -d "${EVAL_ROOT}/ifeval/${BASE_RUN}" ]]; then
       echo "并且会先评 base（${BASE_RUN}），因为 ${EVAL_ROOT} 里还没有它。"
     fi
   fi
-  echo "确认后 qsub -v DRY_RUN=0,ARM=${ARM},... ${SELF_PATH}"
+  echo "确认后 qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=${ARM},... ${SELF_PATH}"
   exit 0
 fi
 
@@ -873,9 +1023,15 @@ arm_train_args () {
         --replay_sample_seed "${REPLAY_SAMPLE_SEED}" \
         --replay_max_len "${REPLAY_MAXLEN}" \
         --replay_drop_truncated "${REPLAY_DROP_TRUNCATED}" \
-        --replay_cache_dir "${DATASET_CACHE}" \
-        --replay_mix_files "${REPLAY_MIX_FILES}" \
-        --replay_mix_weights "${REPLAY_MIX_WEIGHTS}"
+        --replay_cache_dir "${DATASET_CACHE}"
+      # 单域一个池，mix 两个。两者互斥：train.py 在同时给出时会直接报错。
+      if [[ -n "${REPLAY_MIX_FILES}" ]]; then
+        printf '%s\n' \
+          --replay_mix_files "${REPLAY_MIX_FILES}" \
+          --replay_mix_weights "${REPLAY_MIX_WEIGHTS}"
+      else
+        printf '%s\n' --replay_data_files "${REPLAY_DATA_FILES}"
+      fi
       ;;
   esac
 }
@@ -1021,7 +1177,7 @@ fi
 
 if [[ "${DO_EVAL}" != "1" ]]; then
   echo
-  echo "DO_EVAL=0：跳过评测。补评: qsub -v DRY_RUN=0,ARM=${ARM},LAMBDA=${LAMBDA},DO_TRAIN=0 ${SELF_PATH}"
+  echo "DO_EVAL=0：跳过评测。补评: qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=${ARM},LAMBDA=${LAMBDA},DO_TRAIN=0 ${SELF_PATH}"
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -1039,7 +1195,18 @@ check_nltk_data()
 PY
 }
 
-OLD_METRICS="ifeval gsm8k math500 humaneval mbpp"
+# 默认每个 DOMAIN 都评全套旧能力，见文件头第 7 条：砍掉非本域那几个，"只保 math
+# 会不会连带保住 code"和"mix 比单域强多少"就都成了看不见的东西。
+if [[ "${NARROW_EVAL}" == "1" ]]; then
+  case "${DOMAIN}" in
+    math) OLD_METRICS="ifeval gsm8k math500" ;;
+    code) OLD_METRICS="ifeval humaneval mbpp" ;;
+    *)    OLD_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
+  esac
+  echo "NARROW_EVAL=1：只评 ${DOMAIN} 那一侧（${OLD_METRICS}），跨域对比会缺列。"
+else
+  OLD_METRICS="ifeval gsm8k math500 humaneval mbpp"
+fi
 [[ "${WITH_IFBENCH}" == "1" ]] && OLD_METRICS="${OLD_METRICS} ifbench"
 NEW_METRICS=""
 if [[ "${WITH_TRACE_EVAL}" == "1" ]]; then
@@ -1168,7 +1335,7 @@ fi
 # ===========================================================================
 echo
 echo "========================================================================"
-echo "结果汇总：base / vanilla / ${ARM}"
+echo "结果汇总：base / vanilla / ${ARM}   保护 ${DOMAIN}   run=${RUN}"
 echo "========================================================================"
 OUT_DIR="${EVAL_ROOT}" BASE_NAME="${BASE_RUN}" VANILLA_NAME="${VANILLA_RUN}" \
 RUN_NAME="${RUN}" ARM_NAME="${ARM}" METRIC_NAMES="${AVAIL}" \
@@ -1308,5 +1475,9 @@ echo "读法："
 echo "  d_van 是这条臂相对 vanilla 救回来的量，正数才说明保护起作用。"
 echo "  同时看 TRACE 那张表：旧能力涨、TRACE 掉，就是在拿新任务换旧能力，"
 echo "  那是 λ 选大了，不是方法好。等强度对照看 λR/task_loss，不是等 λ。"
+if [[ "${DOMAIN}" != "mix" ]]; then
+  echo "  本次保护的是单域 ${DOMAIN}：非本域那几个指标也在表里，它们回答的是"
+  echo "  '只保 ${DOMAIN} 有没有连带保住别的'。要和 mix 臂比就直接比同一行。"
+fi
 echo "========================================================================"
 echo "Job finished at: $(date)"

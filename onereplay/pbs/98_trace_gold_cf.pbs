@@ -9,18 +9,22 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# TRACE-as-one-pool 线第一步：在 Llama-3.2-3B-Instruct base 上采 math / code 的
-# C 与 F，并合成 mix
+# TRACE-as-one-pool 线第一步：在 Llama-3.2-3B-Instruct base 上采 if / math / code
+# 的 C 与 F，并合成 mix
 #
-#   qsub -v DRY_RUN=0 onereplay/pbs/98_trace_gold_cf.pbs                  # 两域 C+F+mix
+#   qsub -v DRY_RUN=0 onereplay/pbs/98_trace_gold_cf.pbs                  # math+code C+F+mix
 #   qsub -v DRY_RUN=0,WHAT=cov    onereplay/pbs/98_trace_gold_cf.pbs      # 只采 C
 #   qsub -v DRY_RUN=0,WHAT=fisher onereplay/pbs/98_trace_gold_cf.pbs      # 只采 F
 #   qsub -v DRY_RUN=0,WHAT=fisher,DO_MATH=0 onereplay/pbs/98_trace_gold_cf.pbs  # 一次一个域
 #   qsub -v DRY_RUN=0,WHAT=none   onereplay/pbs/98_trace_gold_cf.pbs      # 只跑诊断
 #   qsub -v DRY_RUN=0,PRUNE_SINGLE=1 onereplay/pbs/98_trace_gold_cf.pbs   # 合成后删掉单域矩阵
 #
+#   !! if 域默认**不采**（DO_IF=0）：99 号的 DOMAIN=if 臂才需要它，而它不在
+#      MIX_DOMAINS 里，所以默认那次投递的行为与加它之前逐字相同。要它就显式开：
+#     qsub -v DRY_RUN=0,DO_IF=1,DO_MATH=0,DO_CODE=0,DO_MIX=0 onereplay/pbs/98_trace_gold_cf.pbs
+#
 # 产物：
-#   两份池 + 两份 val 切片（math / code，C / F / replay 三者共用）
+#   每个开启的域一份池 + 一份 val 切片（C / F / replay 三者共用）
 #   C_mix = 0.5 C_math + 0.5 C_code
 #   F_mix = 0.5 F_math + 0.5 F_code
 #   单域 C/F 默认保留（PRUNE_SINGLE=1 才删），见第 4 条
@@ -46,14 +50,18 @@
 # 2. 与 93 号（finance 线）的差异
 # ------------------------------
 #   模型      Qwen2.5-1.5B-Instruct  ->  Llama-3.2-3B-Instruct
-#   域        if / math / code       ->  只有 math / code（本线只做 mix 保护）
+#   域        if / math / code       ->  同样三个，但 if 默认关（DO_IF=0）
 #   结果根    results_finance_*      ->  results_tracemix_*
-#   单域矩阵  全部保留               ->  合成 mix 后删除，见第 4 条
+#   单域矩阵  全部保留               ->  同样默认保留，见第 4 条
 #
 # 其余**逐字照抄 93 号**：源语料路径、OLD_VAL_ROWS=500、SAMPLE_SEED=1、
-# MATH/CODE 的 maxlen 1024、MIX_WEIGHTS=0.5,0.5、TARGET_MODULES 七类 + lm_head、
-# SYSTEM_PROMPT 空、pool_file_for / val_file_for 的推导规则。改任何一项都要同步
-# 改 99 号，否则四条臂之间会多出第二个变量。
+# IF 的 maxlen 512、MATH/CODE 的 maxlen 1024、MIX_WEIGHTS=0.5,0.5、
+# TARGET_MODULES 七类 + lm_head、SYSTEM_PROMPT 空、pool_file_for / val_file_for
+# 的推导规则。改任何一项都要同步改 99 号，否则四条臂之间会多出第二个变量。
+#
+# !! if 的 maxlen 是 512，与 math/code 的 1024 不同。train.py 的 --replay_max_len
+# 是**全局唯一**的一个值，所以 if 进不了 mix：混进去就必然有一个域的 replay 口径
+# 与它的 C 对不上。99 号的 DOMAIN=if 是单域臂，那里只有 512 这一个预算，没问题。
 #
 # 旧知识语料本身与模型无关：C/F 读的是 gold_targets 列，那是数据集自带的解答，
 # 和当初生成那几个 jsonl 的 1.7B 没有关系。所以换模型不需要重新造池。
@@ -119,7 +127,8 @@
 #   1) ${MODEL_DIR}/Llama-3.2-3B-Instruct
 #   2) ${POOL_ROOT}/replay/metamath_cmath_30k_*_selfdistill_seed1.jsonl（**2 个文件**）
 #   3) ${POOL_ROOT}/replay/opc_edu_ccode_20k_selfdistill_seed1.jsonl
-#   4) /scratch 剩余 > Step 0 实算的需求 + 20 GiB
+#   4) DO_IF=1 时还要 ${FLAN_DIR}/train/*.jsonl（93 号读的那份 FLAN）
+#   5) /scratch 剩余 > Step 0 实算的需求 + 20 GiB
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
 # =============================================================================
 
@@ -173,14 +182,15 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME RESULTS_ROOT POOL_ROOT COV_DIR FISHER_DIR DATASET_CACHE
     SPLIT_DIR OLD_VAL_ROWS
-    WHAT DRY_RUN DO_MATH DO_CODE DO_DIAG FORCE DO_PREP FORCE_PREP
+    WHAT DRY_RUN DO_IF DO_MATH DO_CODE DO_DIAG FORCE DO_PREP FORCE_PREP
     DO_MIX FORCE_MIX PRUNE_SINGLE
     MIX_DOMAINS MIX_WEIGHTS MIX_COV MIX_FISHER
     TARGET_MODULES SEED SAMPLE_SEED GOLD_COLUMN SYSTEM_PROMPT DEBUG_EXAMPLES
     COV_USE_BF16 COV_ACCUM_DEVICE FISHER_USE_BF16 FISHER_DEVICE LOG_EVERY
+    FLAN_DIR FLAN_SAMPLES IF_MAXLEN IF_COV_BATCH
     MATH_VIEW_PREFIX MATH_MAXLEN MATH_COV_BATCH
     CODE_VIEW_PREFIX CODE_MAXLEN CODE_COV_BATCH
-    MATH_COV CODE_COV MATH_FISHER CODE_FISHER
+    IF_COV MATH_COV CODE_COV IF_FISHER MATH_FISHER CODE_FISHER
     ETA_MS_PER_EXAMPLE WALLTIME_HOURS DISK_HEADROOM_GIB
   )
   for _v in "${FORWARD_VARS[@]}"; do
@@ -260,7 +270,13 @@ FISHER_USE_BF16="${FISHER_USE_BF16:-0}"
 FISHER_DEVICE="${FISHER_DEVICE:-cuda}"
 LOG_EVERY="${LOG_EVERY:-500}"
 
-# ---- 两个域的源语料。逐字等于 93 号 ----
+# ---- 三个域的源语料。逐字等于 93 号 ----
+# if 走 FLAN 原始语料（targets 就是 gold，不需要自蒸馏），所以它不读 POOL_ROOT。
+FLAN_DIR="${FLAN_DIR:-${REPO_ROOT}/datasets/flan}"
+FLAN_SAMPLES="${FLAN_SAMPLES:-20000}"
+IF_MAXLEN="${IF_MAXLEN:-512}"
+IF_COV_BATCH="${IF_COV_BATCH:-32}"
+
 MATH_VIEW_PREFIX="${MATH_VIEW_PREFIX:-metamath_cmath_30k}"
 MATH_GLOB="${POOL_ROOT}/replay/${MATH_VIEW_PREFIX}_*_selfdistill_seed${SAMPLE_SEED}.jsonl"
 MATH_MAXLEN="${MATH_MAXLEN:-1024}"
@@ -271,9 +287,11 @@ CODE_FILE="${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${SAMPLE_SEED
 CODE_MAXLEN="${CODE_MAXLEN:-1024}"
 CODE_COV_BATCH="${CODE_COV_BATCH:-16}"
 
-# ---- 产物路径 ----
+# ---- 产物路径。文件名逐字等于 93 号，只是目录换成了本线的结果根 ----
+IF_COV="${IF_COV:-${COV_DIR}/cov_if_flan20k_all.pt}"
 MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_all.pt}"
 CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_all.pt}"
+IF_FISHER="${IF_FISHER:-${FISHER_DIR}/fisher_if_flan20k_all.pt}"
 MATH_FISHER="${MATH_FISHER:-${FISHER_DIR}/fisher_math_metamath30k_gold_all.pt}"
 CODE_FISHER="${CODE_FISHER:-${FISHER_DIR}/fisher_code_opcedu20k_gold_all.pt}"
 
@@ -290,6 +308,9 @@ OLD_VAL_ROWS="${OLD_VAL_ROWS:-500}"
 
 WHAT="${WHAT:-both}"
 DRY_RUN="${DRY_RUN:-1}"
+# if 默认关：它不进 mix，只有 99 号的 DOMAIN=if 单域臂用得上，而采一份 C+F 是
+# 几个小时 GPU 加二十多 GB 磁盘。开着会让"默认那次投递"悄悄变贵。
+DO_IF="${DO_IF:-0}"
 DO_MATH="${DO_MATH:-1}"
 DO_CODE="${DO_CODE:-1}"
 DO_DIAG="${DO_DIAG:-1}"
@@ -317,6 +338,19 @@ mkdir -p "${COV_DIR}" "${FISHER_DIR}" "${DATASET_CACHE}" "${SPLIT_DIR}"
 # ===========================================================================
 source_args_for () {
   case "$1" in
+    if)
+      # FLAN 原始语料的 targets 就是 gold，不需要换列；也因此这里 sample_shuffle=1
+      # 而 math/code 是 0 —— 那两个池在生成自蒸馏答案时就已经定好了行序。
+      printf '%s\n' \
+        --data_files "${FLAN_DIR}/train/*.jsonl" \
+        --dataset_split train \
+        --streaming 0 \
+        --input_column inputs \
+        --target_column targets \
+        --max_samples "${FLAN_SAMPLES}" \
+        --sample_shuffle 1 \
+        --sample_seed "${SAMPLE_SEED}"
+      ;;
     math)
       # 池在 generate_replay_targets 那一步就切好了（文件名里的 30k），所以
       # --max_samples 0 是"整份读完"，不是"读原始数据集的全量"。
@@ -368,6 +402,7 @@ pool_args_for () {
 
 maxlen_for () {
   case "$1" in
+    if)   printf '%s' "${IF_MAXLEN}" ;;
     math) printf '%s' "${MATH_MAXLEN}" ;;
     code) printf '%s' "${CODE_MAXLEN}" ;;
   esac
@@ -375,6 +410,7 @@ maxlen_for () {
 
 cov_batch_for () {
   case "$1" in
+    if)   printf '%s' "${IF_COV_BATCH}" ;;
     math) printf '%s' "${MATH_COV_BATCH}" ;;
     code) printf '%s' "${CODE_COV_BATCH}" ;;
   esac
@@ -382,6 +418,7 @@ cov_batch_for () {
 
 cov_path_for () {
   case "$1" in
+    if)   printf '%s' "${IF_COV}" ;;
     math) printf '%s' "${MATH_COV}" ;;
     code) printf '%s' "${CODE_COV}" ;;
   esac
@@ -389,24 +426,27 @@ cov_path_for () {
 
 fisher_path_for () {
   case "$1" in
+    if)   printf '%s' "${IF_FISHER}" ;;
     math) printf '%s' "${MATH_FISHER}" ;;
     code) printf '%s' "${CODE_FISHER}" ;;
   esac
 }
 
 ACTIVE_DOMAINS=()
+[[ "${DO_IF}"   == "1" ]] && ACTIVE_DOMAINS+=(if)
 [[ "${DO_MATH}" == "1" ]] && ACTIVE_DOMAINS+=(math)
 [[ "${DO_CODE}" == "1" ]] && ACTIVE_DOMAINS+=(code)
 
 echo "========================================================================"
-echo "TRACE-mix 线 第一步：math / code 的 C 与 F，以及 mix"
+echo "TRACE-mix 线 第一步：if / math / code 的 C 与 F，以及 mix"
 echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}   （W_ref，99 号从它起训）"
-echo "  域       = ${ACTIVE_DOMAINS[*]:-<无>}   WHAT=${WHAT}"
-echo "  源语料   = ${MATH_GLOB}"
+echo "  域       = ${ACTIVE_DOMAINS[*]:-<无>}   WHAT=${WHAT}$([[ "${DO_IF}" == "1" ]] || printf '%s' '   （if 默认关，DO_IF=1 开）')"
+echo "  源语料   = ${FLAN_DIR}/train/*.jsonl  (前 ${FLAN_SAMPLES} 行, DO_IF=${DO_IF})"
+echo "             ${MATH_GLOB}"
 echo "             ${CODE_FILE}"
 echo "  池 / val = ${SPLIT_DIR}  （每域末尾 ${OLD_VAL_ROWS} 行留作 val）"
 echo "  targets  = ${TARGET_MODULES}"
-echo "  maxlen   = math ${MATH_MAXLEN} / code ${CODE_MAXLEN}   （不是新任务的 2048）"
+echo "  maxlen   = if ${IF_MAXLEN} / math ${MATH_MAXLEN} / code ${CODE_MAXLEN}   （不是新任务的 2048）"
 echo "  mix      = ${MIX_DOMAINS} @ ${MIX_WEIGHTS} -> ${MIX_TAG}"
 echo "  合成后删单域 = ${PRUNE_SINGLE}   （0 = 保留，默认）"
 echo "  system   = '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system）"
@@ -441,6 +481,18 @@ fi
 if [[ "${DO_CODE}" == "1" ]]; then
   [[ -f "${CODE_FILE}" ]] || { echo "缺 code 语料: ${CODE_FILE}" >&2; exit 1; }
   echo "code 语料: ${CODE_FILE}"
+fi
+if [[ "${DO_IF}" == "1" ]]; then
+  shopt -s nullglob
+  # shellcheck disable=SC2206
+  FLAN_FILES=( ${FLAN_DIR}/train/*.jsonl )
+  shopt -u nullglob
+  if [[ "${#FLAN_FILES[@]}" -eq 0 ]]; then
+    echo "!! 缺 if 语料: ${FLAN_DIR}/train/*.jsonl" >&2
+    echo "   93 号读的是同一份；没有它就跑不了 99 号的 DOMAIN=if 臂。" >&2
+    exit 1
+  fi
+  echo "if 语料: ${#FLAN_FILES[@]} 个分片，取前 ${FLAN_SAMPLES} 行（shuffle seed ${SAMPLE_SEED}）"
 fi
 
 # ---- 按 config.json 实算 C / F 的落盘体积，与 df 比 ----
@@ -526,7 +578,7 @@ if [[ "${PRUNE_SINGLE}" == "1" && "${DO_MIX}" == "1" ]]; then
   echo "注意：PRUNE_SINGLE=1，合成 mix 之后会删掉单域 C/F。"
   echo "      以后要补单域对照臂得重采（两域五六小时）。不确定就别传这个。"
 else
-  echo "单域 C/F 会保留（PRUNE_SINGLE=0）：两域加 mix 合计约 ${NEED_GIB} GiB 常驻。"
+  echo "单域 C/F 会保留（PRUNE_SINGLE=0）：${#ACTIVE_DOMAINS[@]} 个域$([[ "${DO_MIX}" == "1" ]] && printf '%s' ' 加 mix')合计约 ${NEED_GIB} GiB 常驻。"
 fi
 
 # DRY_RUN 在切分之前退出：Step 1 会往磁盘写池和 val，那是副作用，不该在
@@ -804,7 +856,10 @@ if [[ "${DO_MIX}" == "1" ]]; then
   for d in ${MIX_DOMAINS//,/ }; do
     case "${d}" in
       math|code) ;;
-      *) echo "MIX_DOMAINS 只能在 math / code 之间取，收到 '${d}'" >&2; exit 2 ;;
+      # if 的池是 512，math/code 是 1024，而 train.py 的 --replay_max_len 只有一个
+      # 值：把 if 混进来，replay 臂就必然有一个域的口径与它的 C 对不上。见第 2 条。
+      if) echo "MIX_DOMAINS 不能含 if：它的 maxlen ${IF_MAXLEN} 与 math/code 的 1024 不同" >&2; exit 2 ;;
+      *)  echo "MIX_DOMAINS 只能在 math / code 之间取，收到 '${d}'" >&2; exit 2 ;;
     esac
   done
   [[ "${WHAT}" == "cov"    || "${WHAT}" == "both" ]] && mix_one cov    mix_covariances "${MIX_COV}"
@@ -919,7 +974,13 @@ if [[ "${DO_DIAG}" == "1" ]]; then
   DIAG_PATHS=""
   [[ -f "${MIX_COV}" ]]    && DIAG_PATHS="${DIAG_PATHS}${DIAG_PATHS:+,}cov=${MIX_COV}"
   [[ -f "${MIX_FISHER}" ]] && DIAG_PATHS="${DIAG_PATHS}${DIAG_PATHS:+,}fisher=${MIX_FISHER}"
-  for d in ${MIX_DOMAINS//,/ }; do
+  # 本轮采的域 + mix 的输入域。if 只会出现在前者里（它进不了 mix），
+  # 而它恰恰是最该看 lm_head 比值的那个：512 的短序列上 tr(C) 的分布和 1024 不同。
+  DIAG_DOMAINS=""
+  for d in ${ACTIVE_DOMAINS[@]+"${ACTIVE_DOMAINS[@]}"} ${MIX_DOMAINS//,/ }; do
+    [[ " ${DIAG_DOMAINS} " == *" ${d} "* ]] || DIAG_DOMAINS="${DIAG_DOMAINS}${DIAG_DOMAINS:+ }${d}"
+  done
+  for d in ${DIAG_DOMAINS}; do
     [[ -f "$(cov_path_for "${d}")" ]]    && DIAG_PATHS="${DIAG_PATHS}${DIAG_PATHS:+,}cov=$(cov_path_for "${d}")"
     [[ -f "$(fisher_path_for "${d}")" ]] && DIAG_PATHS="${DIAG_PATHS}${DIAG_PATHS:+,}fisher=$(fisher_path_for "${d}")"
   done
@@ -990,13 +1051,15 @@ fi
 
 echo
 echo "========================================================================"
-echo "下一步："
+echo "下一步（99 号的 DOMAIN 取 if / math / code / mix，λ 要各域各扫各的）："
 echo "  1) 确认上面 mix 的层数对得上、lm_head 的比值在可接受范围"
 echo "  2) 扫 λ 的量级（onereplay 和 ewc 各扫一次，两者尺度完全不通用）："
-echo "       qsub -v DRY_RUN=0,ARM=onereplay,LAMBDAS=0:1e-4:1e-3:1e-2 onereplay/pbs/99_trace_mix_arms.pbs"
-echo "       qsub -v DRY_RUN=0,ARM=ewc,LAMBDAS=0:1:1e2:1e4             onereplay/pbs/99_trace_mix_arms.pbs"
+echo "       qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDAS=0:1e-4:1e-3:1e-2 onereplay/pbs/99_trace_mix_arms.pbs"
+echo "       qsub -v DRY_RUN=0,DOMAIN=mix,ARM=ewc,LAMBDAS=0:1:1e2:1e4             onereplay/pbs/99_trace_mix_arms.pbs"
 echo "  3) vanilla 与 replay 不吃 λ，现在就能投："
 echo "       qsub -v DRY_RUN=0,ARM=vanilla onereplay/pbs/99_trace_mix_arms.pbs"
-echo "       qsub -v DRY_RUN=0,ARM=replay  onereplay/pbs/99_trace_mix_arms.pbs"
+echo "       qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay onereplay/pbs/99_trace_mix_arms.pbs"
+echo "  4) 单域对照臂需要对应的单域 C/F；if 那份要先 DO_IF=1 采出来："
+echo "       qsub -v DRY_RUN=0,DO_IF=1,DO_MATH=0,DO_CODE=0,DO_MIX=0 ${SELF_PATH}"
 echo "========================================================================"
 echo "Job finished at: $(date)"

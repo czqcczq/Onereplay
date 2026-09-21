@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -130,6 +131,89 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--json_out", type=str, default="")
     return parser.parse_args()
+
+
+def projector_cost(dims: dict[str, int], element_size: int) -> dict[str, float]:
+    """What the projectors will cost, in bytes, for this covariance file.
+
+    Two numbers, because they peak at different times and the larger one is not
+    the one that stays.
+
+    ``resident`` is one d_in x d_in projector per covered layer, alive for the
+    whole run. ``setup_peak`` adds the eigenvectors: upstream's get_eigens fills
+    an eigenvector matrix of the same size for *every* layer before
+    get_transforms consumes any of them, so both sets exist at once.
+    nscl.py drops the eigenvectors immediately afterwards, but the peak is what
+    has to fit.
+
+    Worth computing here rather than discovering it on the cluster, because the
+    cost is quadratic in d_in and one wide layer dominates it: an MLP down_proj
+    reading a 8960-wide intermediate activation is 34x the projector of a
+    1536-wide attention projection.
+    """
+
+    resident = sum(dim * dim * element_size for dim in dims.values())
+    return {
+        "resident_gb": resident / 1024**3,
+        "setup_peak_gb": 2 * resident / 1024**3,
+        "widest_layer": max(dims, key=lambda name: dims[name]),
+        "widest_dim": max(dims.values()),
+        "widest_gb": max(dims.values()) ** 2 * element_size / 1024**3,
+    }
+
+
+def report_cost(dims: dict[str, int]) -> None:
+    """Print the projector cost at both training precisions."""
+
+    print("\nprojector memory (one d_in x d_in matrix per covered layer):")
+    for label, element_size in (("float32", 4), ("bfloat16", 2)):
+        cost = projector_cost(dims, element_size)
+        print(
+            f"  {label:<9} resident {cost['resident_gb']:6.2f} GiB, "
+            f"setup peak {cost['setup_peak_gb']:6.2f} GiB "
+            "(eigenvectors and projectors coexist)"
+        )
+    cost = projector_cost(dims, 4)
+    widest = [name for name, dim in dims.items() if dim == cost["widest_dim"]]
+    print(
+        f"  widest input is {cost['widest_dim']} ({len(widest)} layers, e.g. "
+        f"{cost['widest_layer']}), {cost['widest_gb']:.2f} GiB each in float32"
+    )
+    if cost["widest_dim"] >= 4 * min(dims.values()):
+        narrow = projector_cost(
+            {name: dim for name, dim in dims.items() if dim < cost["widest_dim"]}, 4
+        )
+        print(
+            f"  dropping them would leave {narrow['resident_gb']:.2f} GiB resident. "
+            "That is a different coverage than the penalty arms run with, so it has "
+            "to be recorded as a difference rather than treated as a tuning knob."
+        )
+
+
+def warn_if_slow(dims: dict[str, int], device: str) -> None:
+    """Say up front when the CPU path is going to take a long time.
+
+    One spectrum costs O(d_in^3). The attention projections of a 1536-wide model
+    are a second each on CPU; an MLP down_proj reading an 8960-wide intermediate
+    activation is nearly two hundred times that much arithmetic, and there is one
+    per layer. The run is not hung, but it can look like it for long enough that
+    somebody kills it, so the estimate goes before the work rather than after.
+    """
+
+    if device != "cpu":
+        return
+    widest = max(dims.values())
+    if widest < 4096:
+        return
+    heavy = sum(1 for dim in dims.values() if dim >= 4096)
+    print(
+        f"\n!! device=cpu with {heavy} layers at {widest}x{widest}. A spectrum costs "
+        f"O(d^3), so those dominate and each takes minutes rather than seconds. "
+        f"Pass --device cuda if a GPU is available; the matrices are moved over one "
+        f"at a time, so only {widest * widest * 4 / 1024**3:.2f} GiB is ever resident "
+        f"on it.",
+        flush=True,
+    )
 
 
 def parse_grid(raw: str) -> list[float]:
@@ -227,13 +311,25 @@ def main() -> int:
     if args.max_layers > 0:
         names = names[: args.max_layers]
     print(f"{len(names)} layers from {args.cov_path}, device={args.device}")
-    print("computing one spectrum per layer", flush=True)
+    dims = {name: int(covariances[name].shape[-1]) for name in names}
+    report_cost(dims)
+    warn_if_slow(dims, args.device)
 
+    print("\ncomputing one spectrum per layer", flush=True)
     spectra: dict[str, torch.Tensor] = {}
+    started = time.time()
     for index, name in enumerate(names, start=1):
+        # Printed per layer, not every tenth. The cost is cubic in d_in, so one
+        # wide layer can run minutes while the narrow ones run in a second, and
+        # a progress line that only ticks every ten layers is indistinguishable
+        # from a hang for as long as it takes to cross an MLP block.
+        layer_started = time.time()
         spectra[name] = layer_spectrum(covariances[name], args.device)
-        if index % 10 == 0 or index == len(names):
-            print(f"  {index}/{len(names)}", flush=True)
+        print(
+            f"  [{index}/{len(names)}] {name} {dims[name]}x{dims[name]} "
+            f"{time.time() - layer_started:6.1f}s  (elapsed {time.time() - started:.0f}s)",
+            flush=True,
+        )
     # The spectra are all that is needed from here on, and the file is the
     # largest thing in the process.
     del covariances
