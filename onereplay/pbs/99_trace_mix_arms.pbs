@@ -958,21 +958,6 @@ if problems:
 PY
 fi
 
-if [[ "${DRY_RUN}" == "1" ]]; then
-  echo
-  echo "DRY_RUN=1：以上为计划，不训练不评测。"
-  if [[ "${SWEEP}" == "1" ]]; then
-    echo "将扫描 λ ∈ {${LAMBDAS//:/, }}，每点 ${MAX_STEPS} 步，不存 checkpoint 不评测。"
-  else
-    echo "run = $(run_name_for "${LAMBDA}")"
-    if [[ "${DO_BASE}" == "1" && ! -d "${EVAL_ROOT}/ifeval/${BASE_RUN}" ]]; then
-      echo "并且会先评 base（${BASE_RUN}），因为 ${EVAL_ROOT} 里还没有它。"
-    fi
-  fi
-  echo "确认后 qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=${ARM},... ${SELF_PATH}"
-  exit 0
-fi
-
 # ===========================================================================
 # 训练
 # ===========================================================================
@@ -1035,6 +1020,37 @@ arm_train_args () {
       ;;
   esac
 }
+
+# DRY_RUN 放在 arm_train_args 后面，就是为了能把它的输出打出来：四条臂 x 四个域
+# 的差别全在那个函数里，而"replay 到底读了哪个池"光看上面的 echo 是看不出来的。
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划，不训练不评测。"
+  if [[ "${SWEEP}" == "1" ]]; then
+    echo "将扫描 λ ∈ {${LAMBDAS//:/, }}，每点 ${MAX_STEPS} 步，不存 checkpoint 不评测。"
+  else
+    echo "run = $(run_name_for "${LAMBDA}")"
+    if [[ "${DO_BASE}" == "1" && ! -d "${EVAL_ROOT}/ifeval/${BASE_RUN}" ]]; then
+      echo "并且会先评 base（${BASE_RUN}），因为 ${EVAL_ROOT} 里还没有它。"
+    fi
+  fi
+  echo
+  echo "train.py 会收到（四条臂只在这一段上不同）："
+  _pair=()
+  while IFS= read -r _item; do
+    _pair+=("${_item}")
+    if (( ${#_pair[@]} == 2 )); then
+      printf '  %s %s\n' "${_pair[0]}" "${_pair[1]:-''}"
+      _pair=()
+    fi
+  done < <(arm_train_args "${LAMBDA:-0}" 0)
+  if (( ${#_pair[@]} > 0 )); then
+    printf '  %s <缺值！奇数个 token，某个 flag 没配值>\n' "${_pair[0]}"
+  fi
+  echo
+  echo "确认后 qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=${ARM},... ${SELF_PATH}"
+  exit 0
+fi
 
 train_one () {
   local lam="$1" run="$2" save="$3" measure_zero="$4"
