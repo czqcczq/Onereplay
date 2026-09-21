@@ -97,8 +97,16 @@
 # -----------------------------------------------------------------------------
 # 投递:
 #
-#   # (1) DialogSum 线 / Qwen3-8B：base + vanilla，math 与 code 两个语料
+#   # (1) DialogSum 线 / Qwen3-8B：base + vanilla，if / math / code 三个语料
 #   qsub onereplay/pbs/102_math_val500_direction.pbs
+#
+#   # (1') DialogSum 线的**全部**臂 x 三个保护域。先 DRY_RUN=1 看 Step 1 的清单
+#   #      抄 run 名，VANILLA_RUN 必须显式给 —— 它是「消除的遗忘」那一列的分母。
+#   qsub -v VANILLA_RUN=ds_vanilla_8b_r16all_lr2e-4_ep2_seed1,\
+#ADAPTERS='ds_vanilla_8b_r16all_lr2e-4_ep2_seed1,ds_onereplay_...,ds_ewc_...,ds_replay_...' \
+#        onereplay/pbs/102_math_val500_direction.pbs
+#   #    14 个 checkpoint x 3 个语料约 1.5 h；赶时间可以 VERIFY=0 砍掉一半前向
+#   #    （那是逐行路径与 evaluate_probe 的互校，第一次跑过一次就够了）。
 #
 #   # (2) finance 线 / Qwen2.5-1.5B-Instruct：同样两个语料，自己的 base 做分母
 #   qsub -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\
@@ -113,6 +121,9 @@
 #
 #   # 只看语料与清单，不打分（约 1 分钟）
 #   qsub -v DRY_RUN=1 onereplay/pbs/102_math_val500_direction.pbs
+#
+#   # 已经打过分，只想把判据重读一遍（判据改了、或上次汇总挂了）：不加载模型，秒级
+#   qsub -v VERDICT_ONLY=1 onereplay/pbs/102_math_val500_direction.pbs
 #
 #   # 自定义语料集合
 #   qsub -v PROBES='foo=/path/a.jsonl,bar=/path/b.jsonl' onereplay/pbs/102_...pbs
@@ -170,10 +181,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
   FORWARD_VARS=(
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTER_DIR
-    PROBES MATH_GOLD_FILE CODE_GOLD_FILE POOL_ROOT
-    ADAPTERS BASE_NAME OUT_PATH PER_ROW_DIR
+    PROBES IF_GOLD_FILE MATH_GOLD_FILE CODE_GOLD_FILE POOL_ROOT
+    ADAPTERS BASE_NAME VANILLA_RUN OUT_PATH PER_ROW_DIR
     MAX_LEN BATCH ROW_BATCH PROBE_SIZE VERIFY
-    DRY_RUN KEEP_GOING
+    DRY_RUN VERDICT_ONLY KEEP_GOING
   )
   for _v in "${FORWARD_VARS[@]}"; do
     if [[ -n "${!_v:-}" ]]; then
@@ -223,12 +234,20 @@ RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
 # LoRA 的臂在 adapters/，全参的在 checkpoints/ —— finance 线要把这个指过去。
 ADAPTER_DIR="${ADAPTER_DIR:-${RESULTS_ROOT}/adapters}"
 
-# gold 语料：finance 线切出来的两份 500 行留出集。两条线共用同一批题，
-# 所以"同一个语料上两个基座各自的漂移"是可以并排看的。
+# gold 语料：93 号 Step 1 切出来的三份 500 行留出集（if / math / code）。
+# 它们物理上落在 finance 线的 pools 目录下，但内容与基座无关 —— 就是三个域各自
+# 的题与参考答案。两条线共用同一批题，所以"同一个语料上不同基座各自的漂移"
+# 可以并排看方向与相对幅度（CE 的绝对值仍然只在同一基座内可比）。
 POOL_ROOT="${POOL_ROOT:-${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/pools}"
+IF_GOLD_FILE="${IF_GOLD_FILE:-${POOL_ROOT}/if_val500.jsonl}"
 MATH_GOLD_FILE="${MATH_GOLD_FILE:-${POOL_ROOT}/math_val500.jsonl}"
 CODE_GOLD_FILE="${CODE_GOLD_FILE:-${POOL_ROOT}/code_val500.jsonl}"
-PROBES="${PROBES:-mathgold=${MATH_GOLD_FILE},codegold=${CODE_GOLD_FILE}}"
+PROBES="${PROBES:-ifgold=${IF_GOLD_FILE},mathgold=${MATH_GOLD_FILE},codegold=${CODE_GOLD_FILE}}"
+# 缺哪一份就少一列，Step 2 会打"跳过：找不到"然后继续，不会整个作业停掉。
+
+# 谁是 vanilla。它是"消除的遗忘"那一列的分母，不能靠名字里有没有 vanilla 猜 ——
+# 一次打十几个 checkpoint 时猜错就是整列作废。留空则回落到子串匹配。
+VANILLA_RUN="${VANILLA_RUN:-}"
 
 OUT_PATH="${OUT_PATH:-${RESULTS_ROOT}/probe_ce/direction.jsonl}"
 PER_ROW_DIR="${PER_ROW_DIR:-${RESULTS_ROOT}/probe_ce/per_row}"
@@ -239,6 +258,7 @@ ROW_BATCH="${ROW_BATCH:-4}"
 PROBE_SIZE="${PROBE_SIZE:-0}"      # 0 = 整个语料（500 行本来就不多）
 VERIFY="${VERIFY:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+VERDICT_ONLY="${VERDICT_ONLY:-0}"   # 1 = 不打分，只把已有的 OUT_PATH 重新判一遍
 KEEP_GOING="${KEEP_GOING:-1}"
 BASE_NAME="${BASE_NAME:-base}"
 
@@ -402,45 +422,52 @@ score_one () {
     --out "${OUT_PATH}"
 }
 
-# 追加写的 jsonl：本轮先挪走旧的，否则汇总会读到上一次不同 max_len 或不同基座的数。
-if [[ -f "${OUT_PATH}" ]]; then
-  mv "${OUT_PATH}" "${OUT_PATH}.$(date +%Y%m%d_%H%M%S).bak"
-  echo "已备份上一次的 ${OUT_PATH}"
-fi
-
 OK_RUNS=()
 FAILED_RUNS=()
-if score_one "${BASE_NAME}" ""; then
-  OK_RUNS+=("${BASE_NAME}")
-else
-  echo "!! base 打分失败。后面的数没有分母，停。"
-  exit 1
-fi
 
-IFS=',' read -r -a _ADAPTER_SPECS <<< "${ADAPTERS}"
-for _spec in "${_ADAPTER_SPECS[@]}"; do
-  _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
-  [[ -z "${_spec}" ]] && continue
-  # 绝对路径直接用，否则当作 ADAPTER_DIR 下的名字。
-  if [[ "${_spec}" == /* ]]; then
-    _path="${_spec}"
-    _name="$(basename "${_spec}")"
+if [[ "${VERDICT_ONLY}" == "1" ]]; then
+  # 已经打过分、只想重读判据（比如判据本身改了）。不碰 OUT_PATH，不加载模型。
+  [[ -f "${OUT_PATH}" ]] || { echo "!! VERDICT_ONLY=1 但没有 ${OUT_PATH}"; exit 1; }
+  echo "VERDICT_ONLY=1：跳过打分，直接读 ${OUT_PATH}"
+else
+  # 追加写的 jsonl：本轮先挪走旧的，否则汇总会读到上一次不同 max_len 或不同基座的数。
+  if [[ -f "${OUT_PATH}" ]]; then
+    mv "${OUT_PATH}" "${OUT_PATH}.$(date +%Y%m%d_%H%M%S).bak"
+    echo "已备份上一次的 ${OUT_PATH}"
+  fi
+
+  if score_one "${BASE_NAME}" ""; then
+    OK_RUNS+=("${BASE_NAME}")
   else
-    _path="${ADAPTER_DIR}/${_spec}"
-    _name="${_spec}"
+    echo "!! base 打分失败。后面的数没有分母，停。"
+    exit 1
   fi
-  if [[ ! -d "${_path}" ]]; then
-    echo "!! 跳过 ${_name}：找不到 ${_path}（看 Step 1 的清单核对名字）"
-    FAILED_RUNS+=("${_name} (缺 checkpoint)")
-    continue
-  fi
-  if score_one "${_name}" "${_path}"; then
-    OK_RUNS+=("${_name}")
-  else
-    FAILED_RUNS+=("${_name} (打分失败)")
-    [[ "${KEEP_GOING}" == "1" ]] || { echo "!! KEEP_GOING=0，停。"; break; }
-  fi
-done
+
+  IFS=',' read -r -a _ADAPTER_SPECS <<< "${ADAPTERS}"
+  for _spec in "${_ADAPTER_SPECS[@]}"; do
+    _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+    [[ -z "${_spec}" ]] && continue
+    # 绝对路径直接用，否则当作 ADAPTER_DIR 下的名字。
+    if [[ "${_spec}" == /* ]]; then
+      _path="${_spec}"
+      _name="$(basename "${_spec}")"
+    else
+      _path="${ADAPTER_DIR}/${_spec}"
+      _name="${_spec}"
+    fi
+    if [[ ! -d "${_path}" ]]; then
+      echo "!! 跳过 ${_name}：找不到 ${_path}（看 Step 1 的清单核对名字）"
+      FAILED_RUNS+=("${_name} (缺 checkpoint)")
+      continue
+    fi
+    if score_one "${_name}" "${_path}"; then
+      OK_RUNS+=("${_name}")
+    else
+      FAILED_RUNS+=("${_name} (打分失败)")
+      [[ "${KEEP_GOING}" == "1" ]] || { echo "!! KEEP_GOING=0，停。"; break; }
+    fi
+  done
+fi
 
 # ===========================================================================
 # Step 4: 逐语料的方向判据
@@ -451,6 +478,7 @@ echo "方向判据"
 echo "========================================================================"
 set +e
 OUT_PATH="${OUT_PATH}" BASE_NAME="${BASE_NAME}" MODEL_NAME="${MODEL_NAME}" \
+VANILLA_RUN="${VANILLA_RUN}" \
 python - <<'PY'
 import json
 import os
@@ -470,14 +498,45 @@ base = next((row for row in records if row["run_name"] == base_name), None)
 if base is None:
     raise SystemExit("找不到 base 那一行，没有分母。")
 
-probe_names = [key[len("probe_"):] for key in base if key.startswith("probe_")]
+# score_probe_ce 也把 "probe_size"（它的 --probe_size 参数）写进同一条记录，所以
+# 光看 probe_ 前缀会凭空多出一个叫 size、值为 0 的"语料"。真正的探针一定同时带着
+# 自己的 <name>_rows，用它把参数筛掉。
+probe_names = [
+    key[len("probe_"):]
+    for key in base
+    if key.startswith("probe_") and f"{key[len('probe_'):]}_rows" in base
+]
 if not probe_names:
-    raise SystemExit("base 那一行没有任何 probe_* 字段。")
+    raise SystemExit("base 那一行没有任何探针字段（probe_<name> 配 <name>_rows）。")
 
 # 96 号那轮实测的噪声地板（bs4 与 bs2 两条 vanilla 曲线末点的间距）。臂间差通常只是
 # vanilla 总漂移的一小截，所以总漂移要有几十个 δ 才够把各臂分开。
 DELTA = 0.0077
+
+# vanilla 是"消除的遗忘"那一列的分母。显式给最好；一次打十几个 checkpoint 时
+# 靠名字里有没有 "vanilla" 猜，猜错就是整列作废，所以猜中了也要把名字打出来。
+want_vanilla = os.environ.get("VANILLA_RUN", "").strip()
+names = [row["run_name"] for row in records]
+if want_vanilla:
+    vanilla_name = want_vanilla if want_vanilla in names else ""
+    if not vanilla_name:
+        print(f"!! VANILLA_RUN={want_vanilla!r} 不在本次打过分的 run 里；"
+              f"实有 {names}。「消除的遗忘」整列会是 n/a。")
+else:
+    guesses = [n for n in names if "vanilla" in n.lower()]
+    vanilla_name = guesses[0] if len(guesses) == 1 else ""
+    if len(guesses) > 1:
+        print(f"!! 名字里带 vanilla 的有 {guesses}，猜不出用哪个。"
+              "传 VANILLA_RUN=<run 名> 指定，否则「消除的遗忘」整列是 n/a。")
+    elif vanilla_name:
+        print(f"note: 未指定 VANILLA_RUN，按名字猜中 {vanilla_name}。")
+print()
+
+WIDTH = max([len(n) for n in names] + [20]) + 2
 verdicts = {}
+# (run, corpus) -> 消除的遗忘；分母为负时记 None，见下面那段。
+eliminated = {}
+below_base = []
 
 for probe in probe_names:
     key = f"probe_{probe}"
@@ -487,6 +546,12 @@ for probe in probe_names:
     cut = base.get(f"{probe}_rows_at_max_len") or 0
     tokens = base.get(f"{probe}_supervised_tokens") or 0
 
+    vanilla = next((row for row in scored if row["run_name"] == vanilla_name), None)
+    # 分母。vanilla 若没掉反涨（gold 探针的老毛病），这个量没有意义：它会把
+    # "漂得更少"报成负的百分比，读起来像"帮倒忙"，其实是分母的方向就错了。
+    span = (vanilla[key] - anchor) if vanilla else None
+    span_usable = span is not None and span > 3 * DELTA
+
     print()
     print(f"######## {probe}")
     print(f"  {rows} 行 / {tokens} 个 supervised token / "
@@ -495,62 +560,106 @@ for probe in probe_names:
         print(f"  !! {cut / rows:.1%} 的行被截断，CE 只覆盖答案前缀。调大 MAX_LEN"
               "（**所有** run 一起重跑，不然不可比）。")
     print()
-    header = f"  {'run':<44}{'CE':>10}{'vs base':>11}{'相对':>10}"
+    header = f"  {'run':<{WIDTH}}{'CE':>10}{'vs base':>11}{'相对':>9}{'δ':>7}{'消除遗忘':>11}"
     print(header)
     print("  " + "-" * (len(header) - 2))
-    for row in scored:
+    for row in sorted(scored, key=lambda r: r[key]):
+        name = row["run_name"]
         value = row[key]
         delta = value - anchor
-        rel = delta / anchor if anchor else 0.0
-        tail = "" if row["run_name"] == base_name else f"{delta:>+11.4f}{rel:>+9.1%}"
-        print(f"  {row['run_name'][:43]:<44}{value:>10.4f}{tail}")
+        if name == base_name:
+            print(f"  {name:<{WIDTH}}{value:>10.4f}{'(锚点)':>13}")
+            continue
+        rel = f"{delta / anchor:+.1%}" if anchor else "n/a"
+        if span_usable:
+            share = 1 - delta / span
+            eliminated[(name, probe)] = share
+            kept = f"{share:>10.1%}"
+        else:
+            eliminated[(name, probe)] = None
+            kept = f"{'n/a':>11}"
+        if delta < -3 * DELTA:
+            below_base.append((name, probe))
+        print(f"  {name:<{WIDTH}}{value:>10.4f}{delta:>+11.4f}{rel:>9}"
+              f"{abs(delta) / DELTA:>7.0f}{kept}")
 
-    vanillas = [row for row in scored if "vanilla" in row["run_name"].lower()]
-    target = vanillas[0] if vanillas else next(
-        (row for row in scored if row["run_name"] != base_name), None
-    )
-    if target is None:
-        print("\n  只打了 base，判不了方向。")
-        verdicts[probe] = "无对照"
+    if vanilla is None:
+        print("\n  没有 vanilla，判不了方向，也算不了「消除的遗忘」。")
+        verdicts[probe] = "无 vanilla"
         continue
 
-    delta = target[key] - anchor
     print()
-    print(f"  判据看 {target['run_name']}: {anchor:.4f} -> {target[key]:.4f} "
-          f"({delta:+.4f}, {delta / anchor:+.1%}, {abs(delta) / DELTA:.0f}δ)")
-    if delta > 40 * DELTA:
+    relative = f"{span / anchor:+.1%}" if anchor else "n/a"
+    print(f"  方向判据看 {vanilla_name}: {anchor:.4f} -> {vanilla[key]:.4f} "
+          f"({span:+.4f}, {relative}, {abs(span) / DELTA:.0f}δ)")
+    if span > 40 * DELTA:
         verdicts[probe] = "可用"
         print("  -> 方向对，幅度够。这个语料能用。")
-    elif delta > 3 * DELTA:
+    elif span > 3 * DELTA:
         verdicts[probe] = "方向对但弱"
         print("  -> 方向对但幅度小，各臂的差多半会淹在噪声里。"
-              "先想清楚怎么提分辨率再投。")
-    elif delta >= -3 * DELTA:
+              "「消除的遗忘」这一列算得出来，但百分比的误差会很大。")
+    elif span >= -3 * DELTA:
         verdicts[probe] = "没信号"
         print("  -> 整轮训练都没让它动（在 3δ 以内）。这不是「没有遗忘」，是这个")
         print("     探针对本次训练不敏感 —— 臂间差只会更小，一样读不出来。")
     else:
         verdicts[probe] = "作废"
-        print("  -> 方向反了：训练让这个语料的 loss 变**低**，没有遗忘可言。"
-              "这个语料作废。")
+        print("  -> 方向反了：训练让这个语料的 loss 变**低**，没有遗忘可言。")
+        print("     分母是负的，所以「消除的遗忘」整列是 n/a，不是 0 也不是负数。")
+
+# ---- 跨域矩阵：一次看完所有模型在所有域上的位置 ----
+if len(probe_names) > 1 and len(names) > 2:
+    print()
+    print("========================================================================")
+    print("跨域矩阵：CE 相对 base 的变化（正 = 遗忘，负 = 比基座还低）")
+    head = f"  {'run':<{WIDTH}}" + "".join(f"{p:>14}" for p in probe_names)
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for row in records:
+        name = row["run_name"]
+        if name == base_name:
+            continue
+        cells = ""
+        for probe in probe_names:
+            key = f"probe_{probe}"
+            cells += (f"{row[key] - base[key]:>+14.4f}" if key in row else f"{'-':>14}")
+        print(f"  {name:<{WIDTH}}{cells}")
 
 print()
 print("========================================================================")
 print("汇总")
 for probe, verdict in verdicts.items():
     print(f"  {probe:<20} {verdict}")
+
+pairs = sum(1 for probe in probe_names for row in records if row["run_name"] != base_name
+            and f"probe_{probe}" in row)
+if below_base:
+    print()
+    print(f"  {len(below_base)}/{pairs} 个 (模型, 语料) 组合的 CE **低于基座**"
+          f"（超过 3δ）。")
+
 usable = [probe for probe, verdict in verdicts.items() if verdict == "可用"]
+weak = [probe for probe, verdict in verdicts.items() if verdict == "方向对但弱"]
 print()
-if usable:
-    print(f"可用的语料: {', '.join(usable)}")
-    print("下一步：把 96 号的 --old_val_* 换成它，再跑 ratio 扫描。")
+if usable or weak:
+    if usable:
+        print(f"方向可用的语料: {', '.join(usable)}")
+    if weak:
+        print(f"方向对但偏弱的语料: {', '.join(weak)} —— 「消除的遗忘」算得出来，")
+        print("  但量程薄，臂间差要先过本线实测的 δ 才能声明，别只看百分比。")
+    if any(eliminated.get(pair) is not None and eliminated[pair] > 1.0
+           for pair in eliminated):
+        print("  注意有臂的「消除的遗忘」超过 100%：它的 CE 掉到了基座**以下**，")
+        print("  那已经不是保留而是在把旧域重新训一遍。报的时候要连锚点一起画出来。")
 else:
     print("这个基座上没有一个 gold 语料方向是对的。")
-    print("如果另一条线也是这个结果，那就不是选错了域：CE(gold) 问的是「多会预测这个")
-    print("语料的参考答案」，而任何指令 SFT 都会让模型更会预测**任何** SFT 语料的 gold")
-    print("答案，这一项与域无关且远大于能力损失带来的上升。")
-    print("那时候这件事本身就是结论 —— 写进论文，作为「本文为什么用 benchmark 而不是")
-    print("loss 报遗忘」的依据。")
+    print("这不是选错了域：CE(gold) 问的是「多会预测这个语料的参考答案」，而任何指令")
+    print("SFT 都会让模型更会预测**任何** SFT 语料的 gold 答案，这一项与域无关且远大于")
+    print("能力损失带来的上升。而且 CE 是 teacher forcing —— 每个位置都喂着正确前缀，")
+    print("量的是「参考答案有多意外」，不是「能不能自己解出来」。")
+    print("这件事本身就是结论：写进论文，作为「本文为什么用 benchmark 而不是 loss 报")
+    print("遗忘」的依据。上面那张跨域矩阵就是它的证据表。")
 PY
 SUMMARY_RC=$?
 set -e
