@@ -554,7 +554,47 @@ def describe_nscl(
         "nscl_energy_share_max": max((layer["energy_share"] for layer in layers), default=0.0),
         "nscl_transform_memory_gb": transform_bytes / 1024**3,
         "nscl_upstream_commit": UPSTREAM_COMMIT,
+        # The kept fraction per module type, which is where the aggregate above
+        # comes from and the only form of it that explains a result. On a
+        # transformer the four distinct inputs inside a block have wildly
+        # different spectra -- the two LayerNorm outputs are dominated by a few
+        # outlier-feature directions while the attention output and the MLP
+        # intermediate are far flatter -- so one global threshold routinely
+        # freezes half the module types and leaves the other half unconstrained.
+        # A single mean hides exactly that, and it is the thing a reader of the
+        # table needs.
+        "nscl_kept_share_by_module": _kept_share_by_module(layers),
+        # Worst retained energy per module type, same reason. A layer whose kept
+        # subspace still carries most of the old second moment is not protected,
+        # however many directions it dropped.
+        "nscl_energy_share_by_module": _energy_share_by_module(layers),
     }
+
+
+def _by_module(layers: list[dict[str, Any]], field: str, reduce) -> dict[str, float]:
+    """Group per-layer values by the last component of the layer name."""
+
+    groups: dict[str, list[float]] = {}
+    for layer in layers:
+        groups.setdefault(str(layer["layer"]).rsplit(".", 1)[-1], []).append(float(layer[field]))
+    return {module: reduce(values) for module, values in sorted(groups.items())}
+
+
+def _kept_share_by_module(layers: list[dict[str, Any]]) -> dict[str, float]:
+    """Median kept fraction per module type; the median, because the spread
+    within one module type is small next to the spread between them."""
+
+    def median(values: list[float]) -> float:
+        ordered = sorted(values)
+        return ordered[len(ordered) // 2]
+
+    return _by_module(layers, "kept_share", median)
+
+
+def _energy_share_by_module(layers: list[dict[str, Any]]) -> dict[str, float]:
+    """Worst retained energy per module type."""
+
+    return _by_module(layers, "energy_share", max)
 
 
 def report_null_space(stats: dict[str, Any], record: dict[str, Any]) -> None:
@@ -576,6 +616,19 @@ def report_null_space(stats: dict[str, Any], record: dict[str, Any]) -> None:
         f"projectors hold {record['nscl_transform_memory_gb']:.2f} GiB",
         flush=True,
     )
+    print("  by module type (median kept / worst retained energy):", flush=True)
+    for module, share in record["nscl_kept_share_by_module"].items():
+        energy = record["nscl_energy_share_by_module"][module]
+        note = ""
+        if share < 0.01:
+            note = "  <- frozen"
+        elif energy > 0.1:
+            # Dropping directions is not protection if the ones kept are where
+            # the old data lives. This is the reading that a high kept_share
+            # alone does not give.
+            note = "  <- unconstrained: the kept subspace holds the old energy"
+        print(f"    {module:<12} {share:.4f}  {energy:.3e}{note}", flush=True)
+
     if record["nscl_kept_share_max"] < 0.01:
         print(
             "Adam-NSCL: every layer kept under 1% of its directions, so the projected "

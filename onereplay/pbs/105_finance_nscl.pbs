@@ -9,19 +9,25 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# finance 线的第五条臂：Adam-NSCL（特征协方差零空间投影），只做 mix
+# finance 线的第五条臂：Adam-NSCL（特征协方差零空间投影）
 #
-#   先看阈值可不可用（几分钟，不占 GPU，见第 3 条）:
-#     python -m onereplay.baselines.inspect_nscl_nullspace \
-#       --cov_path results_finance_*/cov/cov_mix-math-code-w0.5-0.5_gold_all.pt
+#   先看阈值在那个域的 C 上可不可用（几分钟，见第 3 条）:
+#     python -m onereplay.baselines.inspect_nscl_nullspace --device cuda \
+#       --spectrum_dtype fp64 --detail_thres 10 \
+#       --cov_path results_finance_*/cov/cov_math_metamath30k_gold_all.pt
 #
-#   qsub -v DRY_RUN=0,THRES=1000 onereplay/pbs/105_finance_nscl.pbs
-#   qsub -v DRY_RUN=0,THRES=10000,SVD_LR=4e-4 onereplay/pbs/105_finance_nscl.pbs
+#   单域（保护 math 或 code 一侧）:
+#     qsub -v DRY_RUN=0,DOMAIN=math,THRES=10,SVD_LR=4e-5 onereplay/pbs/105_finance_nscl.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=code,THRES=10,SVD_LR=4e-5 onereplay/pbs/105_finance_nscl.pbs
+#   mix（一个模型同时保护 math 和 code，默认）:
+#     qsub -v DRY_RUN=0,DOMAIN=mix,THRES=10,SVD_LR=4e-5 onereplay/pbs/105_finance_nscl.pbs
+#   换 mix 权重（run 名与矩阵文件名都会跟着变，不会覆盖等权那一版）:
+#     qsub -v DRY_RUN=0,DOMAIN=mix,MIX_WEIGHTS=0.25:0.75,THRES=10,... ...
 #   接入自检：一对短跑，见第 6 条
 #     qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1,CONTROL=1 onereplay/pbs/105_finance_nscl.pbs
 #     qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1           onereplay/pbs/105_finance_nscl.pbs
 #   拆两次投:
-#     qsub -v DRY_RUN=0,THRES=1000,DO_EVAL=0 ...   然后   DO_TRAIN=0
+#     qsub -v DRY_RUN=0,DOMAIN=mix,THRES=10,DO_EVAL=0 ...   然后   DO_TRAIN=0
 #
 # -----------------------------------------------------------------------------
 # 1. 这条臂在表里的位置
@@ -32,10 +38,24 @@
 #
 # 所以它是这张表里 onereplay 最直接的对照物 —— 比 OSFT（99 号）更直接，因为 OSFT
 # 的保护信号是权重自身的奇异谱，与旧知识数据无关。要让这个对照成立，C 必须**逐字**
-# 是 95 号 mix 臂用的那一个，下面的 COV_PATH 默认值就是照 95 号 L455 拼的。
+# 是 95 号同一个 DOMAIN 用的那一个，下面每个域的 COV 默认值都是照 95 号 L433-455
+# 拼的。
 #
-# 结构上这个脚本抄的是 99 号（域无关、一个旋钮一个 run），训练调用 / 旧域 val /
-# 评测 / 汇总几段与 95、99 逐字相同。
+# !! 因此这条臂**有保护域这个维度**，DOMAIN 要显式选
+# 这是它和 99 号（OSFT）的结构性区别，也是这个脚本不能照抄 99 号只做 mix 的原因。
+# OSFT 不消费旧知识，DOMAIN=math 和 DOMAIN=code 会训出同一个模型，域只决定评什么；
+# NSCL 吃 C，换一个域就是换一个投影，是三条真正不同的臂：
+#
+#   DOMAIN=math   只把更新投进 C_math 的零空间，只保护 math
+#   DOMAIN=code   同上，只保护 code
+#   DOMAIN=mix    投进 93 号 Step 4 合成的 C_mix 的零空间，同时保护两侧
+#   DOMAIN=if     如果这条线采过 C_if（93 号目前不采，Step 0 会报文件缺失）
+#
+# 单域和 mix 回答的不是同一个问题。单域给出这个方法在"只有一个域要保"时的上限；
+# mix 才会暴露"保护容量够不够、两个域会不会互相挤"，而后者在旧域 val 里是两列分开
+# 报的，正是这张表要读的东西。三条都投，才和 95 号的 onereplay 三行对得上。
+#
+# 训练调用 / 旧域 val / 评测 / 汇总几段与 95、99 逐字相同。
 #
 # -----------------------------------------------------------------------------
 # 2. !! 超参按 profile 走，不散落在文件里
@@ -189,8 +209,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE
     PROFILE PROFILE_SOURCE SKIP_PROFILE_CHECK
     THRES SVD_LR DEGENERATE CONTROL USE_BF16 COV_DIR COV_PATH ADAM_NSCL_SRC
-    SKIP_NULLSPACE_CHECK
+    SKIP_NULLSPACE_CHECK REQUIRE_USABLE
     PROBE PROBE_STEPS MAX_STEPS SAVE
+    DOMAIN IF_COV MATH_COV CODE_COV MIX_COV
     SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS MIX_WEIGHTS
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL WITH_RETENTION
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
@@ -348,6 +369,17 @@ SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
 OLD_VAL="${OLD_VAL:-1}"
 val_file_for () { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
 
+# =============================================================================
+# 保护域。见文件头第 1 条：这条臂有这个维度，OSFT 没有。
+#
+# 每个域的 C 默认路径都照 95 号 L433-455 拼，两边必须指到同一个文件，否则这条臂
+# 和它要对照的那条 onereplay 臂就不是同一个 C 的软硬两版了。
+# =============================================================================
+COV_DIR="${COV_DIR:-${RESULTS_ROOT}/cov}"
+IF_COV="${IF_COV:-${COV_DIR}/cov_if_flan20k_all.pt}"
+MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_all.pt}"
+CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_all.pt}"
+
 # qsub -v 自己按逗号切参数，所以从命令行传的时候只能写成 math:code / 0.25:0.75。
 # 归一回逗号后拼出的 MIX_TAG 与 93/95 号是同一行，才指得到同一个 C 文件。
 MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
@@ -355,10 +387,40 @@ MIX_WEIGHTS="${MIX_WEIGHTS:-0.5,0.5}"
 MIX_DOMAINS="${MIX_DOMAINS//:/,}"
 MIX_WEIGHTS="${MIX_WEIGHTS//:/,}"
 MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")-w$(printf '%s' "${MIX_WEIGHTS//,/-}")"
-OLD_VAL_DOMAINS="${MIX_DOMAINS//,/ }"
+MIX_COV="${MIX_COV:-${COV_DIR}/cov_${MIX_TAG}_gold_all.pt}"
 
-COV_DIR="${COV_DIR:-${RESULTS_ROOT}/cov}"
-COV_PATH="${COV_PATH:-${COV_DIR}/cov_${MIX_TAG}_gold_all.pt}"
+# 默认 mix，因为那是暴露"保护容量够不够"的那一条。单域要显式选。
+DOMAIN="${DOMAIN:-mix}"
+# 哪几个域的 val 切片要每个 epoch 打一次。单域一个，mix 两个（分开报）。
+OLD_VAL_DOMAINS=""
+case "${DOMAIN}" in
+  if)
+    COV_PATH="${COV_PATH:-${IF_COV}}"
+    OLD_VAL_DOMAINS="if"
+    ;;
+  math)
+    COV_PATH="${COV_PATH:-${MATH_COV}}"
+    OLD_VAL_DOMAINS="math"
+    ;;
+  code)
+    COV_PATH="${COV_PATH:-${CODE_COV}}"
+    OLD_VAL_DOMAINS="code"
+    ;;
+  mix)
+    COV_PATH="${COV_PATH:-${MIX_COV}}"
+    OLD_VAL_DOMAINS="${MIX_DOMAINS//,/ }"
+    ;;
+  *)
+    echo "未知 DOMAIN='${DOMAIN}'。可选：if / math / code / mix。" >&2
+    echo "  NSCL 吃 C，所以换域就是换投影，三者是不同的臂，不能省略。" >&2
+    exit 2
+    ;;
+esac
+
+# run 名里的域标签。mix 要带上参与的域与权重：0.5/0.5 和 0.25/0.75 是两个独立的
+# 实验点，名字一样就会在 <metric>_summary.csv 里挤成同一行。与 95 号 L612-614 同。
+DOMAIN_TAG="${DOMAIN}"
+[[ "${DOMAIN}" == "mix" ]] && DOMAIN_TAG="${MIX_TAG}"
 
 # =============================================================================
 # NSCL 的旋钮。见文件头第 3、4、6 条。
@@ -404,6 +466,11 @@ fi
 # 见文件头第 5 条：这条臂默认 fp32，因为 bf16 的权重累加会把保证吃掉。
 USE_BF16="${USE_BF16:-0}"
 SKIP_NULLSPACE_CHECK="${SKIP_NULLSPACE_CHECK:-0}"
+# 预检默认只警告不退出。"usable" 是我们对这个阈值的判断，而一个 baseline 该按它
+# 发表的样子跑 —— 上游自己的 thres 是 10 和 30，在 transformer 协方差上大概率被
+# 判成不可用，但"原样跑出来是什么样"恰恰是要报的东西。REQUIRE_USABLE=1 把它变回
+# 硬门槛，用于那种确实不想浪费排队时间的扫描。
+REQUIRE_USABLE="${REQUIRE_USABLE:-0}"
 
 DRY_RUN="${DRY_RUN:-1}"
 DO_TRAIN="${DO_TRAIN:-1}"
@@ -624,16 +691,23 @@ else
     --require_usable 1 || NSCL_PRECHECK_RC=$?
   if (( NSCL_PRECHECK_RC != 0 )); then
     echo >&2
-    echo "!! THRES=${THRES} 在这个 C 上不可用（上面那行给了判定）。" >&2
+    echo "!! THRES=${THRES} 被判成不可用（上面那行给了判定）。" >&2
     echo "   locked  = 有层被锁死，那一跑的被投影权重几乎不会动，但 loss 照样降。" >&2
     echo "   vanilla = 什么都没约束住，那一跑就是全量微调，只是名字叫 NSCL。" >&2
     echo "   leaky   = 保留的子空间仍带着旧数据的能量，保护的不是它声称保护的东西。" >&2
-    echo "   先扫一遍完整网格再挑：" >&2
-    echo "     python -m onereplay.baselines.inspect_nscl_nullspace --cov_path ${COV_PATH}" >&2
-    echo "   确实要跑一个不可用的点（比如就是要做端点对照）就传 SKIP_NULLSPACE_CHECK=1。" >&2
-    exit 3
+    if [[ "${REQUIRE_USABLE}" == "1" ]]; then
+      echo "   REQUIRE_USABLE=1，就此退出。去掉它就会照样跑下去。" >&2
+      exit 3
+    fi
+    echo "   继续跑。上游自己的 thres 是 10 和 30，在 transformer 的协方差上大概率" >&2
+    echo "   就落在这几档里，而按原样跑出来是什么样正是要报的东西。上面那几个占比" >&2
+    echo "   连同 nscl_* 字段会一起进 metrics，结论事后可审计。" >&2
+    echo "   不想跑不可用的点就传 REQUIRE_USABLE=1，或先扫完整网格挑一个：" >&2
+    echo "     python -m onereplay.baselines.inspect_nscl_nullspace \\" >&2
+    echo "       --cov_path ${COV_PATH} --device cuda --spectrum_dtype fp64" >&2
+  else
+    echo "  预检通过"
   fi
-  echo "  预检通过"
 fi
 
 # =============================================================================
@@ -643,7 +717,7 @@ fi
 # =============================================================================
 run_name_for () {
   local thres="$1" svdlr="$2" control="${3:-${CONTROL}}"
-  local name="fin_nscl_${MIX_TAG}_thres${thres}_svdlr${svdlr}"
+  local name="fin_nscl_${DOMAIN_TAG}_thres${thres}_svdlr${svdlr}"
   name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
   [[ "${USE_BF16}" == "1" ]] && name="${name}_bf16"
   if [[ "${PROBE}" == "1" || "${MAX_STEPS}" != "0" ]]; then
@@ -664,7 +738,7 @@ PARTNER_METRICS="${METRICS_DIR}/${PARTNER_RUN}.jsonl"
 
 echo
 echo "========================================================================"
-echo "finance 线 nscl 臂：保护 ${MIX_TAG}"
+echo "finance 线 nscl 臂：DOMAIN=${DOMAIN}，保护 ${DOMAIN_TAG}"
 echo "  profile  = ${PROFILE}"
 echo "  W_ref    = ${MODEL_DIR}/${MODEL_NAME}   (裸底座，与其它臂相同)"
 echo "  新任务   = ${DATASET_DIR}"
@@ -673,7 +747,7 @@ echo "  CONTROL  = 1   **不开 NSCL**，同一套超参的对照跑。"
 echo "             搭档 = ${PARTNER_RUN}"
 else
 echo "  C        = ${COV_PATH}"
-echo "             与 95 号 mix/onereplay 臂同一个文件 —— 这条臂是它的硬约束版本"
+echo "             与 95 号 DOMAIN=${DOMAIN}/onereplay 臂同一个文件 —— 这条臂是它的硬约束版本"
 echo "  THRES    = ${THRES}   (λ ≤ λ_min x thres 的方向被保留，更新只能动在里面)"
 echo "  SVD_LR   = ${SVD_LR}   (被投影权重的 lr；投影矩阵另有 1/sqrt(k) 的缩小)"
 fi
@@ -816,13 +890,20 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
       fi
       echo "  ok  ${EXPECT_NSCL_LAYERS} 个权重被投影"
       grep -F "Adam-NSCL: kept" "${TRAIN_LOG}" | head -n 1
-      # 两个端点：全锁死和完全没约束。预检已经挡过一次，这里是"实际发生了什么"。
+      # 两个端点：全锁死和完全没约束。和 Step 0 的预检同一套口径 —— 默认只报，
+      # REQUIRE_USABLE=1 才拦。一个故意跑的退化点和一个悄悄坏掉的 run 在日志里
+      # 长得一样，区别只在投递的人知不知道，所以这个判断交给那个人。
+      NSCL_DEGENERATE_SEEN=0
       if grep -qF -- "Adam-NSCL: every layer kept under" "${TRAIN_LOG}"; then
-        echo "  !! 每层保留的方向都不到 1%，这一跑是冻结骨架而不是 NSCL。" >&2
-        exit 1
+        echo "  !! 每层保留的方向都不到 1%，这一跑接近冻结骨架。" >&2
+        NSCL_DEGENERATE_SEEN=1
       fi
       if [[ "${DEGENERATE}" != "1" ]] && grep -qF -- "Adam-NSCL: almost nothing was dropped" "${TRAIN_LOG}"; then
-        echo "  !! 几乎什么都没丢，这一跑等价于全量微调。" >&2
+        echo "  !! 几乎什么都没丢，这一跑接近全量微调。" >&2
+        NSCL_DEGENERATE_SEEN=1
+      fi
+      if (( NSCL_DEGENERATE_SEEN == 1 )) && [[ "${REQUIRE_USABLE}" == "1" ]]; then
+        echo "     REQUIRE_USABLE=1，就此退出。" >&2
         exit 1
       fi
       if grep -qF -- "that ratio is too low" "${TRAIN_LOG}"; then
@@ -1054,7 +1135,7 @@ fi
 # =============================================================================
 echo
 echo "========================================================================"
-echo "结果汇总：nscl 保护 ${MIX_TAG}   THRES=${THRES} SVD_LR=${SVD_LR}"
+echo "结果汇总：nscl 保护 ${DOMAIN_TAG}   THRES=${THRES} SVD_LR=${SVD_LR}"
 echo "========================================================================"
 OUT_DIR="${EVAL_ROOT}" RUN_NAME="${RUN}" ARM_NAME="nscl" \
 BASE_NAME="${BASE_RUN}" VANILLA_NAME="${VANILLA_RUN}" \
@@ -1235,6 +1316,28 @@ for key, label, spec in (
     print(f"  {label:<20}" + ("-" if value is None else format(value, spec)))
 print(f"  上游 commit         {ours_m.get('nscl_upstream_commit', '-')}")
 print(f"  C                   {ours_m.get('nscl_cov_path', '-')}")
+by_module = ours_m.get("nscl_kept_share_by_module") or {}
+energy_by_module = ours_m.get("nscl_energy_share_by_module") or {}
+if by_module:
+    print()
+    print("  按模块类型（保留占比中位数 / 最差层的残留能量）:")
+    print(f"    {'module':<14}{'kept':>9}{'energy':>12}")
+    for module in sorted(by_module):
+        share = by_module[module]
+        energy = energy_by_module.get(module)
+        note = ""
+        if share < 0.01:
+            note = "   冻结"
+        elif energy is not None and energy > 0.1:
+            note = "   没被约束：保留的子空间里就是旧数据的能量"
+        print(
+            f"    {module:<14}{share:>9.4f}"
+            + ("-" if energy is None else f"{energy:>12.3e}")
+            + note
+        )
+    print("  一个 thres 同时冻住一半模块、放开另一半，是这个判据在 transformer 上的")
+    print("  典型表现：它锚在每层自己的 λ_min 上，而 block 里四种输入的条件数差很多。")
+
 resolution = ours_m.get("nscl_step_resolution")
 if isinstance(resolution, (int, float)) and resolution < 10:
     print("  !! step/spacing 比值低于 10：更新大部分被权重 dtype 的舍入吃掉，而舍入")
@@ -1269,13 +1372,20 @@ PY
 echo
 echo "========================================================================"
 echo "本臂完成: ${RUN}"
-echo "  同一张表里还差哪几条就投哪几条："
-echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
-echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=ewc,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
-echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "  同一个域里还差哪几条就投哪几条（都用 DOMAIN=${DOMAIN}，C 同一份）："
+echo "    qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=onereplay,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "    qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=ewc,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "    qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=replay ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "  本臂的另外两个域（NSCL 吃 C，换域就是换投影，是不同的臂）："
+for _other in math code mix; do
+  [[ "${_other}" == "${DOMAIN}" ]] && continue
+  echo "    qsub -v DRY_RUN=0,DOMAIN=${_other},THRES=${THRES},SVD_LR=${SVD_LR} ${SELF_PATH}"
+done
+echo "  域无关的那条臂（OSFT，不消费旧知识，只有一版）："
 echo "    qsub -v DRY_RUN=0,URR=0.25 ${REPO_ROOT}/onereplay/pbs/99_finance_osft.pbs"
-echo "  本臂换一个点就改 THRES / SVD_LR，先用预检脚本确认那个 THRES 可用："
-echo "    python -m onereplay.baselines.inspect_nscl_nullspace --cov_path ${COV_PATH}"
+echo "  本臂换一个点就改 THRES / SVD_LR，先用预检脚本看那个 THRES 选中了什么："
+echo "    python -m onereplay.baselines.inspect_nscl_nullspace --device cuda \\"
+echo "      --spectrum_dtype fp64 --detail_thres ${THRES} --cov_path ${COV_PATH}"
 echo "  接入自检是一对短跑（见文件头第 6 条）："
 echo "    qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1,CONTROL=1 ${SELF_PATH}"
 echo "    qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1           ${SELF_PATH}"
