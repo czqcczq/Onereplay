@@ -30,10 +30,10 @@ plan to prune: check 4 writes two full checkpoints into a temporary directory,
 so it costs twice the checkpoint in scratch space and two model loads.
 
 Usage:
-    python -m onereplay.scripts.check_fapm \
+    python -m onereplay.baselines.check_fapm \
         --model_dir /home/weiliu1/huggingface/models/ --model_name Qwen3-1.7B
 
-    python -m onereplay.scripts.check_fapm --skip_model 1   # checks 1-3 only
+    python -m onereplay.baselines.check_fapm --skip_model 1   # checks 1-3 only
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ from onereplay.core.modeling import (  # noqa: E402
     load_causal_lm_and_tokenizer,
     set_seed,
 )
-from onereplay.scripts.apply_fapm import fapm_prune  # noqa: E402
+from onereplay.baselines.apply_fapm import fapm_prune  # noqa: E402
 
 _results: list[tuple[str, bool, str]] = []
 
@@ -246,7 +246,7 @@ def run_cli(args: argparse.Namespace, adapter_path: Path, ratio: float, out: Pat
         [
             sys.executable,
             "-m",
-            "onereplay.scripts.apply_fapm",
+            "onereplay.baselines.apply_fapm",
             "--model_dir", args.model_dir,
             "--model_name", args.model_name,
             "--use_bf16", str(args.use_bf16),

@@ -298,7 +298,7 @@ def parse_args() -> argparse.Namespace:
             "directions are frozen as old knowledge, and both gradients and "
             "parameters are projected into the orthogonal complement at each step. "
             "The decomposition and the projections are executed out of the authors' "
-            "repository under baseline/mini_trainer; see onereplay/core/osft.py. "
+            "repository under baseline/mini_trainer; see onereplay/baselines/osft.py. "
             "Requires --full_finetune 1 and is mutually exclusive with the penalty "
             "arms, since it constrains DeltaW structurally rather than by a loss term."
         ),
@@ -338,6 +338,64 @@ def parse_args() -> argparse.Namespace:
             "Precision the SVD and the weight reconstruction run in. fp32 is "
             "upstream's default; the factors themselves are stored in the training "
             "dtype."
+        ),
+    )
+
+    parser.add_argument(
+        "--nscl",
+        type=int,
+        default=0,
+        help=(
+            "1 runs the Adam-NSCL baseline (CVPR 2021) instead of a DeltaW penalty. "
+            "Every Adam update to a covered weight is multiplied by the projector onto "
+            "the approximate null space of that layer's input covariance, so DeltaW x "
+            "stays near zero for old x by construction rather than by a loss term. The "
+            "optimizer is the authors' own, imported from the clone under "
+            "baseline/Adam-NSCL; see onereplay/baselines/nscl.py. Requires "
+            "--full_finetune 1 and takes the same C the OneReplay arm is weighted by, "
+            "which is what makes the two directly comparable."
+        ),
+    )
+    parser.add_argument(
+        "--nscl_cov_path",
+        type=str,
+        default="",
+        help=(
+            "Covariance from scripts/collect_cov.py whose null space the updates are "
+            "projected into. Separate from --cov_path so that a run cannot accidentally "
+            "inherit the penalty arm's default while reporting itself as Adam-NSCL. "
+            "Point both at the same file to compare the hard and soft constraint on "
+            "identical C."
+        ),
+    )
+    parser.add_argument(
+        "--nscl_thres",
+        type=float,
+        default=-1.0,
+        help=(
+            "Eigenvalue cutoff for the null space: a direction is kept when its "
+            "eigenvalue is at most thres times the *smallest* eigenvalue of that "
+            "layer's C. The method's only real hyperparameter, so it plays the role "
+            "--replay_lambda plays for OneReplay and needs its own sweep; upstream's "
+            "scripts use 10 and 30. Because the rule is anchored to the bottom of the "
+            "spectrum rather than to the top, the kept fraction is governed by how far "
+            "the noise floor spreads and cannot be guessed from the model -- run "
+            "baselines/inspect_nscl_nullspace.py on the covariance first. Must be >= 1: "
+            "below that the selection can come back empty, and upstream then divides an "
+            "all-zero projector by its own zero norm and returns NaN."
+        ),
+    )
+    parser.add_argument(
+        "--nscl_svd_lr",
+        type=float,
+        default=-1.0,
+        help=(
+            "Learning rate for the projected weights; everything else uses --lr. "
+            "Separate because upstream carries it separately (5e-5 against a model_lr "
+            "of 1e-4) and because their projector is divided by its Frobenius norm, "
+            "which shrinks each update by a further 1/sqrt(k) with k the number of kept "
+            "directions in that layer. The nominal rate is therefore not the effective "
+            "one and does not transfer from the other arms. Negative means use --lr."
         ),
     )
 
@@ -798,7 +856,7 @@ def build_osft_factory(args: argparse.Namespace):
     up the loader's config munging, dtype and pad-token handling unchanged.
     """
 
-    from onereplay.core.osft import build_osft_model, parse_target_patterns
+    from onereplay.baselines.osft import build_osft_model, parse_target_patterns
 
     patterns = parse_target_patterns(args.osft_target_patterns)
     upcast_dtype = {"fp32": torch.float32, "fp64": torch.float64}[args.osft_upcast_dtype]
@@ -873,6 +931,129 @@ def validate_osft_args(args: argparse.Namespace) -> None:
         raise ValueError("--osft 1 is only defined for --paradigm sft")
 
 
+def validate_nscl_args(args: argparse.Namespace) -> None:
+    """Refuse the combinations where an Adam-NSCL run would not be an Adam-NSCL run.
+
+    The shape of these checks follows validate_osft_args, because the two arms
+    fail the same way: both replace an unconstrained update with a constrained
+    one, and both degrade into plain full fine-tuning without anything in the
+    loss curve saying so.
+
+    LoRA is refused for the reason spelled out in baselines/nscl.py: the
+    constraint applies to the updates, while a LoRA adapter's DeltaW also
+    contains A's random initialization, which no projection of the updates ever
+    touches.
+    """
+
+    if args.nscl != 1:
+        if args.nscl_thres >= 0 or args.nscl_cov_path or args.nscl_svd_lr >= 0:
+            raise ValueError(
+                "--nscl_* was set but --nscl is 0, so nothing would read it and the run "
+                "would silently be a vanilla one. Pass --nscl 1."
+            )
+        return
+
+    if not args.nscl_cov_path:
+        raise ValueError(
+            "--nscl 1 requires --nscl_cov_path. The null space is a property of the "
+            "old-knowledge covariance, so there is no run without one."
+        )
+    if args.nscl_thres < 0:
+        raise ValueError(
+            "--nscl 1 requires --nscl_thres. It is the method's only hyperparameter and "
+            "has no defensible default: the kept fraction it produces depends on the "
+            "conditioning of C, not on the model, so a value that works on one "
+            "covariance locks the weights on another. Run "
+            "python -m onereplay.baselines.inspect_nscl_nullspace first."
+        )
+    if args.nscl_thres < 1.0:
+        raise ValueError(
+            f"--nscl_thres {args.nscl_thres} is below 1. The rule keeps eigenvalues at "
+            "most thres times the smallest one, so below 1 it can select nothing, and "
+            "upstream then builds an all-zero projector and divides it by its own zero "
+            "norm. The result is NaN weights on the first step rather than an error."
+        )
+    if args.full_finetune != 1:
+        raise ValueError(
+            "--nscl 1 requires --full_finetune 1. Adam-NSCL constrains the update of W "
+            "itself; under LoRA the adapter's DeltaW = B A also contains A's random "
+            "initialization, which projecting the updates never removes, so the "
+            "null-space guarantee would not hold."
+        )
+    if args.osft == 1:
+        raise ValueError(
+            "--nscl 1 and --osft 1 are two different subspace constraints. Running both "
+            "would be neither baseline."
+        )
+    if args.replay_lambda > 0:
+        raise ValueError(
+            "--nscl 1 with --replay_lambda > 0 would apply the hard constraint and the "
+            "soft penalty at once, which is neither baseline. Run them as separate arms."
+        )
+    if (
+        args.replay_ratio > 0
+        or args.replay_rows > 0
+        or args.replay_per_batch > 0
+        or args.replay_steps_per_update > 0
+    ):
+        raise ValueError(
+            "--nscl 1 with replay mixing enabled would be an NSCL+replay combination, "
+            "not the Adam-NSCL baseline. Run them as separate arms."
+        )
+    if args.paradigm != "sft":
+        raise ValueError("--nscl 1 is only defined for --paradigm sft")
+
+
+def build_nscl_arm(args: argparse.Namespace, model: torch.nn.Module):
+    """Swap in the authors' optimizer and install the null-space projectors.
+
+    Returns (optimizer, record). Called instead of constructing torch's Adam, and
+    before the LR scheduler is built so the scheduler's step counter still wraps
+    one optimizer update.
+
+    C is dropped as soon as the projectors exist. Unlike the penalty arms, which
+    read C at every step and keep it resident, this arm only needs it once: the
+    d_in x d_in projector replaces it and is the same size, so holding both would
+    double this arm's fixed overhead for no reason.
+    """
+
+    from onereplay.baselines.nscl import (
+        build_nscl_optimizer,
+        describe_nscl,
+        install_null_space_transforms,
+        report_null_space,
+        report_step_resolution,
+        step_resolution,
+    )
+    from onereplay.core.covariance import load_covariance_file
+
+    svd_lr = args.lr if args.nscl_svd_lr < 0 else args.nscl_svd_lr
+    covariances = load_covariance_file(args.nscl_cov_path)
+    print(f"Adam-NSCL: loaded C for {len(covariances)} layers from {args.nscl_cov_path}")
+    optimizer, covered = build_nscl_optimizer(
+        model, covariances, lr=args.lr, svd_lr=svd_lr, thres=args.nscl_thres
+    )
+    stats = install_null_space_transforms(
+        optimizer, covered, covariances, thres=args.nscl_thres
+    )
+    record = describe_nscl(optimizer, covered, stats, thres=args.nscl_thres, svd_lr=svd_lr)
+    # The penalty arms record their matrix under penalty_path, which this arm
+    # leaves at its default because no penalty ran. Without this the NSCL row and
+    # the OneReplay row it is meant to be compared against could not be shown to
+    # have come from the same C.
+    record["nscl_cov_path"] = args.nscl_cov_path
+    report_null_space(stats, record)
+    # Whether the step this arm is about to take is representable in the weight
+    # dtype at all. Recorded rather than only printed: a bf16 run whose ratio sat
+    # below 1 did not test the method, and that has to be visible in the table
+    # next to the number it produced.
+    resolution = step_resolution(covered, stats, svd_lr=svd_lr)
+    report_step_resolution(resolution)
+    record["nscl_step_resolution"] = resolution["ratio"]
+    del covariances
+    return optimizer, record
+
+
 def main() -> None:
     args = parse_args()
     print("the file is " + str(Path(__file__).resolve()))
@@ -882,6 +1063,7 @@ def main() -> None:
     set_seed(args.seed)
     configure_system_prompt(args.system_prompt)
     validate_osft_args(args)
+    validate_nscl_args(args)
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     model, tokenizer = load_causal_lm_and_tokenizer(
@@ -908,14 +1090,17 @@ def main() -> None:
 
     osft_record: dict[str, Any] = {}
     if args.osft == 1:
-        from onereplay.core.osft import describe_osft
+        from onereplay.baselines.osft import describe_osft
 
         osft_record = describe_osft(model, args.osft_unfreeze_rank_ratio)
 
-    # validate_osft_args already refused a penalty on this arm; skipping the load
-    # entirely also keeps C off the device, since measure_replay_when_lambda_zero
-    # would otherwise pull it in just to report a number no longer being applied.
-    regularizer = None if args.osft == 1 else build_regularizer(args, device)
+    # The two subspace arms already refused a penalty in their validators;
+    # skipping the load entirely also keeps C off the device, since
+    # measure_replay_when_lambda_zero would otherwise pull it in just to report a
+    # number no longer being applied. Adam-NSCL loads its own copy of C further
+    # down and frees it once the projectors are built.
+    constrained_arm = args.osft == 1 or args.nscl == 1
+    regularizer = None if constrained_arm else build_regularizer(args, device)
     if args.full_finetune == 1 and regularizer is not None:
         # The snapshot has to be taken before the first optimizer step, and
         # after .to(device) so DeltaW never crosses devices mid-training.
@@ -1098,17 +1283,24 @@ def main() -> None:
         args, tokenizer, valid_dataset, old_val_dataset=old_val_dataset
     )
 
-    optimizer = torch.optim.Adam(
-        filter(lambda parameter: parameter.requires_grad, model.parameters()),
-        lr=args.lr,
-    )
-    if args.osft == 1:
-        from onereplay.core.osft import wrap_optimizer
+    nscl_record: dict[str, Any] = {}
+    if args.nscl == 1:
+        # Their Adam entirely, not torch's wrapped: the projection happens inside
+        # step(), between the moment update and the weight, so there is no
+        # equivalent hook to attach to a stock optimizer.
+        optimizer, nscl_record = build_nscl_arm(args, model)
+    else:
+        optimizer = torch.optim.Adam(
+            filter(lambda parameter: parameter.requires_grad, model.parameters()),
+            lr=args.lr,
+        )
+        if args.osft == 1:
+            from onereplay.baselines.osft import wrap_optimizer
 
-        # Before the scheduler is built: an LRScheduler patches optimizer.step
-        # with its own call counter, and it has to sit outside the projections so
-        # that one step() is still one scheduler tick.
-        optimizer = wrap_optimizer(optimizer, model)
+            # Before the scheduler is built: an LRScheduler patches optimizer.step
+            # with its own call counter, and it has to sit outside the projections so
+            # that one step() is still one scheduler tick.
+            optimizer = wrap_optimizer(optimizer, model)
 
     # The schedule advances once per optimizer update, not once per micro-batch,
     # so its horizon has to be counted in the same unit the trainer steps in.
@@ -1307,6 +1499,11 @@ def main() -> None:
             # every non-OSFT run, which keeps their records byte-identical to the
             # ones already in results_log.
             **osft_record,
+            "nscl": args.nscl,
+            # Realized kept directions, retained energy, the covariance the null
+            # space came out of and the upstream commit. Absent on every non-NSCL
+            # run, which keeps those records as they were.
+            **nscl_record,
         },
         save_path=args.save_path if args.save == 1 else "",
         tokenizer=tokenizer,

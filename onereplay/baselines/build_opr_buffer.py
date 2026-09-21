@@ -45,7 +45,7 @@ Three departures, all forced and all recorded in the run log:
   number of non-empty candidates. That is asserted rather than assumed.
 
 Usage:
-    python -m onereplay.scripts.build_opr_buffer \
+    python -m onereplay.baselines.build_opr_buffer \
         --reward sc --buffer_size 766 \
         --pool math=<generated_math.jsonl> --pool code=<generated_code.jsonl> \
         --output_path <opr_buffer_sc.jsonl>

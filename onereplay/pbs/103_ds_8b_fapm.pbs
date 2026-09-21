@@ -49,7 +49,7 @@
 # -----------------------------------------------------------------------------
 # 3. 忠实性契约
 # -------------
-# 原样照搬（见 onereplay/scripts/apply_fapm.py 的文件头，那里逐行对照了上游的
+# 原样照搬（见 onereplay/baselines/apply_fapm.py 的文件头，那里逐行对照了上游的
 # baseline/FAPM/FAPM.py）：打分公式、lamda 系数固定 1.0、lamda 逐矩阵取
 # mean(|W0|)、预算 int(numel*ratio) 截断不四舍、无条件取满 top-k（分数为负也要）。
 #
@@ -450,7 +450,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   echo "      --metrics ${DOMAIN_METRICS// /,} --out_dir ${OUT_DIR}"
   echo "  没有 train.py，也没有 --cov_path / --fisher_path / --replay_*。"
   echo "  先看一眼 10% 的预算会扔掉多少 task vector（不写 16GB 的 ckpt）："
-  echo "    python -m onereplay.scripts.apply_fapm --model_dir ${MODEL_DIR} \\"
+  echo "    python -m onereplay.baselines.apply_fapm --model_dir ${MODEL_DIR} \\"
   echo "      --model_name ${MODEL_NAME} --adapter_path ${VANILLA_ADAPTER} \\"
   echo "      --keep_ratio ${KEEP_RATIO} --save 0 --manifest_path /tmp/fapm.json"
   echo "Job finished at: $(date)"
@@ -469,7 +469,7 @@ if [[ "${DO_PRUNE}" == "1" ]]; then
     [[ "${FORCE_PRUNE}" == "1" ]] && rm -rf "${FAPM_CKPT}"
     echo
     echo "==== prune ${RUN} (keep ${KEEP_RATIO}) ===="
-    python -m onereplay.scripts.apply_fapm \
+    python -m onereplay.baselines.apply_fapm \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
       --adapter_path "${VANILLA_ADAPTER}" \
       --keep_ratio "${KEEP_RATIO}" \

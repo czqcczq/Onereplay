@@ -29,15 +29,18 @@ E_old ||scale * B A x||^2 / ||W x||^2
 ```text
 onereplay/
 ├── core/         regularizer.py  covariance.py  fisher.py  modeling.py
-│                 osft.py        glue onto the vendored OSFT baseline
 │                                                             framework-agnostic kernel
+├── baselines/    osft.py  nscl.py  apply_fapm.py  build_opr_buffer.py
+│                 check_osft.py  check_nscl.py  check_fapm.py
+│                 inspect_nscl_nullspace.py
+│                                    glue onto the clones under baseline/;
+│                                    nothing here is OneReplay
 ├── data/         chat.py  commonsense.py  old_knowledge.py  replay.py  probe.py
 ├── trainers/     base.py  sft.py  opd.py                      shared loop + two paradigms
 ├── eval/         runner.py  generation.py  metrics/           one model load, many metrics
 ├── scripts/      collect_cov.py  collect_fisher.py  generate_replay_targets.py
 │                 train.py  evaluate.py  check_old_knowledge_pool.py
-│                 compare_cov_scale.py  check_osft.py
-│                 build_opr_buffer.py                         the only CLI entry points
+│                 compare_cov_scale.py                         the only CLI entry points
 ├── legacy/       archived single-purpose scripts, not on the active path
 ├── slurm/        01..27 cluster jobs
 ├── pbs/          01..33 the same jobs for the PBS + Singularity cluster
@@ -229,7 +232,7 @@ discover:
 
 Every line of the method runs out of the authors' repository, kept as an
 unmodified clone at `baseline/mini_trainer` and imported rather than copied --
-see the header of `onereplay/core/osft.py` for the pinned commit and for the two
+see the header of `onereplay/baselines/osft.py` for the pinned commit and for the two
 places where our call order had to be stated explicitly. Before spending cluster
 time, run both checks:
 
@@ -239,7 +242,7 @@ python test_code/check_osft_integration.py
 
 # Needs a checkpoint: step-0 logit parity against the plain model, the frozen
 # factors really being frozen, and a save/reload round trip.
-python -m onereplay.scripts.check_osft \
+python -m onereplay.baselines.check_osft \
   --model_dir /home/weiliu1/huggingface/models/ --model_name Qwen3-1.7B \
   --osft_unfreeze_rank_ratio 0.25
 ```
@@ -265,6 +268,69 @@ compresses the whole cosine into its 4800 steps and ends at `lr=0` while
 vanilla is still halfway down a two-epoch cosine at `lr≈4.7e-5`, on twice the
 data. The two stop being the same experiment after the first step, so any
 difference in `val_loss` between them means nothing.
+
+### The Adam-NSCL baseline: the same C, as a hard constraint
+
+Adam-NSCL (CVPR 2021, "Training Networks in Null Space of Feature Covariance
+for Continual Learning") is the closest comparison OneReplay has, because it is
+weighted by the *same matrix*. Where the penalty adds
+`lambda * tr(DeltaW C DeltaW^T)` to the loss and lets the optimizer trade the
+two terms off, Adam-NSCL multiplies every Adam update by the projector onto the
+approximate null space of C, driving that quadratic form toward zero by
+construction. Same coverage, no lambda. Like OSFT it is a full fine-tuning
+method, and for a sharper reason: the guarantee is that the accumulated DeltaW
+lies in the null space, which fails under LoRA because `A`'s random
+initialization is never projected.
+
+The optimizer runs from the authors' clone under `baseline/Adam-NSCL`;
+`onereplay/baselines/nscl.py` documents the pinned commit and the three places
+our setting forced a departure. The largest is that C comes from our
+`collect_cov.py` rather than their forward hook: theirs averages over the batch
+dimension and then calls `torch.mm`, which cannot run on a transformer's
+`(batch, seq, hidden)` activations at all.
+
+**Pick the threshold before spending a GPU.** The selection rule keeps
+eigenvalues within `thres` of the *smallest* one. On the CNN covariances the
+paper targets that works because the spectrum has exact zeros; a transformer's
+decays smoothly over eight or nine orders of magnitude, so what the rule selects
+is decided by how wide the noise floor is, and upstream's own 10 or 30 can lock
+every layer. Both failure modes are invisible in a loss curve, so there is a
+CPU-only script that predicts the outcome from the covariance alone:
+
+```bash
+python -m onereplay.baselines.inspect_nscl_nullspace \
+  --cov_path results/cov/cov_mix-math-code-w0.5-0.5_gold_all.pt
+```
+
+It prints, per threshold, the kept fraction on the tightest and loosest layer,
+how much of the old data's energy the kept subspace still carries, and a
+verdict of locked / vanilla / leaky / usable. `--require_usable 1` turns that
+verdict into an exit code, which is how `105_finance_nscl.pbs` gates itself.
+
+```bash
+python -m onereplay.baselines.check_nscl        # CPU-only, synthetic, ~10s
+qsub -v DRY_RUN=0,THRES=1000 onereplay/pbs/105_finance_nscl.pbs
+```
+
+Two things about this arm that have to be reported alongside its numbers:
+
+`--nscl_svd_lr` is a separate learning rate because upstream stores
+`P / ||P||_F`, which shrinks every update by a further `1/sqrt(k)` with `k` the
+kept directions in that layer. The nominal rate is not the effective one and
+does not transfer from the other arms. Upstream sets theirs to half their base
+rate, i.e. accepts the shrink; the inspector also reports the multiple that
+would compensate for it. Both ends are worth sweeping, since an arm that never
+moved is not evidence about the method.
+
+The arm defaults to **fp32**, not bf16. Their step ends in
+`p.data.add_(update)`, so the accumulation rounds relative to `|W|` rather than
+to `|update|`, and once the step approaches the dtype's spacing the resulting
+error is isotropic — exactly the directions the projection removes. Measured on
+the synthetic check: float32 leaks 1e-6 of DeltaW's energy outside the kept
+subspace, a bf16-*projector* only takes that to 1e-3, but bf16 *weights* take it
+to 7e-2, and to 7e-1 once the step/spacing ratio falls to 1e-3. `train.py`
+prints that ratio at setup, warns below 10, and records it as
+`nscl_step_resolution`.
 
 ### The OPR baseline: on-policy replay with a filtered buffer
 
@@ -295,7 +361,7 @@ python -m onereplay.scripts.generate_replay_targets \
   --output_path <opr>/gen_sc_math.jsonl
 
 # 2. Score and keep the top-k.
-python -m onereplay.scripts.build_opr_buffer --reward sc --buffer_size 766 \
+python -m onereplay.baselines.build_opr_buffer --reward sc --buffer_size 766 \
   --pool math=<opr>/gen_sc_math.jsonl --pool code=<opr>/gen_sc_code.jsonl \
   --output_path <opr>/buffer_sc.jsonl
 
@@ -400,7 +466,7 @@ that it costs no training at all, and the upside for us is that it starts from
 the same vanilla checkpoint every other arm is compared against.
 
 ```bash
-python -m onereplay.scripts.apply_fapm \
+python -m onereplay.baselines.apply_fapm \
   --model_dir models --model_name Qwen3-8B \
   --adapter_path results/qwen3-8b/adapters/ds_vanilla_8b_r16all_lr2e-4_ep2_seed1 \
   --keep_ratio 0.1 --save_path results/qwen3-8b/fapm_ckpt/<run>
@@ -433,8 +499,8 @@ instead, and the manifest reports how many coordinates were affected.
 Before spending cluster time:
 
 ```bash
-python -m onereplay.scripts.check_fapm --skip_model 1   # no GPU, no model
-python -m onereplay.scripts.check_fapm --model_name Qwen3-1.7B
+python -m onereplay.baselines.check_fapm --skip_model 1   # no GPU, no model
+python -m onereplay.baselines.check_fapm --model_name Qwen3-1.7B
 ```
 
 The first three checks compare against a transcription of the authors' own five

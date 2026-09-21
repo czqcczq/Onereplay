@@ -60,7 +60,7 @@ fine-tuning, and all belonging in the paper's table note:
   it to be assumed.
 
 Usage:
-    python -m onereplay.scripts.apply_fapm \
+    python -m onereplay.baselines.apply_fapm \
         --model_dir <models> --model_name Qwen3-8B \
         --adapter_path <results>/adapters/ds_vanilla_8b_... \
         --keep_ratio 0.1 \

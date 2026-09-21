@@ -6,7 +6,7 @@ labelled OSFT actually running OSFT, and is it running it on the same model the
 other arms run on?
 
   1. env        python / torch / transformers, and whether osft_utils imports.
-  2. commit     the clone is at the commit onereplay/core/osft.py was written for.
+  2. commit     the clone is at the commit onereplay/baselines/osft.py was written for.
   3. patterns   upstream's path-substring lookup resolved the architecture we meant.
   4. rebuild    U S V^T reproduces each original weight. This is the decisive
                 correctness test, and it is separate from the logit test below
@@ -26,7 +26,7 @@ other arms run on?
                 collapses onto vanilla full fine-tuning.
 
 Usage:
-    python -m onereplay.scripts.check_osft \
+    python -m onereplay.baselines.check_osft \
         --model_dir /home/weiliu1/huggingface/models/ --model_name Qwen3-1.7B \
         --osft_unfreeze_rank_ratio 0.25
 
@@ -234,17 +234,17 @@ def check_commit() -> bool:
 
     if head != osft.UPSTREAM_COMMIT:
         return record(
-            "commit: matches the one core/osft.py was written for",
+            "commit: matches the one baselines/osft.py was written for",
             False,
             f"clone is at {head[:10]}, expected {osft.UPSTREAM_COMMIT[:10]}. Re-read "
-            "core/osft.py's call order against their setup_model_for_training before "
+            "baselines/osft.py's call order against their setup_model_for_training before "
             "trusting results, then update UPSTREAM_COMMIT.",
         )
-    return record("commit: matches the one core/osft.py was written for", True, head[:10])
+    return record("commit: matches the one baselines/osft.py was written for", True, head[:10])
 
 
 def check_patterns(model_path: str, raw_patterns: str) -> bool:
-    from onereplay.core.osft import load_upstream, parse_target_patterns, resolved_target_patterns
+    from onereplay.baselines.osft import load_upstream, parse_target_patterns, resolved_target_patterns
 
     osft_utils = load_upstream()["osft_utils"]
     resolved = resolved_target_patterns(model_path, parse_target_patterns(raw_patterns))
@@ -287,7 +287,7 @@ def load_plain(model_path: str, dtype, device):
 
 
 def load_osft(model_path: str, args, dtype, device, unfreeze_rank_ratio: float):
-    from onereplay.core.osft import build_osft_model, parse_target_patterns
+    from onereplay.baselines.osft import build_osft_model, parse_target_patterns
 
     model = build_osft_model(
         model_path,
@@ -488,7 +488,7 @@ def check_weight_rebuild(osft_model, original: dict[str, torch.Tensor], limit: f
 def check_buffers_match(plain, osft_model) -> bool:
     """Every buffer must survive the decomposition unchanged.
 
-    Worth its own check because core/osft.py sets torch's default dtype while
+    Worth its own check because baselines/osft.py sets torch's default dtype while
     the OSFT wrapper is constructed, to stop their non-distributed loader from
     quietly widening a bf16 checkpoint to fp32. Non-persistent buffers -- rotary
     inv_freq above all -- are not in the state dict, so they are *created* under
@@ -528,7 +528,7 @@ def check_buffers_match(plain, osft_model) -> bool:
 
 
 def take_steps(model, input_ids, attention_mask, steps: int, lr: float = 1e-5) -> None:
-    from onereplay.core.osft import wrap_optimizer
+    from onereplay.baselines.osft import wrap_optimizer
 
     model.train()
     optimizer = torch.optim.Adam(
@@ -545,7 +545,7 @@ def take_steps(model, input_ids, attention_mask, steps: int, lr: float = 1e-5) -
 
 
 def snapshot_factors(model) -> dict[str, torch.Tensor]:
-    from onereplay.core.osft import _osft_modules
+    from onereplay.baselines.osft import _osft_modules
 
     snapshot: dict[str, torch.Tensor] = {}
     with torch.no_grad():
@@ -558,7 +558,7 @@ def snapshot_factors(model) -> dict[str, torch.Tensor]:
 
 
 def check_frozen_and_moved(model, before: dict[str, torch.Tensor]) -> bool:
-    from onereplay.core.osft import _osft_modules
+    from onereplay.baselines.osft import _osft_modules
 
     frozen_drift = 0.0
     trainable_drift = 0.0
@@ -595,7 +595,7 @@ def check_frozen_and_moved(model, before: dict[str, torch.Tensor]) -> bool:
 
 
 def check_leak(model, limit: float) -> bool:
-    from onereplay.core.osft import max_frozen_subspace_leak
+    from onereplay.baselines.osft import max_frozen_subspace_leak
 
     leak = max_frozen_subspace_leak(model)
     return record(
@@ -608,7 +608,7 @@ def check_leak(model, limit: float) -> bool:
 def check_save_roundtrip(model, input_ids, attention_mask, dtype, device, limits, noise) -> bool:
     """The reconstructed checkpoint must behave like the model we just trained."""
 
-    from onereplay.core.osft import save_osft_checkpoint
+    from onereplay.baselines.osft import save_osft_checkpoint
 
     directory = Path(tempfile.mkdtemp(prefix="osft_roundtrip_"))
     try:
@@ -647,11 +647,11 @@ def check_degenerate_full_ft(model_path: str, args, dtype, device) -> bool:
     already in results_log. Here we only confirm the rank bookkeeping.
 
     This check is also what catches upstream's _build_osft_kwargs dropping a
-    rank_ratio of 0.0 as falsy; core/osft.py bypasses that helper for exactly
+    rank_ratio of 0.0 as falsy; baselines/osft.py bypasses that helper for exactly
     this reason, and if the bypass is ever removed this goes red again.
     """
 
-    from onereplay.core.osft import describe_osft
+    from onereplay.baselines.osft import describe_osft
 
     model = load_osft(model_path, args, dtype, device, unfreeze_rank_ratio=1.0)
     summary = describe_osft(model, 1.0)

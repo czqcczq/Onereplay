@@ -648,7 +648,7 @@ if [[ "${REWARD}" == "ru" ]]; then
     --code_timeout "${CODE_TIMEOUT}"
   )
 fi
-python -m onereplay.scripts.build_opr_buffer "${BUILD_ARGS[@]}"
+python -m onereplay.baselines.build_opr_buffer "${BUILD_ARGS[@]}"
 
 BUFFER_ROWS="$(wc -l < "${BUFFER_FILE}" | tr -d ' ')"
 if [[ "${BUFFER_ROWS}" != "${BUFFER_ROWS_EXPECTED}" ]]; then

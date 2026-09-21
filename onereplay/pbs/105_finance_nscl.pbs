@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -P CFP03-SF-101
-#PBS -N fin_osft
+#PBS -N fin_nscl
 #PBS -j oe
 #PBS -k oed
 #PBS -q autox
@@ -9,129 +9,130 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# finance 线的第四条臂：OSFT（正交子空间微调），只做 mix（math + code）
+# finance 线的第五条臂：Adam-NSCL（特征协方差零空间投影），只做 mix
 #
-#   qsub -v DRY_RUN=0,URR=0.25 onereplay/pbs/99_finance_osft.pbs
-#   qsub -v DRY_RUN=0,URR=0.1  onereplay/pbs/99_finance_osft.pbs
-#   qsub -v DRY_RUN=0,URR=0.5  onereplay/pbs/99_finance_osft.pbs
-#   接入自检：一对短跑，互相对照，见第 6 条。顺序无所谓，后跑的会打并排表。
-#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 onereplay/pbs/99_finance_osft.pbs
-#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1           onereplay/pbs/99_finance_osft.pbs
+#   先看阈值可不可用（几分钟，不占 GPU，见第 3 条）:
+#     python -m onereplay.baselines.inspect_nscl_nullspace \
+#       --cov_path results_finance_*/cov/cov_mix-math-code-w0.5-0.5_gold_all.pt
+#
+#   qsub -v DRY_RUN=0,THRES=1000 onereplay/pbs/105_finance_nscl.pbs
+#   qsub -v DRY_RUN=0,THRES=10000,SVD_LR=4e-4 onereplay/pbs/105_finance_nscl.pbs
+#   接入自检：一对短跑，见第 6 条
+#     qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1,CONTROL=1 onereplay/pbs/105_finance_nscl.pbs
+#     qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1           onereplay/pbs/105_finance_nscl.pbs
 #   拆两次投:
-#   qsub -v DRY_RUN=0,URR=0.25,DO_EVAL=0 ...   然后   DO_TRAIN=0
+#     qsub -v DRY_RUN=0,THRES=1000,DO_EVAL=0 ...   然后   DO_TRAIN=0
 #
 # -----------------------------------------------------------------------------
-# 1. 为什么另起一个脚本，而不是往 95 号里加第四条臂
-# ------------------------------------------------
-# 95 号的骨架是"每个保护域各有一套 C / F / 池子"，它的 Step 0、Step 1、λ 标尺
-# 扫描、assert_coverage 全都建立在这个前提上。OSFT 一样都不需要：它的保护信号
-# 是权重矩阵自身奇异谱的头部，不消费任何旧知识数据。塞进 95 号就是六处分支都
-# 写"跳过"，把那个脚本"每个 if 都在说这条臂和别人差在哪"的组织原则冲淡。
+# 1. 这条臂在表里的位置
+# ---------------------
+# Adam-NSCL 和 onereplay 吃的是**同一个 C**，区别只在软硬：onereplay 把
+# tr(ΔW C ΔWᵀ) 加进 loss 让优化器自己权衡，Adam-NSCL 直接把每一步 Adam 更新投影
+# 到 C 的近似零空间里，让这个二次型按构造趋于零，没有 λ。
 #
-# 结构上 OSFT 是 94 号那个形状：域无关、一个旋钮一个 run。这里照搬的是 95 号的
-# **训练调用、旧域 val、评测与汇总**，那几段必须逐字相同，否则这条臂的数字和
-# 另外三条不在同一张表里。
+# 所以它是这张表里 onereplay 最直接的对照物 —— 比 OSFT（99 号）更直接，因为 OSFT
+# 的保护信号是权重自身的奇异谱，与旧知识数据无关。要让这个对照成立，C 必须**逐字**
+# 是 95 号 mix 臂用的那一个，下面的 COV_PATH 默认值就是照 95 号 L455 拼的。
+#
+# 结构上这个脚本抄的是 99 号（域无关、一个旋钮一个 run），训练调用 / 旧域 val /
+# 评测 / 汇总几段与 95、99 逐字相同。
 #
 # -----------------------------------------------------------------------------
 # 2. !! 超参按 profile 走，不散落在文件里
 # --------------------------------------
-# 这条线（finance）的 lr / epochs / maxlen 等等在下面的 PROFILE=finance 块里，
-# 每个值都标了它来自 94/95 号。换模型或换数据集时**新增一个 profile**，不要改
-# finance 那一组的数 —— 改了就等于把已经跑完的四条臂一起作废。
-#
-# 启动时 Step 0 会把 profile 的值和 95 号脚本里的默认值逐个对表，不等就退出。
-# 这是这个脚本存在的最大风险（超参漂移）唯一的防线：漂了不会报错，只会表现为
-# 一个解释不了的数字。PROFILE 不是 finance 时这项检查会跳过并大声说明。
+# 与 99 号同一套机制：finance 这条线的 lr / epochs / maxlen 在 PROFILE=finance 块
+# 里，Step 0 会和 95 号逐个对表，不等就退出。换模型或换数据集时**新增一个
+# profile**，不要改 finance 那组数。
 #
 # -----------------------------------------------------------------------------
-# 3. OSFT 的旋钮：URR，占据 λ 的位置
-# ---------------------------------
-# --osft_unfreeze_rank_ratio 是每个矩阵里**参与训练**的奇异方向占比。方向直观：
-# 0.0 全冻、1.0 退化成普通全量微调、上游 README 的例子是 0.25。
+# 3. !! THRES 必须先用预检脚本定，不能照抄上游
+# -------------------------------------------
+# 判据是「λ ≤ λ_min × thres」—— 锚在谱的**底部**，不是顶部。上游的 CNN 特征协方差
+# 是真正降秩的（有精确零），所以 thres=10/30 就够。transformer 的输入协方差没有精确
+# 零，谱在八九个数量级上平滑衰减，于是 thres 选中多少完全由"噪声底有多宽"决定，
+# 这个量和模型、任务、hidden size 都没关系，猜不出来。
 #
-# 和 λ 一样不给默认值。但和 λ 不同的是**不需要先扫一遍找量级**：λ 的尺度取决于
-# tr(C) 或 mean(F)，只能实测反推；URR 有界在 [0,1] 且含义明确，0.05 到 0.5 都是
-# 先验合理的值。所以这里没有 95 号那种 SWEEP 模式，直接投几个完整点。
+# 两个失败方向在训练日志里都看不出来：
+#   选太少 → 被投影的权重几乎动不了，这条臂变成"冻结骨架 + 可训嵌入"，loss 照样降
+#   选太多 → 什么都没约束住，这条臂就是 vanilla，只是名字叫 NSCL
 #
-# !! run 名必须带 URR
-# 95 号靠 _lam${lam} 区分同一条臂的不同点。OSFT 不吃 λ，要是照搬就会让所有 URR
-# 的 run 同名 —— checkpoint 互相覆盖、metrics jsonl 追加混在一起（下游读最后一
-# 条会拿到别的 URR 的）、<metric>_summary.csv 挤成一行。下面 run_name_for 用的
-# 是 _urr${URR}。
-#
-# -----------------------------------------------------------------------------
-# 4. 只做 mix，不做单域
-# --------------------
-# OSFT 不消费旧知识，所以它**没有"保护域"这个维度**：DOMAIN=if 和 DOMAIN=mix
-# 会训出同一个模型，域只决定评什么。硬做三个单域版本等于把同一个 checkpoint 存
-# 三份、评三遍，只会让表更难读。
-#
-# 这条臂对标的是 95 号的 DOMAIN=mix 那三行（onereplay / ewc / replay），它们同样
-# 是"一个模型同时保护 math 和 code"。旧域 val 和评测集合都按 mix 取。
+# 所以 Step 0 会**强制**跑一遍 inspect_nscl_nullspace，在这个 THRES 上判定
+# locked / vanilla / leaky / usable，不是 usable 就直接退出。投之前自己先跑一遍能
+# 省一次排队：
+#   python -m onereplay.baselines.inspect_nscl_nullspace --cov_path <上面那个 C>
 #
 # -----------------------------------------------------------------------------
-# 5. 和另外三条臂的两处已知差异，报告时要注明
-# ------------------------------------------
-#   a) OSFT **不需要任何旧知识数据**。另外三条都要 93 号采的 C / F / 池子。这是
-#      假设上的差异，不是实现细节，建议在表里单开一列。
-#   b) 覆盖范围差一个 lm_head。TARGET_MODULES 是 7 个投影 + lm_head，OSFT 的
-#      Qwen 表只有 7 个投影。**不要**为了对齐把 lm_head 加进
-#      --osft_target_patterns：Qwen2.5-1.5B 是 tie_word_embeddings=true，分解一侧
-#      会在训练中拆散绑定，保存后又被重新绑定、把训好的头丢掉。baselines/osft.py 里
-#      有硬拦截，配了会直接报错。
+# 4. SVD_LR：为什么要单独一个学习率
+# --------------------------------
+# 上游的 get_transforms 存的不是投影算子 P，而是 P/‖P‖_F。对秩 k 的正交投影
+# ‖P‖_F = sqrt(k)，所以每一步更新在投影之后还被额外缩小了 1/sqrt(k)，而 k 逐层不同。
+# 名义 lr 不是有效 lr，也不能从另外几条臂搬过来。
 #
-# 另外 --target_modules 在这条臂上完全不起作用（full_finetune=1 时它只用于选
-# regularizer 覆盖的层，而这条臂没有 regularizer），所以下面不传它，免得日志里
-# 出现一个看着像在起作用、实际不起作用的参数。OSFT 的覆盖由
-# --osft_target_patterns 决定，空值表示用上游按架构查表的默认值。
+# 上游自己的选择是 svd_lr = model_lr / 2（5e-5 对 1e-4），也就是**接受**这个缩小而
+# 不是补偿它。预检脚本会同时给出"补偿到和别的臂同步"所需的倍数（约 sqrt(k)）。
+# 两端都值得扫：忠实复现上游是一个问题，"这条臂有没有真的动过"是另一个问题，一条
+# 根本没动的臂不构成对这个方法的证据。
+#
+# SVD_LR 不给就用 LR，并且会在 Step 0 大声提示这既不是上游的设置也不是补偿后的设置。
 #
 # -----------------------------------------------------------------------------
-# 6. 接入自检：URR=1.0 对 CONTROL=1，不是对 94 号
-# ----------------------------------------------
-# URR=1.0 时 top_k = floor(rank x 0) = 0，一个方向都不冻，OSFT 退化成普通全量
-# 微调，所以它的曲线必须和"同样设置但不开 OSFT"的那一跑重合。
+# 5. !! bf16 会破坏这个方法的保证，这条臂的 USE_BF16 默认是 0
+# ----------------------------------------------------------
+# 上游的 step 以 p.data.add_(update) 结束，舍入是相对 |W| 而不是相对 |update| 的。
+# 一旦单步更新接近权重 dtype 在 |W| 处的间隔，ΔW 就主要由舍入构成 —— 而舍入是各向
+# 同性的，正好落满投影本该排除掉的那些方向。
 #
-# !! 这个对照**不能**用 94 号的 vanilla
-# PROBE=1 会把 EPOCHS 钉成 1 并设 MAX_STEPS，而 train.py 的调度 horizon 是
-#   total_updates = ceil(min(len(loader), max_steps) / accum_steps) * epochs
-# 算出来的。于是 4800 步的 probe 会把整条 cosine 压缩进这 4800 步、末尾衰减到
-# lr=0，而 94 号的 vanilla 在同一个位置还在 2 epoch cosine 的一半上（lr≈4.7e-5），
-# 数据量也差一倍。两者从第一步之后就不在同一个实验里，val_loss 差多少都说明
-# 不了问题。
+# check_nscl 在合成数据上量过：fp32 下 ΔW 漏到子空间外的能量是 1e-6；把投影矩阵舍
+# 入到 bf16 只涨到 1e-3；但**权重**用 bf16 就是 7e-2，步长/间隔比降到 1e-3 时是 7e-1。
+# 丢掉保证的是累加，不是投影。
 #
-# 所以对照要用 CONTROL=1：完全相同的命令，只是不传 --osft，run 名加 _control
-# 后缀。URR=1.0 时两者理论上逐步一致（没有因子，就没有因子化前向的数值差）。
+# 所以这条臂默认 USE_BF16=0。代价是显存和墙钟，收益是这条臂测的确实是这个方法。
+# 要跑 bf16 版就显式传 USE_BF16=1，train.py 会打印 step/spacing 比值并在低于 10 时
+# 警告，这个比值也会进 metrics（nscl_step_resolution），报告时必须带上。
 #
-#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 onereplay/pbs/99_finance_osft.pbs
-#   qsub -v DRY_RUN=0,URR=1.0,PROBE=1           onereplay/pbs/99_finance_osft.pbs
+# -----------------------------------------------------------------------------
+# 6. 接入自检：DEGENERATE=1 对 CONTROL=1
+# -------------------------------------
+# NSCL 没有 OSFT 的 URR=1.0 那种"天然退化点"：即使 thres 大到保留全部方向，P 也是
+# 单位阵，而存的是 I/sqrt(d)，更新仍被缩小 sqrt(d) 倍。但这给了一个**精确**的退化
+# 对照：thres → ∞ 且 svd_lr = lr × sqrt(d_in) 时，这条臂逐步等于普通全量微调。
 #
-# 两条都跑完后，后跑的那条会自动把两边的 train_task_loss / val_loss 并排打出来。
-# 顺序无所谓。一条 probe 约 5 分钟。
+# DEGENERATE=1 就是这个模式：自动把 THRES 设成 1e30，把 SVD_LR 设成 LR × sqrt(d_in)
+# （d_in 从 C 里读，并检查所有被覆盖的层同宽）。它必须和 CONTROL=1 那一跑重合。
 #
-# CONTROL=1 配非 1.0 的 URR 是允许的（它就是"本脚本设置下的 vanilla"），但那不是
-# 实验点 —— 正式 run 的 vanilla 分母仍然是 94 号。
+# !! 对照不能用 94 号的 vanilla：PROBE 会把整条 cosine 压进 MAX_STEPS 步、末尾 lr
+# 归零，而 94 号在同一位置还在 2-epoch cosine 的一半上，数据量也差一倍。
 #
-# 代码层面的自检另有两个，投这个作业之前应该已经跑过：
-#   python test_code/check_osft_integration.py          （不需要 GPU 和 checkpoint）
-#   python -m onereplay.baselines.check_osft --model_dir ... --model_name ...
+#   qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1,CONTROL=1 onereplay/pbs/105_finance_nscl.pbs
+#   qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1           onereplay/pbs/105_finance_nscl.pbs
+#
+# 两条都跑完后，后跑的那条会自动打并排表。顺序无所谓。一条 probe 约 5 分钟。
+#
+# 代码层面的自检另有一个，投这个作业之前应该已经跑过（不需要 GPU 和 checkpoint）：
+#   python -m onereplay.baselines.check_nscl
 #
 # -----------------------------------------------------------------------------
 # 7. 方法的出处
 # ------------
-# OSFT = Orthogonal Subspace Fine-Tuning, arXiv:2504.07097。实现全部来自作者的
-# 仓库，以未修改的 git clone 放在 baseline/mini_trainer，由
-# onereplay/baselines/osft.py 导入而不是拷贝。那个文件的头部记了 pin 住的 commit，
-# 以及两处必须显式说明的调用顺序。Step 0 会核对 commit。
+# Adam-NSCL = "Training Networks in Null Space of Feature Covariance for
+# Continual Learning", CVPR 2021 oral。优化器全部来自作者的仓库，以未修改的 git
+# clone 放在 baseline/Adam-NSCL，由 onereplay/baselines/nscl.py 导入而不是拷贝。
+# 那个文件的头部记了 pin 住的 commit，以及三处必须显式说明的偏离。Step 0 会核对
+# commit。
+#
+# 一处偏离在这里也要知道：C 用的是我们 collect_cov 逐 token 累加的 E[x xᵀ]，不是
+# 上游那个先对 batch 求均值的版本 —— 后者对 (batch, seq, hidden) 的激活根本跑不起来
+# （torch.mm 不吃 3D）。这也正是让这条臂和 onereplay 臂共用同一个 C 的原因。
 #
 # -----------------------------------------------------------------------------
 # 8. 投递前要有
 # ------------
-#   1) baseline/mini_trainer 已 clone 到 REPO_ROOT 下并 checkout 到 pin 的 commit
-#   2) 93 号 Step 1 物化出来的 math / code val 切片（旧域 val 要用，四条臂打同
-#      一批行）。**不需要** C、F 或 replay 池。
-#   3) 94 号的 base 与 vanilla 已评完（base 缺席时 ret_* 三列会是 '-'）
-#   4) ${DATASET_DIR} = data/processed/finance_train
-#   5) 评测数据（缺哪个跳过哪个指标，只警告）
+#   1) baseline/Adam-NSCL 已 clone 到 REPO_ROOT 下并 checkout 到 pin 的 commit
+#   2) 93 号 Step 4 合成的 mix C（与 95 号 mix/onereplay 臂**同一个文件**）
+#   3) 93 号 Step 1 物化出来的 math / code val 切片
+#   4) 94 号的 base 与 vanilla 已评完（base 缺席时 ret_* 三列会是 '-'）
+#   5) ${DATASET_DIR} = data/processed/finance_train
+#   6) 评测数据（缺哪个跳过哪个指标，只警告）
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
 # =============================================================================
 
@@ -141,16 +142,16 @@ REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
 VENV="${VENV:-${REPO_ROOT}/.venv}"
 CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
 NLTK_DATA="${NLTK_DATA:-${VENV}/nltk_data}"
-SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/99_finance_osft.pbs}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/105_finance_nscl.pbs}"
 IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
 
 JOBTAG="${PBS_JOBID:-local$$}"
 SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
 if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
-  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_finosft_${JOBTAG}}"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_finnscl_${JOBTAG}}"
   EXTRA_BIND="-B /local_ssd:/local_ssd"
 else
-  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_finosft_${JOBTAG}}"
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_finnscl_${JOBTAG}}"
   EXTRA_BIND=""
 fi
 
@@ -168,7 +169,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
 
   mkdir -p "${JOB_TMPDIR}"
   cleanup () {
-    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_finosft_* ]]; then
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_finnscl_* ]]; then
       rm -rf --one-file-system "${JOB_TMPDIR}" || true
       echo "cleanup: removed ${JOB_TMPDIR}"
     fi
@@ -187,9 +188,10 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MODEL_DIR MODEL_NAME RESULTS_ROOT METRICS_DIR CKPT_DIR EVAL_ROOT
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE
     PROFILE PROFILE_SOURCE SKIP_PROFILE_CHECK
-    URR OSFT_TARGET_PATTERNS OSFT_UPCAST_DTYPE MINI_TRAINER_SRC CONTROL
+    THRES SVD_LR DEGENERATE CONTROL USE_BF16 COV_DIR COV_PATH ADAM_NSCL_SRC
+    SKIP_NULLSPACE_CHECK
     PROBE PROBE_STEPS MAX_STEPS SAVE
-    SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS
+    SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS MIX_WEIGHTS
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL WITH_RETENTION
     EPOCHS LR LR_SCHEDULER WARMUP_RATIO BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
     EVAL_BATCH SYSTEM_PROMPT SEED MAX_TRAIN_SAMPLES LOG_EVERY EVAL_BEFORE_TRAIN
@@ -250,24 +252,20 @@ cd "${REPO_ROOT}"
 
 # =============================================================================
 # 超参 profile。见文件头第 2 条。
-#
-# 每一块就是"某条实验线的一整套训练超参"。finance 这一套的每个值都与 94/95 号
-# 逐字相同，Step 0 会对表。换实验线时在下面加一个 case 分支，不要动 finance 的
-# 数 —— 已经跑完的四条臂全都挂在这组值上。
 # =============================================================================
 PROFILE="${PROFILE:-finance}"
 
 case "${PROFILE}" in
   finance)
     # ---- 训练：来自 95 号 L375-392，与 94 号的 vanilla 逐字相同 ----
-    PROFILE_MODEL_NAME="Qwen2.5-1.5B-Instruct"   # W_ref，裸底座
+    PROFILE_MODEL_NAME="Qwen2.5-1.5B-Instruct"
     PROFILE_DATASET_SUBDIR="finance_train"
     PROFILE_EPOCHS="2"
-    PROFILE_LR="8e-5"                            # 对全量微调偏大，是为了造出足够的遗忘
+    PROFILE_LR="8e-5"
     PROFILE_LR_SCHEDULER="cosine"
     PROFILE_WARMUP_RATIO="0.1"
     PROFILE_BATCH="8"
-    PROFILE_ACCUM="64"                           # OSFT 不从 batch 里切行，直接用原值
+    PROFILE_ACCUM="64"                           # NSCL 不从 batch 里切行，直接用原值
     PROFILE_MAXLEN="1216"
     PROFILE_VAL_FRAC="0.01"
     PROFILE_MAXVAL="200"
@@ -275,7 +273,7 @@ case "${PROFILE}" in
     PROFILE_MAX_TRAIN_SAMPLES="0"
     PROFILE_LOG_EVERY="500"
     PROFILE_EVAL_BEFORE_TRAIN="1"
-    PROFILE_SYSTEM_PROMPT=""                     # 空 = 用模板自带的默认 system
+    PROFILE_SYSTEM_PROMPT=""
     PROFILE_OLD_VAL_ROWS="500"
     # ---- 评测：来自 95 号 L644-656，与 94 号逐字相同 ----
     PROFILE_FINANCE_MAX_NEW="128"
@@ -290,18 +288,15 @@ case "${PROFILE}" in
     PROFILE_IFBENCH_BATCH="16"
     PROFILE_CODE_TIMEOUT="10"
     PROFILE_DECODE_STOP_ON_IM_END="1"
-    # 对表的来源。换 profile 时指向那条线自己的脚本，或置空跳过。
     PROFILE_SOURCE="${PROFILE_SOURCE:-${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs}"
     ;;
   *)
     echo "未知 PROFILE='${PROFILE}'。现有：finance。" >&2
-    echo "  新实验线请在本文件的 case 里加一个分支，把那条线的超参连同出处写进去，" >&2
-    echo "  不要复用 finance 那组数 —— 它已经绑定了 94/95 号跑完的四条臂。" >&2
+    echo "  新实验线请在本文件的 case 里加一个分支，把那条线的超参连同出处写进去。" >&2
     exit 2
     ;;
 esac
 
-# profile 给默认值，环境变量仍可覆盖（覆盖会在 Step 0 被对表检查抓到并要求确认）。
 MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
 MODEL_NAME="${MODEL_NAME:-${PROFILE_MODEL_NAME}}"
 EPOCHS="${EPOCHS:-${PROFILE_EPOCHS}}"
@@ -335,39 +330,7 @@ CODE_TIMEOUT="${CODE_TIMEOUT:-${PROFILE_CODE_TIMEOUT}}"
 DECODE_STOP_ON_IM_END="${DECODE_STOP_ON_IM_END:-${PROFILE_DECODE_STOP_ON_IM_END}}"
 
 # =============================================================================
-# OSFT 的旋钮。见文件头第 3 条。
-# =============================================================================
-URR="${URR:-}"
-if [[ -z "${URR}" ]]; then
-  echo "必须指定 URR=<0..1>（--osft_unfreeze_rank_ratio，每个矩阵里参与训练的" >&2
-  echo "奇异方向占比）。它是 OSFT 唯一的超参，占据另外两条臂 λ 的位置，同样不给" >&2
-  echo "默认值。" >&2
-  echo "  0.0 全冻 / 1.0 退化成普通全量微调 / 上游 README 的例子是 0.25" >&2
-  echo "  建议的完整点：0.1、0.25、0.5" >&2
-  echo "    qsub -v DRY_RUN=0,URR=0.25 ${SELF_PATH}" >&2
-  echo "  接入自检（短跑，必须重现 94 号 vanilla）：" >&2
-  echo "    qsub -v DRY_RUN=0,URR=1.0,PROBE=1 ${SELF_PATH}" >&2
-  exit 2
-fi
-if ! python -c "import sys; v=float('${URR}'); sys.exit(0 if 0.0 <= v <= 1.0 else 1)" 2>/dev/null; then
-  echo "URR='${URR}' 不在 [0, 1] 区间内。" >&2
-  exit 2
-fi
-# 空 = 用上游按架构查表的默认值（Qwen 是 7 个投影）。见文件头第 5 条 b：
-# 不要为了对齐 TARGET_MODULES 把 lm_head 加进来。
-OSFT_TARGET_PATTERNS="${OSFT_TARGET_PATTERNS:-}"
-OSFT_UPCAST_DTYPE="${OSFT_UPCAST_DTYPE:-fp32}"
-
-# 同一条命令、同一套超参，只是不传 --osft。见文件头第 6 条：URR=1.0 的验收要和
-# 它比，不能和 94 号比，因为 PROBE 会把 cosine 压缩进 MAX_STEPS 步。
-CONTROL="${CONTROL:-0}"
-if [[ "${CONTROL}" != "0" && "${CONTROL}" != "1" ]]; then
-  echo "CONTROL 只能是 0 / 1，得到 '${CONTROL}'" >&2
-  exit 2
-fi
-
-# =============================================================================
-# 路径
+# 路径。C 必须和 95 号 mix/onereplay 臂是同一个文件，见文件头第 1 条。
 # =============================================================================
 RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results_finance_${MODEL_NAME}}"
 METRICS_DIR="${METRICS_DIR:-${RESULTS_ROOT}/metrics}"
@@ -381,18 +344,66 @@ DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data}"
 PROCESSED_DIR="${PROCESSED_DIR:-${DATA_ROOT}/processed}"
 DATASET_DIR="${DATASET_DIR:-${PROCESSED_DIR}/${PROFILE_DATASET_SUBDIR}}"
 
-# 93 号 Step 1 物化出来的 val 切片。这里只读 val，不读池 —— OSFT 不消费旧知识。
 SPLIT_DIR="${SPLIT_DIR:-${RESULTS_ROOT}/pools}"
 OLD_VAL="${OLD_VAL:-1}"
 val_file_for () { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
 
-# mix = math + code。见文件头第 4 条：这条臂只有 mix，没有单域版本。
+# qsub -v 自己按逗号切参数，所以从命令行传的时候只能写成 math:code / 0.25:0.75。
+# 归一回逗号后拼出的 MIX_TAG 与 93/95 号是同一行，才指得到同一个 C 文件。
 MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
+MIX_WEIGHTS="${MIX_WEIGHTS:-0.5,0.5}"
 MIX_DOMAINS="${MIX_DOMAINS//:/,}"
-# 和 95 号拼法相同的前半段。OSFT 没有矩阵权重，所以名字里不带 -w，也不该带 ——
-# 带了会让读表的人以为这条臂也有个可调的域间比例。
-MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")"
+MIX_WEIGHTS="${MIX_WEIGHTS//:/,}"
+MIX_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")-w$(printf '%s' "${MIX_WEIGHTS//,/-}")"
 OLD_VAL_DOMAINS="${MIX_DOMAINS//,/ }"
+
+COV_DIR="${COV_DIR:-${RESULTS_ROOT}/cov}"
+COV_PATH="${COV_PATH:-${COV_DIR}/cov_${MIX_TAG}_gold_all.pt}"
+
+# =============================================================================
+# NSCL 的旋钮。见文件头第 3、4、6 条。
+# =============================================================================
+DEGENERATE="${DEGENERATE:-0}"
+CONTROL="${CONTROL:-0}"
+for _flag in DEGENERATE CONTROL; do
+  if [[ "${!_flag}" != "0" && "${!_flag}" != "1" ]]; then
+    echo "${_flag} 只能是 0 / 1，得到 '${!_flag}'" >&2
+    exit 2
+  fi
+done
+
+THRES="${THRES:-}"
+SVD_LR="${SVD_LR:-}"
+if [[ "${DEGENERATE}" == "1" ]]; then
+  # 精确退化点：保留全部方向，并把 1/sqrt(d_in) 的缩小补偿回去。SVD_LR 在 Step 0
+  # 读到 C 的维度之后才算得出来，这里先占位。
+  THRES="1e30"
+  echo "DEGENERATE=1：THRES 钉成 ${THRES}，SVD_LR 将按 LR x sqrt(d_in) 自动算出。"
+  [[ -n "${SVD_LR}" ]] && {
+    echo "!! DEGENERATE=1 时不能同时指定 SVD_LR，那样就不是退化点了。" >&2
+    exit 2
+  }
+elif [[ -z "${THRES}" ]]; then
+  echo "必须指定 THRES（--nscl_thres，零空间的特征值截断倍数）。它是 Adam-NSCL 唯一" >&2
+  echo "的超参，占据 onereplay 那条臂 λ 的位置，同样不给默认值。" >&2
+  echo "  !! 不要照抄上游的 10 / 30：那是给有精确零空间的 CNN 协方差用的，" >&2
+  echo "     transformer 的谱平滑衰减，同一个值可能把权重全锁死。" >&2
+  echo "  先跑预检（几分钟，不占 GPU）：" >&2
+  echo "    python -m onereplay.baselines.inspect_nscl_nullspace \\" >&2
+  echo "      --cov_path ${COV_PATH}" >&2
+  echo "  然后挑它判成 usable 的值：" >&2
+  echo "    qsub -v DRY_RUN=0,THRES=<值> ${SELF_PATH}" >&2
+  exit 2
+fi
+if ! python -c "import sys; sys.exit(0 if float('${THRES}') >= 1.0 else 1)" 2>/dev/null; then
+  echo "THRES='${THRES}' 不是一个 >= 1 的数。低于 1 时判据可能一个方向都选不中，" >&2
+  echo "上游会拿全零矩阵除以自己的零范数，得到 NaN 投影而不是报错。" >&2
+  exit 2
+fi
+
+# 见文件头第 5 条：这条臂默认 fp32，因为 bf16 的权重累加会把保证吃掉。
+USE_BF16="${USE_BF16:-0}"
+SKIP_NULLSPACE_CHECK="${SKIP_NULLSPACE_CHECK:-0}"
 
 DRY_RUN="${DRY_RUN:-1}"
 DO_TRAIN="${DO_TRAIN:-1}"
@@ -405,12 +416,8 @@ MAX_STEPS="${MAX_STEPS:-0}"
 SAVE="${SAVE:-1}"
 
 # 接入自检的短跑模式。与 95 号 L545-563 同一套理由：max_steps 在
-# trainers/base.py 里是**每个 epoch** 的上限而不是整个 run 的，所以 EPOCHS 要
-# 钉成 1，否则时间翻倍而表里多出的那条 epoch 记录才是被读到的那条。
+# trainers/base.py 里是**每个 epoch** 的上限而不是整个 run 的。
 PROBE="${PROBE:-0}"
-# 下面 PROBE 会把 EPOCHS 改成 1，但"这条线声明的 epochs"仍然是 profile 里那个值：
-# 94 号那条 vanilla 按**正式** epochs 命名，Step 0 的超参对表比的也是正式值。
-# 两处都读这一份，否则探针模式会去找一条不存在的 vanilla，并且被对表判成漂移。
 EPOCHS_DECLARED="${EPOCHS}"
 if [[ "${PROBE}" == "1" ]]; then
   PROBE_STEPS="${PROBE_STEPS:-4800}"
@@ -426,25 +433,8 @@ if (( ACCUM_STEPS * BATCH != ACCUM )); then
   exit 2
 fi
 
-# run 名：EVAL_ROOT 与 94/95 号共用，所以必须自带臂名和 URR。见文件头第 3 条。
-run_name_for () {
-  local urr="$1" control="${2:-${CONTROL}}"
-  local name="fin_osft_${MIX_TAG}_urr${urr}"
-  name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
-  if [[ "${PROBE}" == "1" || "${MAX_STEPS}" != "0" ]]; then
-    name="${name}_probe${MAX_STEPS}"
-  fi
-  # 后缀而不是前缀，这样一对 run 在目录列表和 <metric>_summary.csv 里紧挨着，
-  # 一眼看得出它们是同一组设置下开关 OSFT 的两跑。
-  [[ "${control}" == "1" ]] && name="${name}_control"
-  printf '%s' "${name}"
-}
-VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${EPOCHS_DECLARED}_seed${SEED}}"
-BASE_RUN="base"
-
 # =============================================================================
-# 评测配置：与 94/95 号逐字相同。mix 保两个域，两边都要评 —— 只评一边的话
-# "另一边被挤掉了"这个最可能的失败模式根本不会出现在表里。
+# 评测配置：与 94/95/99 号逐字相同。
 # =============================================================================
 BENCH_ROOT="${BENCH_ROOT:-${REPO_ROOT}/datasets/bench}"
 FPB_DATA="${FPB_DATA:-${BENCH_ROOT}/fpb/test.jsonl}"
@@ -470,62 +460,21 @@ DOMAIN_METRICS="${DOMAIN_METRICS} fpb fiqasa tfns"
 
 mkdir -p "${METRICS_DIR}" "${CKPT_DIR}" "${EVAL_ROOT}" "${TRAIN_LOG_DIR}" "${DATASET_CACHE}"
 
-RUN="$(run_name_for "${URR}")"
-RUN_METRICS="${METRICS_DIR}/${RUN}.jsonl"
-TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
-# The same settings with the OSFT switch flipped. Only used to print a
-# side-by-side once both halves of the pair exist; nothing depends on it.
-PARTNER_RUN="$(run_name_for "${URR}" "$((1 - CONTROL))")"
-PARTNER_METRICS="${METRICS_DIR}/${PARTNER_RUN}.jsonl"
-
-echo "========================================================================"
-echo "finance 线 osft 臂：保护 ${MIX_TAG}（OSFT 没有保护域维度，这里只决定评什么）"
-echo "  profile  = ${PROFILE}"
-echo "  W_ref    = ${MODEL_DIR}/${MODEL_NAME}   (裸底座，与另外三条臂相同)"
-echo "  新任务   = ${DATASET_DIR}"
-if [[ "${CONTROL}" == "1" ]]; then
-echo "  CONTROL  = 1   **不开 OSFT**，同一套超参的对照跑。URR=${URR} 只进 run 名。"
-echo "             搭档 = ${PARTNER_RUN}"
-else
-echo "  URR      = ${URR}   (参与训练的奇异方向占比；1.0 = 退化成 vanilla)"
-echo "  覆盖     = ${OSFT_TARGET_PATTERNS:-（上游按架构查表：Qwen 是 7 个投影，不含 lm_head）}"
-fi
-echo "  旧知识   = 不消费。没有 C / F / replay 池，这是与另外三条臂的假设差异。"
-if [[ "${OLD_VAL}" == "1" ]]; then
-echo "  旧域 val = ${OLD_VAL_ROWS} 行/域，域：${OLD_VAL_DOMAINS}"
-echo "             ${SPLIT_DIR}  （93 号切好的，四条臂打同一批行）"
-else
-echo "  旧域 val = OLD_VAL=0，不测"
-fi
-echo "  batch    = ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM} 行/update"
-echo "             每次更新 ${ACCUM} 行新任务（与 vanilla / onereplay / ewc 相同）"
-echo "  训练     = lr ${LR} ${LR_SCHEDULER} warmup ${WARMUP_RATIO} epochs ${EPOCHS} seed ${SEED}"
-echo "             maxlen ${MAXLEN}"
-echo "             system '${SYSTEM_PROMPT}'（空 = 用模板自带的默认 system）"
-if [[ "${PROBE}" == "1" ]]; then
-echo "  模式     = 接入自检短跑，${MAX_STEPS} 步（约 $((MAX_STEPS * BATCH / ACCUM)) 次更新），不存 checkpoint、不评测"
-echo "             epochs 钉成 1（max_steps 是每 epoch 的上限），对表仍按正式值 ${EPOCHS_DECLARED}"
-echo "             !! 对照是 ${PARTNER_RUN}，不是 ${VANILLA_RUN}"
-echo "                PROBE 把整条 cosine 压进 ${MAX_STEPS} 步、末尾 lr 归零，而 94 号"
-echo "                在同一位置还在 2-epoch cosine 的一半上，数据量也差一倍。"
-else
-echo "  模式     = 正式 run"
-fi
-echo "  run      = ${RUN}"
-echo "  评测     = ${DOMAIN_METRICS}"
-echo "  eval root= ${EVAL_ROOT}   （与 94/95 号共用）"
-echo "  分母     = ${BASE_RUN} / ${VANILLA_RUN}"
-echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} DRY_RUN=${DRY_RUN}"
-echo "========================================================================"
-
-# ===========================================================================
+# =============================================================================
 # Step 0: 前置检查
-# ===========================================================================
+# =============================================================================
 echo
 echo "==== Step 0: 前置检查 ===="
 
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "找不到模型: ${MODEL_DIR}/${MODEL_NAME}" >&2; exit 3; }
 [[ -d "${DATASET_DIR}" ]] || { echo "找不到新任务数据: ${DATASET_DIR}" >&2; exit 3; }
+if [[ "${CONTROL}" != "1" ]]; then
+  [[ -f "${COV_PATH}" ]] || {
+    echo "找不到 C: ${COV_PATH}" >&2
+    echo "  这条臂和 95 号 mix/onereplay 臂必须用同一个文件（93 号 Step 4 的产物）。" >&2
+    exit 3
+  }
+fi
 if [[ "${OLD_VAL}" == "1" ]]; then
   for _d in ${OLD_VAL_DOMAINS}; do
     _f="$(val_file_for "${_d}")"
@@ -533,10 +482,10 @@ if [[ "${OLD_VAL}" == "1" ]]; then
   done
 fi
 
-# ---- 超参对表。见文件头第 2 条：这是超参漂移唯一的防线。----
+# ---- 超参对表。见文件头第 2 条。----
 if [[ "${SKIP_PROFILE_CHECK}" == "1" ]]; then
   echo "  !! SKIP_PROFILE_CHECK=1：跳过与 ${PROFILE_SOURCE##*/} 的超参对表。"
-  echo "     这条臂和另外三条是否可比，现在没有任何东西在保证。"
+  echo "     这条臂和另外几条是否可比，现在没有任何东西在保证。"
 elif [[ -z "${PROFILE_SOURCE}" || ! -f "${PROFILE_SOURCE}" ]]; then
   echo "  !! 找不到对表来源 '${PROFILE_SOURCE}'，跳过超参对表。"
 else
@@ -558,9 +507,6 @@ import os
 import re
 import sys
 
-# 这条臂和另外三条唯一必须相同的东西就是这些值。95 号把它们写成
-#   NAME="${NAME:-default}"
-# 所以默认值可以直接读出来，不需要去 source 那个脚本（它一进去就要起容器）。
 NAMES = [
     "MODEL_NAME", "EPOCHS", "LR", "LR_SCHEDULER", "WARMUP_RATIO", "BATCH",
     "ACCUM", "MAXLEN", "VAL_FRAC", "MAXVAL", "SEED", "MAX_TRAIN_SAMPLES",
@@ -585,7 +531,6 @@ for name in NAMES:
         continue
     theirs = match.group(1)
     if "${" in theirs:
-        # 从别的变量推出来的（EVAL_BATCH 那种），没有可比的字面值。
         continue
     ours = os.environ.get(name, "")
     if ours != theirs:
@@ -596,88 +541,179 @@ for name in NAMES:
 print(f"  超参对表：{os.path.basename(source)}，比中 {len(checked)} 项")
 if missing:
     print(f"  !! 在对表来源里找不到这些名字，无法核对：{missing}")
-    print("     多半是那个脚本改了写法。核对不了就等于没有防线，先手工确认。")
 if mismatched:
     print()
-    print("!! 超参与对表来源不一致。这条臂和另外三条不可比，而这种偏差事后")
+    print("!! 超参与对表来源不一致。这条臂和另外几条不可比，而这种偏差事后")
     print("   只会表现为一个解释不了的数字，不会报错：")
     for name, ours, theirs in mismatched:
         print(f"   - {name}: 本脚本 '{ours}'  vs  {os.path.basename(source)} '{theirs}'")
     print()
-    print("   要么改回来，要么这本来就是一条新的实验线 —— 那就在本文件里新增一个")
-    print("   PROFILE 分支，把新值连同出处写进去，再用 PROFILE=<新名> 投递。")
+    print("   要么改回来，要么在本文件里新增一个 PROFILE 分支。")
     sys.exit(1)
 print("  超参对表通过")
 PY
 fi
 
-# ---- OSFT 的实现来自哪里，以及会分解多少个矩阵 ----
-EXPECT_OSFT_MATRICES="$(
-  MODEL_PATH="${MODEL_DIR}/${MODEL_NAME}" OSFT_TARGET_PATTERNS="${OSFT_TARGET_PATTERNS}" \
-  python - <<'PY'
+# ---- 上游 commit ----
+if git -C "${REPO_ROOT}/baseline/Adam-NSCL" rev-parse HEAD >/dev/null 2>&1; then
+  NSCL_HEAD="$(git -C "${REPO_ROOT}/baseline/Adam-NSCL" rev-parse HEAD)"
+  EXPECT_HEAD="$(python -c 'from onereplay.baselines.nscl import UPSTREAM_COMMIT; print(UPSTREAM_COMMIT)')"
+  if [[ "${NSCL_HEAD}" != "${EXPECT_HEAD}" ]]; then
+    echo "!! baseline/Adam-NSCL 在 ${NSCL_HEAD:0:10}，baselines/nscl.py 是对着 ${EXPECT_HEAD:0:10} 写的。" >&2
+    echo "   get_eigens / get_transforms / step 的调用约定可能已经变了。" >&2
+    exit 3
+  fi
+  echo "  clone commit 与 baselines/nscl.py 一致 (${NSCL_HEAD:0:10})"
+else
+  echo "  !! baseline/Adam-NSCL 不是 git checkout，无法核对 commit。"
+fi
+
+# ---- C 的形状，以及 DEGENERATE 需要的 sqrt(d_in) ----
+EXPECT_NSCL_LAYERS=0
+COV_DIM=0
+if [[ "${CONTROL}" != "1" ]]; then
+  read -r EXPECT_NSCL_LAYERS COV_DIM < <(
+    COV_PATH="${COV_PATH}" python - <<'PY'
 import os
 import sys
 
-from transformers import AutoConfig
+from onereplay.core.covariance import load_covariance_file
 
-from onereplay.baselines.osft import (
-    UPSTREAM_COMMIT,
-    load_upstream,
-    parse_target_patterns,
-    resolved_target_patterns,
-    upstream_source_dir,
-)
-
-model_path = os.environ["MODEL_PATH"]
-patterns = resolved_target_patterns(
-    model_path, parse_target_patterns(os.environ.get("OSFT_TARGET_PATTERNS", ""))
-)
-# Importing it here is itself part of the check: the training job would
-# otherwise discover a missing clone or a broken import after queueing.
-load_upstream()
-config = AutoConfig.from_pretrained(model_path)
-layers = int(config.num_hidden_layers)
-
-# Everything except the count goes to stderr, because stdout is what the shell
-# captures into EXPECT_OSFT_MATRICES.
-print(f"  OSFT 实现   : {upstream_source_dir()}", file=sys.stderr)
-print(f"  pin commit  : {UPSTREAM_COMMIT[:10]}", file=sys.stderr)
-print(f"  覆盖 pattern: {patterns}", file=sys.stderr)
-# One 2D matrix per layer per pattern. The training log's "N matrices
-# decomposed" has to equal this, or the patterns matched something else.
-print(layers * len(patterns))
+covariances = load_covariance_file(os.environ["COV_PATH"])
+dims = {int(matrix.shape[-1]) for matrix in covariances.values()}
+print(f"  C           : {os.environ['COV_PATH']}", file=sys.stderr)
+print(f"  覆盖层数    : {len(covariances)}，输入维度 {sorted(dims)}", file=sys.stderr)
+if len(dims) != 1:
+    # DEGENERATE 的补偿系数是单一的 sqrt(d_in)，逐层不同宽时那个退化点不成立。
+    # 正常的 THRES run 不受影响，所以这里只在 DEGENERATE 下是致命的。
+    print("  !! 各层输入维度不一致，DEGENERATE 模式不可用。", file=sys.stderr)
+    print(f"{len(covariances)} 0")
+else:
+    print(f"{len(covariances)} {dims.pop()}")
 PY
-)"
-echo "  期望分解 ${EXPECT_OSFT_MATRICES} 个矩阵（层数 x pattern 数）"
-
-if git -C "${REPO_ROOT}/baseline/mini_trainer" rev-parse HEAD >/dev/null 2>&1; then
-  OSFT_HEAD="$(git -C "${REPO_ROOT}/baseline/mini_trainer" rev-parse HEAD)"
-  EXPECT_HEAD="$(python -c 'from onereplay.baselines.osft import UPSTREAM_COMMIT; print(UPSTREAM_COMMIT)')"
-  if [[ "${OSFT_HEAD}" != "${EXPECT_HEAD}" ]]; then
-    echo "!! baseline/mini_trainer 在 ${OSFT_HEAD:0:10}，baselines/osft.py 是对着 ${EXPECT_HEAD:0:10} 写的。" >&2
-    echo "   调用顺序可能已经变了。先核对再跑，然后更新 UPSTREAM_COMMIT。" >&2
+  )
+  if ! [[ "${EXPECT_NSCL_LAYERS}" =~ ^[0-9]+$ ]] || (( EXPECT_NSCL_LAYERS == 0 )); then
+    echo "!! 读不出 C 的层数（上面是 python 的输出）。C 文件可能损坏或为空。" >&2
     exit 3
   fi
-  echo "  clone commit 与 baselines/osft.py 一致"
-else
-  echo "  !! baseline/mini_trainer 不是 git checkout，无法核对 commit。"
+  echo "  期望 ${EXPECT_NSCL_LAYERS} 个被投影的权重"
 fi
+
+if [[ "${DEGENERATE}" == "1" ]]; then
+  if (( COV_DIM <= 0 )); then
+    echo "!! DEGENERATE=1 需要所有被覆盖层的输入维度相同，当前不满足。" >&2
+    exit 3
+  fi
+  SVD_LR="$(python -c "print(repr(${LR} * ${COV_DIM} ** 0.5))")"
+  echo "  DEGENERATE  : d_in=${COV_DIM}，SVD_LR = ${LR} x sqrt(${COV_DIM}) = ${SVD_LR}"
+  echo "                这一跑应当逐步等于 CONTROL=1，见文件头第 6 条。"
+fi
+SVD_LR="${SVD_LR:-${LR}}"
+
+# ---- !! 这个 THRES 到底选中了什么。见文件头第 3 条。----
+if [[ "${CONTROL}" == "1" || "${SKIP_NULLSPACE_CHECK}" == "1" || "${DEGENERATE}" == "1" ]]; then
+  echo "  （跳过零空间预检：CONTROL / DEGENERATE / SKIP_NULLSPACE_CHECK）"
+else
+  echo
+  echo "  零空间预检 THRES=${THRES}"
+  # 判定走退出码而不是抓 stdout：表格用 %g 印阈值，命令行传的 1e5 在表里是
+  # 100000，正则对不上。--require_usable 把同一个判定变成退出码。
+  NSCL_PRECHECK_RC=0
+  python -m onereplay.baselines.inspect_nscl_nullspace \
+    --cov_path "${COV_PATH}" --thres_grid "${THRES}" --device cuda \
+    --require_usable 1 || NSCL_PRECHECK_RC=$?
+  if (( NSCL_PRECHECK_RC != 0 )); then
+    echo >&2
+    echo "!! THRES=${THRES} 在这个 C 上不可用（上面那行给了判定）。" >&2
+    echo "   locked  = 有层被锁死，那一跑的被投影权重几乎不会动，但 loss 照样降。" >&2
+    echo "   vanilla = 什么都没约束住，那一跑就是全量微调，只是名字叫 NSCL。" >&2
+    echo "   leaky   = 保留的子空间仍带着旧数据的能量，保护的不是它声称保护的东西。" >&2
+    echo "   先扫一遍完整网格再挑：" >&2
+    echo "     python -m onereplay.baselines.inspect_nscl_nullspace --cov_path ${COV_PATH}" >&2
+    echo "   确实要跑一个不可用的点（比如就是要做端点对照）就传 SKIP_NULLSPACE_CHECK=1。" >&2
+    exit 3
+  fi
+  echo "  预检通过"
+fi
+
+# =============================================================================
+# run 名：EVAL_ROOT 与 94/95/99 号共用，所以必须自带臂名、THRES 和 SVD_LR。
+# 两个都要进名字：它们是这条臂的两个独立旋钮，少一个就会让不同的点同名，
+# checkpoint 互相覆盖、metrics jsonl 追加混在一起。
+# =============================================================================
+run_name_for () {
+  local thres="$1" svdlr="$2" control="${3:-${CONTROL}}"
+  local name="fin_nscl_${MIX_TAG}_thres${thres}_svdlr${svdlr}"
+  name="${name}_lr${LR}_ep${EPOCHS}_seed${SEED}"
+  [[ "${USE_BF16}" == "1" ]] && name="${name}_bf16"
+  if [[ "${PROBE}" == "1" || "${MAX_STEPS}" != "0" ]]; then
+    name="${name}_probe${MAX_STEPS}"
+  fi
+  # 后缀而不是前缀，这样一对 run 在目录列表里紧挨着。
+  [[ "${control}" == "1" ]] && name="${name}_control"
+  printf '%s' "${name}"
+}
+VANILLA_RUN="${VANILLA_RUN:-fin_vanilla_lr${LR}_ep${EPOCHS_DECLARED}_seed${SEED}}"
+BASE_RUN="base"
+
+RUN="$(run_name_for "${THRES}" "${SVD_LR}")"
+RUN_METRICS="${METRICS_DIR}/${RUN}.jsonl"
+TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
+PARTNER_RUN="$(run_name_for "${THRES}" "${SVD_LR}" "$((1 - CONTROL))")"
+PARTNER_METRICS="${METRICS_DIR}/${PARTNER_RUN}.jsonl"
+
+echo
+echo "========================================================================"
+echo "finance 线 nscl 臂：保护 ${MIX_TAG}"
+echo "  profile  = ${PROFILE}"
+echo "  W_ref    = ${MODEL_DIR}/${MODEL_NAME}   (裸底座，与其它臂相同)"
+echo "  新任务   = ${DATASET_DIR}"
+if [[ "${CONTROL}" == "1" ]]; then
+echo "  CONTROL  = 1   **不开 NSCL**，同一套超参的对照跑。"
+echo "             搭档 = ${PARTNER_RUN}"
+else
+echo "  C        = ${COV_PATH}"
+echo "             与 95 号 mix/onereplay 臂同一个文件 —— 这条臂是它的硬约束版本"
+echo "  THRES    = ${THRES}   (λ ≤ λ_min x thres 的方向被保留，更新只能动在里面)"
+echo "  SVD_LR   = ${SVD_LR}   (被投影权重的 lr；投影矩阵另有 1/sqrt(k) 的缩小)"
+fi
+echo "  精度     = $([[ "${USE_BF16}" == "1" ]] && echo 'bf16 !! 见文件头第 5 条' || echo 'fp32（这条臂的默认，bf16 会吃掉零空间保证）')"
+if [[ "${OLD_VAL}" == "1" ]]; then
+echo "  旧域 val = ${OLD_VAL_ROWS} 行/域，域：${OLD_VAL_DOMAINS}"
+echo "             ${SPLIT_DIR}  （93 号切好的，各臂打同一批行）"
+else
+echo "  旧域 val = OLD_VAL=0，不测"
+fi
+echo "  batch    = ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM} 行/update"
+echo "  训练     = lr ${LR} ${LR_SCHEDULER} warmup ${WARMUP_RATIO} epochs ${EPOCHS} seed ${SEED}"
+echo "             maxlen ${MAXLEN}"
+if [[ "${PROBE}" == "1" ]]; then
+echo "  模式     = 接入自检短跑，${MAX_STEPS} 步，不存 checkpoint、不评测"
+echo "             !! 对照是 ${PARTNER_RUN}，不是 ${VANILLA_RUN}"
+else
+echo "  模式     = 正式 run"
+fi
+echo "  run      = ${RUN}"
+echo "  评测     = ${DOMAIN_METRICS}"
+echo "  分母     = ${BASE_RUN} / ${VANILLA_RUN}"
+echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} DRY_RUN=${DRY_RUN}"
+echo "========================================================================"
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo
   echo "DRY_RUN=1：以上为计划，不训练不评测。"
   echo "  train.py 会收到："
-  echo "    --paradigm sft --full_finetune 1"
+  echo "    --paradigm sft --full_finetune 1 --use_bf16 ${USE_BF16}"
   echo "    --model_dir ${MODEL_DIR} --model_name ${MODEL_NAME}"
   echo "    --dataset_path ${DATASET_DIR}"
   echo "    --epochs ${EPOCHS} --lr ${LR} --lr_scheduler ${LR_SCHEDULER} --warmup_ratio ${WARMUP_RATIO}"
   echo "    --batch_size ${BATCH} --accumulation_size ${ACCUM} --max_len ${MAXLEN}"
   if [[ "${CONTROL}" == "1" ]]; then
-    echo "    （CONTROL=1：不传 --osft，也不传 --osft_unfreeze_rank_ratio —— train.py"
-    echo "      在 --osft 0 时看到设过的 URR 会直接报错，那个检查是故意的）"
+    echo "    （CONTROL=1：不传 --nscl，也不传任何 --nscl_* —— train.py 在 --nscl 0 时"
+    echo "      看到设过的 --nscl_* 会直接报错，那个检查是故意的）"
   else
-    echo "    --osft 1 --osft_unfreeze_rank_ratio ${URR}"
-    echo "    --osft_target_patterns '${OSFT_TARGET_PATTERNS}' --osft_upcast_dtype ${OSFT_UPCAST_DTYPE}"
+    echo "    --nscl 1 --nscl_cov_path ${COV_PATH}"
+    echo "    --nscl_thres ${THRES} --nscl_svd_lr ${SVD_LR}"
   fi
   if [[ "${OLD_VAL}" == "1" ]]; then
     _spec=""
@@ -687,20 +723,16 @@ if [[ "${DRY_RUN}" == "1" ]]; then
     echo "    --prior_val_jsonl ${_spec} --old_val_presliced 1 --old_val_rows ${OLD_VAL_ROWS}"
   fi
   echo "    --save ${SAVE} --save_path ${CKPT_DIR}/${RUN}"
-  echo "  没有 --cov_path / --fisher_path / --replay_*：这条臂不消费旧知识。"
+  echo "  没有 --cov_path / --fisher_path / --replay_*：这条臂是硬约束，不加罚项。"
   echo "  没有 --target_modules：full_finetune=1 且无 regularizer 时它不起作用，"
-  echo "  OSFT 的覆盖由 --osft_target_patterns 决定。"
+  echo "  NSCL 的覆盖由 --nscl_cov_path 里有哪些层决定。"
   echo "Job finished at: $(date)"
   exit 0
 fi
 
-# ===========================================================================
-# 旧域 val：每个 epoch 在被保护的域上打一条交叉熵。
-#
-# 与 95 号 L1181-1192 逐字相同，四条臂必须打同一批行，否则这几个数之间没法比。
-# 一律走带标签的 --prior_val_jsonl，列名恒为 old_val_loss_<domain>；mix 那边两个
-# 域各一列，正是它要回答的"是不是一侧保住了另一侧塌了"。
-# ===========================================================================
+# =============================================================================
+# 旧域 val：与 95 号 L1181-1192 逐字相同，各臂必须打同一批行。
+# =============================================================================
 OLD_VAL_ARGS=()
 if [[ "${OLD_VAL}" == "1" ]]; then
   _spec=""
@@ -714,9 +746,9 @@ if [[ "${OLD_VAL}" == "1" ]]; then
   )
 fi
 
-# ===========================================================================
+# =============================================================================
 # Step 1: 训练
-# ===========================================================================
+# =============================================================================
 if [[ "${DO_TRAIN}" == "1" ]]; then
   if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${CKPT_DIR}/${RUN}" ]]; then
     echo
@@ -727,23 +759,23 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
     echo
     echo "==== train ${RUN} ===="
     if [[ "${CONTROL}" == "1" ]]; then
-      echo "  CONTROL=1：不开 OSFT  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
-      # 一个数组而不是复制整条命令：两条 run 只应该差这几个 flag，如果把命令写
-      # 两遍，以后改了一处忘了另一处，对照就悄悄失效了。
-      OSFT_ARGS=()
+      echo "  CONTROL=1：不开 NSCL  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
+      # 一个数组而不是复制整条命令：两条 run 只应该差这几个 flag。
+      NSCL_ARGS=()
     else
-      echo "  URR=${URR}  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
-      echo "  启动时会先做一次 SVD 分解（${EXPECT_OSFT_MATRICES} 个矩阵），几分钟到十几分钟。"
-      OSFT_ARGS=(
-        --osft 1
-        --osft_unfreeze_rank_ratio "${URR}"
-        --osft_target_patterns "${OSFT_TARGET_PATTERNS}"
-        --osft_upcast_dtype "${OSFT_UPCAST_DTYPE}"
+      echo "  THRES=${THRES} SVD_LR=${SVD_LR}  batch ${BATCH} x accum ${ACCUM_STEPS} = ${ACCUM}"
+      echo "  启动时会先对 ${EXPECT_NSCL_LAYERS} 个协方差各做一次 SVD，几分钟。"
+      NSCL_ARGS=(
+        --nscl 1
+        --nscl_cov_path "${COV_PATH}"
+        --nscl_thres "${THRES}"
+        --nscl_svd_lr "${SVD_LR}"
       )
     fi
 
     python -m onereplay.scripts.train --paradigm sft --full_finetune 1 \
       --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" --seed "${SEED}" \
+      --use_bf16 "${USE_BF16}" \
       --system_prompt "${SYSTEM_PROMPT}" \
       --dataset_path "${DATASET_DIR}" \
       --epochs "${EPOCHS}" --lr "${LR}" \
@@ -758,43 +790,53 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
       --map_cache_dir "${RESULTS_ROOT}/map_cache/${RUN}" \
       --log_every "${LOG_EVERY}" \
       ${OLD_VAL_ARGS[@]+"${OLD_VAL_ARGS[@]}"} \
-      ${OSFT_ARGS[@]+"${OSFT_ARGS[@]}"} \
+      ${NSCL_ARGS[@]+"${NSCL_ARGS[@]}"} \
       --save "${SAVE}" --save_path "${CKPT_DIR}/${RUN}" \
       --metrics_path "${RUN_METRICS}" 2>&1 | tee "${TRAIN_LOG}"
 
     # ---- 训练自检 ----
-    # 95 号那边是 assert_coverage（罚项覆盖了几层）。这条臂没有罚项，对应的问题
-    # 是"分解到底有没有发生、发生在几个矩阵上"。日志里没有这一行就说明 pattern
-    # 没匹配上，而那样的 run 和 vanilla 完全一样，却会被当成 OSFT 记进表里。
+    # 95 号那边是 assert_coverage（罚项覆盖了几层）。这条臂没有罚项，对应的问题是
+    # "投影到底装上没有、装在几层上"。日志里没有这一行就说明投影没生效，而那样的
+    # run 和 vanilla 完全一样，却会被当成 NSCL 记进表里。
     echo
     echo "==== 训练自检 ===="
     if [[ "${CONTROL}" == "1" ]]; then
-      if grep -qF -- "OSFT:" "${TRAIN_LOG}"; then
-        echo "  !! CONTROL=1 的日志里出现了 OSFT 的输出，说明 --osft 还是传进去了。" >&2
-        grep -F "OSFT:" "${TRAIN_LOG}" | head -n 3 >&2
-        echo "     这条对照没有对照作用。" >&2
+      if grep -qF -- "Adam-NSCL:" "${TRAIN_LOG}"; then
+        echo "  !! CONTROL=1 的日志里出现了 Adam-NSCL 的输出，说明 --nscl 还是传进去了。" >&2
+        grep -F "Adam-NSCL:" "${TRAIN_LOG}" | head -n 3 >&2
         exit 1
       fi
-      echo "  ok  没有任何 OSFT 输出，这是一条纯全量微调的对照"
-    elif python -c "import sys; sys.exit(0 if float('${URR}') >= 1.0 else 1)"; then
-      if grep -qF -- "OSFT: no matrix was decomposed" "${TRAIN_LOG}"; then
-        echo "  ok  URR=1.0，没有冻结任何方向，这一跑等价于全量微调"
-      else
-        echo "  !! URR=1.0 却仍有矩阵被分解。baselines/osft.py 绕开上游" >&2
-        echo "     _build_osft_kwargs 的那段可能被改回去了（它把 0.0 当 falsy 丢掉）。" >&2
-        exit 1
-      fi
-    elif grep -qF -- "OSFT: ${EXPECT_OSFT_MATRICES} matrices decomposed" "${TRAIN_LOG}"; then
-      echo "  ok  分解了 ${EXPECT_OSFT_MATRICES} 个矩阵"
-      grep -F "OSFT: ${EXPECT_OSFT_MATRICES} matrices decomposed" "${TRAIN_LOG}" | head -n 1
+      echo "  ok  没有任何 Adam-NSCL 输出，这是一条纯全量微调的对照"
     else
-      echo "  !! 日志里没有 'OSFT: ${EXPECT_OSFT_MATRICES} matrices decomposed'。" >&2
-      grep -F "matrices decomposed" "${TRAIN_LOG}" | head -n 1 || true
-      echo "     分解没有按预期发生，这个 run 不可用。" >&2
-      exit 1
+      if ! grep -qF -- "Adam-NSCL: ${EXPECT_NSCL_LAYERS} weights projected" "${TRAIN_LOG}"; then
+        echo "  !! 日志里没有 'Adam-NSCL: ${EXPECT_NSCL_LAYERS} weights projected'。" >&2
+        grep -F "weights projected" "${TRAIN_LOG}" | head -n 1 || true
+        echo "     投影没有按预期装上，这个 run 不可用。" >&2
+        exit 1
+      fi
+      echo "  ok  ${EXPECT_NSCL_LAYERS} 个权重被投影"
+      grep -F "Adam-NSCL: kept" "${TRAIN_LOG}" | head -n 1
+      # 两个端点：全锁死和完全没约束。预检已经挡过一次，这里是"实际发生了什么"。
+      if grep -qF -- "Adam-NSCL: every layer kept under" "${TRAIN_LOG}"; then
+        echo "  !! 每层保留的方向都不到 1%，这一跑是冻结骨架而不是 NSCL。" >&2
+        exit 1
+      fi
+      if [[ "${DEGENERATE}" != "1" ]] && grep -qF -- "Adam-NSCL: almost nothing was dropped" "${TRAIN_LOG}"; then
+        echo "  !! 几乎什么都没丢，这一跑等价于全量微调。" >&2
+        exit 1
+      fi
+      if grep -qF -- "that ratio is too low" "${TRAIN_LOG}"; then
+        echo "  !! step/spacing 比值过低：更新大部分被权重 dtype 的舍入吃掉了，" >&2
+        echo "     而舍入是各向同性的，零空间保证不成立。见文件头第 5 条。" >&2
+        grep -F "spacing of" "${TRAIN_LOG}" | head -n 1 >&2
+        if [[ "${USE_BF16}" == "1" ]]; then
+          echo "     这条跑的是 USE_BF16=1。改用默认的 fp32，或调高 SVD_LR。" >&2
+        fi
+        exit 1
+      fi
     fi
     if grep -qE -- "(covariance|Fisher) matrices from" "${TRAIN_LOG}"; then
-      echo "  !! 日志里出现了矩阵加载：这条臂不该有任何 regularizer。" >&2
+      echo "  !! 日志里出现了 regularizer 的矩阵加载：这条臂不该有罚项。" >&2
       exit 1
     fi
 
@@ -806,14 +848,12 @@ fi
 if [[ "${PROBE}" == "1" ]]; then
   echo
   echo "PROBE=1：短跑结束，不存 checkpoint、不评测。"
-  # 对照必须是 CONTROL 那一跑，不能是 94 号：PROBE 把整条 cosine 压缩进
-  # MAX_STEPS 步（lr 末尾归零），而 94 号在同一位置还在 2-epoch cosine 的一半
-  # 上，数据量也差一倍。详见文件头第 6 条。
   if [[ -s "${PARTNER_METRICS}" ]]; then
     echo
-    echo "==== URR=${URR} 的 OSFT / 对照 并排 ===="
+    echo "==== NSCL / 对照 并排 ===="
     A_NAME="${RUN}" A_METRICS="${RUN_METRICS}" \
     B_NAME="${PARTNER_RUN}" B_METRICS="${PARTNER_METRICS}" \
+    DEGENERATE="${DEGENERATE}" \
     python - <<'PY'
 import json
 import os
@@ -833,8 +873,7 @@ def last_epoch(path):
 
 a = last_epoch(os.environ["A_METRICS"])
 b = last_epoch(os.environ["B_METRICS"])
-# lr_end and train_steps come first: if those two disagree the rest is not a
-# comparison at all, it is two different experiments.
+# train_steps 和 lr_end 排在最前：这两个不同的话下面就不是对照，是两个实验。
 FIELDS = [
     ("train_steps", ".0f"),
     ("train_samples", ".0f"),
@@ -866,17 +905,19 @@ for field, spec in FIELDS:
 print()
 if a.get("train_steps") != b.get("train_steps") or a.get("lr_end") != b.get("lr_end"):
     print("!! train_steps 或 lr_end 不同：两跑的调度不一样，下面的 loss 不可比。")
+elif os.environ.get("DEGENERATE") == "1":
+    print("DEGENERATE=1：保留了全部方向，且 svd_lr 已把 1/sqrt(d_in) 补偿回去，所以")
+    print("两跑应当几乎重合。train_task_loss 和 val_loss 差到小数点后三四位以外，就")
+    print("说明接入有问题 —— 最可能是投影矩阵的 dtype 转换或 Adam 状态没对齐。")
 else:
-    print("URR=1.0 时两跑应该几乎重合：没有 SVD 因子，也就没有因子化前向的数值差，")
-    print("同一个 seed 下唯一的差别只是模型走了 OSFT 的加载路径。train_task_loss")
-    print("和 val_loss 差到小数点后三四位以外，就说明接入有问题。")
+    print("这不是退化点，两跑本来就应该不同。要做接入自检请用 DEGENERATE=1。")
 PY
   else
     echo "  搭档还没跑：${PARTNER_METRICS}"
     if [[ "${CONTROL}" == "1" ]]; then
-      echo "    qsub -v DRY_RUN=0,URR=${URR},PROBE=1 ${SELF_PATH}"
+      echo "    qsub -v DRY_RUN=0,DEGENERATE=${DEGENERATE},PROBE=1 ${SELF_PATH}"
     else
-      echo "    qsub -v DRY_RUN=0,URR=${URR},PROBE=1,CONTROL=1 ${SELF_PATH}"
+      echo "    qsub -v DRY_RUN=0,DEGENERATE=${DEGENERATE},PROBE=1,CONTROL=1 ${SELF_PATH}"
     fi
     echo "  两条都跑完后，后跑的那条会自动打并排表。"
   fi
@@ -887,14 +928,14 @@ fi
 if [[ "${DO_EVAL}" != "1" ]]; then
   echo
   echo "DO_EVAL=0：跳过评测。补评："
-  echo "  qsub -v DRY_RUN=0,URR=${URR}$([[ "${CONTROL}" == "1" ]] && echo ",CONTROL=1"),DO_TRAIN=0 ${SELF_PATH}"
+  echo "  qsub -v DRY_RUN=0,THRES=${THRES},SVD_LR=${SVD_LR},DO_TRAIN=0 ${SELF_PATH}"
   echo "Job finished at: $(date)"
   exit 0
 fi
 
-# ===========================================================================
-# Step 2: 评测（与 95 号 Step 3 逐字相同）
-# ===========================================================================
+# =============================================================================
+# Step 2: 评测（与 95 号 Step 3 / 99 号 Step 2 逐字相同）
+# =============================================================================
 ifbench_ready () {
   python - <<'PY' >/dev/null 2>&1
 from ifbench import instructions_registry
@@ -920,8 +961,7 @@ for m in ${DOMAIN_METRICS}; do
       if ifbench_ready; then
         AVAIL="${AVAIL} ${m}"
       else
-        echo "跳过 ifbench：依赖没就绪。在登录节点补齐后 DO_TRAIN=0 重投即可只补评。"
-        echo "  见 onereplay/pbs/73_ifbench_eval.pbs 文件头。"
+        echo "跳过 ifbench：依赖没就绪。见 onereplay/pbs/73_ifbench_eval.pbs 文件头。"
       fi
       ;;
   esac
@@ -945,7 +985,7 @@ pending_metrics () {
 
 if [[ ! -d "${CKPT_DIR}/${RUN}" ]]; then
   echo "找不到 checkpoint: ${CKPT_DIR}/${RUN}" >&2
-  echo "  先跑 DO_TRAIN=1，或检查 URR 是否与训练时一致。" >&2
+  echo "  先跑 DO_TRAIN=1，或检查 THRES / SVD_LR 是否与训练时一致。" >&2
   exit 4
 fi
 
@@ -988,9 +1028,9 @@ else
   python -m onereplay.scripts.evaluate "${EVAL_ARGS[@]}"
 fi
 
-# ===========================================================================
+# =============================================================================
 # Step 3: base 答对子集上的保留率（与 95 号 Step 4 逐字相同）
-# ===========================================================================
+# =============================================================================
 RETENTION_JSON=""
 if [[ "${WITH_RETENTION}" == "1" ]]; then
   RET_METRICS="${AVAIL// /,}"
@@ -1005,19 +1045,18 @@ if [[ "${WITH_RETENTION}" == "1" ]]; then
     --json_out "${RETENTION_JSON}" || RET_RC=$?
   if (( RET_RC != 0 )); then
     echo "warning: score_retention_subset 退出码 ${RET_RC}，主表的 ret_* 三列会是 '-'。"
-    echo "         最常见的原因是 base 在本 OUT_DIR 下还没评过（94 号还没跑）。"
   fi
   [[ -s "${RETENTION_JSON}" ]] || RETENTION_JSON=""
 fi
 
-# ===========================================================================
+# =============================================================================
 # Step 4: 汇总 —— base / vanilla / 本臂并排（与 95 号 Step 5 同一套表）
-# ===========================================================================
+# =============================================================================
 echo
 echo "========================================================================"
-echo "结果汇总：osft 保护 ${MIX_TAG}   URR=${URR}"
+echo "结果汇总：nscl 保护 ${MIX_TAG}   THRES=${THRES} SVD_LR=${SVD_LR}"
 echo "========================================================================"
-OUT_DIR="${EVAL_ROOT}" RUN_NAME="${RUN}" ARM_NAME="osft" \
+OUT_DIR="${EVAL_ROOT}" RUN_NAME="${RUN}" ARM_NAME="nscl" \
 BASE_NAME="${BASE_RUN}" VANILLA_NAME="${VANILLA_RUN}" \
 METRIC_NAMES="${AVAIL}" RETENTION_JSON="${RETENTION_JSON}" \
 RUN_METRICS="${RUN_METRICS}" VANILLA_METRICS="${METRICS_DIR}/${VANILLA_RUN}.jsonl" \
@@ -1035,9 +1074,6 @@ metric_names = os.environ["METRIC_NAMES"].split()
 
 NEW_TASK = {"fpb", "fiqasa", "tfns"}
 SCORE_KEYS = ("accuracy", "pass_at_1", "strict_prompt_accuracy")
-# IFBench 例外：论文主报 prompt-level loose，73 号的表也是这个口径。
-# 注意 ret_* 三列按 strict 判分（与 IFEval 同口径），所以 IFBench 这一行的分数列
-# 是 loose、保留率列是 strict，不能把两者相减来读。
 METRIC_SCORE_KEY = {"ifbench": "loose_prompt_accuracy"}
 
 
@@ -1118,11 +1154,9 @@ for metric in metric_names:
 if retention:
     print()
     print("ret_* = base 答对的题里这个 run 还答对的比例（1.0 = 一道没丢），d_ret = 本臂 - vanilla。")
-    print("  这才是反遗忘主张针对的那个数：整体分数里混着 base 本来就不会的题，")
-    print("  在那些题上得分是学到了新东西，不是'保住了'。两者方向可以相反。")
 else:
     print()
-    print("ret_* 三列是 '-'：没有保留率结果（WITH_RETENTION=0，或 base 在本 OUT_DIR 下还没评过）。")
+    print("ret_* 三列是 '-'：没有保留率结果（WITH_RETENTION=0，或 base 还没评过）。")
 
 
 def read_records(path):
@@ -1155,9 +1189,7 @@ old_keys = sorted(k for k in ours_m if k.startswith("old_val_loss"))
 if old_keys:
     print()
     print("旧域 val loss（Δ 是相对各自训练前的起点；正数 = 忘了，越小越好）:")
-    print(
-        f"{'domain':<12}{'baseline':>12}{'van_Δ':>12}{'ours_Δ':>12}{'救回':>12}"
-    )
+    print(f"{'domain':<12}{'baseline':>12}{'van_Δ':>12}{'ours_Δ':>12}{'救回':>12}")
     for key in old_keys:
         start = ours_b.get(key)
         final = ours_m.get(key)
@@ -1170,43 +1202,48 @@ if old_keys:
             f"{name:<12}" + cell(start, ".6f", 12) + cell(d_van, "+.6f", 12)
             + cell(d_ours, "+.6f", 12) + cell(saved, "+.6f", 12)
         )
-    print("  这条只随权重动，不随生成和解析动。它和 bench 说法不一致时先信它，")
-    print("  再回头查 bench 的 parse_rate —— 这条线上答案被压成一个词，解析失败是常态。")
+    print("  这条只随权重动，不随生成和解析动。它和 bench 说法不一致时先信它。")
     if len(old_keys) > 1:
         print("  mix 要读的就是这两行分开的数：一侧保住、另一侧塌了，才是「保护容量不够，")
         print("  两个域在抢」这个结论。平均成一个数会把它藏起来。")
-    # OSFT 的 baseline 行和 vanilla 的不会完全相等：分解后的模型在 bf16 下走的是
-    # 因子化前向（四次矩阵乘），与稠密前向差一个存储精度量级的量。差得远就不对了，
-    # 差一点点是方法本身的性质，不是起点没对齐。
-    if old_keys and van_b:
+    # NSCL 不改变前向（投影只在 optimizer.step 里），所以起点必须和 vanilla 一致。
+    # 这一点比 OSFT 强：那边有因子化前向的固有差，这边没有。
+    if van_b:
         drift = [
             abs(ours_b[k] - van_b[k])
             for k in old_keys
             if ours_b.get(k) is not None and van_b.get(k) is not None
         ]
-        if drift:
-            print(f"  起点与 vanilla 的差异 {max(drift):.2e}（bf16 因子化前向的固有量级，非零是正常的）")
+        if drift and max(drift) > 1e-6:
+            print(f"  !! 起点与 vanilla 差 {max(drift):.2e}，但 NSCL 不动前向，这里应当为 0。")
+            print("     两跑的加载路径或 seed 不一致，后面的 Δ 不可比。")
 
 print()
-print("OSFT 的分解（这几个数确认这一跑确实是 OSFT，而不是悄悄退化成了 vanilla）:")
+print("零空间（这几个数确认这一跑确实是 NSCL，而不是悄悄退化成了 vanilla 或冻结骨架）:")
 for key, label, spec in (
-    ("osft_unfreeze_rank_ratio", "URR（训练占比）", ".4f"),
-    ("osft_matrices", "分解的矩阵数", ".0f"),
-    ("osft_frozen_rank_share", "实际冻结占比", ".4f"),
-    ("osft_factor_memory_gb", "因子常驻 GiB", ".2f"),
-    ("osft_dense_memory_gb", "对应稠密 GiB", ".2f"),
+    ("nscl_thres", "THRES", ".6g"),
+    ("nscl_svd_lr", "SVD_LR", ".3e"),
+    ("nscl_layers", "被投影的权重数", ".0f"),
+    ("nscl_kept_share", "保留方向占比", ".4f"),
+    ("nscl_kept_share_min", "  最紧的层", ".4f"),
+    ("nscl_kept_share_max", "  最松的层", ".4f"),
+    ("nscl_energy_share_max", "最差层的残留能量", ".3e"),
+    ("nscl_transform_memory_gb", "投影矩阵常驻 GiB", ".2f"),
+    ("nscl_step_resolution", "step/spacing 比值", ".2f"),
 ):
     value = ours_m.get(key)
     print(f"  {label:<20}" + ("-" if value is None else format(value, spec)))
-print(f"  上游 commit         {ours_m.get('osft_upstream_commit', '-')}")
-print("  实际冻结占比与 1-URR 不会精确相等：top_k 按每个矩阵向下取整、")
-print("  并被夹到 full_rank - 1。")
+print(f"  上游 commit         {ours_m.get('nscl_upstream_commit', '-')}")
+print(f"  C                   {ours_m.get('nscl_cov_path', '-')}")
+resolution = ours_m.get("nscl_step_resolution")
+if isinstance(resolution, (int, float)) and resolution < 10:
+    print("  !! step/spacing 比值低于 10：更新大部分被权重 dtype 的舍入吃掉，而舍入")
+    print("     各向同性，零空间保证在这一跑上不成立。这个数必须随结果一起报出来。")
+print("  保留占比接近 0 = 冻结骨架；接近 1 = vanilla。两端在 loss 曲线上都看不出来。")
 
 print()
 print("新任务拟合与开销:")
-print(
-    f"{'':<14}{'val_loss':>12}{'train_sec':>12}{'peak_mem_GB':>13}"
-)
+print(f"{'':<14}{'val_loss':>12}{'train_sec':>12}{'peak_mem_GB':>13}")
 for label, row in (("vanilla", van_m), (arm_name, ours_m)):
     print(
         f"{label:<14}"
@@ -1221,22 +1258,25 @@ if ours_m.get("val_loss") and van_m.get("val_loss"):
         print("  <= 0：新任务没被本臂拖慢，上面的 d_van 可以直接当保护效果读。")
     else:
         print("  > 0：新任务学得更差了，d_van 里有一部分是'少学了'而不是'保住了'。")
-        print("       报结果时必须同时给这两个数，否则就是拿新任务性能换旧能力。")
+        print("       报结果时必须同时给这两个数。")
 if ours_m.get("train_sec") and van_m.get("train_sec"):
     print(f"墙钟比 = {ours_m['train_sec'] / van_m['train_sec']:.2f}x vanilla")
-    print("  OSFT 的每个 linear 做四次矩阵乘而不是一次，所以这个数会大于 1。")
-    print("  它是要报出来的开销数字之一（replay 臂那个约 2x 是另一类原因）。")
+    print("  NSCL 每次 optimizer.step 对每个被投影的权重多做一次 d_in x d_in 矩阵乘，")
+    print("  但只发生在 update 上（不是每个 micro-batch），所以这个数应当接近 1。")
+    print("  显著大于 1 多半是 fp32 带来的，不是投影本身。")
 PY
 
 echo
 echo "========================================================================"
 echo "本臂完成: ${RUN}"
-echo "  同一张表里还差哪几条就投哪几条（95 号，DOMAIN=mix）："
-echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "  同一张表里还差哪几条就投哪几条："
 echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=onereplay,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
 echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=ewc,LAMBDA=<中心点> ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
-echo "  本臂换一个 URR 就改 URR=（建议 0.1 / 0.25 / 0.5），不需要扫描模式。"
-echo "  接入自检是一对短跑，和 94 号无关（见文件头第 6 条）："
-echo "    qsub -v DRY_RUN=0,URR=1.0,PROBE=1,CONTROL=1 ${SELF_PATH}"
-echo "    qsub -v DRY_RUN=0,URR=1.0,PROBE=1           ${SELF_PATH}"
+echo "    qsub -v DRY_RUN=0,DOMAIN=mix,ARM=replay ${REPO_ROOT}/onereplay/pbs/95_finance_arms.pbs"
+echo "    qsub -v DRY_RUN=0,URR=0.25 ${REPO_ROOT}/onereplay/pbs/99_finance_osft.pbs"
+echo "  本臂换一个点就改 THRES / SVD_LR，先用预检脚本确认那个 THRES 可用："
+echo "    python -m onereplay.baselines.inspect_nscl_nullspace --cov_path ${COV_PATH}"
+echo "  接入自检是一对短跑（见文件头第 6 条）："
+echo "    qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1,CONTROL=1 ${SELF_PATH}"
+echo "    qsub -v DRY_RUN=0,DEGENERATE=1,PROBE=1           ${SELF_PATH}"
 echo "========================================================================"

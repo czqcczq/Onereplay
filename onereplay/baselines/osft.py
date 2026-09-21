@@ -130,7 +130,7 @@ def _install_gpt_oss_stub() -> None:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 raise RuntimeError(
                     "GptOssForCausalLM is not available in this transformers version. "
-                    "onereplay.core.osft installed a placeholder so that OSFT could be "
+                    "onereplay.baselines.osft installed a placeholder so that OSFT could be "
                     "imported for a non-gpt-oss model; loading an actual gpt-oss "
                     "checkpoint requires transformers>=4.55."
                 )
