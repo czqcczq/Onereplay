@@ -112,6 +112,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--spectrum_dtype",
+        type=str,
+        choices=sorted(SPECTRUM_DTYPES),
+        default="fp32",
+        help=(
+            "Arithmetic for the decomposition. fp32 matches what the training run "
+            "feeds upstream's torch.svd. Re-run with fp64 whenever a condition number "
+            "exceeds ~1e7: past that point the float32 floor is the algorithm's own "
+            "roundoff rather than anything in the data, and the rule is anchored to "
+            "exactly that floor. If the two precisions disagree about the condition "
+            "numbers, the float32 answer is the wrong one."
+        ),
+    )
+    parser.add_argument(
+        "--by_module",
+        type=int,
+        default=1,
+        help=(
+            "1 also breaks the kept fraction down by the last component of each layer "
+            "name. 'which layers are locked' is usually answered by the module type, "
+            "and a 197-row table does not show it."
+        ),
+    )
+    parser.add_argument(
         "--max_layers",
         type=int,
         default=0,
@@ -228,19 +252,31 @@ def parse_grid(raw: str) -> list[float]:
     return sorted(values)
 
 
-def layer_spectrum(covariance: torch.Tensor, device: str) -> torch.Tensor:
-    """Descending singular values of one C, in float64 on the host.
+SPECTRUM_DTYPES = {"fp32": torch.float32, "fp64": torch.float64}
 
-    float64 because every quantity below is a ratio across the condition number,
-    which runs past 1e8 on real covariances; in float32 the small end of the
-    spectrum is the part that rounds away, and the small end is the whole
-    question. The SVD itself runs in the input's precision on the requested
-    device, then the values are widened -- widening afterwards does not recover
-    lost digits, but it keeps the sums and ratios below from adding their own
-    error on top.
+
+def layer_spectrum(
+    covariance: torch.Tensor,
+    device: str,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Descending singular values of one C, returned in float64 on the host.
+
+    The arithmetic precision is a real choice here, not a detail. The selection
+    rule is anchored to the *smallest* singular value, and a float32 SVD carries
+    its own error of order eps * sigma_max with eps = 1.2e-7. Any singular value
+    below that is produced by the algorithm rather than measured from the data,
+    so on a matrix whose condition number exceeds ~1e7 the float32 floor -- and
+    therefore the whole selection -- is roundoff. float64 does not add
+    information to a covariance that was stored in float32, but it does stop the
+    decomposition from adding error of its own, which is what separates "this
+    matrix really is that ill-conditioned" from "float32 could not tell".
+
+    Values are widened to float64 on return either way, because every quantity
+    computed from them is a ratio spanning the condition number.
     """
 
-    matrix = covariance.to(device=device, dtype=torch.float32)
+    matrix = covariance.to(device=device, dtype=dtype)
     values = torch.linalg.svdvals(matrix)
     return values.detach().to(device="cpu", dtype=torch.float64)
 
@@ -324,7 +360,9 @@ def main() -> int:
         # a progress line that only ticks every ten layers is indistinguishable
         # from a hang for as long as it takes to cross an MLP block.
         layer_started = time.time()
-        spectra[name] = layer_spectrum(covariances[name], args.device)
+        spectra[name] = layer_spectrum(
+            covariances[name], args.device, SPECTRUM_DTYPES[args.spectrum_dtype]
+        )
         print(
             f"  [{index}/{len(names)}] {name} {dims[name]}x{dims[name]} "
             f"{time.time() - layer_started:6.1f}s  (elapsed {time.time() - started:.0f}s)",
@@ -348,6 +386,31 @@ def main() -> int:
         "the floor, so a layer needs thres comparable to its condition number before "
         "it keeps a meaningful fraction."
     )
+    spread = max(conditions) / max(min(conditions), 1e-30)
+    if spread > 1e3:
+        print(
+            f"  !! those condition numbers span {spread:.1e}. A single global --nscl_thres "
+            "has to serve all of them, so anything small enough to constrain the "
+            "best-conditioned layer leaves the worst one frozen, and anything large "
+            "enough to free the worst turns the best into plain fine-tuning. Check the "
+            "locked/vanilla counts below rather than the median."
+        )
+    precision_limit = 1.0 / float(torch.finfo(SPECTRUM_DTYPES[args.spectrum_dtype]).eps)
+    over = [name for name, cond in zip(names, conditions) if cond > precision_limit]
+    if over:
+        print(
+            f"  !! {len(over)} layers report a condition number above "
+            f"{precision_limit:.1e}, which is 1/eps for {args.spectrum_dtype}. Past that "
+            "point the smallest singular values are the decomposition's own roundoff, "
+            "not the data -- and the rule is anchored to exactly those. The selected "
+            "eigenvectors would be arbitrary directions."
+        )
+        if args.spectrum_dtype != "fp64":
+            print(
+                "     Re-run with --spectrum_dtype fp64 before reading anything into "
+                "this table. If the condition numbers drop, float32 was the problem; "
+                "if they hold, the covariance really is that ill-conditioned."
+            )
 
     print(
         f"\n{'thres':>10}  {'kept_share min/med/max':>26}  {'energy max':>11}  "
@@ -399,6 +462,22 @@ def main() -> int:
             "this covariance has no null space to train in and Adam-NSCL does not "
             "transfer to it. That is a reportable result, not a bug."
         )
+
+    if args.by_module and args.detail_thres >= 1.0:
+        print(f"\nby module type at thres={args.detail_thres:g}")
+        print(f"{'module':<16}{'layers':>8}{'kept min':>11}{'kept med':>11}{'kept max':>11}{'locked':>8}")
+        print("-" * 65)
+        groups: dict[str, list[str]] = {}
+        for name in names:
+            groups.setdefault(name.rsplit(".", 1)[-1], []).append(name)
+        for module, members in sorted(groups.items()):
+            shares = sorted(selection(spectra[n], args.detail_thres)["kept_share"] for n in members)
+            print(
+                f"{module:<16}{len(members):>8}"
+                f"{shares[0]:>11.4f}{shares[len(shares) // 2]:>11.4f}{shares[-1]:>11.4f}"
+                f"{sum(1 for s in shares if s < 0.01):>8}"
+            )
+        print("  'locked' counts layers keeping under 1% of their directions.")
 
     if args.detail_thres >= 1.0:
         print(f"\nper layer at thres={args.detail_thres:g}")
