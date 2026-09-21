@@ -427,14 +427,16 @@ def generate_targets(args: argparse.Namespace) -> None:
         sampling_kwargs = {"do_sample": False}
         print("decoding: greedy")
     if args.record_logprob == 1:
-        # output_logits carries the unprocessed logits, output_scores the ones the
-        # sampler actually drew from. Ask for both so --logprob_source can pick
-        # without a second pass.
-        scoring_kwargs = {
-            "return_dict_in_generate": True,
-            "output_scores": True,
-            "output_logits": True,
-        }
+        # output_logits carries the unprocessed logits, output_scores the ones
+        # the sampler actually drew from. Ask for only the one --logprob_source
+        # names: each keeps one (batch, vocab) tensor per decoding step alive
+        # until generate returns, so requesting both doubles the peak for
+        # nothing and forces a smaller --batch_size.
+        scoring_kwargs = {"return_dict_in_generate": True}
+        if args.logprob_source == "raw":
+            scoring_kwargs["output_logits"] = True
+        else:
+            scoring_kwargs["output_scores"] = True
         print(f"recording avg_logprob from the {args.logprob_source} distribution")
     else:
         scoring_kwargs = {}

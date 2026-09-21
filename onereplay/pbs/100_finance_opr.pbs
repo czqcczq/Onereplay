@@ -34,9 +34,14 @@
 # 原样照搬：数据级回放（concatenate + shuffle，追加不替换）、ρ=0.01、
 # buffer 行数 = int(ρ x 新任务行数)、候选池 = 旧域训练池、temperature=0.1 采样、
 # 各池降序排序后取 int(buffer_size / 池数)、训练目标用生成答案替换 gold、
-# ACCUM 保持 64（追加行不占 batch 名额）、SC 与 RU 各自独立生成一次。
+# ACCUM 保持 64（追加行不占 batch 名额）。
 #
-# 三处偏离，每一处都要出现在论文的表注里：
+# 四处偏离，每一处都要出现在论文的表注里：
+#
+#   0) 两个打分变体**共用同一批候选**（SHARE_GEN=1）。他们的 repo 是两个脚本各
+#      生成一次，但那是代码组织方式，不是方法主张 —— 方法只说"生成、打分、取
+#      top-k"。共享之后 SC 与 RU 的差值只剩选择准则，不含采样噪声，比他们的做法
+#      更可控；生成开销也省掉一半。SHARE_GEN=0 退回原样。
 #
 #   a) 生成长度。他们写死 `if task_id in [0,1]: max_tokens=1 else 512`，那个
 #      分支是给 C-STANCE / FOMC 两个单字母答案任务开的；单阶段设定下 task_id
@@ -142,7 +147,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATA_ROOT PROCESSED_DIR STATS_DIR DATASET_DIR DATASET_CACHE
     PROFILE PROFILE_SOURCE SKIP_PROFILE_CHECK
     REWARD RHO BUFFER_SIZE GEN_BATCH GEN_MAX_NEW TEMPERATURE LOGPROB_SOURCE
-    OPR_DIR CODE_VIEW_FILE CODE_OPC_PATH CODE_TIMEOUT
+    SHARE_GEN OPR_DIR CODE_VIEW_FILE CODE_OPC_PATH CODE_TIMEOUT
     DO_GENERATE FORCE_GENERATE
     PROBE PROBE_STEPS MAX_STEPS SAVE
     SPLIT_DIR OLD_VAL OLD_VAL_ROWS MIX_DOMAINS REPLAY_MAXLEN
@@ -384,9 +389,23 @@ RUN="$(run_name_for "${RHO}")"
 RUN_METRICS="${METRICS_DIR}/${RUN}.jsonl"
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
 
-# 生成产物按 REWARD 分开：SC 与 RU 各自独立生成一次，这是他们的做法（两个脚本
-# 各跑各的），代价是两者的差值里含采样噪声。
-gen_file_for () { printf '%s' "${OPR_DIR}/gen_${REWARD}_$1.jsonl"; }
+# 生成产物默认**不带 REWARD**，两个打分变体共用同一批候选。
+#
+# 他们的 repo 是 generate_opr_ru.py 与 generate_opr_sc.py 各自生成一次，但那是
+# 代码组织方式 —— 每个脚本是一个独立入口 —— 不是方法主张。方法只说"用当前模型
+# 生成、打分、取 top-k"，没有要求两个变体必须看不同的采样。
+#
+# 共享反而更可控：SC 与 RU 面对同一批候选，两者的差值就只剩"选择准则不同"，
+# 不再混进 temperature=0.1 的采样噪声。生成文件里 targets / gold_targets /
+# avg_logprob 三样俱全，两个打分器各取所需。
+#
+# SHARE_GEN=0 退回他们的做法（各生成一次），文件名带回 REWARD。
+SHARE_GEN="${SHARE_GEN:-1}"
+if [[ "${SHARE_GEN}" == "1" ]]; then
+  gen_file_for () { printf '%s' "${OPR_DIR}/gen_$1.jsonl"; }
+else
+  gen_file_for () { printf '%s' "${OPR_DIR}/gen_${REWARD}_$1.jsonl"; }
+fi
 BUFFER_FILE="${OPR_DIR}/buffer_${REWARD}_${MIX_TAG}_rho${RHO}.jsonl"
 SCORES_FILE="${OPR_DIR}/scores_${REWARD}_${MIX_TAG}.json"
 
@@ -427,6 +446,11 @@ echo "  ρ        = ${RHO}   (回放行数占新任务的比例，他们的默�
 echo "  打分     = ${REWARD}$([[ "${REWARD}" == "sc" ]] && echo "（平均 logprob，来源 ${LOGPROB_SOURCE}）" || echo "（math 最终答案 / code testcase，打分器是替换过的）")"
 echo "  生成     = temperature ${TEMPERATURE}, max_new ≤ ${GEN_MAX_NEW}, 预算从 max_len ${REPLAY_MAXLEN} 反推"
 echo "             截断的答案保留（OPR 行为），训练侧 --replay_drop_truncated 0"
+if [[ "${SHARE_GEN}" == "1" ]]; then
+echo "             SHARE_GEN=1：sc 与 ru 共用同一批候选（差值里没有采样噪声）"
+else
+echo "             SHARE_GEN=0：本 REWARD 单独生成一批（他们 repo 的做法）"
+fi
 echo "  候选池   = $(for d in ${OLD_VAL_DOMAINS}; do printf '%s ' "$(pool_file_for "${d}")"; done)"
 if [[ "${OLD_VAL}" == "1" ]]; then
 echo "  旧域 val = ${OLD_VAL_ROWS} 行/域，域：${OLD_VAL_DOMAINS}（与另外几条臂同一批行）"

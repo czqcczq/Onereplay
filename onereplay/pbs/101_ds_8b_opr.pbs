@@ -16,6 +16,10 @@
 #   生成很慢，建议先只做前两步：
 #   qsub -v DRY_RUN=0,REWARD=sc,DO_TRAIN=0,DO_EVAL=0 ...   然后   DO_GENERATE=0
 #
+#   !! 生成只做一次，两个 REWARD 共用（SHARE_GEN=1，默认）。所以第二个变体直接
+#      DO_GENERATE=0 就行，不必再等一遍 8B 把整个池过完：
+#      qsub -v DRY_RUN=0,REWARD=ru,DO_GENERATE=0 onereplay/pbs/101_ds_8b_opr.pbs
+#
 # 74 号给 base / vanilla 的分母，81 号是 OneReplay 臂，83 号是 gold replay 臂。
 # 本臂与 83 号同池、同参数化，差别只在"回放行的答案从哪来、要不要筛"。
 #
@@ -64,9 +68,14 @@
 # ----------------------------------
 # 原样照搬：数据级回放、ρ=0.01、buffer 行数 = int(ρ x 新任务行数)、追加不替换、
 # 候选池 = 旧域池、temperature=0.1 采样、各池降序排序后取 int(buffer_size/池数)、
-# 训练目标用生成答案替换 gold、SC 与 RU 各自独立生成一次。
+# 训练目标用生成答案替换 gold。
 #
-# 三处偏离，每一处都要出现在论文的表注里：
+# 四处偏离，每一处都要出现在论文的表注里：
+#
+#   0) 两个打分变体**共用同一批候选**（SHARE_GEN=1）。他们的 repo 是两个脚本各
+#      生成一次，但那是代码组织方式，不是方法主张 —— 方法只说"生成、打分、取
+#      top-k"。共享之后 SC 与 RU 的差值只剩选择准则，不含采样噪声，比他们的做法
+#      更可控；而且 8B 过一遍整个池的开销省掉一半。SHARE_GEN=0 退回原样。
 #
 #   a) 生成长度。他们写死 `if task_id in [0,1]: max_tokens=1 else 512`，那个分支
 #      是给 TRACE 两个单字母答案任务开的；单阶段设定下 task_id 恒为 0，逐字照抄
@@ -167,7 +176,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     MATH_DATA_DIR CODE_DATA_DIR
     PROFILE_SOURCE SKIP_PROFILE_CHECK
     REWARD RHO BUFFER_SIZE GEN_BATCH GEN_MAX_NEW TEMPERATURE LOGPROB_SOURCE
-    OPR_DIR CODE_VIEW_FILE CODE_OPC_PATH CODE_TIMEOUT
+    SHARE_GEN OPR_DIR CODE_VIEW_FILE CODE_OPC_PATH CODE_TIMEOUT
     DO_GENERATE FORCE_GENERATE
     PROBE PROBE_STEPS MAX_STEPS SAVE
     MIX_DOMAINS REPLAY_MAXLEN REPLAY_SAMPLE_SEED REPLAY_DROP_TRUNCATED
@@ -362,8 +371,23 @@ VANILLA_RUN="${VANILLA_RUN:-ds_vanilla_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS_DECLARED
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
 RUN_METRICS="${RESULTS_ROOT}/metrics/${RUN}.jsonl"
 
-# 生成产物按 REWARD 分开：SC 与 RU 各自独立生成一次，这是他们的做法。
-gen_file_for () { printf '%s' "${OPR_DIR}/gen_8b_${REWARD}_$1.jsonl"; }
+# 生成产物默认**不带 REWARD**，两个打分变体共用同一批候选。
+#
+# 他们的 repo 是 generate_opr_ru.py 与 generate_opr_sc.py 各自生成一次，但那是
+# 代码组织方式 —— 每个脚本是一个独立入口 —— 不是方法主张。方法只说"用当前模型
+# 生成、打分、取 top-k"，没有要求两个变体必须看不同的采样。
+#
+# 共享反而更可控：SC 与 RU 面对同一批候选，两者的差值就只剩"选择准则不同"，
+# 不再混进 temperature=0.1 的采样噪声。生成文件里 targets / gold_targets /
+# avg_logprob 三样俱全，两个打分器各取所需。
+#
+# SHARE_GEN=0 退回他们的做法（各生成一次），文件名带回 REWARD。
+SHARE_GEN="${SHARE_GEN:-1}"
+if [[ "${SHARE_GEN}" == "1" ]]; then
+  gen_file_for () { printf '%s' "${OPR_DIR}/gen_8b_$1.jsonl"; }
+else
+  gen_file_for () { printf '%s' "${OPR_DIR}/gen_8b_${REWARD}_$1.jsonl"; }
+fi
 BUFFER_FILE="${OPR_DIR}/buffer_8b_${REWARD}_${DOMAIN_TAG}_rho${RHO}.jsonl"
 SCORES_FILE="${OPR_DIR}/scores_8b_${REWARD}_${DOMAIN_TAG}.json"
 
@@ -428,6 +452,11 @@ echo "  ρ        = ${RHO}   (回放行数占新任务的比例，他们的默�
 echo "  打分     = ${REWARD}$([[ "${REWARD}" == "sc" ]] && echo "（平均 logprob，来源 ${LOGPROB_SOURCE}）" || echo "（math 最终答案 / code testcase，打分器是替换过的）")"
 echo "  生成     = temperature ${TEMPERATURE}, max_new ≤ ${GEN_MAX_NEW}, 预算从 max_len ${REPLAY_MAXLEN} 反推"
 echo "             截断的答案保留（OPR 行为），训练侧 --replay_drop_truncated ${REPLAY_DROP_TRUNCATED}"
+if [[ "${SHARE_GEN}" == "1" ]]; then
+echo "             SHARE_GEN=1：sc 与 ru 共用同一批候选（差值里没有采样噪声）"
+else
+echo "             SHARE_GEN=0：本 REWARD 单独生成一批（他们 repo 的做法）"
+fi
 echo "  旧域 val = 不测（74/81/83 都没记，没有分母；见文件头第 3 条）"
 echo "  混合     = 数据级追加，ACCUM ${ACCUM}（83 号批级要 128，本臂不用）"
 echo "             accum_steps ${ACCUM_STEPS} x ${BATCH} = ${NEW_PER_UPDATE} 行新任务/更新（要 = 64）"
