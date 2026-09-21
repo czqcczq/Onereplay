@@ -100,11 +100,14 @@
 #   # (1) DialogSum 线 / Qwen3-8B：base + vanilla，if / math / code 三个语料
 #   qsub onereplay/pbs/102_math_val500_direction.pbs
 #
-#   # (1') DialogSum 线的**全部**臂 x 三个保护域。先 DRY_RUN=1 看 Step 1 的清单
-#   #      抄 run 名，VANILLA_RUN 必须显式给 —— 它是「消除的遗忘」那一列的分母。
-#   qsub -v VANILLA_RUN=ds_vanilla_8b_r16all_lr2e-4_ep2_seed1,\
-#ADAPTERS='ds_vanilla_8b_r16all_lr2e-4_ep2_seed1,ds_onereplay_...,ds_ewc_...,ds_replay_...' \
+#   # (1') DialogSum 线的**全部**臂 x 三个保护域。ADAPTERS 不传就只打默认那一个，
+#   #      要全打得显式说。VANILLA_RUN 也必须给 —— 它是「消除的遗忘」的分母。
+#   qsub -v ADAPTERS=all,VANILLA_RUN=ds_vanilla_8b_r16all_lr2e-4_ep2_seed1 \
 #        onereplay/pbs/102_math_val500_direction.pbs
+#
+#   # 只要其中一部分：ADAPTER_GLOB 过滤，或者 ADAPTERS 显式列举
+#   qsub -v ADAPTERS=all,ADAPTER_GLOB='ds_*',VANILLA_RUN=... onereplay/pbs/102_...pbs
+#
 #   #    14 个 checkpoint x 3 个语料约 1.5 h；赶时间可以 VERIFY=0 砍掉一半前向
 #   #    （那是逐行路径与 evaluate_probe 的互校，第一次跑过一次就够了）。
 #
@@ -182,7 +185,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
     MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTER_DIR
     PROBES IF_GOLD_FILE MATH_GOLD_FILE CODE_GOLD_FILE POOL_ROOT
-    ADAPTERS BASE_NAME VANILLA_RUN OUT_PATH PER_ROW_DIR
+    ADAPTERS ADAPTER_GLOB BASE_NAME VANILLA_RUN OUT_PATH PER_ROW_DIR
     MAX_LEN BATCH ROW_BATCH PROBE_SIZE VERIFY
     DRY_RUN VERDICT_ONLY KEEP_GOING
   )
@@ -262,8 +265,14 @@ VERDICT_ONLY="${VERDICT_ONLY:-0}"   # 1 = 不打分，只把已有的 OUT_PATH �
 KEEP_GOING="${KEEP_GOING:-1}"
 BASE_NAME="${BASE_NAME:-base}"
 
-# 74 号的 vanilla（DialogSum 线）。finance 线要传 fin_vanilla_lr8e-5_ep2_seed42。
+# 要打哪些 checkpoint。默认只有 74 号的 vanilla —— 方向检查只要它，而多打一个就是
+# 几分钟前向，不该由默认值替人做这个决定。想打全部用 ADAPTERS=all。
+#   ADAPTERS=all          把 ADAPTER_DIR 下所有子目录都打一遍
+#   ADAPTER_GLOB='ds_*'   配合 all 过滤（默认 *）
+#   ADAPTERS='a,b,c'      显式列举；绝对路径也认
+# finance 线要传 fin_vanilla_lr8e-5_ep2_seed42（或 all + ADAPTER_GLOB='fin_*'）。
 ADAPTERS="${ADAPTERS:-ds_vanilla_8b_r16all_lr2e-4_ep2_seed1}"
+ADAPTER_GLOB="${ADAPTER_GLOB:-*}"
 
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
@@ -283,14 +292,52 @@ echo "========================================================================"
 # ===========================================================================
 echo ""
 echo "==== Step 1: ${ADAPTER_DIR} 下现有的 checkpoint ===="
+AVAILABLE=()
 if [[ -d "${ADAPTER_DIR}" ]]; then
-  ls -1 "${ADAPTER_DIR}" 2>/dev/null | sed 's/^/  /' || echo "  （空）"
+  while IFS= read -r _dir; do
+    [[ -n "${_dir}" ]] && AVAILABLE+=("$(basename "${_dir}")")
+  done < <(find "${ADAPTER_DIR}" -mindepth 1 -maxdepth 1 -type d -name "${ADAPTER_GLOB}" 2>/dev/null | sort)
+  if (( ${#AVAILABLE[@]} == 0 )); then
+    echo "  （没有匹配 '${ADAPTER_GLOB}' 的子目录）"
+  else
+    for _name in "${AVAILABLE[@]}"; do echo "  ${_name}"; done
+  fi
 else
   echo "  !! 目录不存在: ${ADAPTER_DIR}"
 fi
+
+# ADAPTERS=all：省掉手抄十几个长 run 名这一步，那正是最容易出错的地方。
+if [[ "${ADAPTERS}" == "all" ]]; then
+  if (( ${#AVAILABLE[@]} == 0 )); then
+    echo "!! ADAPTERS=all，但 ${ADAPTER_DIR} 下没有匹配 '${ADAPTER_GLOB}' 的目录。"
+    exit 1
+  fi
+  ADAPTERS="$(IFS=,; printf '%s' "${AVAILABLE[*]}")"
+  echo ""
+  echo "ADAPTERS=all 展开成 ${#AVAILABLE[@]} 个 checkpoint。"
+fi
+
+# 本次到底要打几个 —— 只打了一个而目录里有一堆，多半是忘了传 ADAPTERS。
+WANT_COUNT="$(printf '%s' "${ADAPTERS}" | tr ',' '\n' | grep -c '[^[:space:]]' || true)"
+PROBE_COUNT="$(printf '%s' "${PROBES}" | tr ',' '\n' | grep -c '[^[:space:]]' || true)"
 echo ""
-echo "81/82/83（LoRA）与 95（全参）的 SAVE 默认是 1。上面若有 OneReplay / EWC /"
-echo "replay 的条目，把它们加进 ADAPTERS 重投一次，就能不重训拿到端点对比。"
+echo "本次要打 ${WANT_COUNT} 个 checkpoint + base，各 ${PROBE_COUNT} 个语料。"
+if (( WANT_COUNT <= 1 )) && (( ${#AVAILABLE[@]} > 1 )); then
+  echo ""
+  echo "!! 目录里有 ${#AVAILABLE[@]} 个 checkpoint，本次只打 ${WANT_COUNT} 个。"
+  echo "   ADAPTERS 没传就是这个默认值。要全打是:"
+  echo ""
+  echo "     qsub -v ADAPTERS=all,VANILLA_RUN=<vanilla 的 run 名> \\"
+  echo "          onereplay/pbs/102_math_val500_direction.pbs"
+  echo ""
+  echo "   或者把下面这行粘进 -v（只要其中几个就自己删）:"
+  echo "     ADAPTERS='$(IFS=,; printf '%s' "${AVAILABLE[*]}")'"
+  echo ""
+  echo "   VANILLA_RUN 要显式给：它是「消除的遗忘」那一列的分母。"
+fi
+echo ""
+echo "81/82/83（LoRA）与 95（全参）的 SAVE 默认是 1，所以 OneReplay / EWC / replay"
+echo "的 checkpoint 大概率都在上面 —— 不重训就能拿到端点对比。"
 
 # ===========================================================================
 # Step 2: 语料体检 + 列名归一
