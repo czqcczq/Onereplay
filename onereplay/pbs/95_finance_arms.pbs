@@ -168,6 +168,25 @@
 # 报告，但仍然要求空行占比 <= 1%。
 #
 # -----------------------------------------------------------------------------
+# 4b. REPLAY_SOURCE=selfdistill：同一批行，答案换成底座自己的
+# ----------------------------------------------------------
+# 默认 gold，上面第 4 条原样成立、run 名不变。selfdistill 只动 replay 读的语料，
+# 其余超参、编排、评测一律不变：
+#
+#   语料      ${SELFDISTILL_DIR}/<域>_pool_selfdistill_${MODEL_NAME}.jsonl（108 号，
+#             就是在本脚本读的那三份 93 号池上整份贪心生成的）
+#   答案列    targets（gold_targets 不读）
+#   drop_truncated 1 —— 与第 4 条相反：这里的 truncated 说的就是要训的这份答案被
+#             预算截断了，没有停止符（108 号第 4 条）
+#   maxlen    不变（if 512 / math,code 1024），108 号生成时用的就是这组预算
+#
+# 行数因此比 C 的 pool_rows 少（丢掉的是 prompt 越界 + 答案没写完的行），Step 1
+# 改为对 108 号的 .meta.json：训练行数 == meta.usable_rows、model_name == MODEL_NAME、
+# max_len == REPLAY_MAXLEN、complete 为真，并且 meta.pool_path 必须就是 93 号那份池
+# —— 否则 old_val 切片与 replay 行不再保证不相交。只对 ARM=replay 有意义。
+# run 名带 _sd，汇总表标 replay-sd。
+#
+# -----------------------------------------------------------------------------
 # 5. !! replay_max_len 跟着 C 走，不跟着新任务走
 # ----------------------------------------------
 # 新任务是 MAXLEN=1216，三个旧池是 512 / 1024 / 1024。这**不是**要对齐的两个数：
@@ -334,6 +353,7 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     NORM_BY_LAYERS REG_ONCE REG_IMPL IDENTITY_COV MEASURE_ZERO
     REPLAY_MODE REPLAY_PER_BATCH REPLAY_STEPS_PER_UPDATE
     REPLAY_MAXLEN REPLAY_DROP_TRUNCATED REPLAY_SAMPLE_SEED
+    REPLAY_SOURCE SELFDISTILL_DIR
     MATH_VIEW_PREFIX CODE_VIEW_PREFIX
     BENCH_ROOT FPB_DATA FIQASA_DATA TFNS_DATA
     MATH_DATA_DIR CODE_DATA_DIR MATH500_FILE GSM8K_FILE
@@ -478,8 +498,24 @@ REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-4}"
 REPLAY_STEPS_PER_UPDATE="${REPLAY_STEPS_PER_UPDATE:-8}"
 # 必须等于 93 号采该域 C/F 时的 --sample_seed。
 REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
-# 见第 4 条：那个标记说的是自蒸馏答案顶到了上限，与 gold_targets 无关。
-REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED:-0}"
+# replay 读哪份答案，见第 4b 条。gold = 池自带的 gold_targets；selfdistill = 108 号采的底座答案。
+REPLAY_SOURCE="${REPLAY_SOURCE:-gold}"
+case "${REPLAY_SOURCE}" in
+  gold|selfdistill) ;;
+  *) echo "REPLAY_SOURCE 只能是 gold / selfdistill，得到 '${REPLAY_SOURCE}'" >&2; exit 2 ;;
+esac
+if [[ "${REPLAY_SOURCE}" == "selfdistill" && "${ARM}" != "replay" ]]; then
+  echo "REPLAY_SOURCE=selfdistill 只对 ARM=replay 有意义（${ARM} 臂不读 replay 语料）。" >&2
+  exit 2
+fi
+SELFDISTILL_DIR="${SELFDISTILL_DIR:-${REPO_ROOT}/datasets/selfdistill}"
+# gold（第 4 条）：那个标记说的是 1.7B 自蒸馏答案顶到了上限，与 gold_targets 无关，必须 0。
+# selfdistill（第 4b 条）：标记说的就是要训的这份答案被截断了，必须 1。
+if [[ "${REPLAY_SOURCE}" == "selfdistill" ]]; then
+  REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED:-1}"
+else
+  REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED:-0}"
+fi
 
 DRY_RUN="${DRY_RUN:-1}"
 DO_TRAIN="${DO_TRAIN:-1}"
@@ -526,10 +562,21 @@ MIX_FISHER="${MIX_FISHER:-${FISHER_DIR}/fisher_${MIX_TAG}_gold_all.pt}"
 # 切走，所以这里三个域的参数除了 maxlen 之外完全相同。
 pool_file_for () { printf '%s' "${SPLIT_DIR}/$1_pool.jsonl"; }
 val_file_for ()  { printf '%s' "${SPLIT_DIR}/$1_val${OLD_VAL_ROWS}.jsonl"; }
+# 108 号在 pool_file_for 那份池上整份生成的自蒸馏语料，见第 4b 条。
+sd_file_for ()   { printf '%s' "${SELFDISTILL_DIR}/$1_pool_selfdistill_${MODEL_NAME}.jsonl"; }
+# replay 臂实际读的那份：gold 读 93 号池，selfdistill 读 108 号语料。
+replay_file_for () {
+  if [[ "${REPLAY_SOURCE}" == "selfdistill" ]]; then sd_file_for "$1"; else pool_file_for "$1"; fi
+}
 
 REPLAY_INPUT_COLUMN="inputs"
-REPLAY_TARGET_COLUMN="gold_targets"
+if [[ "${REPLAY_SOURCE}" == "selfdistill" ]]; then
+  REPLAY_TARGET_COLUMN="targets"
+else
+  REPLAY_TARGET_COLUMN="gold_targets"
+fi
 REPLAY_POOL_SIZE=0              # 文件本身就是池，不再二次切
+REPLAY_FILE=""
 REPLAY_MIX_FILES=""
 REPLAY_MIX_WEIGHTS=""
 # 哪几个域的 val 切片要每个 epoch 打一次。单域一个，mix 两个（分开报，见第 9 条）。
@@ -540,7 +587,6 @@ case "${DOMAIN}" in
     COV_PATH="${COV_PATH:-${IF_COV}}"
     FISHER_PATH="${FISHER_PATH:-${IF_FISHER}}"
     REPLAY_DATA_FILES="$(pool_file_for if)"
-    REPLAY_FILE=""
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-512}"   # = 93 号的 IF_MAXLEN
     OLD_VAL_DOMAINS="if"
     ;;
@@ -548,7 +594,6 @@ case "${DOMAIN}" in
     COV_PATH="${COV_PATH:-${MATH_COV}}"
     FISHER_PATH="${FISHER_PATH:-${MATH_FISHER}}"
     REPLAY_DATA_FILES="$(pool_file_for math)"
-    REPLAY_FILE=""
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
     OLD_VAL_DOMAINS="math"
     ;;
@@ -556,7 +601,6 @@ case "${DOMAIN}" in
     COV_PATH="${COV_PATH:-${CODE_COV}}"
     FISHER_PATH="${FISHER_PATH:-${CODE_FISHER}}"
     REPLAY_DATA_FILES="$(pool_file_for code)"
-    REPLAY_FILE=""
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
     OLD_VAL_DOMAINS="code"
     ;;
@@ -568,7 +612,7 @@ case "${DOMAIN}" in
     REPLAY_DATA_FILES=""
     REPLAY_FILE=""
     for _d in ${MIX_DOMAINS//,/ }; do
-      REPLAY_MIX_FILES="${REPLAY_MIX_FILES}${REPLAY_MIX_FILES:+,}${_d}=$(pool_file_for "${_d}")"
+      REPLAY_MIX_FILES="${REPLAY_MIX_FILES}${REPLAY_MIX_FILES:+,}${_d}=$(replay_file_for "${_d}")"
       OLD_VAL_DOMAINS="${OLD_VAL_DOMAINS}${OLD_VAL_DOMAINS:+ }${_d}"
     done
     REPLAY_MIX_WEIGHTS="${MIX_WEIGHTS}"
@@ -577,6 +621,12 @@ case "${DOMAIN}" in
     REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"
     ;;
 esac
+# 单域 selfdistill：换成 --replay_self_distill_file 那条路（按 index 排回池序、
+# 按 truncated 丢行），不再走 --replay_data_files 的 shuffle。
+if [[ "${REPLAY_SOURCE}" == "selfdistill" && "${DOMAIN}" != "mix" ]]; then
+  REPLAY_FILE="$(sd_file_for "${DOMAIN}")"
+  REPLAY_DATA_FILES=""
+fi
 
 # =============================================================================
 # λ：onereplay / ewc 必须显式给，见第 2 条。
@@ -695,6 +745,8 @@ run_name_for () {
   local tag="${DOMAIN}"
   [[ "${DOMAIN}" == "mix" ]] && tag="${MIX_TAG}"
   local name="fin_${ARM}_${tag}"
+  # 自蒸馏语料的 replay 带 _sd，否则会覆盖 gold 那条的 checkpoint 与评测结果。
+  [[ "${REPLAY_SOURCE}" == "selfdistill" ]] && name="${name}_sd"
   # 步级 replay 自带编排后缀，否则它与批级臂同名，会覆盖对方的 checkpoint 并在
   # <metric>_summary.csv 里挤成一行 —— 而这两条臂正是要并排读的。批级不加后缀：
   # 已经跑完的那些 run 名必须保持原样，否则找不到自己的 checkpoint 和评测结果。
@@ -767,7 +819,8 @@ echo "  新任务   = ${DATASET_DIR}"
 case "${ARM}" in
   onereplay) echo "  C        = ${COV_PATH}   identity_cov=${IDENTITY_COV}" ;;
   ewc)       echo "  F        = ${FISHER_PATH}" ;;
-  replay)    echo "  replay 池 = ${REPLAY_MIX_FILES:-${REPLAY_DATA_FILES}}"
+  replay)    echo "  replay 数据 = $([[ "${REPLAY_SOURCE}" == "selfdistill" ]] && echo "self-distill（${MODEL_NAME} 自蒸馏答案，108 号产物）" || echo "gold（池自带答案）")"
+             echo "  replay 池 = ${REPLAY_MIX_FILES:-${REPLAY_FILE:-${REPLAY_DATA_FILES}}}"
              [[ -n "${REPLAY_MIX_WEIGHTS}" ]] && echo "             行份额 ${REPLAY_MIX_WEIGHTS}"
              echo "             答案列 ${REPLAY_TARGET_COLUMN} / maxlen ${REPLAY_MAXLEN} /"
              echo "             drop_truncated ${REPLAY_DROP_TRUNCATED}" ;;
@@ -878,6 +931,12 @@ for _d in ${OLD_VAL_DOMAINS}; do
     echo "找不到池文件: $(pool_file_for "${_d}")" >&2
     echo "  它是 93 号 Step 1 的产物（物化后的池，C / F / replay 三者共用）：" >&2
     echo "    qsub -v DRY_RUN=0 onereplay/pbs/93_finance_gold_cf.pbs" >&2
+    exit 1
+  fi
+  if [[ "${ARM}" == "replay" && "${REPLAY_SOURCE}" == "selfdistill" && ! -f "$(sd_file_for "${_d}")" ]]; then
+    echo "找不到自蒸馏语料: $(sd_file_for "${_d}")" >&2
+    echo "  它是 108 号的产物：" >&2
+    echo "    qsub -v DRY_RUN=0,MODELS=${MODEL_NAME},DOMAINS=${_d} onereplay/pbs/108_selfdistill_pools.pbs" >&2
     exit 1
   fi
   if [[ "${OLD_VAL}" == "1" && ! -f "$(val_file_for "${_d}")" ]]; then
@@ -1060,15 +1119,18 @@ if [[ "${ARM}" == "replay" ]]; then
   DOMAIN="${DOMAIN}" COV_PATH="${COV_PATH}" SKIP_POOL_CHECK="${SKIP_POOL_CHECK}" \
   MIX_COV_LIST="${MIX_COV_LIST}" \
   REPLAY_MIX_FILES="${REPLAY_MIX_FILES}" REPLAY_MIX_WEIGHTS="${REPLAY_MIX_WEIGHTS}" \
-  REPLAY_DATA_FILES="${REPLAY_DATA_FILES}" \
+  REPLAY_DATA_FILES="${REPLAY_DATA_FILES}" REPLAY_FILE="${REPLAY_FILE}" \
+  REPLAY_SOURCE="${REPLAY_SOURCE}" MODEL_NAME="${MODEL_NAME}" SPLIT_DIR="${SPLIT_DIR}" \
   REPLAY_TARGET_COLUMN="${REPLAY_TARGET_COLUMN}" REPLAY_INPUT_COLUMN="${REPLAY_INPUT_COLUMN}" \
   REPLAY_POOL_SIZE="${REPLAY_POOL_SIZE}" REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED}" \
   REPLAY_MAXLEN="${REPLAY_MAXLEN}" REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED}" \
   MAXLEN="${MAXLEN}" DATASET_CACHE="${DATASET_CACHE}" \
   python - <<'PY'
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
 import torch
 
@@ -1088,7 +1150,7 @@ args = argparse.Namespace(
     replay_data_files=os.environ["REPLAY_DATA_FILES"],
     replay_split="train",
     replay_cache_dir=os.environ["DATASET_CACHE"],
-    replay_self_distill_file="",
+    replay_self_distill_file=os.environ["REPLAY_FILE"],
     replay_mix_files=os.environ["REPLAY_MIX_FILES"],
     replay_mix_weights=os.environ["REPLAY_MIX_WEIGHTS"],
     replay_drop_truncated=int(os.environ["REPLAY_DROP_TRUNCATED"]),
@@ -1101,11 +1163,13 @@ args = argparse.Namespace(
 )
 
 failures = []
+self_distill_source = os.environ.get("REPLAY_SOURCE", "gold") == "selfdistill"
 # 池清单走 train.py 自己的解析函数，不在这里另切一遍字符串 —— 那样解析出来的
 # 东西和训练实际消费的可以不一致，而这一步的全部意义就是证明两者一致。
 mix = parse_replay_mix(args)
 
 print(f"  域           = {os.environ['DOMAIN']}")
+print(f"  replay 数据  = {'self-distill' if self_distill_source else 'gold'}")
 print(f"  答案列       = {args.replay_target_column}   ({replay_target_flavor(args)})")
 print(f"  replay_max_len = {replay_max_len(args)}   (新任务仍是 {args.max_len})")
 
@@ -1114,7 +1178,7 @@ if mix:
     cov_paths = [item for item in os.environ.get("MIX_COV_LIST", "").split(",") if item]
     print(f"  池数         = {len(specs)}（行份额由 loader 逐 micro-batch 落实）")
 else:
-    specs = [("", args.replay_data_files, 1.0)]
+    specs = [("", args.replay_self_distill_file or args.replay_data_files, 1.0)]
     cov_paths = [os.environ["COV_PATH"]]
 
 
@@ -1141,7 +1205,15 @@ def assemble(path):
         # self_distill_file=path)，走的就是这一条。物化后的池没有 index 列，
         # 于是 load_self_distilled_pool 不排序，结果就是文件序。
         pool = load_self_distilled_pool(args, path)
-        ordering = "文件序（物化后的池没有 index 列，不排序也不 shuffle）"
+        ordering = (
+            "按 index 列排回池序（108 号写入），不再 shuffle"
+            if self_distill_source
+            else "文件序（物化后的池没有 index 列，不排序也不 shuffle）"
+        )
+    elif args.replay_self_distill_file:
+        # 与 build_replay_dataset 的单池自蒸馏分支同一个函数：按 index 排序、按 truncated 丢行。
+        pool = load_self_distilled_pool(args)
+        ordering = "按 index 列排回池序（108 号写入），不再 shuffle"
     else:
         pool = load_replay_pool(args)
         raw_total = len(pool)
@@ -1204,6 +1276,68 @@ def check_against_cov(tag, cov_path, after_pool, rows):
         )
 
 
+def check_against_sd_meta(tag, path, cov_path, rows):
+    """selfdistill 档的对表，见文件头第 4b 条。行数对 meta，来源池对 93 号的池与 C。"""
+
+    meta_path = Path(path[: -len(".jsonl")] + ".meta.json" if path.endswith(".jsonl") else path + ".meta.json")
+    if not meta_path.is_file():
+        failures.append(
+            f"{tag}: 缺 {meta_path}。没有它就证明不了这份语料是 {os.environ['MODEL_NAME']} "
+            "在 93 号的池上生成的（old_val 是否与 replay 行不相交也无从确认）。"
+            "确实要跑就 SKIP_POOL_CHECK=1 并在结果里注明。"
+        )
+        return
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    print(f"  meta[{tag}]   = {meta_path}")
+    print(f"    model_name       = {meta.get('model_name')}")
+    print(f"    pool_path        = {meta.get('pool_path')}")
+    print(f"    pool_usable_rows = {meta.get('pool_usable_rows')}")
+    print(f"    usable_rows      = {meta.get('usable_rows')} / generated {meta.get('generated_rows')}"
+          f"（丢 {meta.get('dropped_rows')}）")
+    print(f"    max_len          = {meta.get('max_len')}   complete={meta.get('complete')}")
+    print(f"    答案 token       = 中位 {meta.get('median_answer_tokens')} / P95 {meta.get('p95_answer_tokens')}")
+
+    if meta.get("model_name") != os.environ["MODEL_NAME"]:
+        failures.append(
+            f"{tag}: 语料由 {meta.get('model_name')} 生成，本次训练的是 {os.environ['MODEL_NAME']}。"
+            "拿别的模型的答案来训是跨模型蒸馏，不是自蒸馏。"
+        )
+    if not meta.get("complete"):
+        failures.append(f"{tag}: complete={meta.get('complete')}，108 号还没采完（或只是冒烟的半份）。")
+    if meta.get("max_len") is not None and int(meta["max_len"]) != replay_max_len(args):
+        failures.append(
+            f"{tag}: 生成预算 max_len={meta['max_len']} 与 replay_max_len={replay_max_len(args)} 不等。"
+        )
+    want_pool = os.path.realpath(os.path.join(os.environ["SPLIT_DIR"], f"{tag}_pool.jsonl"))
+    if os.path.realpath(str(meta.get("pool_path") or "")) != want_pool:
+        failures.append(
+            f"{tag}: 语料是在 {meta.get('pool_path')} 上生成的，不是 93 号的 {want_pool}。"
+            "old_val 切片与 replay 行就不保证不相交了。"
+        )
+    if meta.get("usable_rows") is None:
+        failures.append(f"{tag}: meta 里没有 usable_rows，行数无从对表。")
+    elif int(meta["usable_rows"]) != rows:
+        failures.append(
+            f"{tag}: replay 会训 {rows} 行，meta 记的可用行是 {meta['usable_rows']}。"
+            "先查 replay_drop_truncated（应为 1）与答案列（应为 targets）。"
+        )
+    else:
+        print(f"    -> 行数一致（{rows}），与 108 号记录的可用行相同。")
+
+    # 生成它的那份池就是采 C 的那份池：meta 的分母要等于 C 的 pool_rows。
+    cov_rows = load_cov_meta(cov_path).get("pool_rows") if cov_path else None
+    source_rows = {meta.get("pool_rows"), meta.get("pool_usable_rows")} - {None}
+    if cov_rows is not None and source_rows:
+        if int(cov_rows) not in {int(value) for value in source_rows}:
+            failures.append(
+                f"{tag}: 108 号生成时池有 {meta.get('pool_rows')} 行（可用 {meta.get('pool_usable_rows')}），"
+                f"C 是在 {cov_rows} 行上采的。93 号在那之后重切过池（FORCE_PREP），自蒸馏语料要重采。"
+            )
+        else:
+            print(f"    -> 来源池与 C 同一批 {cov_rows} 行；replay 实训 {rows} 行"
+                  f"（{int(cov_rows) - rows} 行因 prompt 越界或答案截断被丢，写进报告）。")
+
+
 total_rows = 0
 for index, (label, path, weight) in enumerate(specs):
     tag = label or os.environ["DOMAIN"]
@@ -1224,7 +1358,13 @@ for index, (label, path, weight) in enumerate(specs):
     if mix:
         print(f"  行份额       = {weight:.4f}")
 
-    if args.replay_drop_truncated == 1 and has_truncated:
+    if self_distill_source:
+        if args.replay_drop_truncated != 1 and has_truncated:
+            failures.append(
+                f"{tag}: selfdistill 档 replay_drop_truncated 必须是 1：truncated 行的 targets"
+                " 是被预算截断的自蒸馏答案，没有停止符。"
+            )
+    elif args.replay_drop_truncated == 1 and has_truncated:
         failures.append(
             f"{tag}: replay_drop_truncated=1 且池里有 truncated 列：那些行的 gold_targets"
             " 是完整的，93 号采矩阵时也算了它们。丢掉它们等于 replay 训的行比 C 覆盖的少。"
@@ -1232,6 +1372,8 @@ for index, (label, path, weight) in enumerate(specs):
 
     if os.environ["SKIP_POOL_CHECK"] == "1":
         print("  SKIP_POOL_CHECK=1：不与 C 对表，本臂与 onereplay 是否同池没有证据。")
+    elif self_distill_source:
+        check_against_sd_meta(tag, path, cov_paths[index] if index < len(cov_paths) else "", rows)
     elif index < len(cov_paths):
         check_against_cov(tag, cov_paths[index], after_pool, rows)
     else:
@@ -1350,6 +1492,8 @@ arm_train_args () {
         printf '%s\n' \
           --replay_mix_files "${REPLAY_MIX_FILES}" \
           --replay_mix_weights "${REPLAY_MIX_WEIGHTS}"
+      elif [[ -n "${REPLAY_FILE}" ]]; then
+        printf '%s\n' --replay_self_distill_file "${REPLAY_FILE}"
       else
         printf '%s\n' --replay_data_files "${REPLAY_DATA_FILES}"
       fi
@@ -1436,6 +1580,20 @@ assert_orchestration () {
   fi
   echo "  !! 日志里没有 '${want}'"
   grep -F "accumulation" "${log_path}" | head -n 2 || true
+  return 1
+}
+
+# replay 训到的是哪份答案，只有 build_replay_pools 打的这一行能证明。
+assert_replay_source () {
+  local log_path="$1" want="replay targets: gold-target"
+  [[ "${ARM}" != "replay" ]] && return 0
+  [[ "${REPLAY_SOURCE}" == "selfdistill" ]] && want="replay targets: self-distilled"
+  if grep -qF -- "${want}" "${log_path}"; then
+    echo "  ok  ${want}"
+    return 0
+  fi
+  echo "  !! 日志里没有 '${want}'"
+  grep -F "replay targets:" "${log_path}" | head -n 1 || true
   return 1
 }
 
@@ -1673,6 +1831,10 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
       echo "   每次更新的新任务行数不是 ${NEW_PER_UPDATE}，与其他臂不再可比。这个 run 不可用。" >&2
       exit 1
     fi
+    if ! assert_replay_source "${TRAIN_LOG}"; then
+      echo "   replay 训到的答案与 REPLAY_SOURCE=${REPLAY_SOURCE} 不符，run 名名不副实。这个 run 不可用。" >&2
+      exit 1
+    fi
     if [[ "${ARM}" == "ewc" ]] && grep -qF -- "covariance matrices from" "${TRAIN_LOG}"; then
       echo "   !! 日志里出现了 'covariance matrices from'：罚项来自 C 而不是 F。" >&2
       exit 1
@@ -1815,8 +1977,18 @@ fi
 echo
 echo "========================================================================"
 ARM_LABEL="${ARM}"
-[[ "${ARM}" == "replay" ]] && ARM_LABEL="${ARM}(${REPLAY_MODE})"
+if [[ "${ARM}" == "replay" ]]; then
+  if [[ "${REPLAY_SOURCE}" == "selfdistill" ]]; then
+    ARM_LABEL="replay-sd(${REPLAY_MODE})"
+  else
+    ARM_LABEL="${ARM}(${REPLAY_MODE})"
+  fi
+fi
 echo "结果汇总：${ARM_LABEL} 保护 ${DOMAIN}   λ=${LAMBDA_LIST[0]:-（不用）}"
+if [[ "${ARM}" == "replay" && "${REPLAY_SOURCE}" == "selfdistill" ]]; then
+  echo "!! 这是 replay 的 self-distill 版本：replay 数据 = ${MODEL_NAME} 自蒸馏答案（targets 列，"
+  echo "   ${SELFDISTILL_DIR}），不是 gold。行来自同一份 93 号池，但丢掉了截断行。"
+fi
 echo "========================================================================"
 OUT_DIR="${EVAL_ROOT}" RUN_NAME="${RUN}" ARM_NAME="${ARM_LABEL}" \
 COST_MULTIPLE="$(awk -v a="${ARM_ACCUM}" -v b="${ACCUM}" 'BEGIN{printf "%.6f", a/b}')" \
@@ -1833,6 +2005,7 @@ run_name = os.environ["RUN_NAME"]
 base_name = os.environ["BASE_NAME"]
 vanilla_name = os.environ["VANILLA_NAME"]
 arm_name = os.environ["ARM_NAME"]
+arm_w = max(11, len(arm_name) + 1)
 metric_names = os.environ["METRIC_NAMES"].split()
 
 NEW_TASK = {"fpb", "fiqasa", "tfns"}
@@ -1876,7 +2049,7 @@ def read_retention(metric, name):
 
 print("保留（d_base 是遗忘量，d_van 才是本臂救回来多少 —— 后者是方法的效果）")
 print(
-    f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>11}"
+    f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>{arm_w}}"
     f"{'d_base(pp)':>12}{'d_van(pp)':>11}{'ret_van':>10}{'ret_ours':>10}{'d_ret(pp)':>11}"
 )
 print("-" * 97)
@@ -1896,14 +2069,14 @@ for metric in metric_names:
         else None
     )
     print(
-        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", 11)
+        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", arm_w)
         + cell(d_base, "+.2f", 12) + cell(d_van, "+.2f", 11)
         + cell(ret_van) + cell(ret_ours) + cell(d_ret, "+.2f", 11)
     )
 
 print()
 print("新任务（方向相反：这里掉了就是在拿 finance 的性能换旧能力）")
-print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>11}{'d_van(pp)':>12}")
+print(f"{'metric':<12}{'base':>10}{'vanilla':>10}{arm_name:>{arm_w}}{'d_van(pp)':>12}")
 print("-" * 55)
 for metric in metric_names:
     if metric not in NEW_TASK:
@@ -1913,7 +2086,7 @@ for metric in metric_names:
     ours = read_score(metric, run_name)
     d_van = (ours - van) * 100 if (van is not None and ours is not None) else None
     print(
-        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", 11)
+        f"{metric:<12}" + cell(base) + cell(van) + cell(ours, ".4f", arm_w)
         + cell(d_van, "+.2f", 12)
     )
 
@@ -1985,12 +2158,12 @@ if old_keys:
 print()
 print("新任务拟合与开销（全量微调下三条臂的额外内存是能逐项点名的）:")
 print(
-    f"{'':<14}{'val_loss':>12}{'train_sec':>12}{'peak_mem_GB':>13}"
+    f"{'':<{arm_w + 3}}{'val_loss':>12}{'train_sec':>12}{'peak_mem_GB':>13}"
     f"{'mat_mem_GB':>12}{'W0_mem_GB':>11}"
 )
 for label, row in (("vanilla", van_m), (arm_name, ours_m)):
     print(
-        f"{label:<14}"
+        f"{label:<{arm_w + 3}}"
         + cell(row.get("val_loss"), ".6f", 12)
         + cell(row.get("train_sec"), ".0f", 12)
         + cell(row.get("peak_memory_gb"), ".2f", 13)
@@ -2032,5 +2205,12 @@ for _arm in onereplay ewc replay_batch replay_step; do
       ;;
   esac
 done
+if [[ "${ARM}" == "replay" && "${REPLAY_SOURCE}" == "selfdistill" ]]; then
+  echo "  本条是 replay 的 self-distill 版。gold 对照（同池同编排，只差答案来源）:"
+  echo "    qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=replay,REPLAY_MODE=${REPLAY_MODE} ${SELF_PATH}"
+else
+  echo "  replay 的 self-distill 版（replay 数据换成 ${MODEL_NAME} 自蒸馏答案）:"
+  echo "    qsub -v DRY_RUN=0,DOMAIN=${DOMAIN},ARM=replay,REPLAY_MODE=step,REPLAY_SOURCE=selfdistill ${SELF_PATH}"
+fi
 echo "  换一个保护域就改 DOMAIN=（if / math / code），λ 要各扫各的。"
 echo "========================================================================"
