@@ -1460,8 +1460,15 @@ def main() -> None:
             ),
             # Replay rows can be tokenized at a different budget than the new
             # task, so the effective one has to be recorded rather than inferred
-            # from max_len.
-            "replay_max_len": replay_max_len(args) if args.replay_per_batch > 0 else 0,
+            # from max_len. Step-level mixing tokenizes its pool through the
+            # same build_replay_pools call, so it carries a budget too; reading
+            # only replay_per_batch reported 0 for it and made the field look
+            # like "no replay" on exactly the arms that had it.
+            "replay_max_len": (
+                replay_max_len(args)
+                if args.replay_per_batch > 0 or args.replay_steps_per_update > 0
+                else 0
+            ),
             # Whether the rehearsal rows arrived in the form the model was
             # taught them in. Empty means they inherited the new task's turn,
             # which is right for a single-corpus run and wrong for a continual

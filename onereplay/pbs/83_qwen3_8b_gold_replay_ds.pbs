@@ -45,6 +45,7 @@
 #
 # -----------------------------------------------------------------------------
 # !! 2 new + 2 replay，以及 ACCUM 为什么是 128 而不是 64
+#   （以下是 REPLAY_MODE=batch，默认档。步级见下一条。）
 #   本臂用 batch 级混合（--replay_per_batch），不是数据级（--replay_ratio）：
 #   数据级混完再全局 shuffle，一个 accumulation 窗口里的新任务行数是二项分布
 #   （64 ± 5.7），batch 级是逐 micro-batch 定死的。
@@ -58,6 +59,34 @@
 #
 #   这就是为什么本脚本的 ACCUM 默认 128 而 81 号是 64，而两者的 new_per_update
 #   都是 64。Step 0 断言的是 new_per_update，不是 ACCUM。
+#
+# -----------------------------------------------------------------------------
+# !! REPLAY_MODE=batch / step：同一批旧数据，两种 loss 平均方式
+#   两条路见到的旧知识完全相同（同一个池、同一个 seed、同一份答案列、同样 64 行
+#   new + 64 行 replay/更新、同样 32 个 micro-batch x 4 行）。唯一的差别是 loss
+#   在哪一层做平均，而这个差别不小：
+#
+#   batch  新任务行与 replay 行在**同一个** micro-batch 里，共用一次 token 平均。
+#          于是各自占多少梯度取决于**答案长度**，而不是行数。finance 线实测
+#          50.00% 的行份额在 math 上携带 98.51% 的 supervised token（新任务答案
+#          2.5 token，math 答案 167.2 token）。本线是 DialogSum 摘要，答案不算短，
+#          真实份额要看自己 train.log 里 describe() 打的那行：
+#              replay share of rows=..., of supervised tokens=...
+#
+#   step   两类 micro-batch 各自按自己的 token 平均，window 再等权相加，所以
+#          累积梯度精确等于
+#
+#              (1 - w) * L_new + w * L_replay ,   w = R / (new_steps + R)
+#
+#          与答案长度无关。这就是 CL 文献里 L = L_new + L_replay 的标准写法，
+#          梯度累积只是它的实现手段。R=16 时 w 是精确的 0.5。
+#
+#   步级的 ACCUM 不用动：window_steps = ACCUM/BATCH = 32，new_steps = 32 - R，
+#   R=16 就是 16 x 4 = 64 行新任务/更新，与批级那档逐行相等。所以这两条臂是彼此
+#   的对照臂，不是两套实验 —— 并排跑出来的差，量的就是"行份额 != loss 权重"这件
+#   事在本线上值多少 retention。
+#
+#   run 名自带 _step 后缀（16n16r_step），不会覆盖批级的 2n2r。
 #
 #   池是被**循环**用的，不是无放回采样。这是刻意的 —— 池就是产生 C 的那批行，
 #   为了避免重复而扩池等于让 replay 拿到比 C 更多的信息。
@@ -208,6 +237,16 @@
 #     注意自己把 ACCUM 配平到 new_per_update=64：(ACCUM/4) x (4-3) = 64 -> ACCUM=256
 #     配不平就取最近的整数步，Step 0 会打印实际值并要求 ALLOW_DRIFT=1 才放行。
 #     BATCH=4 下只有 1/2/3 三种 replay 行数可选，1:1 是默认那档。
+#
+#   步级混合（new 一个 micro-batch、replay 一个 micro-batch，见文件头第 3 条）:
+#   qsub -v DRY_RUN=0,DOMAIN=if,REPLAY_MODE=step   onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
+#   qsub -v DRY_RUN=0,DOMAIN=math,REPLAY_MODE=step onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
+#   qsub -v DRY_RUN=0,DOMAIN=code,REPLAY_MODE=step onereplay/pbs/83_qwen3_8b_gold_replay_ds.pbs
+#     ACCUM 不用动（默认 128）：R=16 时 new_steps=16，16 x 4 = 64 行新任务/更新，
+#     与批级那档逐行相等，w 精确 0.5。run 名是 ..._16n16r_step_...
+#   换步级比例（w = R/32，同样要把 new_per_update 配回 64，Step 0 会拦）:
+#   qsub -v DRY_RUN=0,DOMAIN=if,REPLAY_MODE=step,REPLAY_STEPS_PER_UPDATE=8,ACCUM=96 <本脚本>
+#     (96/4 - 8) x 4 = 64，w = 8/24 = 0.3333
 #   拆两次投（训练与评测分开）:
 #   qsub -v DRY_RUN=0,DOMAIN=if,DO_EVAL=0  ...   然后   DO_TRAIN=0
 #
@@ -277,7 +316,8 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATASET_CACHE OUT_DIR FLAN_DIR POOL_ROOT
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE ALLOW_DRIFT SKIP_POOL_CHECK
     DOMAIN COV_PATH IF_COV MATH_COV CODE_COV
-    REPLAY_PER_BATCH REPLAY_FILE REPLAY_DATA_FILES REPLAY_TARGET_COLUMN
+    REPLAY_MODE REPLAY_PER_BATCH REPLAY_STEPS_PER_UPDATE
+    REPLAY_FILE REPLAY_DATA_FILES REPLAY_TARGET_COLUMN
     REPLAY_INPUT_COLUMN REPLAY_POOL_SIZE REPLAY_SAMPLE_SEED REPLAY_MAXLEN
     REPLAY_DROP_TRUNCATED REPLAY_MIX_FILES REPLAY_MIX_WEIGHTS
     MIX_DOMAINS MIX_WEIGHTS WITH_RETENTION
@@ -398,6 +438,17 @@ BATCH="${BATCH:-4}"              # micro-batch 总行数，与 vanilla 同值才
 # 每次更新的新任务行数回到 64。见文件头的算术。
 ACCUM="${ACCUM:-128}"
 REPLAY_PER_BATCH="${REPLAY_PER_BATCH:-2}"   # 从 BATCH 里切出来的 replay 行数
+# 混合粒度，见文件头第 3 条。batch 与 step 见到的旧知识完全相同，只差 loss 在哪
+# 一层平均，所以它们是彼此的对照臂，不是两套实验。
+REPLAY_MODE="${REPLAY_MODE:-batch}"
+case "${REPLAY_MODE}" in
+  batch|step) ;;
+  *) echo "REPLAY_MODE 只能是 batch / step，得到 '${REPLAY_MODE}'" >&2; exit 1 ;;
+esac
+# step 模式：window 里几个 micro-batch 整批是 replay。默认 16 = ACCUM/BATCH/2，
+# 于是 new_steps 也是 16，w = 16/32 = 0.5，正好 1:1，与批级臂的行份额对齐，
+# 且每次更新的新任务行数仍是 16 x 4 = 64。batch 模式下这个值不用。
+REPLAY_STEPS_PER_UPDATE="${REPLAY_STEPS_PER_UPDATE:-16}"
 EVAL_BATCH="${EVAL_BATCH:-8}"    # 钉住，否则 val_loss 与 74 号及其余各臂不可比
 MAXLEN="${MAXLEN:-1024}"
 VAL_FRAC="${VAL_FRAC:-0.04}"
@@ -563,9 +614,21 @@ if [[ "${PROBE}" == "1" ]]; then
 fi
 
 # 每次更新的新任务行数：这是与 74/81 号必须相等的量（不是 ACCUM）。
-NEW_PER_BATCH=$(( BATCH - REPLAY_PER_BATCH ))
+# 两种模式只会有一个非零：批级是每步少几行，步级是少几步。所以下面那个式子对两
+# 条路都成立，Step 0 只要断言 NEW_PER_UPDATE 就够，不必分模式各写一遍。
+ARM_REPLAY_PER_BATCH=0
+ARM_REPLAY_STEPS=0
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+  ARM_REPLAY_STEPS="${REPLAY_STEPS_PER_UPDATE}"
+else
+  ARM_REPLAY_PER_BATCH="${REPLAY_PER_BATCH}"
+fi
+NEW_PER_BATCH=$(( BATCH - ARM_REPLAY_PER_BATCH ))
 ACCUM_STEPS=$(( ACCUM / BATCH ))
-NEW_PER_UPDATE=$(( ACCUM_STEPS * NEW_PER_BATCH ))
+NEW_STEPS=$(( ACCUM_STEPS - ARM_REPLAY_STEPS ))
+NEW_PER_UPDATE=$(( NEW_STEPS * NEW_PER_BATCH ))
+# 步级下 replay 也是整批，所以它的行数由步数定；批级下由每步切几行定。
+REPLAY_PER_UPDATE=$(( ARM_REPLAY_STEPS * BATCH + NEW_STEPS * ARM_REPLAY_PER_BATCH ))
 
 # ---- run 名：域与混合比都编进去 ----
 # 71/81/82 号都是这个默认值，三个脚本的 run 名要能并排比较，这里不能不一样。
@@ -585,7 +648,15 @@ else
   DOMAIN_TAG="${DOMAIN}gold"
   DOMAIN_ARGS="DOMAIN=${DOMAIN}"
 fi
-RUN="${RUN:-ds_replay_8b_${DOMAIN_TAG}_${RUN_TAG}_${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r_lr${LR}_seed${SEED}}"
+# 混合比标签：批级数的是每个 micro-batch 里的行，步级数的是 window 里的步。
+# 批级那串必须逐字保持原样（2n2r），否则已经跑完的那些 run 找不到自己的 adapter
+# 和评测结果；步级自带 _step 后缀，两条臂因此能并排读而不互相覆盖。
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+  ORCH_TAG="${NEW_STEPS}n${ARM_REPLAY_STEPS}r_step"
+else
+  ORCH_TAG="${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r"
+fi
+RUN="${RUN:-ds_replay_8b_${DOMAIN_TAG}_${RUN_TAG}_${ORCH_TAG}_lr${LR}_seed${SEED}}"
 # 74 号的 vanilla：分母。名字必须按同一套规则拼，否则末尾的对照表读不到它。
 VANILLA_RUN="${VANILLA_RUN:-ds_vanilla_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS}_seed${SEED}}"
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
@@ -704,8 +775,17 @@ if [[ "${DOMAIN}" == "mix" ]]; then
 else
   echo "  同池参照 = ${COV_PATH}   skip_check=${SKIP_POOL_CHECK}"
 fi
-echo "  混合     = ${NEW_PER_BATCH} new + ${REPLAY_PER_BATCH} replay / micro-batch(${BATCH})"
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+echo "  混合     = 步级：window ${ACCUM_STEPS} 步 = ${NEW_STEPS} 新任务 + ${ARM_REPLAY_STEPS} replay，整批不混"
+echo "             ${NEW_STEPS} x ${BATCH} = ${NEW_PER_UPDATE} 行新任务/更新（要 = 64），replay ${REPLAY_PER_UPDATE} 行"
+echo "             w = ${ARM_REPLAY_STEPS}/${ACCUM_STEPS} = $(awk -v a="${ARM_REPLAY_STEPS}" -v b="${ACCUM_STEPS}" 'BEGIN{printf "%.4f", a/b}')  （精确的 loss 权重，与答案长度无关）"
+else
+echo "  混合     = 批级：${NEW_PER_BATCH} new + ${REPLAY_PER_BATCH} replay / micro-batch(${BATCH})"
 echo "             accum_steps ${ACCUM_STEPS} x ${NEW_PER_BATCH} = ${NEW_PER_UPDATE} 行新任务/更新（要 = 64）"
+echo "             !! 行份额 ${REPLAY_PER_BATCH}/${BATCH} 不是 loss 权重：两类行共用一次 token"
+echo "                平均，真实权重取决于答案长度。训完看 train.log 里 describe() 那行"
+echo "                'replay share of rows=..., of supervised tokens=...'"
+fi
 echo "  LoRA     = r${LORA_RANK} alpha${LORA_ALPHA} dropout${LORA_DROPOUT}"
 echo "             targets=${TARGET_MODULES}"
 echo "  训练     = LR ${LR} / EPOCHS ${EPOCHS} / BATCH ${BATCH} / ACCUM ${ACCUM} / MAXLEN ${MAXLEN}"
@@ -797,13 +877,22 @@ elif [[ ! -f "${COV_PATH}" ]]; then
 fi
 
 # ---- 混合比的算术：要保的是新任务行数，不是 ACCUM ----
-if (( REPLAY_PER_BATCH <= 0 || REPLAY_PER_BATCH >= BATCH )); then
+if (( ACCUM % BATCH != 0 )); then
+  echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"; exit 1
+fi
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+  # train.py 自己也会算 new_steps = accumulation_size/batch_size - R 并拒绝
+  # 不整除的组合。这里先替它算一遍，对不上就现在退，而不是等它跑起来。
+  if (( ARM_REPLAY_STEPS <= 0 || ARM_REPLAY_STEPS >= ACCUM_STEPS )); then
+    echo "!! REPLAY_STEPS_PER_UPDATE=${ARM_REPLAY_STEPS} 必须在 1..$((ACCUM_STEPS-1)) 之间"
+    echo "   （window 是 ACCUM/BATCH = ${ACCUM_STEPS} 步）。=0 就是 vanilla（74 号），"
+    echo "   =${ACCUM_STEPS} 就一个新任务 micro-batch 都不剩了。"
+    exit 1
+  fi
+elif (( REPLAY_PER_BATCH <= 0 || REPLAY_PER_BATCH >= BATCH )); then
   echo "!! REPLAY_PER_BATCH=${REPLAY_PER_BATCH} 必须在 1..$((BATCH-1)) 之间。"
   echo "   =0 就是 vanilla（74 号），=BATCH 就一行新任务都没有了。"
   exit 1
-fi
-if (( ACCUM % BATCH != 0 )); then
-  echo "ACCUM=${ACCUM} 不能被 BATCH=${BATCH} 整除，每次更新的行数会被静默取整"; exit 1
 fi
 
 # 74 号钉下来的值。LR 不在其中：它是有意留的自由度，但必须与被比的 vanilla 同值。
@@ -815,8 +904,13 @@ DRIFT=()
 [[ "${LORA_DROPOUT}" == "0.05" ]] || DRIFT+=("lora_dropout=${LORA_DROPOUT}（74 号: 0.05）")
 [[ "${BATCH}"        == "4"    ]] || DRIFT+=("batch_size=${BATCH}（74 号: 4，每步开销靠它可比）")
 # 本臂刻意与 74 号不同的一项。要对齐的是 NEW_PER_UPDATE，ACCUM 只是达到它的手段。
-(( NEW_PER_UPDATE == 64 )) || DRIFT+=("每次更新的新任务行数=${NEW_PER_UPDATE}（74/81 号: 64）；\
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+  (( NEW_PER_UPDATE == 64 )) || DRIFT+=("每次更新的新任务行数=${NEW_PER_UPDATE}（74/81 号: 64）；\
+调 ACCUM 使 (ACCUM/${BATCH}-${ARM_REPLAY_STEPS})x${BATCH}=64，当前 ACCUM=${ACCUM} R=${ARM_REPLAY_STEPS}")
+else
+  (( NEW_PER_UPDATE == 64 )) || DRIFT+=("每次更新的新任务行数=${NEW_PER_UPDATE}（74/81 号: 64）；\
 调 ACCUM 使 (ACCUM/${BATCH})x${NEW_PER_BATCH}=64，当前 ACCUM=${ACCUM}")
+fi
 [[ "${EVAL_BATCH}"   == "8"    ]] || DRIFT+=("eval_batch_size=${EVAL_BATCH}（74 号: 8，val_loss 靠它可比）")
 [[ "${MAXLEN}"       == "1024" ]] || DRIFT+=("max_len=${MAXLEN}（74 号: 1024，对话比 CS 的短指令长）")
 [[ "${VAL_FRAC}"     == "0.04" ]] || DRIFT+=("val_fraction=${VAL_FRAC}（74 号: 0.04，12460 行的 1% 只切出 125 行）")
@@ -876,6 +970,7 @@ export REPLAY_FILE REPLAY_DATA_FILES REPLAY_TARGET_COLUMN REPLAY_INPUT_COLUMN
 export REPLAY_POOL_SIZE REPLAY_SAMPLE_SEED REPLAY_MAXLEN REPLAY_DROP_TRUNCATED
 export MAXLEN DATASET_CACHE LEN_DIAG_SAMPLE
 export BATCH REPLAY_PER_BATCH ACCUM EPOCHS
+export REPLAY_MODE ARM_REPLAY_STEPS NEW_STEPS NEW_PER_UPDATE REPLAY_PER_UPDATE
 export REPLAY_MIX_FILES REPLAY_MIX_WEIGHTS MIX_COV_LIST
 POOL_REPORT_FILE="${TMPDIR}/pool_preflight_${RUN}.txt"
 
@@ -1066,18 +1161,36 @@ batch = int(os.environ["BATCH"])
 per_batch = int(os.environ["REPLAY_PER_BATCH"])
 accum = int(os.environ["ACCUM"])
 epochs = int(os.environ["EPOCHS"])
-new_per_batch = batch - per_batch
+step_mode = os.environ.get("REPLAY_MODE", "batch") == "step"
+replay_steps = int(os.environ.get("ARM_REPLAY_STEPS", "0"))
+new_steps = int(os.environ.get("NEW_STEPS", accum // batch))
+new_per_update = int(os.environ.get("NEW_PER_UPDATE", accum // batch * (batch - per_batch)))
+new_per_batch = batch if step_mode else batch - per_batch
 total_rows = sum(item["rows"] for item in assembled)
 print()
 print("---- 混合比")
-print(f"micro-batch {batch} = {new_per_batch} new + {per_batch} replay")
-print(f"每次更新的新任务行 = ({accum}/{batch}) x {new_per_batch} = {accum // batch * new_per_batch}"
-      "   (74/81 号是 64)")
+if step_mode:
+    window = new_steps + replay_steps
+    print(f"window {window} 步 x {batch} 行 = {window * batch} 行/更新："
+          f"{new_steps} 步整批新任务 + {replay_steps} 步整批 replay")
+    print(f"每次更新的新任务行 = {new_steps} x {batch} = {new_per_update}   (74/81 号是 64)")
+    print(f"replay 的 loss 权重 w = {replay_steps}/{window} = {replay_steps / window:.4f}"
+          "   （精确值，与答案长度无关）")
+else:
+    print(f"micro-batch {batch} = {new_per_batch} new + {per_batch} replay")
+    print(f"每次更新的新任务行 = ({accum}/{batch}) x {new_per_batch} = {new_per_update}"
+          "   (74/81 号是 64)")
+    print("replay 的 loss 权重 = 它的 supervised token 份额，不是行份额 "
+          f"{per_batch}/{batch}；实际值看训练日志 describe() 那行")
 if total_rows:
     # DialogSum 的确切行数由 train.py 划分 val 后才定，这里只按池的循环
     # 次数给个量级：replay 消费的行数 = 新任务步数 x per_batch。
-    print(f"池合计 {total_rows} 行被循环使用；每 epoch 的 replay 行数 = "
-          f"(新任务行数/{new_per_batch}) x {per_batch}")
+    if step_mode:
+        print(f"池合计 {total_rows} 行被循环使用；每 epoch 的 replay 行数 = "
+              f"(新任务行数/{new_steps}) x {replay_steps}")
+    else:
+        print(f"池合计 {total_rows} 行被循环使用；每 epoch 的 replay 行数 = "
+              f"(新任务行数/{new_per_batch}) x {per_batch}")
     print(f"{epochs} 个 epoch 下来会把池过很多遍。这是刻意的：为了避免重复而扩池，")
     print("等于让 replay 拿到比 C 更多的信息，对比就不成立了。")
     if mix:
@@ -1244,7 +1357,6 @@ set -x
 #   读了 C 就白付 33.75 GB 显存和每步的求值，本臂上报的开销也就不是它自己的了。
 # ===========================================================================
 REPLAY_ARGS=(
-  --replay_per_batch "${REPLAY_PER_BATCH}"
   --replay_input_column "${REPLAY_INPUT_COLUMN}"
   --replay_target_column "${REPLAY_TARGET_COLUMN}"
   --replay_pool_size "${REPLAY_POOL_SIZE}"
@@ -1253,6 +1365,14 @@ REPLAY_ARGS=(
   --replay_drop_truncated "${REPLAY_DROP_TRUNCATED}"
   --replay_cache_dir "${DATASET_CACHE}"
 )
+# 两个编排旗标互斥，train.py 在同时收到时会报错。批级传每步切几行，步级传
+# window 里几步整批是 replay；new_steps 由 train.py 自己从 accumulation_size 减
+# 出来，所以这里不传，两套算术对不上就会在训练自检那一关被抓住。
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+  REPLAY_ARGS+=( --replay_steps_per_update "${ARM_REPLAY_STEPS}" )
+else
+  REPLAY_ARGS+=( --replay_per_batch "${REPLAY_PER_BATCH}" )
+fi
 if [[ -n "${REPLAY_MIX_FILES}" ]]; then
   # 多池：每个 micro-batch 里的 replay 行按权重在这些池之间分配，由 loader 的
   # 调度器逐 batch 落实。--replay_self_distill_file 一个都不能传 —— train.py 在
@@ -1273,7 +1393,7 @@ if [[ "${DO_TRAIN}" == "1" ]]; then
     echo "跳过训练 ${RUN}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
   else
     mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
-    echo "==== train: ${RUN} (${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r, 池=${POOL_GLOB}) ===="
+    echo "==== train: ${RUN} (${ORCH_TAG}, 池=${POOL_GLOB}) ===="
     # 训练输出同时留一份文件：池行数、混合比、答案口径那几句只在 stdout 上，
     # metrics jsonl 里没有。
     python -m onereplay.scripts.train --paradigm sft \
@@ -1327,8 +1447,29 @@ if [[ -f "${TRAIN_LOG}" ]]; then
       "训练用的池行数与 Step 1 数出的 ${EXPECT_POOL_ROWS} 不符。行数变了就不再与 81 号同池。"
   fi
   # 混合比：describe() 打的是实际装配出来的，不是命令行回显。
-  assert_log "batch-level replay: ${NEW_PER_BATCH} new + ${REPLAY_PER_BATCH} replay per micro-batch (micro-batch=${BATCH})" \
-    "实际混合比与 run 名不符。run 名里的 ${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r 就名不副实了。"
+  if [[ "${REPLAY_MODE}" == "step" ]]; then
+    # layout 那串（nnRnn...）跟在后面，不进断言：它由 R 和 window 唯一决定，
+    # 前半句对上了它就对上了，而写进来只会让这行断言随 R 变得难维护。
+    assert_log "step-level replay: ${NEW_STEPS} new + ${ARM_REPLAY_STEPS} replay micro-batches per update (window=${ACCUM_STEPS} steps x ${BATCH} rows)" \
+      "实际编排与 run 名不符。run 名里的 ${ORCH_TAG} 就名不副实了。"
+    # 步级唯一的卖点就是这个权重与答案长度无关，所以把它断言死。
+    assert_log "replay's share of the accumulated gradient = $(awk -v a="${ARM_REPLAY_STEPS}" -v b="${ACCUM_STEPS}" 'BEGIN{printf "%.4f", a/b}')" \
+      "replay 的 loss 权重不是 R/window，编排被 train.py 改写过。"
+  else
+    assert_log "batch-level replay: ${NEW_PER_BATCH} new + ${REPLAY_PER_BATCH} replay per micro-batch (micro-batch=${BATCH})" \
+      "实际混合比与 run 名不符。run 名里的 ${ORCH_TAG} 就名不副实了。"
+  fi
+  # 编排到底生效了没有，只有 train.py 自己打的这行 accumulation 能证明。它推
+  # new_steps / new_per_batch 的方式和本脚本推 NEW_PER_UPDATE 的方式是两套算术，
+  # 对上了才说明「每次更新 64 行新任务」这个跨臂不变量真的成立 —— 而它错了的表现
+  # 只是 retention 偏一点，不会报错。
+  if [[ "${REPLAY_MODE}" == "step" ]]; then
+    assert_log "of which ${NEW_PER_UPDATE} are new-task rows (${NEW_STEPS} steps) and ${REPLAY_PER_UPDATE} are replay (${ARM_REPLAY_STEPS} steps)" \
+      "train.py 算出的每次更新新任务行数与本脚本的 ${NEW_PER_UPDATE} 不符，与 74/81 号不再可比。"
+  else
+    assert_log "accumulation: ${ACCUM_STEPS} steps x ${NEW_PER_BATCH} new-task rows = ${NEW_PER_UPDATE} new-task rows per update" \
+      "train.py 算出的每次更新新任务行数与本脚本的 ${NEW_PER_UPDATE} 不符，与 74/81 号不再可比。"
+  fi
   # 答案口径：从 gold_targets 列读的话这一句会写明「column ... of the self-distilled file」。
   # mix 也走这一支：replay_target_flavor 把 --replay_mix_files 也算作自蒸馏来源。
   if [[ -n "${REPLAY_FILE}" || -n "${REPLAY_MIX_FILES}" ]]; then
@@ -1400,7 +1541,9 @@ if [[ -f "${METRICS_FILE}" ]]; then
   VANILLA_METRICS="${RESULTS_ROOT}/metrics/${VANILLA_RUN}.jsonl" \
   ONEREPLAY_METRICS="${ONEREPLAY_METRICS:-}" \
   WANT_BATCH="${BATCH}" WANT_ACCUM="${ACCUM}" WANT_EVAL_BATCH="${EVAL_BATCH}" \
-  WANT_EPOCHS="${EPOCHS}" WANT_PER_BATCH="${REPLAY_PER_BATCH}" \
+  WANT_EPOCHS="${EPOCHS}" WANT_PER_BATCH="${ARM_REPLAY_PER_BATCH}" \
+  WANT_REPLAY_MODE="${REPLAY_MODE}" WANT_REPLAY_STEPS="${ARM_REPLAY_STEPS}" \
+  WANT_REPLAY_PER_UPDATE="${REPLAY_PER_UPDATE}" \
   WANT_NEW_PER_UPDATE="${NEW_PER_UPDATE}" WANT_REPLAY_MAXLEN="${REPLAY_MAXLEN}" \
   WANT_SELF_DISTILL_FILE="${REPLAY_FILE}" \
   WANT_MIX_FILES="${REPLAY_MIX_FILES}" WANT_MIX_WEIGHTS="${REPLAY_MIX_WEIGHTS}" \
@@ -1437,9 +1580,21 @@ print(f"records         = {len(epochs)} 条 epoch 记录（含历史追加），
 print(f"regularizer     = {last.get('regularizer')}   penalty_path={last.get('penalty_path')!r}")
 print("  ^ regularizer 是 train.py 的默认值，本臂没传；看下面两行才知道有没有罚项")
 print(f"replay_lambda   = {last.get('replay_lambda')}   (本臂必须是 0)")
-print(f"replay_per_batch= {last.get('replay_per_batch')} (want {os.environ['WANT_PER_BATCH']})")
-print(f"new_per_batch   = {last.get('new_per_batch')}")
-print(f"replay_row_share= {last.get('replay_row_share')}")
+step_mode = os.environ["WANT_REPLAY_MODE"] == "step"
+if step_mode:
+    # 步级下 new_per_batch / replay_row_share 按设计留 0（micro-batch 是同质的，
+    # 没有"批内行份额"这个量），所以这里改看步数和那个精确的 loss 权重。
+    print(f"replay_steps_per_update = {last.get('replay_steps_per_update')} "
+          f"(want {os.environ['WANT_REPLAY_STEPS']})")
+    print(f"replay_per_update = {last.get('replay_per_update')} "
+          f"(want {os.environ['WANT_REPLAY_PER_UPDATE']})")
+    print(f"replay_loss_weight= {last.get('replay_loss_weight')}"
+          "   (= R/window，精确值；批级下这里是 null)")
+else:
+    print(f"replay_per_batch= {last.get('replay_per_batch')} (want {os.environ['WANT_PER_BATCH']})")
+    print(f"new_per_batch   = {last.get('new_per_batch')}")
+    print(f"replay_row_share= {last.get('replay_row_share')}")
+    print("  ^ 行份额，不是 loss 权重。后者取决于答案长度，只在训练日志里")
 print(f"new_per_update  = {last.get('new_per_update')} (want {want_new_per_update}；74/81 号是 64)")
 print(f"batch/accum     = {last.get('batch_size')}/{last.get('accumulation_size')} "
       f"(want {os.environ['WANT_BATCH']}/{os.environ['WANT_ACCUM']})")
@@ -1460,7 +1615,23 @@ if last.get("covariance_memory_gb"):
         f"covariance_memory_gb={last.get('covariance_memory_gb')}：C 被加载了。"
         "开销数字（train_sec / peak_memory_gb）作废，加 --measure_replay_when_lambda_zero 0 重跑。"
     )
-if int(last.get("replay_per_batch") or 0) != int(os.environ["WANT_PER_BATCH"]):
+if step_mode:
+    if int(last.get("replay_steps_per_update") or 0) != int(os.environ["WANT_REPLAY_STEPS"]):
+        failures.append(
+            f"replay_steps_per_update={last.get('replay_steps_per_update')}，"
+            "与 run 名里的编排不符"
+        )
+    if int(last.get("replay_per_batch") or 0) != 0:
+        failures.append(
+            f"replay_per_batch={last.get('replay_per_batch')}，步级臂不该同时有批级混合。"
+            "两个旗标一起传的话 micro-batch 又变回混合的了。"
+        )
+    if int(last.get("replay_per_update") or 0) != int(os.environ["WANT_REPLAY_PER_UPDATE"]):
+        failures.append(
+            f"replay_per_update={last.get('replay_per_update')}，"
+            f"本次要求 {os.environ['WANT_REPLAY_PER_UPDATE']}"
+        )
+elif int(last.get("replay_per_batch") or 0) != int(os.environ["WANT_PER_BATCH"]):
     failures.append(
         f"replay_per_batch={last.get('replay_per_batch')}，与 run 名里的配比不符"
     )
@@ -1572,8 +1743,14 @@ if vanilla:
         print(f"val_loss 差值 = {last['val_loss'] - v_last['val_loss']:+.6f}"
               "  （<=0 就是新任务没被 replay 拖慢，主表要的就是这一点）")
     if v_last.get("train_sec") and last.get("train_sec"):
+        # 两种编排的 2x 来路不同：批级是每步只装一半新任务行，步级是步数翻倍。
+        # 结论一样，但打成哪一句得看这条 run 自己是谁。
+        if step_mode:
+            why = (f"window 里 {os.environ['WANT_REPLAY_STEPS']} 步是 replay，micro-batch 数翻倍")
+        else:
+            why = f"每步只装 {last.get('new_per_batch')} 行新任务"
         print(f"墙钟倍数 = {last['train_sec'] / v_last['train_sec']:.2f}x"
-              f"  （每步只装 {last.get('new_per_batch')} 行新任务，约 2x 是预期的）")
+              f"  （{why}，约 2x 是预期的）")
     if v_last.get("peak_memory_gb") and last.get("peak_memory_gb"):
         print(f"峰值显存差 = {last['peak_memory_gb'] - v_last['peak_memory_gb']:+.2f} GB"
               "  （行数不变且 replay 行的 P90 低于新任务的 512，应该接近 0；"
@@ -1891,7 +2068,7 @@ fi
 set +x
 echo ""
 echo "========================================================================"
-echo "结果汇总：保护 ${DOMAIN}   replay ${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r"
+echo "结果汇总：保护 ${DOMAIN}   replay(${REPLAY_MODE}) ${ORCH_TAG}"
 if [[ "${DOMAIN}" == "mix" ]]; then
   echo "replay 池 = ${MIX_FORMULA}"
 fi
@@ -2066,7 +2243,8 @@ if "dialogsum" in metric_names:
         if gap < -1.0:
             print("  掉了 1pp 以上：混入比例偏高，新任务被挤掉的训练量已经能测出来。")
             print("  主表的 d_van 里有一部分不是'保住了旧能力'而是'没学会新任务'，")
-            print("  两张表必须一起报，或者调低 REPLAY_PER_BATCH 再跑一个点。")
+            print("  两张表必须一起报，或者调低混合比再跑一个点"
+                  "（批级 REPLAY_PER_BATCH，步级 REPLAY_STEPS_PER_UPDATE）。")
     if not van_ds or not ds["base"]:
         print("  base/vanilla 是 '-'：74 号那轮还没评 dialogsum。补评不用重训 ——")
         print("  qsub -v DRY_RUN=0,DO_TRAIN=0,WITH_BASE=1,WITH_VANILLA=1,... 本脚本")
@@ -2075,8 +2253,10 @@ if "dialogsum" in metric_names:
     print("  BERTScore 未做 baseline rescaling，绝对值天然在 0.8+，只有 delta 有意义。")
 print()
 print("这一臂的开销结论（文档 6.3 要的对照）:")
-print("  常驻显存 0（不加载 C），但每步只装 %s 行新任务，墙钟约 vanilla 的 2x，"
-      % (ours_m.get("new_per_batch") or "?"))
+# replay_per_update 两种编排都有值；new_per_batch 只有批级有（步级的 micro-batch
+# 是同质的，那个字段按设计留 0），拿它写这句会让步级臂打出 "0 行新任务"。
+print("  常驻显存 0（不加载 C），但每次更新多跑 %s 行 replay，墙钟约 vanilla 的 2x，"
+      % (ours_m.get("replay_per_update") or "?"))
 print("  而且必须一直留着整个语料。OneReplay 反过来：语料只过一遍，之后常驻一份 C。")
 PY
 
@@ -2111,13 +2291,22 @@ echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},DO_TRAIN=0,DO_EVAL=0,ONEREPLAY_METRICS
 echo "   换混合比是本臂自己的旋钮（记得同时配平 ACCUM 让 new/update 回到 64）:"
 echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},REPLAY_PER_BATCH=3,ACCUM=256 ${SELF_PATH}"
 echo "   配比写在 run 名里，不会互相覆盖。"
+if [[ "${REPLAY_MODE}" == "step" ]]; then
+  echo "   本条是步级臂。批级那条（同池同行数，只差 loss 在哪一层平均）是:"
+  echo "     ds_replay_8b_${DOMAIN_TAG}_${RUN_TAG}_$((BATCH - REPLAY_PER_BATCH))n${REPLAY_PER_BATCH}r_lr${LR}_seed${SEED}"
+  echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS} ${SELF_PATH}"
+else
+  echo "   步级对照臂（同池同行数，replay 的 loss 权重精确 0.5，与答案长度无关）:"
+  echo "   qsub -v DRY_RUN=0,${DOMAIN_ARGS},REPLAY_MODE=step ${SELF_PATH}"
+  echo "   本条批级臂的真实权重看训练日志里 'of supervised tokens=' 那个数。"
+fi
 if [[ "${DOMAIN}" == "mix" ]]; then
   echo ""
   echo "4) mix 臂特有：把两侧分开读。这一臂只有在两个被复习的域**都**不比对应的"
   echo "   单域臂差得多时才算成立；若一侧保住、另一侧塌了，要报的是这个权衡，"
   echo "   而不是两边的平均分。对照的是:"
   for d in "${MIX_DOMAIN_LIST[@]}"; do
-    echo "     ds_replay_8b_${d}gold_${RUN_TAG}_${NEW_PER_BATCH}n${REPLAY_PER_BATCH}r_lr${LR}_seed${SEED}"
+    echo "     ds_replay_8b_${d}gold_${RUN_TAG}_${ORCH_TAG}_lr${LR}_seed${SEED}"
   done
   echo "   注意单域臂上每个池被过的遍数是本臂的约 $(( ${#MIX_DOMAIN_LIST[@]} ))x（replay 的总"
   echo "   消耗量不变，摊到了 ${#MIX_DOMAIN_LIST[@]} 个池上）。这个差别要写进报告。"
