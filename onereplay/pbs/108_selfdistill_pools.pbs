@@ -1,0 +1,712 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_sdpool
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: 在**全量**保护域池子上做自蒸馏，两个基座各采一份
+#
+# 产物是 replay 臂的另一种答案来源：同一批旧知识的行，答案从数据集自带的
+# gold_targets 换成**基座自己的贪心输出**。93 号切出来的三个池整份都过一遍。
+#
+# -----------------------------------------------------------------------------
+# 1. 为什么值得采这一份
+#
+#   gold 目标对一个已经指令微调过的基座来说不是"复习"而是"学一个新任务"：
+#   FLAN 的 gold 是一行式答案键，起始 loss 约 3.0（新任务只有 0.05），名义 10%
+#   的样本吃掉近 80% 的梯度。13 号那条线上 IFEval 从 0.634 掉到 0.486，42% 的
+#   回答陷入重复退化 —— replay 臂反而在教模型换一种说话方式。
+#
+#   换成基座自己的答案后，replay 的初始 loss 接近 0，它只起**锚定 W0** 的作用。
+#   那正是 OneReplay 的罚项所近似的东西，两条路线消费的信息才对等。所以这一份
+#   语料既是"更强的 replay 基线"，也是让 replay vs OneReplay 变成
+#   apples-to-apples 的前提。
+#
+# -----------------------------------------------------------------------------
+# 2. !! 语料与基座是绑死的，两个基座必须各采一份
+#
+#   "自蒸馏"的定义就是"**这个**模型自己的答案"。拿 1.5B 的答案去训 8B，那是
+#   跨模型蒸馏，是另一个方法，不是这个。所以文件名里带 MODEL_NAME，而且每份
+#   语料旁边写一个 .meta.json 记下是谁、用什么解码生成的 —— 107 号踩过这个坑，
+#   靠文件名防不住。
+#
+#   两个基座的答案长度分布会明显不同（8B 更啰嗦），所以下面的可用率、耗时都要
+#   分开看，不要拿 1.5B 那一轮的数去估 8B 那一轮。
+#
+# -----------------------------------------------------------------------------
+# 3. !! --max_len 必须等于训练时的 --replay_max_len
+#
+#   生成侧的 --max_len 是**训练序列预算**，不是生成长度上限。脚本按它逐批收缩
+#   生成预算（budget = max_len - 本批最长 prompt - length_margin），保证
+#   prompt + 答案 + 模板一定塞得进训练时的窗口，训练时不会触发左截断。
+#
+#   所以它必须和 95 号那个域的 REPLAY_MAXLEN 对齐，本脚本的默认值就是照抄的：
+#
+#       if    512      math  1024      code  1024
+#
+#   卡小了：答案被预算截断 -> 标 truncated -> 训练时丢行，池子白采一部分。
+#   卡大了：训练时左截断，行保住了但**问题被砍掉、只剩答案**，问答复习退化成
+#   裸续写。两头都不是"答案没了"这么简单，DRY_RUN 会把越界行数先报出来。
+#
+# -----------------------------------------------------------------------------
+# 4. !! 采完之后，95 号的 REPLAY_DROP_TRUNCATED 要从 0 改成 1
+#
+#   95 号现在钉的是 0，理由写在它文件头第 4 条：它训的是 gold_targets，而池文件
+#   里那个 truncated 标记说的是**1.7B 当年自蒸馏时**答案顶到了上限，与 gold 无关，
+#   传 1 会白丢约 13% 的行。
+#
+#   这一份语料反过来：targets 就是自蒸馏答案，truncated 说的就是**这一份答案**
+#   被截断了。截断的答案没有停止符，训它等于教模型别结束回合 —— 13 号那条线上
+#   的重复退化就是这么来的。所以用这份语料训练时必须 --replay_drop_truncated 1。
+#
+#   本脚本 --keep_truncated_text 0：截断行的 targets 直接写空串，to_sft_schema
+#   无论如何都会滤掉，双保险。
+#
+# -----------------------------------------------------------------------------
+# 5. 行序：--sample_shuffle 1 + --sample_seed 1，与 95 号 gold 路径逐字一致
+#
+#   95 号 gold 那一路走 cut_pool(shuffle(seed=1), pool_size=0)，也就是**整份文件
+#   按 seed 1 洗一遍**。自蒸馏那一路走 load_self_distilled_pool，它按写进去的
+#   index 排序、不再洗。所以这里用 shuffle 1 / seed 1 生成，index 就是 gold 路径
+#   里的位置，两条臂的行序才逐字相同。
+#
+#   pool_size=0 整份都要，所以洗不洗都不改变**集合**，只改变顺序；而批级/步级
+#   混合的 loader 每轮还会自己再洗一次。真正吃顺序的是数据级混合
+#   （--replay_ratio 取前 N 行），那条路在 finance 线上没人走。留着对齐是为了
+#   将来真有人走的时候不用回头查。
+#
+# -----------------------------------------------------------------------------
+# 6. 解码口径：贪心 + 不开思考块
+#
+#   TEMPERATURE=0（贪心）与 13/107 号已有的自蒸馏语料同口径。ENABLE_THINKING=0
+#   是硬要求：开了之后 Qwen3 会吐 <think> 段，长度翻几倍，绝大多数行会被预算
+#   截断；而且 collect_cov 那边不传 --concat_prompt_target 1 的话，chat 模板会
+#   把 <think> 再剥掉，语料和矩阵就对不上了。
+#
+# -----------------------------------------------------------------------------
+# 7. 耗时：这是本作业唯一需要你先估一下的东西
+#
+#   6 份语料 = 2 个基座 x 3 个域，每份都是整池。池子是万行量级，8B 又比 1.5B
+#   慢好几倍，一次 24h 的 walltime **大概率吃不下全部 6 份**。
+#
+#   所以：先 DRY_RUN=1 看 Step 0 打的行数与预算分析，再按 (基座, 域) 分批投。
+#   脚本对每份语料都能断点续跑（--resume 1 + meta.json 完整性判据），被
+#   walltime 砍掉之后直接重投同一条命令就接着写，不会重复也不会串行。
+#
+#   冒烟：NUM_SAMPLES=64 先看几十行的生成质量，再放开跑整池。冒烟写进的是同一个
+#   jsonl，正式跑会从第 65 行接着写，不冲突。
+#
+# -----------------------------------------------------------------------------
+# 投递:
+#   # 看计划 + 预算分析（默认，不加载权重、不生成，几分钟）
+#   qsub onereplay/pbs/108_selfdistill_pools.pbs
+#
+#   # 先冒烟：两个基座 x 三个域各 64 行，看答案像不像话
+#   qsub -v DRY_RUN=0,NUM_SAMPLES=64 onereplay/pbs/108_selfdistill_pools.pbs
+#
+#   # 正式跑，按基座拆开投（推荐）
+#   qsub -v DRY_RUN=0,MODELS=Qwen2.5-1.5B-Instruct onereplay/pbs/108_selfdistill_pools.pbs
+#   qsub -v DRY_RUN=0,MODELS=Qwen3-8B onereplay/pbs/108_selfdistill_pools.pbs
+#
+#   # 8B 太慢就再按域拆（DOMAINS 用冒号，qsub -v 自己按逗号切参数）
+#   qsub -v DRY_RUN=0,MODELS=Qwen3-8B,DOMAINS=math onereplay/pbs/108_selfdistill_pools.pbs
+#   qsub -v DRY_RUN=0,MODELS=Qwen3-8B,DOMAINS=if:code onereplay/pbs/108_selfdistill_pools.pbs
+#
+#   # 被 walltime 砍了：原样重投，接着写
+#   # 要推倒重来：FORCE_GEN=1
+#
+# 产物:
+#   ${SD_DIR}/<domain>_pool_selfdistill_<MODEL_NAME>.jsonl
+#   ${SD_DIR}/<domain>_pool_selfdistill_<MODEL_NAME>.meta.json
+#
+#   每行: index / inputs / targets（自蒸馏答案）/ gold_targets（池子自带的原答案）
+#         truncated / prompt_tokens / target_tokens
+#   gold_targets 原样留着，所以同一份文件可以直接做 "gold vs 自蒸馏" 的消融：
+#   --replay_self_distill_file FILE --replay_target_column gold_targets 就是
+#   "同样这批行、同样这个顺序，只把答案换回 gold"。
+#
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/108_selfdistill_pools.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。起容器，然后把脚本自己在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODELS DOMAINS POOL_ROOT DATASETS_ROOT SD_DIR
+    POOL_INPUT_COLUMN POOL_TARGET_COLUMN
+    SEED SAMPLE_SEED SAMPLE_SHUFFLE NUM_SAMPLES
+    GEN_BATCH GEN_BATCH_8B GEN_MIN_NEW GEN_LEN_MARGIN
+    MAXLEN_IF MAXLEN_MATH MAXLEN_CODE
+    MAX_NEW_IF MAX_NEW_MATH MAX_NEW_CODE
+    TEMPERATURE ENABLE_THINKING LOG_EVERY
+    DRY_RUN FORCE_GEN KEEP_GOING ANALYZE_ROWS
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python : $(which python)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+cd "${REPO_ROOT}"
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+# qsub -v 按逗号切参数，所以从命令行传多个值时用冒号；这里归一回空格。
+MODELS="${MODELS:-Qwen2.5-1.5B-Instruct:Qwen3-8B}"
+MODELS="${MODELS//,/ }"; MODELS="${MODELS//:/ }"
+DOMAINS="${DOMAINS:-if:math:code}"
+DOMAINS="${DOMAINS//,/ }"; DOMAINS="${DOMAINS//:/ }"
+
+# 三个池：93 号 Step 1 物化出来的那一份，只读。列名已经归一成
+# inputs / gold_targets、val 尾巴已经切走，所以这里整份直接用。
+POOL_ROOT="${POOL_ROOT:-${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/pools}"
+POOL_INPUT_COLUMN="${POOL_INPUT_COLUMN:-inputs}"
+POOL_TARGET_COLUMN="${POOL_TARGET_COLUMN:-gold_targets}"
+
+DATASETS_ROOT="${DATASETS_ROOT:-${REPO_ROOT}/datasets}"
+SD_DIR="${SD_DIR:-${DATASETS_ROOT}/selfdistill}"
+
+SEED="${SEED:-1}"
+# = 95 号的 REPLAY_SAMPLE_SEED，也 = 93 号采 C/F 的 --sample_seed。见文件头第 5 条。
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+SAMPLE_SHUFFLE="${SAMPLE_SHUFFLE:-1}"
+NUM_SAMPLES="${NUM_SAMPLES:-0}"          # 0 = 整池；冒烟时设 64
+
+GEN_BATCH="${GEN_BATCH:-32}"             # 1.5B
+GEN_BATCH_8B="${GEN_BATCH_8B:-8}"        # 8B 显存吃紧，单独给
+GEN_MIN_NEW="${GEN_MIN_NEW:-16}"
+GEN_LEN_MARGIN="${GEN_LEN_MARGIN:-8}"
+
+# 训练预算，逐字照抄 95 号各域的 REPLAY_MAXLEN。见文件头第 3 条。
+MAXLEN_IF="${MAXLEN_IF:-512}"
+MAXLEN_MATH="${MAXLEN_MATH:-1024}"
+MAXLEN_CODE="${MAXLEN_CODE:-1024}"
+# 生成长度上限。逐批还会被 max_len - 最长 prompt - margin 压得更低，所以这里只是
+# 个天花板；给足即可，给小了反而会把本来放得下的答案砍掉。
+MAX_NEW_IF="${MAX_NEW_IF:-448}"
+MAX_NEW_MATH="${MAX_NEW_MATH:-960}"
+MAX_NEW_CODE="${MAX_NEW_CODE:-960}"
+
+TEMPERATURE="${TEMPERATURE:-0}"          # 0 = 贪心，与已有自蒸馏语料同口径
+ENABLE_THINKING="${ENABLE_THINKING:-0}"  # 必须 0，见文件头第 6 条
+LOG_EVERY="${LOG_EVERY:-20}"
+
+DRY_RUN="${DRY_RUN:-1}"
+FORCE_GEN="${FORCE_GEN:-0}"
+KEEP_GOING="${KEEP_GOING:-0}"            # 1 = 某份失败了继续采下一份
+ANALYZE_ROWS="${ANALYZE_ROWS:-2000}"     # Step 0 预算分析的抽样行数，0 = 全量
+
+if [[ "${ENABLE_THINKING}" != "0" ]]; then
+  echo "!! ENABLE_THINKING=${ENABLE_THINKING}：思考块会让绝大多数行被预算截断，" >&2
+  echo "   而且 collect_cov 不传 --concat_prompt_target 1 时模板会把 <think> 剥掉。" >&2
+  echo "   确定要开就把这道闸删了，但别忘了同步改 93 号。" >&2
+  exit 2
+fi
+
+pool_file_for () { printf '%s' "${POOL_ROOT}/$1_pool.jsonl"; }
+sd_file_for ()   { printf '%s' "${SD_DIR}/$1_pool_selfdistill_$2.jsonl"; }
+meta_file_for () { printf '%s' "${SD_DIR}/$1_pool_selfdistill_$2.meta.json"; }
+
+maxlen_for () {
+  case "$1" in
+    if)   printf '%s' "${MAXLEN_IF}" ;;
+    math) printf '%s' "${MAXLEN_MATH}" ;;
+    code) printf '%s' "${MAXLEN_CODE}" ;;
+    *)    echo "未知域 '$1'" >&2; return 1 ;;
+  esac
+}
+max_new_for () {
+  case "$1" in
+    if)   printf '%s' "${MAX_NEW_IF}" ;;
+    math) printf '%s' "${MAX_NEW_MATH}" ;;
+    code) printf '%s' "${MAX_NEW_CODE}" ;;
+    *)    echo "未知域 '$1'" >&2; return 1 ;;
+  esac
+}
+# 8B 的 batch 单独给：同样的 batch 在 8B 上要多吃约 5 倍的 KV cache。
+batch_for () {
+  case "$1" in
+    *8B*|*8b*) printf '%s' "${GEN_BATCH_8B}" ;;
+    *)         printf '%s' "${GEN_BATCH}" ;;
+  esac
+}
+
+mkdir -p "${SD_DIR}"
+
+echo "========================================================================"
+echo "全量池自蒸馏采集：${MODELS} x ${DOMAINS}"
+echo "  池目录   = ${POOL_ROOT}   （列 ${POOL_INPUT_COLUMN}/${POOL_TARGET_COLUMN}）"
+echo "  模型目录 = ${MODEL_DIR}"
+echo "  输出     = ${SD_DIR}"
+echo "  解码     = $([[ "${TEMPERATURE}" == "0" ]] && echo 贪心 || echo "采样 T=${TEMPERATURE}") / thinking=${ENABLE_THINKING} / seed ${SEED}"
+echo "  池顺序   = sample_shuffle=${SAMPLE_SHUFFLE} sample_seed=${SAMPLE_SEED}（= 95 号 gold 路径）"
+echo "  每域预算 = if ${MAXLEN_IF} / math ${MAXLEN_MATH} / code ${MAXLEN_CODE}   （= 95 号 REPLAY_MAXLEN）"
+echo "  规模     = $([[ "${NUM_SAMPLES}" == "0" ]] && echo 整池 || echo "每份只取前 ${NUM_SAMPLES} 行（冒烟）")"
+echo "  阶段     = DRY_RUN=${DRY_RUN} FORCE_GEN=${FORCE_GEN} KEEP_GOING=${KEEP_GOING}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 0: 前置检查 + 预算分析
+#
+# 预算分析回答的是唯一一个投递前必须知道的数：按这个域的训练预算，有多少行的
+# prompt 长到**塞不下一个答案**。generate_replay_targets 会把它们直接写成空串
+# 跳过，所以这个数就是这份语料的可用率上限。只加载 tokenizer，不碰权重。
+# ===========================================================================
+echo
+echo "==== Step 0: 前置检查 ===="
+
+for _m in ${MODELS}; do
+  [[ -d "${MODEL_DIR}/${_m}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${_m}" >&2; exit 1; }
+done
+for _d in ${DOMAINS}; do
+  _pool="$(pool_file_for "${_d}")"
+  [[ -f "${_pool}" ]] || {
+    echo "找不到池文件: ${_pool}" >&2
+    echo "  它是 93 号 Step 1 的产物（C / F / replay 三者共用的那一份）：" >&2
+    echo "    qsub -v DRY_RUN=0 onereplay/pbs/93_finance_gold_cf.pbs" >&2
+    exit 1
+  }
+done
+df -h "${DATASETS_ROOT}" | tail -n 1
+
+echo
+echo "---- 预算分析（tokenizer 口径与生成时逐字相同，抽样 ${ANALYZE_ROWS} 行）"
+for _m in ${MODELS}; do
+  for _d in ${DOMAINS}; do
+    MODEL_PATH="${MODEL_DIR}/${_m}" MODEL_LABEL="${_m}" DOMAIN="${_d}" \
+    POOL="$(pool_file_for "${_d}")" \
+    INPUT_COLUMN="${POOL_INPUT_COLUMN}" TARGET_COLUMN="${POOL_TARGET_COLUMN}" \
+    MAX_LEN="$(maxlen_for "${_d}")" MIN_NEW="${GEN_MIN_NEW}" MARGIN="${GEN_LEN_MARGIN}" \
+    ANALYZE_ROWS="${ANALYZE_ROWS}" ENABLE_THINKING="${ENABLE_THINKING}" \
+    python - <<'PY'
+import json
+import os
+
+from transformers import AutoTokenizer
+
+from onereplay.data.chat import apply_prompt_template
+
+pool = os.environ["POOL"]
+max_len = int(os.environ["MAX_LEN"])
+min_new = int(os.environ["MIN_NEW"])
+margin = int(os.environ["MARGIN"])
+limit = int(os.environ["ANALYZE_ROWS"])
+input_column = os.environ["INPUT_COLUMN"]
+target_column = os.environ["TARGET_COLUMN"]
+
+rows = []
+total_lines = 0
+empty_input = 0
+empty_gold = 0
+with open(pool, encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        total_lines += 1
+        record = json.loads(line)
+        if input_column not in record:
+            raise SystemExit(
+                f"{pool} 第 {total_lines} 行没有列 '{input_column}'；实际列: {list(record)}"
+            )
+        prompt = str(record.get(input_column) or "").strip()
+        gold = str(record.get(target_column) or "").strip()
+        if not prompt:
+            empty_input += 1
+        if not gold:
+            empty_gold += 1
+        # to_sft_schema 两列都要非空才留下，所以可用行的分母就是这个条件。
+        if prompt and gold and (limit <= 0 or len(rows) < limit):
+            rows.append(prompt)
+
+tokenizer = AutoTokenizer.from_pretrained(os.environ["MODEL_PATH"])
+thinking = os.environ["ENABLE_THINKING"] == "1"
+rendered = [apply_prompt_template(tokenizer, prompt, enable_thinking=thinking) for prompt in rows]
+lengths = sorted(
+    len(ids) for ids in tokenizer(rendered, add_special_tokens=False)["input_ids"]
+)
+
+
+def pct(fraction):
+    if not lengths:
+        return 0
+    return lengths[min(int(fraction * len(lengths)), len(lengths) - 1)]
+
+
+ceiling = max_len - min_new - margin
+over = sum(1 for value in lengths if value > ceiling)
+room = [max_len - value - margin for value in lengths if value <= ceiling]
+
+print(f"  [{os.environ['MODEL_LABEL']} / {os.environ['DOMAIN']}] max_len={max_len}")
+print(
+    f"    池 {total_lines} 行（空 {input_column} {empty_input}，空 {target_column} {empty_gold}），"
+    f"分析 {len(lengths)} 行"
+)
+print(
+    f"    prompt token: 中位 {pct(0.5)} / P90 {pct(0.9)} / P99 {pct(0.99)} / 最长 "
+    f"{lengths[-1] if lengths else 0}"
+)
+print(
+    f"    prompt > {ceiling} 的行: {over}（{over / max(len(lengths), 1):.2%}）"
+    "  <- 这些行会被写成空串跳过"
+)
+if room:
+    room.sort()
+    print(f"    留给答案的空间: 中位 {room[len(room) // 2]} token / 最少 {room[0]}")
+if over > len(lengths) * 0.05:
+    print("    !! 越界行超过 5%，考虑把这个域的 MAXLEN_* 抬上去（训练侧要同步改）")
+PY
+  done
+done
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo
+  echo "DRY_RUN=1：以上为计划与预算分析，未加载权重、未生成。"
+  echo "下一步："
+  echo "  冒烟   qsub -v DRY_RUN=0,NUM_SAMPLES=64 ${SELF_PATH}"
+  echo "  按基座 qsub -v DRY_RUN=0,MODELS=Qwen2.5-1.5B-Instruct ${SELF_PATH}"
+  echo "         qsub -v DRY_RUN=0,MODELS=Qwen3-8B ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 1: 逐 (基座, 域) 生成
+#
+# --resume 1 让被 walltime 砍掉的作业重投后接着写。判据不是"文件在不在"而是
+# "meta.json 说写完了且行数对得上" —— 半截的文件必须接着写，不能当成完成品。
+# ===========================================================================
+echo
+echo "==== Step 1: 自蒸馏采集 ===="
+FAILED=()
+
+for _m in ${MODELS}; do
+  for _d in ${DOMAINS}; do
+    _pool="$(pool_file_for "${_d}")"
+    _sd="$(sd_file_for "${_d}" "${_m}")"
+    _meta="$(meta_file_for "${_d}" "${_m}")"
+    _max_len="$(maxlen_for "${_d}")"
+    _max_new="$(max_new_for "${_d}")"
+    _batch="$(batch_for "${_m}")"
+
+    echo
+    echo "########################################################################"
+    echo "# ${_m} / ${_d}"
+    echo "#   池     = ${_pool}"
+    echo "#   输出   = ${_sd}"
+    echo "#   预算   = max_len ${_max_len} / max_new ${_max_new} / batch ${_batch}"
+    echo "########################################################################"
+
+    if [[ "${FORCE_GEN}" == "1" && -f "${_sd}" ]]; then
+      mv "${_sd}" "${_sd}.$(date +%Y%m%d_%H%M%S).bak"
+      rm -f "${_meta}"
+      echo "FORCE_GEN=1：已备份旧语料，重新生成"
+    elif [[ -f "${_sd}" && -f "${_meta}" ]]; then
+      if META="${_meta}" SD="${_sd}" python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+meta = json.loads(Path(os.environ["META"]).read_text(encoding="utf-8"))
+written = sum(
+    1 for line in Path(os.environ["SD"]).read_text(encoding="utf-8").splitlines() if line.strip()
+)
+if not meta.get("complete"):
+    print("  上次没写完，接着生成")
+    sys.exit(1)
+if written != meta.get("generated_rows"):
+    print(f"  行数与 meta 不符（{written} vs {meta.get('generated_rows')}），重新生成")
+    sys.exit(1)
+PY
+      then
+        echo "跳过：已有完整语料（FORCE_GEN=1 可重生成）"
+        continue
+      fi
+    fi
+
+    _rc=0
+    python -m onereplay.scripts.generate_replay_targets \
+      --seed "${SEED}" \
+      --model_dir "${MODEL_DIR}" --model_name "${_m}" \
+      --data_files "${_pool}" --split train \
+      --cache_dir "${TMPDIR}/hf_datasets" \
+      --input_column "${POOL_INPUT_COLUMN}" --target_column "${POOL_TARGET_COLUMN}" \
+      --pool_size 0 --pool_offset 0 --num_samples "${NUM_SAMPLES}" \
+      --sample_shuffle "${SAMPLE_SHUFFLE}" --sample_seed "${SAMPLE_SEED}" \
+      --batch_size "${_batch}" \
+      --max_new_tokens "${_max_new}" --min_new_tokens "${GEN_MIN_NEW}" \
+      --max_len "${_max_len}" --length_margin "${GEN_LEN_MARGIN}" \
+      --temperature "${TEMPERATURE}" --enable_thinking "${ENABLE_THINKING}" \
+      --keep_truncated_text 0 \
+      --output_path "${_sd}" \
+      --resume 1 --log_every "${LOG_EVERY}" || _rc=$?
+
+    if (( _rc != 0 )); then
+      echo "!! ${_m}/${_d} 生成失败（退出码 ${_rc}）"
+      FAILED+=("${_m}/${_d}")
+      if [[ "${KEEP_GOING}" == "1" ]]; then
+        continue
+      fi
+      echo "   KEEP_GOING=1 可以让后面几份继续采。" >&2
+      exit "${_rc}"
+    fi
+
+    # meta.json 是这份语料的身份证：谁生成的、什么解码、什么预算。107 号踩过
+    # "8B 的语料被拿去当 1.5B 的"这个坑，靠文件名防不住。
+    # complete 只在 NUM_SAMPLES=0（整池）时才为真，冒烟出来的半份不能被当成完成品。
+    DOMAIN="${_d}" MODEL_LABEL="${_m}" MODEL_DIR="${MODEL_DIR}" \
+    POOL_PATH="${_pool}" SD_PATH="${_sd}" META_PATH="${_meta}" \
+    MAX_LEN="${_max_len}" MAX_NEW="${_max_new}" MIN_NEW="${GEN_MIN_NEW}" \
+    MARGIN="${GEN_LEN_MARGIN}" GEN_BATCH="${_batch}" NUM_SAMPLES="${NUM_SAMPLES}" \
+    TEMPERATURE="${TEMPERATURE}" ENABLE_THINKING="${ENABLE_THINKING}" SEED="${SEED}" \
+    SAMPLE_SEED="${SAMPLE_SEED}" SAMPLE_SHUFFLE="${SAMPLE_SHUFFLE}" \
+    INPUT_COLUMN="${POOL_INPUT_COLUMN}" TARGET_COLUMN="${POOL_TARGET_COLUMN}" \
+    python - <<'PY'
+import json
+import os
+import time
+from pathlib import Path
+
+sd_path = Path(os.environ["SD_PATH"])
+rows = [
+    json.loads(line)
+    for line in sd_path.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+
+usable = [row for row in rows if str(row.get("targets") or "").strip()]
+dropped = len(rows) - len(usable)
+answer_tokens = sorted(int(row.get("target_tokens", 0)) for row in usable)
+prompt_tokens = sorted(int(row.get("prompt_tokens", 0)) for row in rows)
+
+
+def quantile(fraction, values):
+    if not values:
+        return 0
+    return values[min(int(fraction * len(values)), len(values) - 1)]
+
+
+# 两个分母都要记。generate_replay_targets 迭代的是 to_sft_schema **过滤后**的池
+# （两列都非空才留），所以"采齐了没有"只能拿 pool_usable_rows 去比 —— 拿原始行数
+# 比的话，if 域那 6 行空 target 会让 complete 永远为假，每次重投都白加载一遍模型。
+# 两个数都写进 meta，是因为它们不相等本身就是要报的事（95 号那里是 20000 vs 19994）。
+pool_input = os.environ["INPUT_COLUMN"]
+pool_target = os.environ["TARGET_COLUMN"]
+pool_rows = 0
+pool_usable_rows = 0
+with open(os.environ["POOL_PATH"], encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        pool_rows += 1
+        record = json.loads(line)
+        if str(record.get(pool_input) or "").strip() and str(record.get(pool_target) or "").strip():
+            pool_usable_rows += 1
+asked = int(os.environ["NUM_SAMPLES"])
+meta = {
+    "domain": os.environ["DOMAIN"],
+    "model_name": os.environ["MODEL_LABEL"],
+    "model_dir": os.environ["MODEL_DIR"],
+    "pool_path": os.environ["POOL_PATH"],
+    "pool_rows": pool_rows,
+    "pool_usable_rows": pool_usable_rows,
+    "input_column": pool_input,
+    "target_column": pool_target,
+    "generated_rows": len(rows),
+    "usable_rows": len(usable),
+    "dropped_rows": dropped,
+    "mean_answer_tokens": (sum(answer_tokens) / len(answer_tokens)) if answer_tokens else 0.0,
+    "median_answer_tokens": quantile(0.5, answer_tokens),
+    "p95_answer_tokens": quantile(0.95, answer_tokens),
+    "max_answer_tokens": answer_tokens[-1] if answer_tokens else 0,
+    "median_prompt_tokens": quantile(0.5, prompt_tokens),
+    "max_prompt_tokens": prompt_tokens[-1] if prompt_tokens else 0,
+    "max_len": int(os.environ["MAX_LEN"]),
+    "max_new_tokens": int(os.environ["MAX_NEW"]),
+    "min_new_tokens": int(os.environ["MIN_NEW"]),
+    "length_margin": int(os.environ["MARGIN"]),
+    "gen_batch_size": int(os.environ["GEN_BATCH"]),
+    "temperature": float(os.environ["TEMPERATURE"]),
+    "enable_thinking": int(os.environ["ENABLE_THINKING"]),
+    "seed": int(os.environ["SEED"]),
+    "sample_seed": int(os.environ["SAMPLE_SEED"]),
+    "sample_shuffle": int(os.environ["SAMPLE_SHUFFLE"]),
+    "num_samples_requested": asked,
+    # 冒烟跑（NUM_SAMPLES>0）永远不算完成，否则下次整池跑会被"已完成"跳过。
+    "complete": asked == 0 and len(rows) >= pool_usable_rows,
+    "written_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+}
+Path(os.environ["META_PATH"]).write_text(
+    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+print(
+    f"  meta: {meta['usable_rows']}/{meta['generated_rows']} 可用"
+    f"（丢 {meta['dropped_rows']}），答案 token 中位 {meta['median_answer_tokens']}"
+    f" / P95 {meta['p95_answer_tokens']}，complete={meta['complete']}"
+)
+PY
+  done
+done
+
+# ===========================================================================
+# Step 2: 汇总
+# ===========================================================================
+echo
+echo "========================================================================"
+echo "采集汇总"
+echo "========================================================================"
+SD_DIR="${SD_DIR}" MODELS="${MODELS}" DOMAINS="${DOMAINS}" python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+sd_dir = Path(os.environ["SD_DIR"])
+header = (
+    f"{'模型':<26}{'域':<6}{'池行数':>8}{'已生成':>8}{'可用':>8}"
+    f"{'可用率':>9}{'答案中位':>10}{'P95':>7}{'完成':>6}"
+)
+print(header)
+print("-" * len(header))
+for model in os.environ["MODELS"].split():
+    for domain in os.environ["DOMAINS"].split():
+        meta_path = sd_dir / f"{domain}_pool_selfdistill_{model}.meta.json"
+        if not meta_path.is_file():
+            print(f"{model:<26}{domain:<6}{'(未采)':>8}")
+            continue
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        generated = meta.get("generated_rows", 0)
+        usable = meta.get("usable_rows", 0)
+        rate = usable / generated if generated else 0.0
+        print(
+            f"{model:<26}{domain:<6}{meta.get('pool_rows', 0):>8}{generated:>8}{usable:>8}"
+            f"{rate:>8.1%}{meta.get('median_answer_tokens', 0):>10}"
+            f"{meta.get('p95_answer_tokens', 0):>7}"
+            f"{'是' if meta.get('complete') else '否':>5}"
+        )
+print()
+print("可用率低于 80% 的，多半是这个域的 max_len 卡太小：prompt 占满了预算，")
+print("答案没写完就撞上上限，被标 truncated 之后 targets 写成了空串。")
+PY
+
+if (( ${#FAILED[@]} > 0 )); then
+  echo
+  echo "!! 以下几份没采成: ${FAILED[*]}"
+  echo "   原样重投即可接着写（--resume 1）。"
+fi
+
+echo
+echo "========================================================================"
+echo "怎么用这份语料训练（95 号 replay 臂）"
+echo "========================================================================"
+cat <<USAGE
+  把 --replay_data_files 换成 --replay_self_distill_file，并且把
+  --replay_drop_truncated 改成 1：
+
+    --replay_self_distill_file ${SD_DIR}/math_pool_selfdistill_<MODEL>.jsonl
+    --replay_target_column     targets
+    --replay_drop_truncated    1
+
+  !! drop_truncated 必须是 1，与 95 号现在钉的 0 相反。
+     95 号那个 0 是为 gold_targets 设的：池文件里的 truncated 说的是 1.7B 当年
+     自蒸馏时被截断，与 gold 无关，传 1 会白丢约 13% 的行。
+     这份语料反过来 —— targets 就是自蒸馏答案，truncated 说的就是它被截断了。
+     训截断的答案等于教模型别结束回合，13 号那条线上的重复退化就是这么来的。
+     （本脚本已经把这些行的 targets 写成空串，所以即使忘了改也会被
+       to_sft_schema 滤掉；改成 1 是为了让日志里那行 dropped 数对得上。）
+
+  同一份文件还能做 gold 消融 —— 同样这批行、同样这个顺序，只把答案换回 gold：
+
+    --replay_self_distill_file <同一个文件>
+    --replay_target_column     gold_targets
+    --replay_drop_truncated    0
+
+  这比把 --replay_data_files 指回原池干净：那样会把 shuffle 和池切分一起重来，
+  两个变量混在一起，分不清是"答案变了"还是"行变了"。
+USAGE
+
+echo
+echo "Job finished at: $(date)"
