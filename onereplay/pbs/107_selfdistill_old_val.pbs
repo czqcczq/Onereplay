@@ -402,9 +402,29 @@ model_name = os.environ["MODEL_NAME"]
 in_col = os.environ["VAL_INPUT_COLUMN"]
 out_col = os.environ["VAL_TARGET_COLUMN"]
 
+def read_jsonl(path):
+    """逐行读，不能用 read_text().splitlines()。
+
+    splitlines 除了 \\n 还会在 \\x85 / \\u2028 / \\u2029 上断行，而
+    json.dumps(ensure_ascii=False) 不转义这三个字符（都在 \\x1f 以上）。FLAN 的
+    题面里就带这类分隔符，一行被劈成两半之后两半都不是合法 JSON，json.loads 会抛
+    "Unterminated string"。文件对象只按 \\n 切，才是 JSONL 的正确读法。
+    """
+
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def count_jsonl(path):
+    """同上：拿 splitlines 数行会把行数数多，判据就会误判。"""
+
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
 for domain in os.environ["DOMAINS_ACTIVE"].split(","):
     val_path = pool_root / f"{domain}_val{val_rows}.jsonl"
-    rows = [json.loads(line) for line in val_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    rows = read_jsonl(val_path)
     columns = list(rows[0].keys()) if rows else []
     print(f"---- {domain}")
     print(f"  留出集 {val_path}")
@@ -429,7 +449,7 @@ for domain in os.environ["DOMAINS_ACTIVE"].split(","):
     if not sd_path.is_file():
         print("  自蒸馏语料 : 还没有，Step 2 会生成")
         continue
-    written = sum(1 for line in sd_path.read_text(encoding="utf-8").splitlines() if line.strip())
+    written = count_jsonl(sd_path)
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         print(f"  自蒸馏语料 : {written} 行，生成于 {meta.get('generated_at', '?')}"
@@ -571,7 +591,21 @@ from pathlib import Path
 
 sd_path = Path(os.environ["SD_PATH"])
 val_path = Path(os.environ["VAL_PATH"])
-rows = [json.loads(line) for line in sd_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+# 逐行读，不能用 read_text().splitlines()：splitlines 会在 \x85 / \u2028 / \u2029
+# 上也断行，而 json.dumps(ensure_ascii=False) 不转义这三个（都在 \x1f 以上）。
+# FLAN 的题面里就有，被劈开的两半都不是合法 JSON。文件对象只按 \n 切。
+def count_jsonl(path):
+    with open(path, encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+rows = []
+with sd_path.open(encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            rows.append(json.loads(line))
 
 usable, dropped = [], 0
 for row in rows:
@@ -595,7 +629,7 @@ meta = {
     "model_dir": os.environ["MODEL_DIR"],
     "source_val_file": str(val_path),
     "source_sha256": hashlib.sha256(val_path.read_bytes()).hexdigest()[:16],
-    "source_rows": sum(1 for line in val_path.read_text(encoding="utf-8").splitlines() if line.strip()),
+    "source_rows": count_jsonl(val_path),
     "generated_rows": len(rows),
     "usable_rows": len(usable),
     "dropped_rows": dropped,

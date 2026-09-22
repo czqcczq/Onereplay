@@ -529,9 +529,12 @@ import sys
 from pathlib import Path
 
 meta = json.loads(Path(os.environ["META"]).read_text(encoding="utf-8"))
-written = sum(
-    1 for line in Path(os.environ["SD"]).read_text(encoding="utf-8").splitlines() if line.strip()
-)
+# !! 按文件对象逐行读，不能用 read_text().splitlines()。splitlines 还会在 \x85、
+# \u2028、\u2029 上断行，而 json.dumps(ensure_ascii=False) 不转义这三个（都在
+# \x1f 以上），FLAN 的题面里就有。那样会把一行劈成两半，行数凭空变多，这里就会
+# 误判"行数与 meta 不符"而把一份完好的语料重新生成一遍。
+with open(os.environ["SD"], encoding="utf-8") as handle:
+    written = sum(1 for line in handle if line.strip())
 if not meta.get("complete"):
     print("  上次没写完，接着生成")
     sys.exit(1)
@@ -589,11 +592,16 @@ import time
 from pathlib import Path
 
 sd_path = Path(os.environ["SD_PATH"])
-rows = [
-    json.loads(line)
-    for line in sd_path.read_text(encoding="utf-8").splitlines()
-    if line.strip()
-]
+# !! 按文件对象逐行读，不能用 read_text().splitlines()：splitlines 会在 \x85 /
+# \u2028 / \u2029 上也断行，而 json.dumps(ensure_ascii=False) 不转义这三个字符
+# （它们都在 \x1f 以上）。FLAN 的题面里就带这类分隔符，被劈开的两半都不是合法
+# JSON，json.loads 会抛 "Unterminated string"。文件对象只按 \n 切，才是 JSONL
+# 的正确读法 —— generate_replay_targets 里的 summarize() 也是这么读的。
+rows = []
+with sd_path.open(encoding="utf-8") as handle:
+    for line in handle:
+        if line.strip():
+            rows.append(json.loads(line))
 
 usable = [row for row in rows if str(row.get("targets") or "").strip()]
 dropped = len(rows) - len(usable)
