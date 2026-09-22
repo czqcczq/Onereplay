@@ -436,6 +436,15 @@ method:
   Its math and code pools are used whole and were built by stratified sampling
   rather than a shuffle-and-take, so there is no held-out slice to score, and
   neither vanilla nor the other arms recorded one to compare against.
+* **The 8B line's candidates default to an existing Qwen3-8B self-distillation**
+  (`CANDIDATES=selfdistill`, reading `datasets/selfdistill/<domain>_pool_selfdistill_Qwen3-8B.jsonl`),
+  the same answers the plain replay arm trains on, so the two arms differ only
+  by OPR's filter and rho. Those answers were decoded greedily rather than at
+  `temperature=0.1`, and a plain self-distillation carries no `avg_logprob`, so
+  `onereplay/baselines/score_logprob.py` adds it by one teacher-forced forward
+  pass over the existing answers -- the same raw-logit quantity the decoder
+  would have recorded, at a fraction of the cost of regenerating.
+  `CANDIDATES=generate` restores regeneration from the 83 arm's pools.
 
 Before spending cluster time:
 

@@ -9,19 +9,41 @@
 #PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
 #
 # =============================================================================
-# Qwen3-8B / DialogSum 线的 OPR 臂（On-Policy Replay），只做 mix（math + code）
+# Qwen3-8B / DialogSum 线的 OPR 臂（On-Policy Replay），默认 mix（math + code）
 #
-#   qsub -v DRY_RUN=0,REWARD=sc onereplay/pbs/101_ds_8b_opr.pbs
-#   qsub -v DRY_RUN=0,REWARD=ru onereplay/pbs/101_ds_8b_opr.pbs
-#   生成很慢，建议先只做前两步：
-#   qsub -v DRY_RUN=0,REWARD=sc,DO_TRAIN=0,DO_EVAL=0 ...   然后   DO_GENERATE=0
+# 四个保护域，各投一次（候选默认来自现成的 8B 自蒸馏，见第 0 条）：
+#   qsub -v DRY_RUN=0,REWARD=sc,MIX_DOMAINS=if        onereplay/pbs/101_ds_8b_opr.pbs
+#   qsub -v DRY_RUN=0,REWARD=sc,MIX_DOMAINS=math      onereplay/pbs/101_ds_8b_opr.pbs
+#   qsub -v DRY_RUN=0,REWARD=sc,MIX_DOMAINS=code      onereplay/pbs/101_ds_8b_opr.pbs
+#   qsub -v DRY_RUN=0,REWARD=sc,MIX_DOMAINS=math:code onereplay/pbs/101_ds_8b_opr.pbs
+#   拆两次投（训练与评测分开）:
+#   qsub -v ...,DO_EVAL=0  ...   然后   ...,DO_TRAIN=0
 #
-#   !! 生成只做一次，两个 REWARD 共用（SHARE_GEN=1，默认）。所以第二个变体直接
-#      DO_GENERATE=0 就行，不必再等一遍 8B 把整个池过完：
-#      qsub -v DRY_RUN=0,REWARD=ru,DO_GENERATE=0 onereplay/pbs/101_ds_8b_opr.pbs
+#   CANDIDATES=generate 退回旧路径：用 8B 从 83 号的池重新采样生成（慢，十几小时）。
 #
 # 74 号给 base / vanilla 的分母，81 号是 OneReplay 臂，83 号是 gold replay 臂。
-# 本臂与 83 号同池、同参数化，差别只在"回放行的答案从哪来、要不要筛"。
+#
+# -----------------------------------------------------------------------------
+# 0. 候选来源：现成的 8B 自蒸馏（CANDIDATES=selfdistill，默认）
+# -----------------------------------------------------------------------------
+# 候选直接读 ${SELFDISTILL_DIR}/<域>_pool_selfdistill_${MODEL_NAME}.jsonl，也就是
+# 本线普通 replay 臂要用的那份 8B 自蒸馏。两臂读同一批答案，差别就只剩 OPR 的
+# top-k 筛选和 ρ，这比两边各自生成更干净。
+#
+# 仍然是 on-policy 的：答案由即将被训练的 Qwen3-8B 生成。与 OPR 原实现相比多
+# 两处偏离，要写进表注：
+#   a) 解码是贪心（temperature 0），OPR 是 temperature 0.1。0.1 已经接近贪心。
+#   b) 那份文件多半没记 avg_logprob（普通自蒸馏不需要它）。OPR-SC 缺这个分数就
+#      没法排序，所以 Step 1 用 baselines/score_logprob.py 对已有答案做一次
+#      teacher-forced 前向补算：同一个模型、同一个 chat 模板，取答案 token 的
+#      平均 log-prob。与生成时记录的 raw 口径是同一个量（只差一次 decode/encode
+#      往返的分词误差），开销是一次前向而不是 512 步自回归。文件里已经有
+#      avg_logprob 时直接用，不补算。
+#   c) 若那份文件是用 generate_replay_targets 默认参数生成的，截断的答案已被
+#      清空，这些行进不了候选；OPR 原实现会保留它们。截断行本来就极少进 top-k。
+#
+# 产物写在 ${RESULTS_ROOT}/opr_sd，与旧的 generate 路径（opr/）完全分开；run
+# 名带 _sd，不会和旧路径的 adapter 撞名。
 #
 # -----------------------------------------------------------------------------
 # 1. !! 候选必须用 Qwen3-8B 重新生成，不能复用 1.7B 那批
@@ -115,11 +137,26 @@
 # -----------------------------------------------------------------------------
 # 7. 投递前要有
 #   1) ${MODEL_DIR}/Qwen3-8B
-#   2) ${POOL_ROOT}/replay 下 math/code 的池 jsonl（83 号读的那批）
+#   2) CANDIDATES=selfdistill（默认）：${SELFDISTILL_DIR}/<域>_pool_selfdistill_Qwen3-8B.jsonl
+#      CANDIDATES=generate：${POOL_ROOT}/replay 下 math/code 的池 jsonl（83 号读的那批）
 #   3) ${DS_DATASET} = datasets/dialogsum_sft_hf
 #   4) 74 号的 base 与 vanilla 已评完（base 缺席时 ret_* 三列会是 '-'）
 #   5) REWARD=ru 还需要 OPC 的 view jsonl 和原始 parquet（跑 testcase 用）
 #   6) IFBench 的依赖（不装只跳过这一个指标；见 73 号文件头）
+#   7) MIX_DOMAINS 含 if 时要 ${IF_POOL_FILE}（93 号 Step 1 物化的那份）
+#
+# -----------------------------------------------------------------------------
+# 8. if 域
+# ---------
+# 候选来源是 93 号物化的 if_pool.jsonl：68 号那份 FLAN 2 万行随机子集去掉末尾
+# 500 行 val，列名已归一成 inputs / gold_targets。与 83 号 if 臂的池差这 500 行，
+# 报结果时要写上。if_val500.jsonl 本臂不读（不测旧域 val，见第 3 条）。
+#
+# 只能单独跑，不能和 math/code 混：if 的 replay 预算是 512（= 68 号 if 的 C），
+# math/code 是 1024，而 train.py 的 --replay_max_len 是全局唯一的。
+#
+# 只能 REWARD=sc：build_opr_buffer 的规则打分器只有 math（最终答案）与 code
+# （testcase），FLAN 的开放式指令没有对应的规则指标。
 # 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
 # =============================================================================
 
@@ -177,10 +214,11 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     PROFILE_SOURCE SKIP_PROFILE_CHECK
     REWARD RHO BUFFER_SIZE GEN_BATCH GEN_MAX_NEW TEMPERATURE LOGPROB_SOURCE
     SHARE_GEN OPR_DIR CODE_VIEW_FILE CODE_OPC_PATH CODE_TIMEOUT
+    CANDIDATES SELFDISTILL_DIR ENABLE_THINKING SCORE_TOKENS_PER_BATCH
     DO_GENERATE FORCE_GENERATE
     PROBE PROBE_STEPS MAX_STEPS SAVE
     MIX_DOMAINS REPLAY_MAXLEN REPLAY_SAMPLE_SEED REPLAY_DROP_TRUNCATED
-    MATH_VIEW_PREFIX CODE_VIEW_PREFIX
+    MATH_VIEW_PREFIX CODE_VIEW_PREFIX IF_POOL_FILE IF_REPLAY_MAXLEN
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL WITH_RETENTION
     SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL EVAL_BATCH
     LORA_RANK LORA_ALPHA LORA_DROPOUT TARGET_MODULES RUN_TAG
@@ -252,8 +290,29 @@ POOL_ROOT="${POOL_ROOT:-${REPO_ROOT}/results}"
 DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
 ADAPTERS="${RESULTS_ROOT}/adapters"
 TRAIN_LOG_DIR="${RESULTS_ROOT}/train_logs"
-OPR_DIR="${OPR_DIR:-${RESULTS_ROOT}/opr}"
 export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 候选来源，见文件头第 0 条 ----
+CANDIDATES="${CANDIDATES:-selfdistill}"
+case "${CANDIDATES}" in
+  selfdistill|generate) ;;
+  *) echo "CANDIDATES 只能是 selfdistill / generate，得到 '${CANDIDATES}'" >&2; exit 2 ;;
+esac
+SELFDISTILL_DIR="${SELFDISTILL_DIR:-${REPO_ROOT}/datasets/selfdistill}"
+# 两条路径的产物分目录放：selfdistill 的 buffer 与 generate 的 buffer 名字相同，
+# 放一起会互相覆盖。
+if [[ "${CANDIDATES}" == "selfdistill" ]]; then
+  OPR_DIR="${OPR_DIR:-${RESULTS_ROOT}/opr_sd}"
+  CAND_TAG="_sd"
+else
+  OPR_DIR="${OPR_DIR:-${RESULTS_ROOT}/opr}"
+  CAND_TAG=""
+fi
+selfdistill_file_for () { printf '%s' "${SELFDISTILL_DIR}/$1_pool_selfdistill_${MODEL_NAME}.jsonl"; }
+scored_file_for ()      { printf '%s' "${OPR_DIR}/scored_$1.jsonl"; }
+# 补算 logprob 时要套的 chat 模板必须与生成那份自蒸馏时一致。
+ENABLE_THINKING="${ENABLE_THINKING:-0}"
+SCORE_TOKENS_PER_BATCH="${SCORE_TOKENS_PER_BATCH:-16384}"
 
 # =============================================================================
 # 训练超参：与 74/81/83 号逐字一致（ACCUM 除外，见文件头第 6 条）
@@ -282,9 +341,10 @@ PROFILE_SOURCE="${PROFILE_SOURCE:-${REPO_ROOT}/onereplay/pbs/83_qwen3_8b_gold_re
 # =============================================================================
 REPLAY_SAMPLE_SEED="${REPLAY_SAMPLE_SEED:-1}"
 REPLAY_DROP_TRUNCATED="${REPLAY_DROP_TRUNCATED:-0}"
-REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}"      # = 68 号采 math/code 的 C 用的预算
 MATH_VIEW_PREFIX="${MATH_VIEW_PREFIX:-metamath_cmath_30k}"
 CODE_VIEW_PREFIX="${CODE_VIEW_PREFIX:-opc_edu_ccode_20k}"
+IF_POOL_FILE="${IF_POOL_FILE:-${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/pools/if_pool.jsonl}"
+IF_REPLAY_MAXLEN="${IF_REPLAY_MAXLEN:-512}"  # = 68 号采 if 的 C 用的预算
 
 # 与 83 号 pool_glob_for_domain 的通配逐字相同。math 两个视角一起读，少读一个
 # 就等于换了池。
@@ -292,13 +352,15 @@ pool_glob_for_domain () {
   case "$1" in
     math) printf '%s' "${POOL_ROOT}/replay/${MATH_VIEW_PREFIX}_*_selfdistill_seed${REPLAY_SAMPLE_SEED}.jsonl" ;;
     code) printf '%s' "${POOL_ROOT}/replay/${CODE_VIEW_PREFIX}_selfdistill_seed${REPLAY_SAMPLE_SEED}.jsonl" ;;
-    *)    echo "!! 未知的域 '$1'（本臂只做 math / code）" >&2; return 1 ;;
+    if)   printf '%s' "${IF_POOL_FILE}" ;;
+    *)    echo "!! 未知的域 '$1'（只能是 math / code / if）" >&2; return 1 ;;
   esac
 }
 pool_files_for_domain () {
   case "$1" in
     math) printf '%s' 2 ;;   # canonical + rephrased
     code) printf '%s' 1 ;;
+    if)   printf '%s' 1 ;;
     *)    echo "!! 未知的域 '$1'" >&2; return 1 ;;
   esac
 }
@@ -306,10 +368,26 @@ pool_files_for_domain () {
 MIX_DOMAINS="${MIX_DOMAINS:-math,code}"
 MIX_DOMAINS="${MIX_DOMAINS//:/,}"
 MIX_DOMAIN_SPACED="${MIX_DOMAINS//,/ }"
-# 不带 -w：OPR 的 buffer 在各池之间是等分的（int(buffer_size/池数)），没有可调
-# 的域间比例，名字里带权重会误导读表的人。也不带 -gold：本臂训的是 8B 自己生成
-# 的答案，不是 gold_targets。
-DOMAIN_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")"
+for _d in ${MIX_DOMAIN_SPACED}; do
+  pool_glob_for_domain "${_d}" >/dev/null || exit 2
+done
+
+# replay 预算按域取，但 train.py 的 --replay_max_len 只有一个，所以 if 只能单独跑。
+case ",${MIX_DOMAINS}," in
+  ,if,)   REPLAY_MAXLEN="${REPLAY_MAXLEN:-${IF_REPLAY_MAXLEN}}" ;;
+  *,if,*) echo "!! MIX_DOMAINS='${MIX_DOMAINS}'：if 不能和 math/code 混。" >&2
+          echo "   if 的 replay 预算是 ${IF_REPLAY_MAXLEN}，math/code 是 1024，而 --replay_max_len 全局唯一。" >&2
+          exit 2 ;;
+  *)      REPLAY_MAXLEN="${REPLAY_MAXLEN:-1024}" ;;   # = 68 号采 math/code 的 C 用的预算
+esac
+# 单域就叫域名（if / math / code），多域叫 mix-<域>-<域>。不带 -w：OPR 的 buffer
+# 在各池之间是等分的（int(buffer_size/池数)），没有可调的域间比例，名字里带权重
+# 会误导读表的人。也不带 -gold：本臂训的是 8B 自己生成的答案，不是 gold_targets。
+if [[ "${MIX_DOMAINS}" == *,* ]]; then
+  DOMAIN_TAG="mix-$(printf '%s' "${MIX_DOMAINS//,/-}")"
+else
+  DOMAIN_TAG="${MIX_DOMAINS}"
+fi
 
 # =============================================================================
 # OPR 的旋钮
@@ -324,6 +402,10 @@ case "${REWARD}" in
       exit 2 ;;
   *)  echo "REWARD 只能是 sc / ru，得到 '${REWARD}'" >&2; exit 2 ;;
 esac
+if [[ "${REWARD}" == "ru" && ",${MIX_DOMAINS}," == *,if,* ]]; then
+  echo "!! if 域没有规则打分器（只有 math 最终答案 / code testcase），只能 REWARD=sc。" >&2
+  exit 2
+fi
 
 RHO="${RHO:-0.01}"                 # 他们 argparse 的默认值，也是 README 的例子
 TEMPERATURE="${TEMPERATURE:-0.1}"
@@ -365,7 +447,7 @@ fi
 
 # run 名：81/83 号那套规则，加上 reward 与 ρ
 RUN_TAG="${RUN_TAG:-r${LORA_RANK}all}"
-RUN="${RUN:-ds_opr-${REWARD}_8b_${DOMAIN_TAG}_${RUN_TAG}_rho${RHO}_lr${LR}_seed${SEED}}"
+RUN="${RUN:-ds_opr-${REWARD}_8b${CAND_TAG}_${DOMAIN_TAG}_${RUN_TAG}_rho${RHO}_lr${LR}_seed${SEED}}"
 [[ "${PROBE}" == "1" || "${MAX_STEPS}" != "0" ]] && RUN="${RUN}_probe${MAX_STEPS}"
 VANILLA_RUN="${VANILLA_RUN:-ds_vanilla_8b_${RUN_TAG}_lr${LR}_ep${EPOCHS_DECLARED}_seed${SEED}}"
 TRAIN_LOG="${TRAIN_LOG_DIR}/${RUN}.train.log"
@@ -419,9 +501,13 @@ IFBENCH_BATCH="${IFBENCH_BATCH:-16}"
 TIMEOUT="${TIMEOUT:-10}"
 LIMIT="${LIMIT:-0}"
 
-# mix 保两个域，两边都评 —— 只评一边的话"另一边被挤掉了"这个最可能的失败模式
-# 根本不会出现在表里。
-DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp"
+# 按域取，与 83 号的口径逐字相同。mix 保两个域，两边都评 —— 只评一边的话
+# "另一边被挤掉了"这个最可能的失败模式根本不会出现在表里。
+case "${MIX_DOMAINS}" in
+  math) DOMAIN_METRICS="ifeval gsm8k math500" ;;
+  code) DOMAIN_METRICS="ifeval humaneval mbpp" ;;
+  *)    DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;   # if 与 mix
+esac
 WITH_IFBENCH="${WITH_IFBENCH:-1}"
 [[ "${WITH_IFBENCH}" == "1" ]] && DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
 WITH_DIALOGSUM="${WITH_DIALOGSUM:-1}"
@@ -442,21 +528,25 @@ echo "Qwen3-8B OPR-${REWARD} 臂：保护 ${DOMAIN_TAG}（DialogSum 线）"
 echo "  run      = ${RUN}"
 echo "  分母     = base / ${VANILLA_RUN}   (74 号产出)"
 echo "  对手     = 81 号 OneReplay / 83 号 gold replay（同池，只差怎么用旧知识）"
-echo "  on-policy模型 = ${MODEL_DIR}/${MODEL_NAME}   !! 候选用它重新生成，不复用 1.7B 那批"
-echo "  候选来源 ="
+echo "  on-policy模型 = ${MODEL_DIR}/${MODEL_NAME}"
+if [[ "${CANDIDATES}" == "selfdistill" ]]; then
+echo "  候选来源 = 现成的 ${MODEL_NAME} 自蒸馏（CANDIDATES=selfdistill，贪心解码）"
+for _d in ${MIX_DOMAIN_SPACED}; do
+echo "             ${_d}: $(selfdistill_file_for "${_d}")"
+done
+echo "             缺 avg_logprob 时 Step 1 用 teacher forcing 补算，写到 $(scored_file_for '<域>')"
+else
+echo "  候选来源 = 用 ${MODEL_NAME} 重新生成（CANDIDATES=generate）"
 for _d in ${MIX_DOMAIN_SPACED}; do
 echo "             ${_d}: $(pool_glob_for_domain "${_d}")"
 done
 echo "             读 inputs + gold_targets，写 8B 自己的 targets"
+echo "  生成     = temperature ${TEMPERATURE}, max_new ≤ ${GEN_MAX_NEW}, 预算从 max_len ${REPLAY_MAXLEN} 反推"
+fi
 echo "  ρ        = ${RHO}   (回放行数占新任务的比例，他们的默认值)"
 echo "  打分     = ${REWARD}$([[ "${REWARD}" == "sc" ]] && echo "（平均 logprob，来源 ${LOGPROB_SOURCE}）" || echo "（math 最终答案 / code testcase，打分器是替换过的）")"
-echo "  生成     = temperature ${TEMPERATURE}, max_new ≤ ${GEN_MAX_NEW}, 预算从 max_len ${REPLAY_MAXLEN} 反推"
-echo "             截断的答案保留（OPR 行为），训练侧 --replay_drop_truncated ${REPLAY_DROP_TRUNCATED}"
-if [[ "${SHARE_GEN}" == "1" ]]; then
-echo "             SHARE_GEN=1：sc 与 ru 共用同一批候选（差值里没有采样噪声）"
-else
-echo "             SHARE_GEN=0：本 REWARD 单独生成一批（他们 repo 的做法）"
-fi
+echo "  replay   = max_len ${REPLAY_MAXLEN}，--replay_drop_truncated ${REPLAY_DROP_TRUNCATED}"
+echo "  产物目录 = ${OPR_DIR}"
 echo "  旧域 val = 不测（74/81/83 都没记，没有分母；见文件头第 3 条）"
 echo "  混合     = 数据级追加，ACCUM ${ACCUM}（83 号批级要 128，本臂不用）"
 echo "             accum_steps ${ACCUM_STEPS} x ${BATCH} = ${NEW_PER_UPDATE} 行新任务/更新（要 = 64）"
@@ -477,17 +567,127 @@ echo "==== Step 0: 前置检查 ===="
 
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}" >&2; exit 3; }
 [[ -d "${DS_DATASET}" ]] || { echo "缺 DialogSum 训练池: ${DS_DATASET}" >&2; exit 3; }
-for _d in ${MIX_DOMAIN_SPACED}; do
-  # shellcheck disable=SC2086
-  _n="$(ls -1 $(pool_glob_for_domain "${_d}") 2>/dev/null | wc -l | tr -d ' ')"
-  _want="$(pool_files_for_domain "${_d}")"
-  if [[ "${_n}" != "${_want}" ]]; then
-    echo "!! ${_d} 池展开出 ${_n} 个文件，期望 ${_want} 个：$(pool_glob_for_domain "${_d}")" >&2
-    echo "   少读一个视角就等于换了池，和 83 号不再同源。" >&2
-    exit 3
-  fi
-  echo "  ${_d} 池 ${_n} 个文件，与 83 号同源"
-done
+# 每个域的候选文件最终用哪一份（selfdistill 原文件，或补算 logprob 后的文件）。
+declare -A CAND_FILE=()
+declare -A NEED_SCORE=()
+
+if [[ "${CANDIDATES}" == "generate" ]]; then
+  for _d in ${MIX_DOMAIN_SPACED}; do
+    # shellcheck disable=SC2086
+    _n="$(ls -1 $(pool_glob_for_domain "${_d}") 2>/dev/null | wc -l | tr -d ' ')"
+    _want="$(pool_files_for_domain "${_d}")"
+    if [[ "${_n}" != "${_want}" ]]; then
+      echo "!! ${_d} 池展开出 ${_n} 个文件，期望 ${_want} 个：$(pool_glob_for_domain "${_d}")" >&2
+      echo "   少读一个视角就等于换了池，和 83 号不再同源。" >&2
+      exit 3
+    fi
+    if [[ "${_d}" == "if" ]]; then
+      echo "  if 池 $(wc -l < "${IF_POOL_FILE}") 行（93 号物化，比 83 号 if 臂少末尾 500 行 val）"
+    else
+      echo "  ${_d} 池 ${_n} 个文件，与 83 号同源"
+    fi
+    CAND_FILE[${_d}]="$(gen_file_for "${_d}")"
+    NEED_SCORE[${_d}]=0
+  done
+else
+  # 自蒸馏文件是别处生成的，这里把 OPR 用得到的几件事逐个核对，而不是假设它
+  # 符合 generate_replay_targets 的格式。最后一行 stdout 是结论（complete /
+  # missing），其余说明都走 stderr。
+  for _d in ${MIX_DOMAIN_SPACED}; do
+    _sd="$(selfdistill_file_for "${_d}")"
+    [[ -f "${_sd}" ]] || { echo "!! 找不到 ${_d} 的自蒸馏文件: ${_sd}" >&2; exit 3; }
+    echo "  ${_d}: ${_sd}"
+    _state="$(SD_FILE="${_sd}" REWARD="${REWARD}" REPLAY_MAXLEN="${REPLAY_MAXLEN}" \
+               ENABLE_THINKING="${ENABLE_THINKING}" python - <<'PY'
+import json
+import os
+import sys
+
+path = os.environ["SD_FILE"]
+reward = os.environ["REWARD"]
+budget = int(os.environ["REPLAY_MAXLEN"])
+thinking = os.environ["ENABLE_THINKING"] == "1"
+
+
+def say(message):
+    print(message, file=sys.stderr)
+
+
+rows = []
+with open(path, encoding="utf-8") as handle:
+    for number, line in enumerate(handle, 1):
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                say(f"    !! 第 {number} 行不是合法 JSON: {error}")
+                sys.exit(1)
+
+required = ["index", "inputs", "targets"]
+if reward == "ru":
+    required.append("gold_targets")
+missing = [key for key in required if any(key not in row for row in rows)]
+if missing:
+    say(f"    !! 有行缺字段 {missing}（OPR 要 {required}）")
+    sys.exit(1)
+
+indices = [row["index"] for row in rows]
+if len(set(indices)) != len(indices):
+    say(
+        f"    !! index 有 {len(indices) - len(set(indices))} 个重复。多半是两份文件"
+        "直接拼接没有重新编号；buffer 的出处和打分 sidecar 都按 index 记，先重新编号。"
+    )
+    sys.exit(1)
+
+usable = [row for row in rows if str(row.get("targets", "") or "").strip()]
+truncated = sum(1 for row in usable if row.get("truncated"))
+has_logprob = sum(1 for row in usable if "avg_logprob" in row)
+say(
+    f"    {len(rows)} 行，{len(usable)} 行有答案"
+    f"（{len(rows) - len(usable)} 行空答案不进候选，{truncated} 行截断但有文本）"
+)
+
+# 答案里出现 <think> 说明生成时开了思考模式；补算 logprob 时模板要一致。
+with_think = sum(1 for row in usable if "<think>" in str(row["targets"]))
+if with_think and not thinking:
+    say(
+        f"    !! {with_think} 行答案含 <think>，而 ENABLE_THINKING=0。补算 logprob "
+        "时的 prompt 会和生成时不一致，请传 ENABLE_THINKING=1。"
+    )
+    sys.exit(1)
+
+# 训练侧超出 --replay_max_len 会截掉开头；只有 generate_replay_targets 写了长度
+# 字段时才能核对。
+if all("prompt_tokens" in row and "target_tokens" in row for row in usable):
+    over = sum(
+        1 for row in usable if int(row["prompt_tokens"]) + int(row["target_tokens"]) > budget
+    )
+    say(f"    长度：{over} 行 prompt+答案超过 replay_max_len {budget}（训练时会被截断）")
+else:
+    say("    长度：文件里没有 prompt_tokens / target_tokens，无法核对是否超出 replay_max_len")
+
+say("    生成模型：jsonl 不记录，请自己确认是 Qwen3-8B 生成的（on-policy 的前提）")
+
+if has_logprob == len(usable):
+    say("    avg_logprob：齐全，直接用")
+    print("complete")
+elif has_logprob == 0:
+    say("    avg_logprob：没有，Step 1 用 teacher forcing 补算")
+    print("missing")
+else:
+    say(f"    avg_logprob：只有 {has_logprob}/{len(usable)} 行有，Step 1 全部重算")
+    print("missing")
+PY
+)" || { echo "!! ${_d} 的自蒸馏文件没通过检查" >&2; exit 3; }
+    if [[ "${REWARD}" == "sc" && "${_state}" == "missing" ]]; then
+      CAND_FILE[${_d}]="$(scored_file_for "${_d}")"
+      NEED_SCORE[${_d}]=1
+    else
+      CAND_FILE[${_d}]="${_sd}"
+      NEED_SCORE[${_d}]=0
+    fi
+  done
+fi
 if [[ "${REWARD}" == "ru" ]]; then
   [[ -f "${CODE_VIEW_FILE}" ]] || { echo "REWARD=ru 需要 OPC view: ${CODE_VIEW_FILE}" >&2; exit 3; }
   [[ -f "${CODE_OPC_PATH}" ]]  || { echo "REWARD=ru 需要 OPC parquet: ${CODE_OPC_PATH}" >&2; exit 3; }
@@ -592,20 +792,32 @@ echo "  实际写出 ${BUFFER_ROWS_EXPECTED} 行"
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo
   echo "DRY_RUN=1：以上为计划，不生成不训练不评测。"
-  echo "  Step 1 每个域一次（用 ${MODEL_NAME} 生成）："
-  for _d in ${MIX_DOMAIN_SPACED}; do
-    echo "    generate_replay_targets --data_files '$(pool_glob_for_domain "${_d}")' \\"
-    echo "      --input_column inputs --target_column gold_targets --pool_size 0 \\"
-    echo "      --sample_seed ${REPLAY_SAMPLE_SEED} \\"
-    echo "      --max_len ${REPLAY_MAXLEN} --max_new_tokens ${GEN_MAX_NEW} \\"
-    echo "      --temperature ${TEMPERATURE} --keep_truncated_text 1 \\"
-    echo "      --record_logprob 1 --logprob_source ${LOGPROB_SOURCE} \\"
-    echo "      --output_path $(gen_file_for "${_d}")"
-  done
+  if [[ "${CANDIDATES}" == "generate" ]]; then
+    echo "  Step 1 每个域一次（用 ${MODEL_NAME} 生成）："
+    for _d in ${MIX_DOMAIN_SPACED}; do
+      echo "    generate_replay_targets --data_files '$(pool_glob_for_domain "${_d}")' \\"
+      echo "      --input_column inputs --target_column gold_targets --pool_size 0 \\"
+      echo "      --sample_seed ${REPLAY_SAMPLE_SEED} \\"
+      echo "      --max_len ${REPLAY_MAXLEN} --max_new_tokens ${GEN_MAX_NEW} \\"
+      echo "      --temperature ${TEMPERATURE} --keep_truncated_text 1 \\"
+      echo "      --record_logprob 1 --logprob_source ${LOGPROB_SOURCE} \\"
+      echo "      --output_path $(gen_file_for "${_d}")"
+    done
+  else
+    echo "  Step 1（只对缺 avg_logprob 的域）："
+    for _d in ${MIX_DOMAIN_SPACED}; do
+      if [[ "${NEED_SCORE[${_d}]}" == "1" ]]; then
+        echo "    score_logprob --input_path $(selfdistill_file_for "${_d}") \\"
+        echo "      --output_path $(scored_file_for "${_d}") --enable_thinking ${ENABLE_THINKING}"
+      else
+        echo "    ${_d}: 不需要补算，直接用 $(selfdistill_file_for "${_d}")"
+      fi
+    done
+  fi
   echo "  Step 2:"
   echo "    build_opr_buffer --reward ${REWARD} --buffer_size ${BUFFER_SIZE} \\"
   for _d in ${MIX_DOMAIN_SPACED}; do
-    echo "      --pool ${_d}=$(gen_file_for "${_d}") \\"
+    echo "      --pool ${_d}=${CAND_FILE[${_d}]} \\"
   done
   echo "      --output_path ${BUFFER_FILE}"
   echo "  Step 3 train.py 关键参数（LoRA，不是全参）："
@@ -620,13 +832,42 @@ if [[ "${DRY_RUN}" == "1" ]]; then
 fi
 
 # ===========================================================================
-# Step 1: 用 8B 生成候选答案
+# Step 1: 准备候选
 #
-# 这就是 OPR 的 "on-policy"：答案由**即将开始训练的那个模型**产生。复用 1.7B
-# 那批 targets 就不是 OPR 了。单阶段设定下只生成一次（多任务序列里他们每到边界
-# 重新生成）。
+# selfdistill：答案已经由 8B 生成好了，这里只在缺 avg_logprob 时补算（文件头第 0 条）。
+# generate：用 8B 从 83 号的池重新采样生成。
+#
+# 两条路径都是 OPR 的 "on-policy"：答案由**即将开始训练的那个模型**产生。复用
+# 1.7B 那批 targets 就不是 OPR 了。单阶段设定下只生成一次（多任务序列里他们每到
+# 边界重新生成）。
 # ===========================================================================
-if [[ "${DO_GENERATE}" == "1" ]]; then
+if [[ "${CANDIDATES}" == "selfdistill" ]]; then
+  # 自蒸馏已经在别处跑完，这里只补 OPR-SC 需要的分数。score_logprob 自带续跑，
+  # 已经算完的域再投一次只会读一遍文件，不会重新加载模型。
+  for _d in ${MIX_DOMAIN_SPACED}; do
+    if [[ "${NEED_SCORE[${_d}]}" != "1" ]]; then
+      echo
+      echo "==== ${_d}: 候选直接用 ${CAND_FILE[${_d}]} ===="
+      continue
+    fi
+    _out="$(scored_file_for "${_d}")"
+    if [[ "${DO_GENERATE}" != "1" ]]; then
+      [[ -f "${_out}" ]] || { echo "找不到 ${_out}，需要先 DO_GENERATE=1 补算 logprob" >&2; exit 3; }
+      continue
+    fi
+    [[ "${FORCE_GENERATE}" == "1" ]] && rm -f "${_out}"
+    echo
+    echo "==== ${_d}: teacher-forced avg_logprob -> ${_out} ===="
+    python -m onereplay.baselines.score_logprob \
+      --seed "${SEED}" \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --input_path "$(selfdistill_file_for "${_d}")" \
+      --output_path "${_out}" \
+      --enable_thinking "${ENABLE_THINKING}" \
+      --max_tokens_per_batch "${SCORE_TOKENS_PER_BATCH}" \
+      --resume 1
+  done
+elif [[ "${DO_GENERATE}" == "1" ]]; then
   for _d in ${MIX_DOMAIN_SPACED}; do
     _out="$(gen_file_for "${_d}")"
     [[ "${FORCE_GENERATE}" == "1" ]] && rm -f "${_out}"
@@ -668,7 +909,7 @@ BUILD_ARGS=(
   --scores_out "${SCORES_FILE}"
 )
 for _d in ${MIX_DOMAIN_SPACED}; do
-  BUILD_ARGS+=(--pool "${_d}=$(gen_file_for "${_d}")")
+  BUILD_ARGS+=(--pool "${_d}=${CAND_FILE[${_d}]}")
 done
 if [[ "${REWARD}" == "ru" ]]; then
   BUILD_ARGS+=(
