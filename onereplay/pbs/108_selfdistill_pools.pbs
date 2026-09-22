@@ -378,7 +378,7 @@ limit = int(os.environ["ANALYZE_ROWS"])
 input_column = os.environ["INPUT_COLUMN"]
 target_column = os.environ["TARGET_COLUMN"]
 
-rows = []
+usable_rows = []
 total_lines = 0
 empty_input = 0
 empty_gold = 0
@@ -399,14 +399,32 @@ with open(pool, encoding="utf-8") as handle:
         if not gold:
             empty_gold += 1
         # to_sft_schema 两列都要非空才留下，所以可用行的分母就是这个条件。
-        if prompt and gold and (limit <= 0 or len(rows) < limit):
-            rows.append(prompt)
+        if prompt and gold:
+            usable_rows.append((prompt, gold))
+
+# !! 等距抽样，不能取前 N 行。93 号建池时只有 if 用了 --sample_shuffle 1，
+# math 和 code 保持源文件顺序，而源文件是按 view / 来源分块写的：取开头会得到
+# 一个长度分布紧得不真实的样本（实测 math 前 2000 行的 prompt 全落在 53-61
+# token 之间），据此定预算会严重低估。等距走完整个文件才看得到尾部那些长行。
+if limit > 0 and len(usable_rows) > limit:
+    stride = len(usable_rows) // limit
+    sample = usable_rows[::stride][:limit]
+    sample_note = f"等距抽样 {len(sample)} 行（每 {stride} 行取 1）"
+else:
+    sample = usable_rows
+    sample_note = f"全量 {len(sample)} 行"
 
 tokenizer = AutoTokenizer.from_pretrained(os.environ["MODEL_PATH"])
 thinking = os.environ["ENABLE_THINKING"] == "1"
-rendered = [apply_prompt_template(tokenizer, prompt, enable_thinking=thinking) for prompt in rows]
+rendered = [apply_prompt_template(tokenizer, prompt, enable_thinking=thinking) for prompt, _ in sample]
 lengths = sorted(
     len(ids) for ids in tokenizer(rendered, add_special_tokens=False)["input_ids"]
+)
+# gold 答案的长度是"自蒸馏答案大概要多长"的先验，也就是 max_new 够不够的依据。
+# 自蒸馏答案通常比 gold 长（基座会展开说明），所以 gold 的 P95 只是下界。
+gold_lengths = sorted(
+    len(ids)
+    for ids in tokenizer([gold for _, gold in sample], add_special_tokens=False)["input_ids"]
 )
 
 
@@ -420,14 +438,24 @@ ceiling = max_len - min_new - margin
 over = sum(1 for value in lengths if value > ceiling)
 room = [max_len - value - margin for value in lengths if value <= ceiling]
 
+def gold_pct(fraction):
+    if not gold_lengths:
+        return 0
+    return gold_lengths[min(int(fraction * len(gold_lengths)), len(gold_lengths) - 1)]
+
+
 print(f"  [{os.environ['MODEL_LABEL']} / {os.environ['DOMAIN']}] max_len={max_len}")
 print(
     f"    池 {total_lines} 行（空 {input_column} {empty_input}，空 {target_column} {empty_gold}），"
-    f"分析 {len(lengths)} 行"
+    f"{sample_note}"
 )
 print(
     f"    prompt token: 中位 {pct(0.5)} / P90 {pct(0.9)} / P99 {pct(0.99)} / 最长 "
     f"{lengths[-1] if lengths else 0}"
+)
+print(
+    f"    gold 答案 token: 中位 {gold_pct(0.5)} / P90 {gold_pct(0.9)} / P99 {gold_pct(0.99)}"
+    f" / 最长 {gold_lengths[-1] if gold_lengths else 0}   （自蒸馏答案通常更长）"
 )
 print(
     f"    prompt > {ceiling} 的行: {over}（{over / max(len(lengths), 1):.2%}）"
@@ -437,7 +465,11 @@ if room:
     room.sort()
     print(f"    留给答案的空间: 中位 {room[len(room) // 2]} token / 最少 {room[0]}")
 if over > len(lengths) * 0.05:
-    print("    !! 越界行超过 5%，考虑把这个域的 MAXLEN_* 抬上去（训练侧要同步改）")
+    print(
+        "    !! 越界行超过 5%。先看上面 prompt 的 P99 和最长：如果是少数极长行拖的，"
+        "抬 MAXLEN_* 救不回来，\n"
+        "       而且 95 号 Step 1 会因为它与 C 的 max_len 不等而拒绝训练。"
+    )
 PY
   done
 done
@@ -702,7 +734,12 @@ cat <<USAGE
 
     --replay_self_distill_file <同一个文件>
     --replay_target_column     gold_targets
-    --replay_drop_truncated    0
+    --replay_drop_truncated    1
+
+  !! 这里也是 1，不是 0。drop_truncated 在 load_self_distilled_pool 里是**先于**
+     答案列生效的：它按 truncated 标记滤行，与你读哪一列无关。传 1 时两条臂丢掉
+     的是**同一批行**（prompt 越界的 + 答案没写完的），于是"只有答案变了"。传 0
+     的话 gold 那一路会多出这些行，行数和答案同时变，消融就不干净了。
 
   这比把 --replay_data_files 指回原池干净：那样会把 shuffle 和池切分一起重来，
   两个变量混在一起，分不清是"答案变了"还是"行变了"。
