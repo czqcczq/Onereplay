@@ -43,6 +43,18 @@ def parse_args() -> argparse.Namespace:
         help="Directory of *.jsonl metrics files written by --metrics_path.",
     )
     parser.add_argument(
+        "--glob",
+        type=str,
+        default="*.jsonl",
+        help=(
+            "Which files under --metrics_dir to read. Several lines share one "
+            "metrics directory (results/qwen3-8b/metrics holds both cs_* and "
+            "ds_*), so 'cs_*.jsonl' is what keeps one line's table from filling "
+            "up with another line's runs, whose step counts and epoch lengths "
+            "are not comparable with it."
+        ),
+    )
+    parser.add_argument(
         "--extra_metrics_dir",
         type=str,
         default="",
@@ -96,7 +108,7 @@ def select_record(records: list[dict[str, Any]], epoch: int) -> dict[str, Any] |
 def collect_runs(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
     """Map run name -> the one record we report for it."""
 
-    paths = sorted(Path(args.metrics_dir).glob("*.jsonl"))
+    paths = sorted(Path(args.metrics_dir).glob(args.glob))
     if args.extra_metrics_dir:
         paths += sorted(Path(args.extra_metrics_dir).glob(args.extra_glob))
 
@@ -220,7 +232,9 @@ def main() -> None:
     args = parse_args()
     runs = collect_runs(args)
     if not runs:
-        raise SystemExit(f"no usable metrics files under {args.metrics_dir}")
+        raise SystemExit(
+            f"no usable metrics files matching {args.glob!r} under {args.metrics_dir}"
+        )
 
     names = order_runs(runs, args.baseline)
     profiled = [name for name in names if is_profiled(runs[name])]
