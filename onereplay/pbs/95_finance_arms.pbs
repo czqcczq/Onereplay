@@ -32,6 +32,10 @@
 #     qsub -v DRY_RUN=0,DOMAIN=if,ARM=replay,DO_EVAL=0 ...   然后   DO_TRAIN=0
 #   L2 对照臂（C 换成单位阵，隔离"协方差结构"与"任何收缩"）:
 #     qsub -v DRY_RUN=0,DOMAIN=if,ARM=onereplay,LAMBDA=...,IDENTITY_COV=1 ...
+#   replay 的 self-distill 版（replay 数据换成底座自己的答案，见第 4b 条）:
+#     qsub -v DRY_RUN=0,DOMAIN=if,ARM=replay,REPLAY_MODE=step,REPLAY_SOURCE=selfdistill onereplay/pbs/95_finance_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=math,ARM=replay,REPLAY_MODE=step,REPLAY_SOURCE=selfdistill onereplay/pbs/95_finance_arms.pbs
+#     qsub -v DRY_RUN=0,DOMAIN=code,ARM=replay,REPLAY_MODE=step,REPLAY_SOURCE=selfdistill onereplay/pbs/95_finance_arms.pbs
 #
 # -----------------------------------------------------------------------------
 # 1. 三条臂各是什么，以及什么必须逐字相同
