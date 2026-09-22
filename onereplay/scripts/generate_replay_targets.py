@@ -101,6 +101,19 @@ def parse_args() -> argparse.Namespace:
         help="Must match collect_cov's --sample_seed so the subset stays nested.",
     )
     parser.add_argument(
+        "--sample_shuffle",
+        type=int,
+        default=1,
+        help=(
+            "1 shuffles before cutting, which is how every self-distilled pool on "
+            "disk was built and what keeps a subset nested inside the pool that "
+            "produced C. 0 keeps file order, so the written index is the input "
+            "file's line number -- use it when the file already holds exactly the "
+            "rows to generate on and something downstream has to join back to it "
+            "by line rather than by reproducing this permutation."
+        ),
+    )
+    parser.add_argument(
         "--num_samples",
         type=int,
         default=0,
@@ -224,7 +237,10 @@ def build_pool(args: argparse.Namespace):
         replay_target_column=args.target_column,
     )
     pool = load_replay_pool(loader_args)
-    pool = pool.shuffle(seed=args.sample_seed)
+    if args.sample_shuffle == 1:
+        pool = pool.shuffle(seed=args.sample_seed)
+    else:
+        print("sample_shuffle=0: file order kept, index is the input file's line number")
     start = min(max(args.pool_offset, 0), len(pool))
     end = min(start + args.pool_size, len(pool)) if args.pool_size > 0 else len(pool)
     if start >= end:

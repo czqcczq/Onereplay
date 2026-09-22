@@ -1,0 +1,1021 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_sdval
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: 保护域 old val loss 的**第二把尺子** —— 目标换成基座自己的答案
+#
+# 先用 base 在 if / math / code 三份 500 行留出集上自蒸馏（贪心生成），再拿这份
+# 语料去打 base 与全部训练后 checkpoint 的 CE。生成一次，之后同基座的所有臂共用。
+#
+# -----------------------------------------------------------------------------
+# !! 这个脚本存在的原因：102 号那把尺子是反的
+#
+#   102 号打的是 CE(gold)：模型有多会预测**数据集自带的参考答案**。实测三个域、
+#   两个基座上它一律反向 —— 训练让它变低：
+#
+#       FLAN gold      base 2.9218 -> vanilla 1.9118   (-34.6%)
+#       MetaMath gold  base 0.6769 -> vanilla 0.3865   (-42.9%)
+#
+#   同期 IFEval 78.74% -> 63.96%、MATH500 79.60% -> 58.60%。能力实实在在掉了，
+#   尺子却说"遗忘是负的"。机制在 102 号的文件头里：任何指令 SFT 都会把模型推进
+#   "按数据集口吻直接作答"的通用模式，于是它在**任何** SFT 语料的 gold 答案上 CE
+#   都会降；这一项与域无关且远大于能力损失带来的上升，把后者完全淹没。
+#
+#   换域没用（已经在三个域上确认过），能改的只有**目标**。所以这里把参考答案换成
+#   base 自己的贪心输出：base 在自己的输出上 CE 就是它对自己那条序列的置信度，
+#   是这把尺子的下界；训练只能让它变高。方向由构造保证，不再需要"方向检查"。
+#
+#   这条路不是新发明的，它就是 Chapter 3 那两条 flan_heldout / flan_inpool 曲线
+#   用的量（data/probe.py），也是 score_probe_ce.py 文件头记的那个灵敏度：
+#   FLAN 上 vanilla 动了 285%（0.1231 -> 0.4742），同期 IFEval 只动 11.5pp。
+#   本脚本只是把它接到 93 号切出来的三份 val500 上，好和 102 号并排读。
+#
+# -----------------------------------------------------------------------------
+# !! 它量的是什么，不是什么 —— 报结果时必须一起写上
+#
+#   量的是**行为漂移**：模型离基座当初那套输出有多远。
+#   不是能力：CE 是 teacher forcing，每个位置都喂着正确前缀，问的是"这条序列有多
+#   意外"，不是"能不能自己解出来"。能力仍然只有 benchmark 说得准。
+#
+#   !! 它对 OneReplay / EWC 天然有利，这一点不能不说
+#   这两个方法的正则项就是对 ΔW 的惩罚（λ tr(ΔW C ΔWᵀ) / Fisher 加权 L2），而
+#   "输出分布离 W0 多远"正是同一件事的一阶近似。所以它们在这把尺子上领先，一部分
+#   是"保住了旧本事"，一部分只是"被直接优化了这个量"。replay 训在 gold 答案上，
+#   它反而会被这把尺子罚。
+#   因此这一列的读法是"对基座行为的锚定程度"，要和 benchmark 那一列并排放，
+#   不能单独当作遗忘的证据。base 也必须画出来 —— 它是下界，不是 0。
+#
+# -----------------------------------------------------------------------------
+# !! 语料与基座是**绑死**的
+#   8B 生成的自蒸馏语料拿去给 1.5B 打分，得到的是"1.5B 离 8B 的输出多远"，
+#   和遗忘毫无关系，而且不会报错。所以：
+#     * 文件名带基座名           <domain>_val500_selfdistill_<MODEL_NAME>.jsonl
+#     * 每份语料配一个 meta.json 记下生成它的基座与全部生成参数
+#     * Step 3 打分前逐份断言 meta.model_name == MODEL_NAME，不符就停
+#   两条线各自的 SD_DIR 也在各自的 RESULTS_ROOT 下，物理上不会串。
+#
+# -----------------------------------------------------------------------------
+# !! 口径
+#
+#   语料      93 号 Step 1 切出的三份 500 行（{question, response}），与 102 号
+#             读的是同一批行，所以两把尺子逐行可比。--sample_shuffle 0 让写出的
+#             index 就是 val500 的行号，gold 那一路的 per_row 因此按行号就能对上。
+#   解码      贪心（TEMPERATURE=0），非 thinking（ENABLE_THINKING=0）。后者必须是 0：
+#             训练侧 apply_train_template 渲染 prompt 时写死了 enable_thinking=False，
+#             生成时开了 thinking，目标里就会多一段 <think>，与打分时的渲染不一致。
+#   截断行    答案没吐出 eos 的行，target 置空、truncated=1，打分时被丢掉
+#             （--replay_drop_truncated 1）。语料是一份文件，所以**所有模型丢的是
+#             同一批行**，可减。Step 2 会把每个域的丢弃率打出来，超过 20% 就该调大
+#             GEN_MAX_NEW 重新生成（而且是三个域一起，别只补一个）。
+#   长度      GEN_MAXLEN == SCORE_MAXLEN == 2048。生成时按 prompt+答案+margin 卡在
+#             2048 以内，打分时同一个预算，所以能生成出来的行打分时基本不会再被截。
+#   打分      走 score_probe_ce，也就是 build_self_distilled_probe +
+#             build_probe_loader + evaluate_probe 三件套：只对 assistant token 求 CE、
+#             **token 加权**（不是 batch 平均）、shuffle=False。与 metrics jsonl 里的
+#             probe_* 字段同口径，与 102 号也同口径 —— 两把尺子只差目标那一列。
+#
+# -----------------------------------------------------------------------------
+# !! 两条线，两次投递，各自的 base 各自算
+#
+#   (1) Qwen3-8B 线：cs_* 与 ds_* 同基座同目录，**生成只做一次**，两批臂共用
+#   (2) finance 线：Qwen2.5-1.5B-Instruct，全参 checkpoint 在 checkpoints/
+#
+#   跨线只能比方向和相对幅度，CE 绝对值不可比（两个模型对自己输出的置信度本来不同）。
+#
+# -----------------------------------------------------------------------------
+# 投递:
+#
+#   # (1) 8B 线：先看计划（不加载模型，约 1 分钟）
+#   qsub -v DRY_RUN=1 onereplay/pbs/107_selfdistill_old_val.pbs
+#
+#   # (1') 8B 线正式跑：生成 + 打全部 cs_*/ds_* 臂 + 汇总
+#   qsub -v VANILLA_RUNS='cs_vanilla_8b_r16all_lr2e-4_seed1,ds_vanilla_8b_r16all_lr2e-4_ep2_seed1' \
+#        onereplay/pbs/107_selfdistill_old_val.pbs
+#
+#   # 只生成语料（两阶段分开投，生成挂了不会连带丢掉打分）
+#   qsub -v STAGE=gen onereplay/pbs/107_selfdistill_old_val.pbs
+#   # 只打分（语料已在）
+#   qsub -v STAGE=score,VANILLA_RUNS='...' onereplay/pbs/107_selfdistill_old_val.pbs
+#
+#   # (2) finance 线 / Qwen2.5-1.5B-Instruct
+#   qsub -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\
+#RESULTS_ROOT=/scratch/weiliu87/student/czq/Onereplay/results_finance_Qwen2.5-1.5B-Instruct,\
+#ADAPTER_DIR=/scratch/weiliu87/student/czq/Onereplay/results_finance_Qwen2.5-1.5B-Instruct/checkpoints,\
+#VANILLA_RUNS=fin_vanilla_lr8e-5_ep2_seed42 \
+#        onereplay/pbs/107_selfdistill_old_val.pbs
+#
+#   # 只打其中几个臂
+#   qsub -v ADAPTERS='cs_vanilla_8b_r16all_lr2e-4_seed1,cs_onereplay_...' onereplay/pbs/107_...pbs
+#   # 上一轮打分中途挂了，接着打（已有的同口径记录跳过）
+#   qsub -v STAGE=score,RESUME_SCORE=1,VANILLA_RUNS='...' onereplay/pbs/107_...pbs
+#   # 只把汇总重读一遍（判据/表格改了），不加载模型，秒级
+#   qsub -v SUMMARY_ONLY=1,VANILLA_RUNS='...' onereplay/pbs/107_...pbs
+#
+# 产物:
+#   语料  ${SD_DIR}/<domain>_val500_selfdistill_<MODEL_NAME>.jsonl  (+ .meta.json)
+#   分数  ${OUT_PATH}                = ${RESULTS_ROOT}/probe_ce/selfdistill_val.jsonl
+#   逐行  ${PER_ROW_DIR}/<run>__<domain>.jsonl   (喂 bootstrap_probe_ce 出误差棒)
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/107_selfdistill_old_val.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。起容器，然后把脚本自己在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTER_DIR POOL_ROOT SD_DIR
+    DOMAINS VAL_ROWS VAL_INPUT_COLUMN VAL_TARGET_COLUMN
+    ADAPTERS ADAPTER_GLOB BASE_NAME VANILLA_RUNS OUT_PATH PER_ROW_DIR GOLD_JSONL
+    STAGE SEED GEN_BATCH GEN_MAXLEN GEN_MAX_NEW GEN_MIN_NEW GEN_LEN_MARGIN
+    GEN_MAX_NEW_IF GEN_MAX_NEW_MATH GEN_MAX_NEW_CODE
+    TEMPERATURE ENABLE_THINKING
+    SCORE_MAXLEN BATCH ROW_BATCH PROBE_SIZE VERIFY DELTA
+    DRY_RUN FORCE_GEN RESUME_SCORE SUMMARY_ONLY KEEP_GOING
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python : $(which python)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+# LoRA 的臂在 adapters/，全参的在 checkpoints/ —— finance 线要把这个指过去。
+ADAPTER_DIR="${ADAPTER_DIR:-${RESULTS_ROOT}/adapters}"
+
+# 三份 500 行留出集。93 号 Step 1 的产物，物理上落在 finance 线的 pools 目录下，
+# 但内容与基座无关（就是三个域各自的题与参考答案），102 号读的也是这三份。
+POOL_ROOT="${POOL_ROOT:-${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/pools}"
+DOMAINS="${DOMAINS:-if,math,code}"
+VAL_ROWS="${VAL_ROWS:-500}"
+VAL_INPUT_COLUMN="${VAL_INPUT_COLUMN:-question}"
+VAL_TARGET_COLUMN="${VAL_TARGET_COLUMN:-response}"
+
+# 自蒸馏语料落在**本线自己的** RESULTS_ROOT 下，文件名再带一次基座名。见文件头
+# "语料与基座是绑死的"。
+SD_DIR="${SD_DIR:-${RESULTS_ROOT}/selfdistill_val}"
+OUT_PATH="${OUT_PATH:-${RESULTS_ROOT}/probe_ce/selfdistill_val.jsonl}"
+PER_ROW_DIR="${PER_ROW_DIR:-${RESULTS_ROOT}/probe_ce/per_row_sdval}"
+
+STAGE="${STAGE:-all}"               # all | gen | score
+SEED="${SEED:-1}"
+
+# ---- 生成 ----
+GEN_BATCH="${GEN_BATCH:-16}"
+GEN_MAXLEN="${GEN_MAXLEN:-2048}"    # 与 SCORE_MAXLEN 一致，见文件头"长度"
+GEN_MAX_NEW="${GEN_MAX_NEW:-1024}"
+GEN_MIN_NEW="${GEN_MIN_NEW:-16}"
+GEN_LEN_MARGIN="${GEN_LEN_MARGIN:-16}"
+# 按域可以单独放宽：if 的 gold 是一行，但基座会写一段；math 的链最长。
+GEN_MAX_NEW_IF="${GEN_MAX_NEW_IF:-${GEN_MAX_NEW}}"
+GEN_MAX_NEW_MATH="${GEN_MAX_NEW_MATH:-${GEN_MAX_NEW}}"
+GEN_MAX_NEW_CODE="${GEN_MAX_NEW_CODE:-${GEN_MAX_NEW}}"
+TEMPERATURE="${TEMPERATURE:-0}"         # 0 = 贪心，与已有的自蒸馏语料同解码
+ENABLE_THINKING="${ENABLE_THINKING:-0}" # 必须 0，见文件头"口径"
+
+# ---- 打分 ----
+SCORE_MAXLEN="${SCORE_MAXLEN:-2048}"
+BATCH="${BATCH:-8}"
+ROW_BATCH="${ROW_BATCH:-4}"
+PROBE_SIZE="${PROBE_SIZE:-0}"       # 0 = 整份语料（500 行本来就不多）
+VERIFY="${VERIFY:-1}"               # 逐行路径与 evaluate_probe 互校，跑过一次可以关
+DELTA="${DELTA:-0.0077}"            # 噪声地板，见 Step 4 的注释
+
+BASE_NAME="${BASE_NAME:-base}"
+ADAPTERS="${ADAPTERS:-all}"
+ADAPTER_GLOB="${ADAPTER_GLOB:-*}"
+# 每条线的 vanilla。"消除的漂移"那一列的分母，按 run 名第一段（cs_ / ds_ / fin_）
+# 与臂配对，所以 8B 线要把 cs 和 ds 两个都给上。
+VANILLA_RUNS="${VANILLA_RUNS:-}"
+
+DRY_RUN="${DRY_RUN:-0}"
+FORCE_GEN="${FORCE_GEN:-0}"
+RESUME_SCORE="${RESUME_SCORE:-0}"
+SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
+KEEP_GOING="${KEEP_GOING:-1}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+# 拼错的 STAGE 会静默落进"跳过生成、直接打分"，而那时语料还不在。
+case "${STAGE}" in
+  all|gen|score) ;;
+  *) echo "!! STAGE 只能是 all / gen / score，收到 '${STAGE}'"; exit 1 ;;
+esac
+mkdir -p "${SD_DIR}" "$(dirname "${OUT_PATH}")" "${PER_ROW_DIR}"
+
+IFS=',' read -r -a DOMAIN_LIST <<< "${DOMAINS}"
+
+val_file_for () { printf '%s' "${POOL_ROOT}/$1_val${VAL_ROWS}.jsonl"; }
+sd_file_for ()  { printf '%s' "${SD_DIR}/$1_val${VAL_ROWS}_selfdistill_${MODEL_NAME}.jsonl"; }
+meta_file_for () { printf '%s' "${SD_DIR}/$1_val${VAL_ROWS}_selfdistill_${MODEL_NAME}.meta.json"; }
+max_new_for () {
+  case "$1" in
+    if)   printf '%s' "${GEN_MAX_NEW_IF}" ;;
+    math) printf '%s' "${GEN_MAX_NEW_MATH}" ;;
+    code) printf '%s' "${GEN_MAX_NEW_CODE}" ;;
+    *)    printf '%s' "${GEN_MAX_NEW}" ;;
+  esac
+}
+
+# gold 那一路的分数，用来在 Step 4 末尾并排打"同一批行上两把尺子的方向"。
+# 不传就自动找 probe_ce/direction*.jsonl（102 号的落点），找不到就跳过这一段。
+if [[ -z "${GOLD_JSONL:-}" ]]; then
+  _golds=()
+  while IFS= read -r _f; do
+    [[ -n "${_f}" ]] && _golds+=("${_f}")
+  done < <(find "$(dirname "${OUT_PATH}")" -maxdepth 1 -type f -name 'direction*.jsonl' 2>/dev/null | sort)
+  GOLD_JSONL="$(IFS=,; printf '%s' "${_golds[*]:-}")"
+fi
+
+case "${TEMPERATURE}" in
+  0|0.0|0.00) DECODE_DESC="贪心" ;;
+  *)          DECODE_DESC="采样 T=${TEMPERATURE}" ;;
+esac
+
+echo "========================================================================"
+echo "自蒸馏 old val loss（CE 对基座自己的答案）"
+echo "  基座   = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  ckpt   = ${ADAPTER_DIR}"
+echo "  留出集 = ${POOL_ROOT}/<${DOMAINS}>_val${VAL_ROWS}.jsonl"
+echo "  语料   = ${SD_DIR}/<domain>_val${VAL_ROWS}_selfdistill_${MODEL_NAME}.jsonl"
+echo "  生成   = ${DECODE_DESC} / thinking=${ENABLE_THINKING}"
+echo "           max_len ${GEN_MAXLEN} / max_new if=${GEN_MAX_NEW_IF} math=${GEN_MAX_NEW_MATH} code=${GEN_MAX_NEW_CODE}"
+echo "  打分   = max_len ${SCORE_MAXLEN} / batch ${BATCH} / row_batch ${ROW_BATCH} / verify ${VERIFY}"
+echo "  输出   = ${OUT_PATH}"
+echo "  阶段   = STAGE=${STAGE}  DRY_RUN=${DRY_RUN}  SUMMARY_ONLY=${SUMMARY_ONLY}"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 1: 留出集体检 + 已有语料 + checkpoint 清单
+#   三件事都可能让整轮作废，而三件都是秒级就能查的：留出集的列名对不对、已有的
+#   自蒸馏语料是哪个基座生成的、要打的 checkpoint 在不在。
+# ===========================================================================
+echo ""
+echo "==== Step 1: 留出集与已有语料 ===="
+ACTIVE_DOMAINS=()
+for _d in "${DOMAIN_LIST[@]}"; do
+  _d="$(printf '%s' "${_d}" | tr -d '[:space:]')"
+  [[ -z "${_d}" ]] && continue
+  _val="$(val_file_for "${_d}")"
+  if [[ ! -f "${_val}" ]]; then
+    echo "  !! ${_d}: 找不到留出集 ${_val} —— 跳过这个域"
+    continue
+  fi
+  ACTIVE_DOMAINS+=("${_d}")
+done
+(( ${#ACTIVE_DOMAINS[@]} > 0 )) || { echo "!! 一个留出集都没找到，停。看 POOL_ROOT / VAL_ROWS。"; exit 1; }
+
+DOMAINS_ACTIVE="$(IFS=,; printf '%s' "${ACTIVE_DOMAINS[*]}")"
+SD_SPEC=""
+for _d in "${ACTIVE_DOMAINS[@]}"; do
+  SD_SPEC="${SD_SPEC}${SD_SPEC:+,}${_d}=$(sd_file_for "${_d}")"
+done
+
+DOMAINS_ACTIVE="${DOMAINS_ACTIVE}" POOL_ROOT="${POOL_ROOT}" VAL_ROWS="${VAL_ROWS}" \
+SD_DIR="${SD_DIR}" MODEL_NAME="${MODEL_NAME}" \
+VAL_INPUT_COLUMN="${VAL_INPUT_COLUMN}" VAL_TARGET_COLUMN="${VAL_TARGET_COLUMN}" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+pool_root = Path(os.environ["POOL_ROOT"])
+sd_dir = Path(os.environ["SD_DIR"])
+val_rows = os.environ["VAL_ROWS"]
+model_name = os.environ["MODEL_NAME"]
+in_col = os.environ["VAL_INPUT_COLUMN"]
+out_col = os.environ["VAL_TARGET_COLUMN"]
+
+for domain in os.environ["DOMAINS_ACTIVE"].split(","):
+    val_path = pool_root / f"{domain}_val{val_rows}.jsonl"
+    rows = [json.loads(line) for line in val_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    columns = list(rows[0].keys()) if rows else []
+    print(f"---- {domain}")
+    print(f"  留出集 {val_path}")
+    if in_col not in columns or out_col not in columns:
+        # 93 号 Step 1 写的是 question / response。列名不对就不是那份文件，
+        # 生成会从 datasets 的 worker 里抛 KeyError，离原因很远。
+        print(f"  !! 缺列 {in_col} / {out_col}，实有 {columns}。"
+              " 传 VAL_INPUT_COLUMN / VAL_TARGET_COLUMN 或确认文件对不对。")
+        raise SystemExit(1)
+    usable = [r for r in rows
+              if str(r.get(in_col) or "").strip() and str(r.get(out_col) or "").strip()]
+    lengths = sorted(len(str(r[in_col])) for r in usable)
+
+    def quantile(fraction, values=lengths):
+        return values[min(int(fraction * len(values)), len(values) - 1)]
+
+    print(f"  {len(rows)} 行 -> 滤空后 {len(usable)}，列 {in_col}/{out_col}")
+    print(f"  题面字符数 P50={quantile(0.5)} P90={quantile(0.9)} max={lengths[-1]}")
+
+    sd_path = sd_dir / f"{domain}_val{val_rows}_selfdistill_{model_name}.jsonl"
+    meta_path = sd_dir / f"{domain}_val{val_rows}_selfdistill_{model_name}.meta.json"
+    if not sd_path.is_file():
+        print("  自蒸馏语料 : 还没有，Step 2 会生成")
+        continue
+    written = sum(1 for line in sd_path.read_text(encoding="utf-8").splitlines() if line.strip())
+    if meta_path.is_file():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        print(f"  自蒸馏语料 : {written} 行，生成于 {meta.get('generated_at', '?')}"
+              f"，基座 {meta.get('model_name', '?')}")
+        print(f"               可用 {meta.get('usable_rows', '?')} / 截断丢弃 "
+              f"{meta.get('dropped_rows', '?')}")
+        if meta.get("model_name") != model_name:
+            print(f"  !! meta 里的基座是 {meta.get('model_name')}，本次是 {model_name}。"
+                  " 这份语料不能用于本基座（见文件头）。")
+    else:
+        print(f"  自蒸馏语料 : {written} 行，但没有 meta.json —— 不知道是谁生成的，"
+              "Step 3 会拒绝用它（FORCE_GEN=1 重新生成）")
+PY
+
+echo ""
+echo "==== Step 1b: ${ADAPTER_DIR} 下现有的 checkpoint ===="
+AVAILABLE=()
+if [[ -d "${ADAPTER_DIR}" ]]; then
+  while IFS= read -r _dir; do
+    [[ -n "${_dir}" ]] && AVAILABLE+=("$(basename "${_dir}")")
+  done < <(find "${ADAPTER_DIR}" -mindepth 1 -maxdepth 1 -type d -name "${ADAPTER_GLOB}" 2>/dev/null | sort)
+fi
+if (( ${#AVAILABLE[@]} == 0 )); then
+  echo "  （没有匹配 '${ADAPTER_GLOB}' 的子目录）"
+else
+  for _name in "${AVAILABLE[@]}"; do echo "  ${_name}"; done
+fi
+
+if [[ "${ADAPTERS}" == "all" ]]; then
+  if (( ${#AVAILABLE[@]} == 0 )); then
+    echo "!! ADAPTERS=all，但 ${ADAPTER_DIR} 下没有匹配 '${ADAPTER_GLOB}' 的目录。"
+    exit 1
+  fi
+  ADAPTERS="$(IFS=,; printf '%s' "${AVAILABLE[*]}")"
+  echo ""
+  echo "ADAPTERS=all 展开成 ${#AVAILABLE[@]} 个 checkpoint（λ 扫描的短跑、_idcov 对照臂"
+  echo "也会被展开进来；只要正式那几个就把 ADAPTERS 显式列举）。"
+fi
+
+WANT_COUNT="$(printf '%s' "${ADAPTERS}" | tr ',' '\n' | grep -c '[^[:space:]]' || true)"
+echo ""
+echo "本次要打 ${WANT_COUNT} 个 checkpoint + base，各 ${#ACTIVE_DOMAINS[@]} 个域。"
+if [[ -z "${VANILLA_RUNS}" ]]; then
+  echo "!! 没传 VANILLA_RUNS：「消除的漂移」整列会是 n/a。它是那一列的分母，"
+  echo "   8B 线要两个（cs_ 和 ds_ 各一个），按 run 名第一段与臂配对。"
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo ""
+  echo "DRY_RUN=1：只看清单，不生成、不打分。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 2: 自蒸馏采集
+#   base 在三份留出集的题面上贪心作答，答案写进 targets，数据集自带的参考答案
+#   留在 gold_targets（generate_replay_targets 一直这么写），所以同一份文件同时
+#   是这把尺子的语料和 102 号那把尺子的语料 —— 逐行可比。
+#
+#   --sample_shuffle 0：写出的 index 就是留出集的行号。默认的 shuffle 是给"子集必须
+#   嵌套在产生 C 的池里"那个约束用的，这里的文件本身就是要生成的全部行，没有池可嵌，
+#   而保住行号换来的是 gold 那一路的 per_row 按行号就能对上。
+#
+#   --resume 1：作业被 requeue 后接着生成，不重跑已写出的行。
+# ===========================================================================
+if [[ "${STAGE}" == "all" || "${STAGE}" == "gen" ]] && [[ "${SUMMARY_ONLY}" != "1" ]]; then
+  echo ""
+  echo "==== Step 2: 自蒸馏采集（${DECODE_DESC}）===="
+  for _d in "${ACTIVE_DOMAINS[@]}"; do
+    _val="$(val_file_for "${_d}")"
+    _sd="$(sd_file_for "${_d}")"
+    _meta="$(meta_file_for "${_d}")"
+    _max_new="$(max_new_for "${_d}")"
+
+    if [[ "${FORCE_GEN}" == "1" && -f "${_sd}" ]]; then
+      mv "${_sd}" "${_sd}.$(date +%Y%m%d_%H%M%S).bak"
+      rm -f "${_meta}"
+      echo "FORCE_GEN=1：已备份旧语料，重新生成 ${_d}"
+    elif [[ -f "${_sd}" && -f "${_meta}" ]]; then
+      # 已经生成完的才跳过。行数不够（上次被 walltime 砍掉）就落到下面接着生成。
+      if META="${_meta}" SD="${_sd}" python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+meta = json.loads(Path(os.environ["META"]).read_text(encoding="utf-8"))
+written = sum(1 for line in Path(os.environ["SD"]).read_text(encoding="utf-8").splitlines() if line.strip())
+if not meta.get("complete"):
+    print("  上次没写完，接着生成")
+    sys.exit(1)
+if written != meta.get("generated_rows"):
+    print(f"  行数与 meta 不符（{written} vs {meta.get('generated_rows')}），重新生成")
+    sys.exit(1)
+PY
+      then
+        echo "跳过 ${_d}：已有完整语料 ${_sd}（FORCE_GEN=1 可重生成）"
+        continue
+      fi
+    fi
+
+    echo ""
+    echo "---- ${_d}  (max_new_tokens ${_max_new})"
+    python -m onereplay.scripts.generate_replay_targets \
+      --seed "${SEED}" \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --data_files "${_val}" --split train \
+      --cache_dir "${TMPDIR}/hf_datasets" \
+      --input_column "${VAL_INPUT_COLUMN}" --target_column "${VAL_TARGET_COLUMN}" \
+      --pool_size 0 --pool_offset 0 --num_samples 0 \
+      --sample_shuffle 0 --sample_seed "${SEED}" \
+      --batch_size "${GEN_BATCH}" \
+      --max_new_tokens "${_max_new}" --min_new_tokens "${GEN_MIN_NEW}" \
+      --max_len "${GEN_MAXLEN}" --length_margin "${GEN_LEN_MARGIN}" \
+      --temperature "${TEMPERATURE}" --enable_thinking "${ENABLE_THINKING}" \
+      --keep_truncated_text 0 \
+      --output_path "${_sd}" \
+      --resume 1 --log_every 5
+
+    # meta.json 是 Step 3 的准入凭证：它记下这份语料是谁生成的、怎么生成的。
+    # 没有它，"8B 的语料拿去给 1.5B 打分"这个错就只能靠文件名去防。
+    DOMAIN="${_d}" VAL_PATH="${_val}" SD_PATH="${_sd}" META_PATH="${_meta}" \
+    MODEL_NAME="${MODEL_NAME}" MODEL_DIR="${MODEL_DIR}" \
+    GEN_MAXLEN="${GEN_MAXLEN}" GEN_MAX_NEW="${_max_new}" GEN_MIN_NEW="${GEN_MIN_NEW}" \
+    GEN_LEN_MARGIN="${GEN_LEN_MARGIN}" GEN_BATCH="${GEN_BATCH}" \
+    TEMPERATURE="${TEMPERATURE}" ENABLE_THINKING="${ENABLE_THINKING}" SEED="${SEED}" \
+    python - <<'PY'
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+sd_path = Path(os.environ["SD_PATH"])
+val_path = Path(os.environ["VAL_PATH"])
+rows = [json.loads(line) for line in sd_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+usable, dropped = [], 0
+for row in rows:
+    if str(row.get("targets") or "").strip():
+        usable.append(row)
+    else:
+        dropped += 1
+
+answer_tokens = sorted(int(row.get("target_tokens", 0)) for row in usable)
+
+
+def quantile(fraction, values):
+    if not values:
+        return 0
+    return values[min(int(fraction * len(values)), len(values) - 1)]
+
+
+meta = {
+    "domain": os.environ["DOMAIN"],
+    "model_name": os.environ["MODEL_NAME"],
+    "model_dir": os.environ["MODEL_DIR"],
+    "source_val_file": str(val_path),
+    "source_sha256": hashlib.sha256(val_path.read_bytes()).hexdigest()[:16],
+    "source_rows": sum(1 for line in val_path.read_text(encoding="utf-8").splitlines() if line.strip()),
+    "generated_rows": len(rows),
+    "usable_rows": len(usable),
+    "dropped_rows": dropped,
+    "answer_tokens_p50": quantile(0.5, answer_tokens),
+    "answer_tokens_p90": quantile(0.9, answer_tokens),
+    "answer_tokens_max": answer_tokens[-1] if answer_tokens else 0,
+    "max_len": int(os.environ["GEN_MAXLEN"]),
+    "max_new_tokens": int(os.environ["GEN_MAX_NEW"]),
+    "min_new_tokens": int(os.environ["GEN_MIN_NEW"]),
+    "length_margin": int(os.environ["GEN_LEN_MARGIN"]),
+    "batch_size": int(os.environ["GEN_BATCH"]),
+    "temperature": float(os.environ["TEMPERATURE"]),
+    "enable_thinking": int(os.environ["ENABLE_THINKING"]),
+    "seed": int(os.environ["SEED"]),
+    "sample_shuffle": 0,
+    "keep_truncated_text": 0,
+    "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    "complete": True,
+}
+Path(os.environ["META_PATH"]).write_text(
+    json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+
+frac = dropped / max(len(rows), 1)
+print(f"  可用 {len(usable)} / 丢弃 {dropped} ({frac:.1%})"
+      f"，答案 token P50={meta['answer_tokens_p50']} P90={meta['answer_tokens_p90']}"
+      f" max={meta['answer_tokens_max']}")
+if frac > 0.2:
+    # 丢弃的都是"答案没吐完"的行，也就是基座话最长的那些。丢得多了，语料就偏向
+    # 基座答得短的题，这一列量的东西跟着变窄。三个域要一起重生成，不然不可比。
+    print(f"  !! 丢弃率 {frac:.1%} > 20%：调大 GEN_MAX_NEW_{os.environ['DOMAIN'].upper()}"
+          " 后 FORCE_GEN=1 重新生成（三个域一起）")
+# 眼看两行，防的是"生成跑通了但输出是退化的"（空答案、复读、模板碎片）——
+# 那种语料打出来的 CE 一样是数，只是量的不是东西。
+for row in usable[:2]:
+    question = str(row.get("inputs", ""))[:160].replace("\n", " ")
+    answer = str(row.get("targets", ""))[:240].replace("\n", " ")
+    print(f"  [{row.get('index')}] Q: {question}")
+    print(f"       A: {answer}")
+PY
+  done
+fi
+
+if [[ "${STAGE}" == "gen" ]]; then
+  echo ""
+  echo "STAGE=gen：语料已就位，没有打分。接着投："
+  echo "  qsub -v STAGE=score,VANILLA_RUNS='${VANILLA_RUNS}' ${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 3: 打分
+# ===========================================================================
+# ---- 准入：每份语料必须是**本基座**生成的 ----
+# 拿别的基座的自蒸馏语料打分不会报错，只会得到"这个 checkpoint 离另一个模型的
+# 输出多远"，然后被当成遗忘写进表。所以在加载模型之前先把它挡掉。
+echo ""
+echo "==== Step 3a: 语料准入（meta.model_name 必须等于 ${MODEL_NAME}）===="
+SCORE_PROBES=""
+for _d in "${ACTIVE_DOMAINS[@]}"; do
+  _sd="$(sd_file_for "${_d}")"
+  _meta="$(meta_file_for "${_d}")"
+  if [[ ! -f "${_sd}" ]]; then
+    echo "  ${_d}: 跳过，没有语料 ${_sd}（先 STAGE=gen）"
+    continue
+  fi
+  if [[ ! -f "${_meta}" ]]; then
+    echo "  ${_d}: 跳过，没有 ${_meta} —— 不知道是谁生成的。FORCE_GEN=1 重新生成。"
+    continue
+  fi
+  if ! META="${_meta}" WANT_MODEL="${MODEL_NAME}" WANT_MAXLEN="${SCORE_MAXLEN}" \
+       python - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+meta = json.loads(Path(os.environ["META"]).read_text(encoding="utf-8"))
+if meta.get("model_name") != os.environ["WANT_MODEL"]:
+    print(f"    生成它的是 {meta.get('model_name')}，本次基座是 {os.environ['WANT_MODEL']}")
+    sys.exit(1)
+if not meta.get("complete"):
+    print("    meta.complete 不是 true，语料没写完")
+    sys.exit(1)
+want_maxlen = int(os.environ["WANT_MAXLEN"])
+if int(meta.get("max_len", 0)) > want_maxlen:
+    # 生成时的预算比打分预算大，说明有答案在打分时会被截掉尾巴，两个数不再是
+    # 同一件事。反过来（生成预算更小）是安全的。
+    print(f"    生成 max_len {meta.get('max_len')} > 打分 max_len {want_maxlen}，"
+          "打分会截断答案尾部")
+    sys.exit(1)
+PY
+  then
+    echo "  ${_d}: !! 不准入，跳过（上面写了原因）"
+    continue
+  fi
+  echo "  ${_d}: 准入 ${_sd}"
+  SCORE_PROBES="${SCORE_PROBES}${SCORE_PROBES:+,}${_d}=${_sd}"
+done
+[[ -n "${SCORE_PROBES}" ]] || { echo "!! 没有一份语料准入，停。"; exit 1; }
+
+OK_RUNS=()
+FAILED_RUNS=()
+SKIPPED_RUNS=()
+
+if [[ "${SUMMARY_ONLY}" == "1" ]]; then
+  [[ -f "${OUT_PATH}" ]] || { echo "!! SUMMARY_ONLY=1 但没有 ${OUT_PATH}"; exit 1; }
+  echo ""
+  echo "SUMMARY_ONLY=1：跳过打分，直接读 ${OUT_PATH}"
+else
+  # 追加写的 jsonl。默认整轮重打并先把旧的挪走，否则汇总会读到上一次不同 max_len
+  # 或不同基座的数。RESUME_SCORE=1 则保留旧文件、跳过已打过的同口径 run
+  # —— 三小时的打分被 walltime 砍掉时用它。
+  SCORED_SET="${TMPDIR}/scored.txt"
+  : > "${SCORED_SET}"
+  if [[ "${RESUME_SCORE}" == "1" && -f "${OUT_PATH}" ]]; then
+    OUT_PATH="${OUT_PATH}" WANT_MAXLEN="${SCORE_MAXLEN}" PROBES="${SCORE_PROBES}" \
+    python - > "${SCORED_SET}" <<'PY'
+import json
+import os
+
+want_maxlen = int(os.environ["WANT_MAXLEN"])
+names = [item.split("=", 1)[0] for item in os.environ["PROBES"].split(",") if item.strip()]
+done = set()
+with open(os.environ["OUT_PATH"], encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if int(record.get("max_len", -1)) != want_maxlen:
+            continue
+        if all(f"probe_{name}" in record for name in names):
+            done.add(record["run_name"])
+for name in sorted(done):
+    print(name)
+PY
+    echo "RESUME_SCORE=1：${OUT_PATH} 里已有 $(wc -l < "${SCORED_SET}") 个同口径 run，跳过它们。"
+  elif [[ -f "${OUT_PATH}" ]]; then
+    mv "${OUT_PATH}" "${OUT_PATH}.$(date +%Y%m%d_%H%M%S).bak"
+    echo "已备份上一次的 ${OUT_PATH}"
+  fi
+
+  score_one () {
+    local run_name="$1" adapter_path="$2"
+    if grep -Fxq "${run_name}" "${SCORED_SET}" 2>/dev/null; then
+      echo "跳过 ${run_name}：${OUT_PATH} 里已有同口径记录"
+      SKIPPED_RUNS+=("${run_name}")
+      return 0
+    fi
+    echo ""
+    echo "---- ${run_name}"
+    python -m onereplay.scripts.score_probe_ce \
+      --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+      --adapter_path "${adapter_path}" \
+      --run_name "${run_name}" \
+      --probes "${SCORE_PROBES}" \
+      --probe_size "${PROBE_SIZE}" \
+      --max_len "${SCORE_MAXLEN}" \
+      --batch_size "${BATCH}" --row_batch_size "${ROW_BATCH}" \
+      --replay_input_column inputs \
+      --replay_target_column targets \
+      --replay_drop_truncated 1 \
+      --map_cache_dir "${TMPDIR}/map_cache_${run_name}" \
+      --verify_aggregate "${VERIFY}" \
+      --per_row_dir "${PER_ROW_DIR}" \
+      --out "${OUT_PATH}"
+  }
+
+  echo ""
+  echo "==== Step 3b: 打分（base 在前，它是这把尺子的下界）===="
+  if score_one "${BASE_NAME}" ""; then
+    OK_RUNS+=("${BASE_NAME}")
+  else
+    echo "!! base 打分失败。后面的数没有锚点，停。"
+    exit 1
+  fi
+
+  IFS=',' read -r -a _ADAPTER_SPECS <<< "${ADAPTERS}"
+  for _spec in "${_ADAPTER_SPECS[@]}"; do
+    _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+    [[ -z "${_spec}" ]] && continue
+    if [[ "${_spec}" == /* ]]; then
+      _path="${_spec}"
+      _name="$(basename "${_spec}")"
+    else
+      _path="${ADAPTER_DIR}/${_spec}"
+      _name="${_spec}"
+    fi
+    if [[ ! -d "${_path}" ]]; then
+      echo "!! 跳过 ${_name}：找不到 ${_path}（看 Step 1b 的清单核对名字）"
+      FAILED_RUNS+=("${_name} (缺 checkpoint)")
+      continue
+    fi
+    if score_one "${_name}" "${_path}"; then
+      OK_RUNS+=("${_name}")
+    else
+      FAILED_RUNS+=("${_name} (打分失败)")
+      [[ "${KEEP_GOING}" == "1" ]] || { echo "!! KEEP_GOING=0，停。"; break; }
+    fi
+  done
+fi
+
+# ===========================================================================
+# Step 4: 汇总
+# ===========================================================================
+echo ""
+echo "========================================================================"
+echo "自蒸馏 old val loss"
+echo "========================================================================"
+set +e
+OUT_PATH="${OUT_PATH}" BASE_NAME="${BASE_NAME}" MODEL_NAME="${MODEL_NAME}" \
+VANILLA_RUNS="${VANILLA_RUNS}" DELTA="${DELTA}" GOLD_JSONL="${GOLD_JSONL}" \
+python - <<'PY'
+import json
+import os
+
+base_name = os.environ["BASE_NAME"]
+# 噪声地板。0.0077 是 96 号那轮在 **gold** CE 上实测的（bs4 与 bs2 两条 vanilla
+# 曲线末点的间距），这把尺子上还没量过自己的。δ 列因此只当量级参考读：这把尺子上
+# vanilla 的漂移通常是几十个 δ，臂间差是它的一小截，要声明臂间差就得先在本线上
+# 用同一个臂变一次 batch size 把地板量出来。
+delta = float(os.environ.get("DELTA") or 0.0077)
+
+records, order = {}, []
+with open(os.environ["OUT_PATH"], encoding="utf-8") as handle:
+    for line in handle:
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        name = record["run_name"]
+        if name not in records:
+            order.append(name)
+        # 同名取最后一条：RESUME_SCORE 下同一个 run 可能被写过两次。
+        records[name] = record
+
+base = records.get(base_name)
+if base is None:
+    raise SystemExit("找不到 base 那一行，这一列没有锚点。")
+
+# score_probe_ce 把 --probe_size 也写进同一条记录，所以光看 probe_ 前缀会凭空
+# 多出一个叫 size 的"域"。真正的域一定同时带着自己的 <name>_rows。
+probe_names = [
+    key[len("probe_"):]
+    for key in base
+    if key.startswith("probe_") and f"{key[len('probe_'):]}_rows" in base
+]
+if not probe_names:
+    raise SystemExit("base 那一行没有任何域字段（probe_<name> 配 <name>_rows）。")
+
+print(f"基座 = {os.environ['MODEL_NAME']}   （CE 的绝对值只在同一基座内可比）")
+print("base 的 CE 是它对自己那条贪心序列的置信度，是这把尺子的下界，不是 0。")
+
+def prefix(name):
+    return name.split("_", 1)[0]
+
+vanilla_by_prefix = {}
+for spec in (os.environ.get("VANILLA_RUNS") or "").split(","):
+    spec = spec.strip()
+    if not spec:
+        continue
+    if spec not in records:
+        print(f"!! VANILLA_RUNS 里的 {spec!r} 不在本次打过分的 run 里，"
+              f"{prefix(spec)}_ 那一组的「消除的漂移」会是 n/a")
+        continue
+    vanilla_by_prefix[prefix(spec)] = spec
+
+arms = [name for name in order if name != base_name]
+groups = {}
+for name in arms:
+    groups.setdefault(prefix(name), []).append(name)
+
+WIDTH = max([len(name) for name in records] + [20]) + 2
+below_base = []
+
+for probe in probe_names:
+    key = f"probe_{probe}"
+    anchor = base[key]
+    rows = base.get(f"{probe}_rows") or 0
+    cut = base.get(f"{probe}_rows_at_max_len") or 0
+    tokens = base.get(f"{probe}_supervised_tokens") or 0
+
+    print()
+    print(f"######## {probe}")
+    print(f"  {rows} 行 / {tokens} 个 supervised token / "
+          f"{cut} 行顶到 max_len={base.get('max_len')}")
+    if rows and cut / rows > 0.05:
+        print(f"  !! {cut / rows:.1%} 的行被截断，CE 只覆盖答案前缀。调大 SCORE_MAXLEN"
+              "（生成也要一起调大，且**所有** run 重打，不然不可比）。")
+    if anchor > 0.5:
+        # 自蒸馏语料上基座自己的 CE 本该在 0.1 上下。高到这个程度，多半是语料不是
+        # 这个基座生成的，或者生成与打分的渲染不是一套（thinking 开关、系统提示词）。
+        print(f"  !! base 的 CE = {anchor:.4f}，对自己的输出不该这么高。检查语料的"
+              " meta.json 与 ENABLE_THINKING。")
+    print()
+    header = (f"  {'run':<{WIDTH}}{'CE':>10}{'vs base':>11}{'相对':>9}"
+              f"{'δ':>7}{'消除漂移':>11}")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    print(f"  {base_name:<{WIDTH}}{anchor:>10.4f}{'(锚点/下界)':>17}")
+
+    for pfx in sorted(groups):
+        members = [name for name in groups[pfx] if key in records[name]]
+        if not members:
+            continue
+        vanilla_name = vanilla_by_prefix.get(pfx)
+        vanilla = records.get(vanilla_name) if vanilla_name else None
+        span = (vanilla[key] - anchor) if vanilla and key in vanilla else None
+        span_usable = span is not None and span > 3 * delta
+        note = f"vanilla = {vanilla_name}" if vanilla_name else "没给 vanilla，分母缺失"
+        print(f"  -- {pfx}_*   ({note})")
+        for name in sorted(members, key=lambda item: records[item][key]):
+            value = records[name][key]
+            gap = value - anchor
+            rel = f"{gap / anchor:+.1%}" if anchor else "n/a"
+            kept = f"{1 - gap / span:>10.1%}" if span_usable else f"{'n/a':>11}"
+            if gap < -3 * delta:
+                below_base.append((name, probe))
+            print(f"  {name:<{WIDTH}}{value:>10.4f}{gap:>+11.4f}{rel:>9}"
+                  f"{abs(gap) / delta:>7.0f}{kept}")
+        if span is not None:
+            relative = f"{span / anchor:+.1%}" if anchor else "n/a"
+            print(f"     {vanilla_name} 的总漂移 {anchor:.4f} -> {vanilla[key]:.4f} "
+                  f"({span:+.4f}, {relative}, {abs(span) / delta:.0f}δ)")
+            if span < -3 * delta:
+                # 这把尺子上不可能：目标就是 base 自己的输出，它是下界。真出现了，
+                # 先查语料是不是这个基座生成的、生成与打分的渲染是不是一套。
+                print("     !! vanilla 的 CE 低于 base。这把尺子上不该发生（base 是下界），"
+                      "先查语料与渲染，别当结论读。")
+            elif span <= 3 * delta:
+                print("     !! vanilla 几乎没动：这个域上整轮训练都没产生可测的漂移，"
+                      "臂间差只会更小。")
+
+# ---- 跨域矩阵 ----
+if len(probe_names) > 1 and arms:
+    print()
+    print("========================================================================")
+    print("跨域矩阵：CE 相对 base 的变化（越大 = 离基座当初的输出越远）")
+    head = f"  {'run':<{WIDTH}}" + "".join(f"{p:>14}" for p in probe_names)
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for name in arms:
+        cells = ""
+        for probe in probe_names:
+            key = f"probe_{probe}"
+            cells += (f"{records[name][key] - base[key]:>+14.4f}"
+                      if key in records[name] else f"{'-':>14}")
+        print(f"  {name:<{WIDTH}}{cells}")
+
+# ---- 与 102 号那把尺子并排 ----
+# 这一段是本脚本的动因本身：同一批行上，gold 目标让 CE 往下走，自蒸馏目标让它
+# 往上走。两列并排打出来，"为什么本文用 benchmark 而不是 gold loss 报遗忘"就有
+# 了一张自带证据的表。
+gold_files = [item.strip() for item in (os.environ.get("GOLD_JSONL") or "").split(",") if item.strip()]
+gold = {}
+for path in gold_files:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                for key, value in record.items():
+                    if not key.startswith("probe_"):
+                        continue
+                    name = key[len("probe_"):]
+                    if not name.endswith("gold") or f"{name}_rows" not in record:
+                        continue
+                    gold.setdefault(record["run_name"], {})[name[: -len("gold")]] = float(value)
+    except OSError as error:
+        print(f"\n（读不到 gold 分数 {path}: {error}）")
+
+gold_base = gold.get(base_name, {})
+shared = [p for p in probe_names if p in gold_base]
+if shared:
+    print()
+    print("========================================================================")
+    print("两把尺子并排（同一批行，只差目标那一列）")
+    print(f"  gold 分数来自 {', '.join(gold_files)}")
+    head = (f"  {'run':<{WIDTH}}" + "".join(f"{p + ' Δgold':>16}{p + ' Δ自蒸馏':>16}"
+                                            for p in shared))
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    reversed_gold = 0
+    pairs = 0
+    for name in arms:
+        if name not in gold:
+            continue
+        cells = ""
+        for probe in shared:
+            gold_gap = (gold[name][probe] - gold_base[probe]) if probe in gold[name] else None
+            sd_gap = (records[name][f"probe_{probe}"] - base[f"probe_{probe}"]
+                      if f"probe_{probe}" in records[name] else None)
+            cells += (f"{gold_gap:>+16.4f}" if gold_gap is not None else f"{'-':>16}")
+            cells += (f"{sd_gap:>+16.4f}" if sd_gap is not None else f"{'-':>16}")
+            if gold_gap is not None and sd_gap is not None:
+                pairs += 1
+                if gold_gap < 0 <= sd_gap:
+                    reversed_gold += 1
+        print(f"  {name:<{WIDTH}}{cells}")
+    print()
+    print(f"  {reversed_gold}/{pairs} 个 (臂, 域) 组合上两把尺子方向相反："
+          "gold 说 loss 降了（像是没遗忘），自蒸馏说模型确实漂走了。")
+    print("  gold 那一列不是噪声，它量的是另一件事 —— 模型有多会预测数据集的口吻，"
+          "而任何指令 SFT 都会让它更会。")
+
+print()
+print("========================================================================")
+if below_base:
+    print(f"!! {len(below_base)} 个 (臂, 域) 组合的 CE 低于 base 超过 3δ。这把尺子上"
+          "这件事不该发生（base 是下界），出现就先怀疑语料/渲染，再怀疑结论：")
+    for name, probe in below_base[:10]:
+        print(f"     {name} @ {probe}")
+print("读法：这一列是**对基座行为的锚定程度**，不是能力。")
+print("  * CE 是 teacher forcing，量的是「这条序列有多意外」，不是「能不能自己解出来」。")
+print("  * OneReplay / EWC 的正则项就是对 ΔW 的惩罚，而这一列是同一件事的一阶近似，")
+print("    所以它们在这里领先有一部分是被直接优化的；replay 训在 gold 上，会被这把")
+print("    尺子罚。必须和 benchmark 那一列并排报，base 也要画出来。")
+print("  * 误差棒: python -m onereplay.scripts.bootstrap_probe_ce --help（逐行数据已落盘）")
+PY
+SUMMARY_RC=$?
+set -e
+
+echo ""
+echo "成功 ${#OK_RUNS[@]} 个: ${OK_RUNS[*]:-}"
+if (( ${#SKIPPED_RUNS[@]} > 0 )); then
+  echo "跳过 ${#SKIPPED_RUNS[@]} 个（已有同口径记录）: ${SKIPPED_RUNS[*]}"
+fi
+if (( ${#FAILED_RUNS[@]} > 0 )); then
+  echo "失败 ${#FAILED_RUNS[@]} 个:"
+  for name in "${FAILED_RUNS[@]}"; do echo "  ${name}"; done
+fi
+
+echo ""
+echo "产物:"
+echo "  语料    : ${SD_DIR}/<domain>_val${VAL_ROWS}_selfdistill_${MODEL_NAME}.jsonl (+ .meta.json)"
+echo "  分数    : ${OUT_PATH}"
+echo "  逐行    : ${PER_ROW_DIR}/<run>__<domain>.jsonl"
+echo ""
+echo "配对 bootstrap（登录节点，纯 CPU）:"
+echo "  python -m onereplay.scripts.bootstrap_probe_ce \\"
+echo "    --per_row_dir ${PER_ROW_DIR} \\"
+echo "    --base ${BASE_NAME} --vanilla <vanilla 的 run 名> --compare <臂1,臂2,...>"
+echo ""
+echo "另一条线（同一个脚本，换基座与 checkpoint 目录）:"
+if [[ "${MODEL_NAME}" == "Qwen3-8B" ]]; then
+  echo "  qsub -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\\"
+  echo "RESULTS_ROOT=${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct,\\"
+  echo "ADAPTER_DIR=${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/checkpoints,\\"
+  echo "VANILLA_RUNS=fin_vanilla_lr8e-5_ep2_seed42 \\"
+  echo "       ${SELF_PATH}"
+else
+  echo "  qsub -v VANILLA_RUNS='cs_vanilla_8b_r16all_lr2e-4_seed1,ds_vanilla_8b_r16all_lr2e-4_ep2_seed1' \\"
+  echo "       ${SELF_PATH}"
+fi
+echo "Job finished at: $(date)"
+
+exit "${SUMMARY_RC}"

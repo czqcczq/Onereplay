@@ -170,6 +170,11 @@ def build_cost_table(
         "run",
         "λ",
         "replay r",
+        # Without these two, steps and ms/step cannot be read: halving batch_size
+        # doubles the step count and cuts per-step time, which looks exactly like
+        # "this arm is faster per step" while it is a different batch shape.
+        "batch",
+        "rows/update",
         "steps",
         "epoch time (s)",
         "vs base",
@@ -191,6 +196,8 @@ def build_cost_table(
                 name,
                 f"{lam:g}" if lam else "0",
                 f"{replay_ratio:g}" if replay_ratio else "0",
+                str(record.get("batch_size", MISSING)),
+                str(record.get("accumulation_size", MISSING)),
                 str(record.get("train_steps", MISSING)),
                 number(record.get("train_sec"), ".1f"),
                 ratio(record.get("train_sec"), base.get("train_sec")),
@@ -255,6 +262,11 @@ def main() -> None:
         (
             "`epoch time` 变长可能来自更多步数（replay 追加了样本），`ms/step` 变长"
             "才是单步变慢。base 模型不训练，训练开销一栏应写 “—”。"
+        ),
+        (
+            "`ms/step` 只在 `batch` 相同的 run 之间可比：batch 减半会让步数翻倍、"
+            "单步变快，读起来和“这一臂更快”一模一样，其实是 batch 形状不同。"
+            "batch 不一致时只有 `samples/s` 和 `tokens/s` 是可比的吞吐量。"
         ),
     ]
     if headline is names and profiled:
