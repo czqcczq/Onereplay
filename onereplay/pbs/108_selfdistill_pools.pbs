@@ -257,7 +257,12 @@ SAMPLE_SHUFFLE="${SAMPLE_SHUFFLE:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-0}"          # 0 = 整池；冒烟时设 64
 
 GEN_BATCH="${GEN_BATCH:-32}"             # 1.5B
-GEN_BATCH_8B="${GEN_BATCH_8B:-8}"        # 8B 显存吃紧，单独给
+# 8B 单独给，但不必给小：prompt_ceiling 已经把超长 prompt 挡在批外，所以一批里
+# 最长的序列不会超过该域的 max_len（if 488 / math+code 1000）。Qwen3-8B 是 GQA
+# （8 个 KV head），每 token 的 KV 约 150KB，batch 32 x 1024 token 也就 ~5GB，
+# 对着 80GB 卡 + 16GB 权重绰绰有余。8B 那一轮的墙钟几乎只由这个数决定，给 8 等于
+# 白扔三四倍的时间。真 OOM 了对半砍再重投即可，--resume 1 不会丢已写出的行。
+GEN_BATCH_8B="${GEN_BATCH_8B:-32}"
 GEN_MIN_NEW="${GEN_MIN_NEW:-16}"
 GEN_LEN_MARGIN="${GEN_LEN_MARGIN:-8}"
 
