@@ -53,14 +53,18 @@
 #   臂间差通常只是 vanilla 总漂移的一小截，所以总漂移要有几十个 δ 才够用。
 #
 # -----------------------------------------------------------------------------
-# !! 两条线是两个基座，base 分母必须各算各的
+# !! 三条线，base 分母必须各算各的
 #
-#   DialogSum 线   Qwen3-8B              LoRA，checkpoint 在 results/qwen3-8b/adapters
+#   DialogSum 线   Qwen3-8B              LoRA，ds_*，checkpoint 在 results/qwen3-8b/adapters
+#   commonsense 线 Qwen3-8B              LoRA，cs_*，同一个 adapters 目录（67/70/71/72）
 #   finance 线     Qwen2.5-1.5B-Instruct 全参，checkpoint 在
 #                                        results_finance_.../checkpoints
 #
-#   所以是**两次投递**，不是一次。跨线只能比"方向和相对幅度"，CE 的绝对值不可比：
+#   所以是**三次投递**，不是一次。跨线只能比"方向和相对幅度"，CE 的绝对值不可比：
 #   两个模型在同一批题上的起点本来就不同。
+#
+#   ds 与 cs 同基座同目录，只差 ADAPTER_GLOB，但 OUT_PATH 必须分开传：默认那个
+#   路径两条线会互相备份掉，汇总时读到的就是上一条线的数。
 #
 #   score_probe_ce 的 --adapter_path 同时吃 LoRA 目录和全参 checkpoint 目录
 #   （95 号自己就是这么把 fin_* 传给评测的），所以两条线共用这一个脚本。
@@ -107,6 +111,19 @@
 #
 #   # 只要其中一部分：ADAPTER_GLOB 过滤，或者 ADAPTERS 显式列举
 #   qsub -v ADAPTERS=all,ADAPTER_GLOB='ds_*',VANILLA_RUN=... onereplay/pbs/102_...pbs
+#
+#   # (1'') commonsense 线 / Qwen3-8B：67/70/71/72 那批 cs_* 的保护域 old val loss。
+#   #       同一个 adapters 目录，所以只差 glob；OUT_PATH 一定要另给，否则会把 ds
+#   #       线的 direction.jsonl 备份掉，两条线的数混在一个汇总里。
+#   qsub -v ADAPTERS=all,ADAPTER_GLOB='cs_*',\
+#VANILLA_RUN=cs_vanilla_8b_r16all_lr2e-4_seed1,\
+#OUT_PATH=/scratch/weiliu87/student/czq/Onereplay/results/qwen3-8b/probe_ce/direction_cs.jsonl,\
+#PER_ROW_DIR=/scratch/weiliu87/student/czq/Onereplay/results/qwen3-8b/probe_ce/per_row_cs \
+#        onereplay/pbs/102_math_val500_direction.pbs
+#
+#   #       先 DRY_RUN=1 看一眼 Step 1：cs_* 里混着 λ 扫描的 _probe 短跑和 _idcov
+#   #       的 L2 对照臂，它们也会被 all 展开进来。正式那 13 个臂（vanilla + 三种
+#   #       方法 x 四个域）要的话就把 ADAPTERS 显式列举。
 #
 #   #    14 个 checkpoint x 3 个语料约 1.5 h；赶时间可以 VERIFY=0 砍掉一半前向
 #   #    （那是逐行路径与 evaluate_probe 的互校，第一次跑过一次就够了）。

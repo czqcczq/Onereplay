@@ -1,0 +1,525 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N cs_newval
+#PBS -j oe
+#PBS -k oed
+#PBS -q autox
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: commonsense 线（Qwen3-8B / cs_*）新任务 val loss 的**分母**
+#
+# 只做前向，不训练、不生成。一次约 10 分钟，绝大半是 8B 的模型加载。
+#
+# -----------------------------------------------------------------------------
+# !! 这个脚本存在的原因
+#
+#   67/70/71/72 那批 cs_* 跑在 --eval_before_train 这个 flag 之前。各臂的
+#   val_loss 在 metrics jsonl 里都有（每个 epoch 一条），但**没有 epoch 0 的
+#   baseline 那一条**，也就是没有未训练的 base 在同一批 val 行上的 loss。
+#
+#   少了它，"vanilla 的 val_loss = 0.42" 这个数说不出这轮到底学到了多少 ——
+#   只说得出它停在哪。ds 线是白捡的（96 号起每次训练都带 --eval_before_train 1），
+#   cs 线得单独补一次前向。
+#
+#   补的办法不是重训：evaluate 的 commonsense metric 和训练期的 val_loss 走
+#   同一条路（onereplay.data.commonsense.load_and_prepare_dataset + build_loader +
+#   batch 平均的 CE），所以拿 base 跑一次就是那条缺掉的 baseline。
+#
+# -----------------------------------------------------------------------------
+# !! 口径：五个数必须与 67 号逐字相同，否则这个分母不能减
+#
+#   seed 1          train_test_split 的 seed，决定**哪 1000 行**是 val 集
+#   val_fraction    0.01
+#   max_val_samples 1000
+#   max_len         512
+#   batch_size      8     <- 最容易错的一个
+#
+#   val_loss 是**batch 平均**而不是 token 平均（见 metrics.commonsense 与
+#   trainers/base.evaluate_loss），所以它随 batch size 漂。67 号把
+#   eval_batch_size 钉在 8 正是为了这个；74 号的 CS_LOSS_BATCH 默认是 16，照抄
+#   过来算出的 base 就和各臂不可减了。Step 1 会把各臂记录里的 eval_batch_size
+#   读出来核对。
+#
+# -----------------------------------------------------------------------------
+# !! 这只是"新任务"那一半
+#
+#   保护域的 old val loss 走 102 号（if / math / code 三份 500 行 gold 留出集）：
+#
+#     qsub -v ADAPTERS=all,ADAPTER_GLOB='cs_*',\
+#     VANILLA_RUN=cs_vanilla_8b_r16all_lr2e-4_seed1,\
+#     OUT_PATH=.../results/qwen3-8b/probe_ce/direction_cs.jsonl \
+#          onereplay/pbs/102_math_val500_direction.pbs
+#
+#   两个数不可互相替代，也不可互减：这里是 commonsense170k 的留出集（学没学会
+#   新任务），那里是三个旧域的 gold 答案（旧本事丢了多少）。
+#
+# -----------------------------------------------------------------------------
+# 投递:
+#
+#   # 默认：只打 base，补上那个缺掉的分母。要的就是这一条。
+#   qsub onereplay/pbs/106_cs_new_val_loss.pbs
+#
+#   # 顺便把某几个臂也用同一口径重打一遍（核对 metrics 里的旧数，或某臂的
+#   # metrics 丢了）。base 永远在里面，它是分母。
+#   qsub -v ADAPTERS=cs_vanilla_8b_r16all_lr2e-4_seed1 onereplay/pbs/106_...pbs
+#   qsub -v ADAPTERS=all,ADAPTER_GLOB='cs_*' onereplay/pbs/106_...pbs
+#
+#   # 只看 metrics 里已有的那一列与清单，不加载模型（秒级）
+#   qsub -v DRY_RUN=1 onereplay/pbs/106_cs_new_val_loss.pbs
+#
+# 产物: ${OUT_DIR}/commonsense/<run>/summary.json 里的 val_loss，与 67 号当年
+# 评测的落点同构。末尾会按 09-22 结果统计那张表的顺序把一列打出来。
+# =============================================================================
+
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/106_cs_new_val_loss.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。起容器，然后把脚本自己在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT ADAPTER_DIR CS_DATASET OUT_DIR
+    ADAPTERS ADAPTER_GLOB BASE_NAME
+    SEED VAL_FRAC MAXVAL MAXLEN CS_LOSS_BATCH
+    DRY_RUN FORCE_EVAL KEEP_GOING
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里
+# =============================================================================
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python : $(which python)"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+ADAPTER_DIR="${ADAPTER_DIR:-${RESULTS_ROOT}/adapters}"
+CS_DATASET="${CS_DATASET:-${REPO_ROOT}/datasets/commonsense_170k_hf}"
+# 自己一层目录，不能直接用 RESULTS_ROOT：74 号（DialogSum 线）的 OUT_DIR 默认就是
+# RESULTS_ROOT，而它跑 commonsense metric 用的是 CS_LOSS_BATCH=16，落点正是
+# ${RESULTS_ROOT}/commonsense/base/summary.json。同名的话本脚本会以为 base 已经
+# 打过而跳过，然后把那个 batch 16 的数当成本次的锚点 —— 一个安静的错。
+#   落点: ${OUT_DIR}/commonsense/<run>/summary.json
+OUT_DIR="${OUT_DIR:-${RESULTS_ROOT}/newval_cs}"
+
+# ---- 口径：五个都是 67 号的值，动任何一个这个分母就不能减了 ----
+SEED="${SEED:-1}"
+VAL_FRAC="${VAL_FRAC:-0.01}"
+MAXVAL="${MAXVAL:-1000}"
+MAXLEN="${MAXLEN:-512}"
+CS_LOSS_BATCH="${CS_LOSS_BATCH:-8}"   # = 67 号的 EVAL_BATCH，见文件头
+
+BASE_NAME="${BASE_NAME:-base}"
+ADAPTERS="${ADAPTERS:-}"              # 空 = 只打 base，那正是本脚本要补的数
+ADAPTER_GLOB="${ADAPTER_GLOB:-cs_*}"
+DRY_RUN="${DRY_RUN:-0}"
+FORCE_EVAL="${FORCE_EVAL:-0}"
+KEEP_GOING="${KEEP_GOING:-1}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+[[ -d "${CS_DATASET}" ]] || { echo "缺 commonsense_170k: ${CS_DATASET}"; exit 1; }
+mkdir -p "${OUT_DIR}"
+
+echo "========================================================================"
+echo "commonsense 线 新任务 val loss"
+echo "  基座   = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  语料   = ${CS_DATASET}"
+echo "  口径   = seed ${SEED} / val_fraction ${VAL_FRAC} / max_val ${MAXVAL}"
+echo "           max_len ${MAXLEN} / batch ${CS_LOSS_BATCH}（batch 平均，钉死）"
+echo "  输出   = ${OUT_DIR}/commonsense/<run>/summary.json"
+echo "========================================================================"
+
+# ===========================================================================
+# Step 1: metrics jsonl 里各臂已有的 val_loss
+#   本脚本只补 base 那一格，其余 13 格早就在这些文件里。顺手把它们读出来，
+#   一是省掉手抄，二是核对 eval_batch_size —— 那是本脚本唯一会算错的地方。
+# ===========================================================================
+echo ""
+echo "==== Step 1: ${RESULTS_ROOT}/metrics 里 cs_* 各臂的 val_loss ===="
+METRICS_DIR="${RESULTS_ROOT}/metrics" WANT_EVAL_BATCH="${CS_LOSS_BATCH}" \
+WANT_MAXVAL="${MAXVAL}" WANT_MAXLEN="${MAXLEN}" WANT_SEED="${SEED}" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+metrics_dir = Path(os.environ["METRICS_DIR"])
+want = {
+    "eval_batch_size": os.environ["WANT_EVAL_BATCH"],
+    "max_val_samples": os.environ["WANT_MAXVAL"],
+    "max_len": os.environ["WANT_MAXLEN"],
+    "seed": os.environ["WANT_SEED"],
+}
+
+files = sorted(metrics_dir.glob("cs_*.jsonl")) if metrics_dir.is_dir() else []
+if not files:
+    print(f"  （{metrics_dir} 下没有 cs_*.jsonl）")
+    raise SystemExit(0)
+
+rows = []
+for path in files:
+    records = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                records.append(json.loads(line))
+    # 末 epoch 那条。有 val_loss 的记录才算：baseline 行（如果有）和纯 cost 行都不是。
+    scored = [r for r in records if r.get("val_loss") is not None]
+    if not scored:
+        print(f"  {path.stem}: 没有带 val_loss 的记录")
+        continue
+    last = scored[-1]
+    drift = [
+        f"{key}={last.get(key)}（要 {value}）"
+        for key, value in want.items()
+        if last.get(key) is not None and str(last.get(key)) != value
+    ]
+    rows.append((path.stem, last, drift))
+
+if not rows:
+    print("  （cs_*.jsonl 里没有一条带 val_loss 的记录）")
+    raise SystemExit(0)
+
+width = max(len(name) for name, _, _ in rows) + 2
+header = f"  {'run':<{width}}{'epoch':>6}{'val_loss':>12}"
+print(header)
+print("  " + "-" * (len(header) - 2))
+for name, last, drift in rows:
+    print(f"  {name:<{width}}{last.get('epoch', '?'):>6}{last['val_loss']:>12.6f}")
+    if drift:
+        print(f"    !! 口径不同: {', '.join(drift)}")
+
+# baseline 行是本脚本要补的那一格。哪个臂已经有了就说一声，那说明它是重训过的。
+have_baseline = []
+for path in files:
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip() and json.loads(line).get("record_type") == "baseline":
+                have_baseline.append(path.stem)
+                break
+print()
+if have_baseline:
+    print(f"  已有 record_type=baseline 的 run: {', '.join(have_baseline)}")
+    print("  它们记的就是 base 在同一 val 集上的 loss，可以和本次前向互校。")
+else:
+    print("  没有任何 run 带 record_type=baseline —— 正是本脚本要补的那一格。")
+PY
+
+# ===========================================================================
+# Step 2: 要打哪些模型
+#   base 必须在，它是本脚本的目的。
+# ===========================================================================
+echo ""
+echo "==== Step 2: 本次要打的模型 ===="
+AVAILABLE=()
+if [[ -d "${ADAPTER_DIR}" ]]; then
+  while IFS= read -r _dir; do
+    [[ -n "${_dir}" ]] && AVAILABLE+=("$(basename "${_dir}")")
+  done < <(find "${ADAPTER_DIR}" -mindepth 1 -maxdepth 1 -type d -name "${ADAPTER_GLOB}" 2>/dev/null | sort)
+fi
+
+if [[ "${ADAPTERS}" == "all" ]]; then
+  if (( ${#AVAILABLE[@]} == 0 )); then
+    echo "!! ADAPTERS=all，但 ${ADAPTER_DIR} 下没有匹配 '${ADAPTER_GLOB}' 的目录。"
+    exit 1
+  fi
+  ADAPTERS="$(IFS=,; printf '%s' "${AVAILABLE[*]}")"
+  echo "ADAPTERS=all 展开成 ${#AVAILABLE[@]} 个 checkpoint。"
+fi
+
+echo "  ${BASE_NAME}（无 adapter）"
+if [[ -z "${ADAPTERS}" ]]; then
+  echo ""
+  echo "  ADAPTERS 为空：只打 base。各臂的 val_loss 见 Step 1，不需要重打。"
+  echo "  要用同一口径重打某几个臂："
+  echo "    qsub -v ADAPTERS=all,ADAPTER_GLOB='cs_*' ${SELF_PATH}"
+else
+  IFS=',' read -r -a _SPECS <<< "${ADAPTERS}"
+  for _spec in "${_SPECS[@]}"; do
+    _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+    [[ -n "${_spec}" ]] && echo "  ${_spec}"
+  done
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo ""
+  echo "DRY_RUN=1：只看清单，未打分。"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# ===========================================================================
+# Step 3: 前向
+# ===========================================================================
+echo ""
+echo "==== Step 3: 前向（commonsense metric，一个模型一次加载）===="
+
+score_one () {
+  local run_name="$1" adapter_path="$2"
+  local summary="${OUT_DIR}/commonsense/${run_name}/summary.json"
+  # 已有的 summary 只有在四个口径字段都对上时才算数。别的脚本也往 commonsense/
+  # 这一层写（74 号用 batch 16），光看文件在不在就会把别人的数当成本次的。
+  if [[ "${FORCE_EVAL}" != "1" && -f "${summary}" ]]; then
+    if SUMMARY="${summary}" WANT_BATCH="${CS_LOSS_BATCH}" WANT_SEED="${SEED}" \
+       WANT_MAXVAL="${MAXVAL}" WANT_MAXLEN="${MAXLEN}" python - <<'PY'
+import json
+import os
+import sys
+
+record = json.loads(open(os.environ["SUMMARY"], encoding="utf-8").read())
+want = {
+    "batch_size": os.environ["WANT_BATCH"],
+    "seed": os.environ["WANT_SEED"],
+    "max_val_samples": os.environ["WANT_MAXVAL"],
+    "max_len": os.environ["WANT_MAXLEN"],
+}
+drift = [f"{k}={record.get(k)}（要 {v}）" for k, v in want.items() if str(record.get(k)) != v]
+if drift or record.get("val_loss") is None:
+    print("  已有 summary 口径不符，重打: " + (", ".join(drift) or "没有 val_loss"))
+    sys.exit(1)
+PY
+    then
+      echo "跳过 ${run_name}：已有同口径的 ${summary}（FORCE_EVAL=1 可重打）"
+      return 0
+    fi
+  fi
+  echo ""
+  echo "---- ${run_name}"
+  python -m onereplay.scripts.evaluate \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --adapter_path "${adapter_path}" --run_name "${run_name}" \
+    --metrics commonsense \
+    --out_dir "${OUT_DIR}" --seed "${SEED}" \
+    --dataset_path "${CS_DATASET}" \
+    --val_fraction "${VAL_FRAC}" --max_val_samples "${MAXVAL}" --max_len "${MAXLEN}" \
+    --batch_size "${CS_LOSS_BATCH}" \
+    --map_cache_dir "${TMPDIR}/map_cache_${run_name}" \
+    --cache_dir "${TMPDIR}/hf_datasets"
+}
+
+OK_RUNS=()
+FAILED_RUNS=()
+
+if score_one "${BASE_NAME}" ""; then
+  OK_RUNS+=("${BASE_NAME}")
+else
+  echo "!! base 打分失败。这是本脚本的目的，停。"
+  exit 1
+fi
+
+if [[ -n "${ADAPTERS}" ]]; then
+  IFS=',' read -r -a _ADAPTER_SPECS <<< "${ADAPTERS}"
+  for _spec in "${_ADAPTER_SPECS[@]}"; do
+    _spec="$(printf '%s' "${_spec}" | tr -d '[:space:]')"
+    [[ -z "${_spec}" ]] && continue
+    if [[ "${_spec}" == /* ]]; then
+      _path="${_spec}"
+      _name="$(basename "${_spec}")"
+    else
+      _path="${ADAPTER_DIR}/${_spec}"
+      _name="${_spec}"
+    fi
+    if [[ ! -d "${_path}" ]]; then
+      echo "!! 跳过 ${_name}：找不到 ${_path}（看 Step 2 的清单核对名字）"
+      FAILED_RUNS+=("${_name} (缺 checkpoint)")
+      continue
+    fi
+    if score_one "${_name}" "${_path}"; then
+      OK_RUNS+=("${_name}")
+    else
+      FAILED_RUNS+=("${_name} (打分失败)")
+      [[ "${KEEP_GOING}" == "1" ]] || { echo "!! KEEP_GOING=0，停。"; break; }
+    fi
+  done
+fi
+
+# ===========================================================================
+# Step 4: 把一整列拼出来
+#   base 来自本次前向，各臂来自 metrics jsonl（同一口径，不用重打）。
+# ===========================================================================
+echo ""
+echo "========================================================================"
+echo "新任务 val loss（commonsense170k 留出 ${MAXVAL} 行）"
+echo "========================================================================"
+set +e
+OUT_DIR="${OUT_DIR}" METRICS_DIR="${RESULTS_ROOT}/metrics" BASE_NAME="${BASE_NAME}" \
+WANT_BATCH="${CS_LOSS_BATCH}" WANT_SEED="${SEED}" \
+WANT_MAXVAL="${MAXVAL}" WANT_MAXLEN="${MAXLEN}" \
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+base_name = os.environ["BASE_NAME"]
+summary_root = Path(os.environ["OUT_DIR"]) / "commonsense"
+metrics_dir = Path(os.environ["METRICS_DIR"])
+want = {
+    "batch_size": os.environ["WANT_BATCH"],
+    "seed": os.environ["WANT_SEED"],
+    "max_val_samples": os.environ["WANT_MAXVAL"],
+    "max_len": os.environ["WANT_MAXLEN"],
+}
+
+# 本次前向打出来的（base，以及显式重打的臂）。口径不符的不进表 —— 同一层目录
+# 下可能躺着别的脚本用别的 batch size 写的 summary。
+scored = {}
+for path in sorted(summary_root.glob("*/summary.json")):
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if record.get("val_loss") is None:
+        continue
+    if any(str(record.get(key)) != value for key, value in want.items()):
+        print(f"  忽略 {path.parent.name}：口径不符 "
+              f"(batch {record.get('batch_size')} / seed {record.get('seed')} / "
+              f"max_val {record.get('max_val_samples')} / max_len {record.get('max_len')})")
+        continue
+    scored[path.parent.name] = float(record["val_loss"])
+
+# metrics jsonl 里各臂末 epoch 的
+trained = {}
+if metrics_dir.is_dir():
+    for path in sorted(metrics_dir.glob("cs_*.jsonl")):
+        values = []
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if record.get("val_loss") is not None and record.get("record_type") != "baseline":
+                    values.append(float(record["val_loss"]))
+        if values:
+            trained[path.stem] = values[-1]
+
+anchor = scored.get(base_name)
+if anchor is None:
+    raise SystemExit("没有 base 的 summary，这一列没有分母。")
+
+names = [base_name] + sorted(set(trained) | (set(scored) - {base_name}))
+width = max(len(name) for name in names) + 2
+header = f"  {'run':<{width}}{'val_loss':>12}{'vs base':>11}{'相对':>9}{'来源':>10}"
+print(header)
+print("  " + "-" * (len(header) - 2))
+for name in names:
+    # 同时存在时以本次前向为准：它和 base 是同一次口径，metrics 里的是当年的。
+    value = scored.get(name, trained.get(name))
+    source = "本次前向" if name in scored else "metrics"
+    if name == base_name:
+        print(f"  {name:<{width}}{value:>12.6f}{'(锚点)':>14}{source:>12}")
+        continue
+    delta = value - anchor
+    rel = f"{delta / anchor:+.1%}" if anchor else "n/a"
+    print(f"  {name:<{width}}{value:>12.6f}{delta:>+11.6f}{rel:>9}{source:>12}")
+
+both = sorted(set(scored) & set(trained))
+if both:
+    print()
+    print("  两个来源都有的 run（本次前向 vs 当年 metrics，差值应该在小数第四位内）:")
+    for name in both:
+        print(f"    {name:<{width}}{scored[name]:>12.6f}{trained[name]:>12.6f}"
+              f"{scored[name] - trained[name]:>+12.6f}")
+    print("  差得多就是口径漂了：batch_size 最可能，其次 seed（换 seed 就是换 val 集）。")
+
+print()
+print("  val_loss 下降 = 学到了新任务。它说的只是这一件事：旧域丢了多少要看 102 号")
+print("  打的 if / math / code gold CE，两个数不可互减。")
+PY
+SUMMARY_RC=$?
+set -e
+
+echo ""
+echo "成功 ${#OK_RUNS[@]} 个: ${OK_RUNS[*]:-}"
+if (( ${#FAILED_RUNS[@]} > 0 )); then
+  echo "失败 ${#FAILED_RUNS[@]} 个:"
+  for name in "${FAILED_RUNS[@]}"; do echo "  ${name}"; done
+fi
+echo ""
+echo "产物:"
+echo "  ${OUT_DIR}/commonsense/<run>/summary.json"
+echo ""
+echo "配套的保护域 old val loss:"
+echo "  qsub -v ADAPTERS=all,ADAPTER_GLOB='cs_*',VANILLA_RUN=cs_vanilla_8b_r16all_lr2e-4_seed1,\\"
+echo "       OUT_PATH=${RESULTS_ROOT}/probe_ce/direction_cs.jsonl,\\"
+echo "       PER_ROW_DIR=${RESULTS_ROOT}/probe_ce/per_row_cs \\"
+echo "       onereplay/pbs/102_math_val500_direction.pbs"
+echo "Job finished at: $(date)"
+
+exit "${SUMMARY_RC}"
