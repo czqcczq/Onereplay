@@ -90,33 +90,45 @@
 #   跨线只能比方向和相对幅度，CE 绝对值不可比（两个模型对自己输出的置信度本来不同）。
 #
 # -----------------------------------------------------------------------------
+# !! 多值参数用**空格**分隔，不能用逗号
+#   PBS 的 -v 本身就是用逗号分隔变量之间，所以 -v VANILLA_RUNS='a,b' 会让 qsub 把 b
+#   当成一个没有 = 的变量名，当场拒收：
+#       qsub: cannot send environment with the job
+#   VANILLA_RUNS / ADAPTERS / DOMAINS 因此接受空格或分号，脚本内部再归一成逗号
+#   （02 号的 LAMBDAS 一直是空格分隔的，同一个原因）。值里带空格的时候记得整个
+#   -v 的参数要加引号，让 shell 把它当一个 argv 传给 qsub。
+#
+# -----------------------------------------------------------------------------
 # 投递:
 #
 #   # (1) 8B 线：先看计划（不加载模型，约 1 分钟）
 #   qsub -v DRY_RUN=1 onereplay/pbs/107_selfdistill_old_val.pbs
 #
 #   # (1') 8B 线正式跑：生成 + 打全部 cs_*/ds_* 臂 + 汇总
-#   qsub -v VANILLA_RUNS='cs_vanilla_8b_r16all_lr2e-4_seed1,ds_vanilla_8b_r16all_lr2e-4_ep2_seed1' \
-#        onereplay/pbs/107_selfdistill_old_val.pbs
+#   #      两个 vanilla 之间是空格，整串加引号，见上面那条
+#   qsub -N sdval_8b \
+#     -v "VANILLA_RUNS=cs_vanilla_8b_r16all_lr2e-4_seed1 ds_vanilla_8b_r16all_lr2e-4_ep2_seed1" \
+#     onereplay/pbs/107_selfdistill_old_val.pbs
 #
 #   # 只生成语料（两阶段分开投，生成挂了不会连带丢掉打分）
 #   qsub -v STAGE=gen onereplay/pbs/107_selfdistill_old_val.pbs
 #   # 只打分（语料已在）
-#   qsub -v STAGE=score,VANILLA_RUNS='...' onereplay/pbs/107_selfdistill_old_val.pbs
+#   qsub -v "STAGE=score,VANILLA_RUNS=<空格分隔>" onereplay/pbs/107_selfdistill_old_val.pbs
 #
-#   # (2) finance 线 / Qwen2.5-1.5B-Instruct
-#   qsub -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\
+#   # (2) finance 线 / Qwen2.5-1.5B-Instruct。与 (1') 无依赖，可以同时投：
+#   #     两条线除了只读的那三份 val500 之外没有共用的落点，各写自己的 RESULTS_ROOT。
+#   qsub -N sdval_fin -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\
 #RESULTS_ROOT=/scratch/weiliu87/student/czq/Onereplay/results_finance_Qwen2.5-1.5B-Instruct,\
 #ADAPTER_DIR=/scratch/weiliu87/student/czq/Onereplay/results_finance_Qwen2.5-1.5B-Instruct/checkpoints,\
 #VANILLA_RUNS=fin_vanilla_lr8e-5_ep2_seed42 \
 #        onereplay/pbs/107_selfdistill_old_val.pbs
 #
-#   # 只打其中几个臂
-#   qsub -v ADAPTERS='cs_vanilla_8b_r16all_lr2e-4_seed1,cs_onereplay_...' onereplay/pbs/107_...pbs
+#   # 只打其中几个臂（同样用空格）
+#   qsub -v "ADAPTERS=cs_vanilla_8b_r16all_lr2e-4_seed1 cs_onereplay_..." onereplay/pbs/107_...pbs
 #   # 上一轮打分中途挂了，接着打（已有的同口径记录跳过）
-#   qsub -v STAGE=score,RESUME_SCORE=1,VANILLA_RUNS='...' onereplay/pbs/107_...pbs
+#   qsub -v "STAGE=score,RESUME_SCORE=1,VANILLA_RUNS=..." onereplay/pbs/107_...pbs
 #   # 只把汇总重读一遍（判据/表格改了），不加载模型，秒级
-#   qsub -v SUMMARY_ONLY=1,VANILLA_RUNS='...' onereplay/pbs/107_...pbs
+#   qsub -v "SUMMARY_ONLY=1,VANILLA_RUNS=..." onereplay/pbs/107_...pbs
 #
 # 产物:
 #   语料  ${SD_DIR}/<domain>_val500_selfdistill_<MODEL_NAME>.jsonl  (+ .meta.json)
@@ -280,6 +292,20 @@ RESUME_SCORE="${RESUME_SCORE:-0}"
 SUMMARY_ONLY="${SUMMARY_ONLY:-0}"
 KEEP_GOING="${KEEP_GOING:-1}"
 
+# !! PBS 的 -v 用逗号分隔**变量之间**，所以值里带逗号的写法投不出去：
+#      qsub -v VANILLA_RUNS='a,b'  ->  qsub: cannot send environment with the job
+#    （qsub 把 b 当成一个没有 = 的变量名。README 和 102 号里那几条 ADAPTERS='a,b,c'
+#    的示例都踩这个坑。）空格和分号能原样传进来 —— 02 号的 LAMBDAS 一直是空格分隔的
+#    就是为了这个。所以这里把三种写法都收下，内部一律归一成逗号。
+norm_list () {
+  printf '%s' "$1" | tr ';' ',' | tr -s '[:space:]' ',' | tr -s ',' | sed 's/^,*//; s/,*$//'
+}
+DOMAINS="$(norm_list "${DOMAINS}")"
+ADAPTERS="$(norm_list "${ADAPTERS}")"
+VANILLA_RUNS="$(norm_list "${VANILLA_RUNS}")"
+# 打出来给人抄的命令一律用空格，照抄才投得出去。
+VANILLA_RUNS_ARG="$(printf '%s' "${VANILLA_RUNS}" | tr ',' ' ')"
+
 cd "${REPO_ROOT}"
 [[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
 # 拼错的 STAGE 会静默落进"跳过生成、直接打分"，而那时语料还不在。
@@ -311,6 +337,10 @@ if [[ -z "${GOLD_JSONL:-}" ]]; then
     [[ -n "${_f}" ]] && _golds+=("${_f}")
   done < <(find "$(dirname "${OUT_PATH}")" -maxdepth 1 -type f -name 'direction*.jsonl' 2>/dev/null | sort)
   GOLD_JSONL="$(IFS=,; printf '%s' "${_golds[*]:-}")"
+else
+  # 多个 gold 文件也绕不过 -v 的逗号，所以这里认分号。路径里可能有空格，
+  # 所以不像上面那几个列表那样把空白也当分隔符。
+  GOLD_JSONL="$(printf '%s' "${GOLD_JSONL}" | tr ';' ',')"
 fi
 
 case "${TEMPERATURE}" in
@@ -445,6 +475,11 @@ echo "本次要打 ${WANT_COUNT} 个 checkpoint + base，各 ${#ACTIVE_DOMAINS[@
 if [[ -z "${VANILLA_RUNS}" ]]; then
   echo "!! 没传 VANILLA_RUNS：「消除的漂移」整列会是 n/a。它是那一列的分母，"
   echo "   8B 线要两个（cs_ 和 ds_ 各一个），按 run 名第一段与臂配对。"
+  echo "   多个之间用**空格**：-v \"VANILLA_RUNS=a b\"。逗号会被 qsub 当成变量之间的"
+  echo "   分隔符，直接报 cannot send environment with the job。"
+else
+  # 把归一后的结果打出来：写成空格/分号/逗号时解析成了什么，只有这一行说得清。
+  echo "vanilla（已归一）: ${VANILLA_RUNS}"
 fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
@@ -607,7 +642,7 @@ fi
 if [[ "${STAGE}" == "gen" ]]; then
   echo ""
   echo "STAGE=gen：语料已就位，没有打分。接着投："
-  echo "  qsub -v STAGE=score,VANILLA_RUNS='${VANILLA_RUNS}' ${SELF_PATH}"
+  echo "  qsub -v \"STAGE=score,VANILLA_RUNS=${VANILLA_RUNS_ARG}\" ${SELF_PATH}"
   echo "Job finished at: $(date)"
   exit 0
 fi
@@ -1007,13 +1042,14 @@ echo "    --base ${BASE_NAME} --vanilla <vanilla 的 run 名> --compare <臂1,�
 echo ""
 echo "另一条线（同一个脚本，换基座与 checkpoint 目录）:"
 if [[ "${MODEL_NAME}" == "Qwen3-8B" ]]; then
-  echo "  qsub -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\\"
+  echo "  qsub -N sdval_fin -v MODEL_NAME=Qwen2.5-1.5B-Instruct,\\"
   echo "RESULTS_ROOT=${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct,\\"
   echo "ADAPTER_DIR=${REPO_ROOT}/results_finance_Qwen2.5-1.5B-Instruct/checkpoints,\\"
   echo "VANILLA_RUNS=fin_vanilla_lr8e-5_ep2_seed42 \\"
   echo "       ${SELF_PATH}"
 else
-  echo "  qsub -v VANILLA_RUNS='cs_vanilla_8b_r16all_lr2e-4_seed1,ds_vanilla_8b_r16all_lr2e-4_ep2_seed1' \\"
+  echo "  qsub -N sdval_8b \\"
+  echo "    -v \"VANILLA_RUNS=cs_vanilla_8b_r16all_lr2e-4_seed1 ds_vanilla_8b_r16all_lr2e-4_ep2_seed1\" \\"
   echo "       ${SELF_PATH}"
 fi
 echo "Job finished at: $(date)"
