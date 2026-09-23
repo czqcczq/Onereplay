@@ -1,0 +1,684 @@
+#!/bin/bash
+#PBS -P CFP03-SF-101
+#PBS -N or_8b_sdcov
+#PBS -j oe
+#PBS -k oed
+#PBS -q auto
+#PBS -l select=1:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -o /scratch/weiliu87/student/czq/Onereplay/logs
+#
+# =============================================================================
+# NUS Hopper: Qwen3-8B 三域**自蒸馏** C 采集（if / math / code）+ 一份 all_tokens C_math 对照
+#
+# 68 号的自蒸馏版。层覆盖、累加设备、maxlen、batch、模板参数逐字沿用 68 号，
+# 差异只有两处：语料换成 8B 自己的贪心答案，C 的监督范围显式钉死。
+#
+# -----------------------------------------------------------------------------
+# 1. 语料：108 号产出的 8B 自蒸馏池，读 targets 列
+#       ${SD_DIR}/<domain>_pool_selfdistill_Qwen3-8B.jsonl
+#
+#   !! 不能用 ${REPO_ROOT}/results/replay/*_selfdistill_seed1.jsonl 的 targets 列。
+#   那两份是 1.7B 当年生成的答案，拿来给 8B 采 C 是跨模型蒸馏，不是自蒸馏。
+#   Step 0 会读每份语料旁边的 .meta.json，model_name 不是 ${MODEL_NAME}、没写完、
+#   max_len 与本脚本不等、开了 thinking，任何一条都直接退出。
+#
+#   108 号的池来自 93 号物化的 <domain>_pool.jsonl（已切掉末尾 val 行），所以行数
+#   比 68 号的 gold 全池少。108 号 --keep_truncated_text 0：答案被预算截断的行
+#   targets 是空串，这里 --require_target 1 把它们滤掉。
+#   后面 replay 臂必须读同一份文件，并且 --replay_drop_truncated 1，两边才同池。
+#   Step 4 打印的 pool_fingerprint 就是对表用的。
+#
+# -----------------------------------------------------------------------------
+# 2. 监督范围：默认 assistant_only，额外一份 all_tokens 的 C_math
+#   assistant_only  只有答案那一段 token 进 C，与 replay / SFT loss、collect_fisher
+#                   监督的是同一批位置。finance 线（93 号）起用的就是这个。
+#   all_tokens      所有非 padding token 进 C，system + prompt + 答案按语料里的
+#                   天然比例混在一起。ds 线那批 C 都是这种（采的时候还没有这个
+#                   flag，collect_cov 当时只有这一种行为）。
+#
+#   !! 68 号没传 --cov_supervision。collect_cov 后来把默认值改成了 assistant_only，
+#   所以现在重跑 68 号得到的是只保护答案的 C，与 ds 线手上那几份不是同一种估计量。
+#   本脚本把它显式传出来，不再依赖默认值。
+#
+#   对照只在 math 上做（DO_MATH_ALLTOK=1）：同一个池、同一批行、同一个前向，
+#   两种采法喂进模型的 input_ids 逐 token 相同，只差 hook 累加时用的 mask。
+#   所以 C_math(ans) vs C_math(alltok) 的差别只来自"prompt 位置进不进 C"。
+#   Step 4 会断言两份的 pool_fingerprint 相等。
+#
+#   !! 两份 C 的 trace 不同，同一个 λ 压出来的约束强度不同。Step 4 会按
+#   λ x tr(C) 给出 alltok 相对 ans 的等强度 λ 换算，但那只是扫描中心点：
+#   对照要成立，两条臂各自扫 λ（0.5x / 1x / 2x），比各自最好的那个点。
+#
+# -----------------------------------------------------------------------------
+# 3. 落盘体积：单域采出来 36.2 GB（fp32，all-linear 七类，36 层），去重后 29.0 GB。
+#   DEDUP=1（默认）时每份采完立刻去重。C 只看层的**输入**：q/k/v 读同一个
+#   input_layernorm 输出，gate/up 读同一个 post_attention_layernorm 输出，所以七类
+#   里每层有三份是逐位相同的副本。dedup_covariances 按内容判等，逐位核对通过后才
+#   覆盖原文件；252 个 key 一个不少，罚项逐位不变，λ 不用重标。
+#   四份最终约 116 GB。峰值在最后一份去重时：前几份去重件 + 这一份原件 + 去重临时件。
+#   Step 0 按公式算出本次要写的量并和 df 比，不够就退出。
+#   不想一次写这么多就分批：DO_IF / DO_MATH / DO_CODE / DO_MATH_ALLTOK 一次开几个。
+#
+# -----------------------------------------------------------------------------
+# 流程（全程只有前向）
+#   Step 0  前置检查：语料 + meta.json 身份核对、磁盘空间预检
+#   Step 1  采 C_if     （assistant_only）
+#   Step 2  采 C_math   （assistant_only）
+#   Step 3  采 C_code   （assistant_only）
+#   Step 4  采 C_math   （all_tokens，对照）
+#           Step 1-4 每份采完即去重 + 逐位核对（DEDUP=1）；已存在而跳过采集的
+#           那份也会补做，metadata 里有 dedup_source 的认作已去重，不重复做
+#   Step 5  诊断：252 层断言 + 分模块 trace + ans vs alltok 对比 + λ 起点
+#
+# 投递前要有的东西
+#   1) ${MODEL_DIR}/Qwen3-8B
+#   2) ${SD_DIR}/{if,math,code}_pool_selfdistill_Qwen3-8B.jsonl 及各自的 .meta.json
+#      （108 号 MODELS=Qwen3-8B 跑完整池，meta 里 complete=true）
+#   3) /scratch 剩余空间 > 本次要写的量 + 20 GiB
+#
+# 投递:
+#   DRY_RUN=1 先看计划（默认），确认无误后 qsub -v DRY_RUN=0 ...
+#   只采对照那一份:  qsub -v DRY_RUN=0,DO_IF=0,DO_MATH=0,DO_CODE=0,DO_MATH_ALLTOK=1 ...
+#   只跑诊断:        qsub -v DRY_RUN=0,DO_IF=0,DO_MATH=0,DO_CODE=0,DO_MATH_ALLTOK=0 ...
+# 查看/管理: qstat -ans1 / qstat -f <job_id> / qdel <job_id> / gstat
+# =============================================================================
+
+set -euo pipefail
+
+# ---- 集群侧固定路径（要换位置改这里）----
+REPO_ROOT="${REPO_ROOT:-/scratch/weiliu87/student/czq/Onereplay}"
+VENV="${VENV:-${REPO_ROOT}/.venv}"
+CACHE_ROOT="${CACHE_ROOT:-/scratch/weiliu87/cache/huggingface}"
+SELF_PATH="${SELF_PATH:-${REPO_ROOT}/onereplay/pbs/109_qwen3_8b_sd_cov.pbs}"
+IMAGE="${IMAGE:-/app1/common/singularity-img/hopper/pytorch/pytorch_2.3.0_cuda_12.4_ngc_24.04.sif}"
+
+JOBTAG="${PBS_JOBID:-local$$}"
+SCRATCH_USER="${SCRATCH_USER:-weiliu87}"
+if [[ -d "/local_ssd/${SCRATCH_USER}" ]]; then
+  EXTRA_BIND="-B /local_ssd:/local_ssd"
+  JOB_TMPDIR="${JOB_TMPDIR:-/local_ssd/${SCRATCH_USER}/tmp_onereplay_${JOBTAG}}"
+else
+  EXTRA_BIND=""
+  JOB_TMPDIR="${JOB_TMPDIR:-/scratch/${SCRATCH_USER}/cache/tmp_onereplay_${JOBTAG}}"
+fi
+
+# =============================================================================
+# 外层：裸计算节点。只负责起容器，然后把这个脚本本身在容器里再跑一遍。
+# =============================================================================
+if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
+  echo "Job started at: $(date)"
+  echo "Running on node: $(hostname)"
+  echo "Job ID: ${PBS_JOBID:-local}"
+  cd "${PBS_O_WORKDIR:-${REPO_ROOT}}"
+
+  [[ -f "${SELF_PATH}" ]] || { echo "找不到脚本自身: ${SELF_PATH}（改 SELF_PATH 或 REPO_ROOT）"; exit 1; }
+  [[ -f "${IMAGE}" ]] || { echo "找不到容器镜像: ${IMAGE}"; exit 1; }
+
+  mkdir -p "${JOB_TMPDIR}"
+  cleanup () {
+    if [[ -n "${JOB_TMPDIR}" && "${JOB_TMPDIR}" == */tmp_onereplay_* ]]; then
+      rm -rf --one-file-system "${JOB_TMPDIR}" || true
+      echo "cleanup: removed ${JOB_TMPDIR}"
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  if ! command -v module >/dev/null 2>&1; then
+    for _init in /etc/profile.d/modules.sh /usr/share/Modules/init/bash /etc/profile.d/lmod.sh; do
+      [[ -f "${_init}" ]] && source "${_init}" && break
+    done
+  fi
+  module load singularity
+
+  FORWARD_VARS=(
+    REPO_ROOT VENV CACHE_ROOT JOB_TMPDIR
+    MODEL_DIR MODEL_NAME RESULTS_ROOT SD_DIR DATASET_CACHE
+    DRY_RUN DO_IF DO_MATH DO_CODE DO_MATH_ALLTOK DO_DIAG FORCE DEDUP
+    TARGET_MODULES COV_ACCUM_DEVICE USE_BF16
+    SEED SAMPLE_SEED TARGET_COLUMN COV_SUPERVISION DEBUG_EXAMPLES
+    IF_MAXLEN IF_COV_BATCH MATH_MAXLEN MATH_COV_BATCH CODE_MAXLEN CODE_COV_BATCH
+    IF_COV MATH_COV CODE_COV MATH_ALLTOK_COV REF_COV_17B REF_LAMBDA
+    MIN_FREE_GB
+  )
+  for _v in "${FORWARD_VARS[@]}"; do
+    if [[ -n "${!_v:-}" ]]; then
+      export "SINGULARITYENV_${_v}=${!_v}"
+      export "APPTAINERENV_${_v}=${!_v}"
+    fi
+  done
+  export SINGULARITYENV_ONEREPLAY_IN_CONTAINER=1
+  export APPTAINERENV_ONEREPLAY_IN_CONTAINER=1
+
+  SINGULARITY_FLAGS="${SINGULARITY_FLAGS:--e --nv -B /scratch:/scratch ${EXTRA_BIND}}"
+  echo "Image           : ${IMAGE}"
+  echo "Singularity args: ${SINGULARITY_FLAGS}"
+  echo "Job TMPDIR      : ${JOB_TMPDIR}"
+  # 不能用 exec：那会把当前 shell 替换掉，上面的 cleanup trap 就跟着没了。
+  # shellcheck disable=SC2086
+  singularity exec ${SINGULARITY_FLAGS} "${IMAGE}" bash "${SELF_PATH}"
+  echo "Job finished at: $(date)"
+  exit 0
+fi
+
+# =============================================================================
+# 内层：容器里。以下是真正的采集。
+# =============================================================================
+set -x
+
+source "${VENV}/bin/activate"
+
+export HF_HOME="${CACHE_ROOT}"
+export XDG_CACHE_HOME="${CACHE_ROOT}"
+export TORCH_HOME="${CACHE_ROOT}/torch"
+export TMPDIR="${JOB_TMPDIR}"
+mkdir -p "${HF_HOME}" "${TORCH_HOME}" "${TMPDIR}"
+
+export PYTHONNOUSERSITE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+export USER="${USER:-$(whoami)}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "Python          : $(which python)"
+python --version
+nvidia-smi --query-gpu=name,memory.total --format=csv
+python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+# collect_cov 看不到 GPU 会静默退回 CPU，8B 前向在 CPU 上等于跑不完，这里直接拦下。
+if [[ "${DRY_RUN:-1}" != "1" ]]; then
+  python -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" \
+    || { echo "!! 容器里看不到 GPU（检查 SINGULARITY_FLAGS 里的 --nv）"; exit 1; }
+fi
+
+# ---- 项目路径 ----
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/models}"
+MODEL_NAME="${MODEL_NAME:-Qwen3-8B}"
+RESULTS_ROOT="${RESULTS_ROOT:-${REPO_ROOT}/results/qwen3-8b}"
+SD_DIR="${SD_DIR:-${REPO_ROOT}/datasets/selfdistill}"
+DATASET_CACHE="${DATASET_CACHE:-${RESULTS_ROOT}/dataset_cache}"
+COV_DIR="${RESULTS_ROOT}/cov"
+export HF_DATASETS_CACHE="${DATASET_CACHE}"
+
+# ---- 阶段开关 ----
+DRY_RUN="${DRY_RUN:-1}"
+DO_IF="${DO_IF:-1}"
+DO_MATH="${DO_MATH:-1}"
+DO_CODE="${DO_CODE:-1}"
+DO_MATH_ALLTOK="${DO_MATH_ALLTOK:-1}"   # all_tokens 版 C_math，对照用
+DO_DIAG="${DO_DIAG:-1}"
+FORCE="${FORCE:-0}"              # 1 = 已有同名 .pt 也重采
+DEDUP="${DEDUP:-1}"              # 1 = 每份采完去重（q/k/v、gate/up 共享一份），见文件头第 3 条
+
+# ---- 覆盖范围：必须与训练臂的 TARGET_MODULES 逐字一致 ----
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
+COV_ACCUM_DEVICE="${COV_ACCUM_DEVICE:-device}"
+USE_BF16="${USE_BF16:-1}"        # 前向 bf16；hook 内部一律升 fp32 再累加
+
+# ---- 采集协议 ----
+SEED="${SEED:-1}"
+SAMPLE_SEED="${SAMPLE_SEED:-1}"
+TARGET_COLUMN="${TARGET_COLUMN:-targets}"          # 自蒸馏答案；传 gold_targets 就是同池 gold 消融
+COV_SUPERVISION="${COV_SUPERVISION:-assistant_only}"  # 三份主 C 的监督范围，见文件头第 2 条
+DEBUG_EXAMPLES="${DEBUG_EXAMPLES:-2}"
+
+case "${COV_SUPERVISION}" in
+  assistant_only) SUP_TAG=ans ;;
+  all_tokens)     SUP_TAG=alltok ;;
+  *) echo "COV_SUPERVISION 只能是 assistant_only / all_tokens，得到 '${COV_SUPERVISION}'" >&2; exit 2 ;;
+esac
+if [[ "${COV_SUPERVISION}" == "all_tokens" && "${DO_MATH_ALLTOK}" == "1" ]]; then
+  echo "COV_SUPERVISION=all_tokens 时主 C_math 就是 all_tokens，对照那一份与它重复，不采。"
+  DO_MATH_ALLTOK=0
+fi
+
+# maxlen 必须等于 108 号生成时的 --max_len（= replay 臂的 REPLAY_MAXLEN），Step 0 会和 meta 对表
+IF_MAXLEN="${IF_MAXLEN:-512}"
+IF_COV_BATCH="${IF_COV_BATCH:-32}"
+MATH_MAXLEN="${MATH_MAXLEN:-1024}"
+MATH_COV_BATCH="${MATH_COV_BATCH:-8}"
+CODE_MAXLEN="${CODE_MAXLEN:-1024}"
+CODE_COV_BATCH="${CODE_COV_BATCH:-8}"
+
+sd_file_for ()   { printf '%s' "${SD_DIR}/$1_pool_selfdistill_${MODEL_NAME}.jsonl"; }
+meta_file_for () { printf '%s' "${SD_DIR}/$1_pool_selfdistill_${MODEL_NAME}.meta.json"; }
+IF_FILE="$(sd_file_for if)"
+MATH_FILE="$(sd_file_for math)"
+CODE_FILE="$(sd_file_for code)"
+
+# ---- 产物：文件名带 sd 和监督范围，不会与 68 号的 gold C 撞名（撞名会被静默跳过）----
+IF_COV="${IF_COV:-${COV_DIR}/cov_if_sd_8b_all_${SUP_TAG}.pt}"
+MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_sd_8b_all_${SUP_TAG}.pt}"
+CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_sd_8b_all_${SUP_TAG}.pt}"
+MATH_ALLTOK_COV="${MATH_ALLTOK_COV:-${COV_DIR}/cov_math_sd_8b_all_alltok.pt}"
+
+# ---- 诊断参照：1.7B 的 C_if（qv 版，采于 flag 之前，所以是 all_tokens）----
+REF_COV_17B="${REF_COV_17B:-${REPO_ROOT}/results/cov/cov_flan_chat_20k_qv.pt}"
+REF_LAMBDA="${REF_LAMBDA:-3e-2}"
+
+MIN_FREE_GB="${MIN_FREE_GB:-120}"
+
+cd "${REPO_ROOT}"
+[[ -d "${MODEL_DIR}/${MODEL_NAME}" ]] || { echo "缺基座模型: ${MODEL_DIR}/${MODEL_NAME}"; exit 1; }
+mkdir -p "${COV_DIR}" "${DATASET_CACHE}"
+
+# Step 0 和 Step 5 的内嵌 Python 靠 os.environ 读这些值，全部显式 export。
+export MODEL_DIR MODEL_NAME COV_DIR TARGET_MODULES
+export DO_IF DO_MATH DO_CODE DO_MATH_ALLTOK DEDUP
+export IF_COV MATH_COV CODE_COV MATH_ALLTOK_COV REF_COV_17B REF_LAMBDA
+export COV_SUPERVISION
+
+set +x
+echo "========================================================================"
+echo "Qwen3-8B 三域自蒸馏 C 采集"
+echo "  模型     = ${MODEL_DIR}/${MODEL_NAME}"
+echo "  层覆盖   = ${TARGET_MODULES}"
+echo "  累加设备 = ${COV_ACCUM_DEVICE}   前向 bf16 = ${USE_BF16}"
+echo "  语料目录 = ${SD_DIR}   读答案列 = ${TARGET_COLUMN}"
+echo "  监督范围 = ${COV_SUPERVISION}（主 C）   对照 all_tokens C_math = ${DO_MATH_ALLTOK}"
+echo "  产物目录 = ${COV_DIR}"
+echo "  if       = ${IF_COV}"
+echo "             ${IF_FILE} / maxlen ${IF_MAXLEN} / batch ${IF_COV_BATCH}"
+echo "  math     = ${MATH_COV}"
+echo "             ${MATH_FILE} / maxlen ${MATH_MAXLEN} / batch ${MATH_COV_BATCH}"
+echo "  code     = ${CODE_COV}"
+echo "             ${CODE_FILE} / maxlen ${CODE_MAXLEN} / batch ${CODE_COV_BATCH}"
+echo "  math对照 = ${MATH_ALLTOK_COV}"
+echo "  阶段     = if:${DO_IF} math:${DO_MATH} code:${DO_CODE} math_alltok:${DO_MATH_ALLTOK} diag:${DO_DIAG}  DRY_RUN=${DRY_RUN}"
+echo "  去重     = ${DEDUP}"
+echo "========================================================================"
+set -x
+
+# ===========================================================================
+# Step 0: 前置检查（纯 CPU）
+#   1) 语料与 meta.json 在不在，meta 说的是不是这个基座、这个预算、写没写完
+#   2) 按公式算落盘体积，和 df 剩余空间比对
+# ===========================================================================
+set +x
+echo "==== Step 0: 前置检查 ===="
+
+check_corpus () {
+  local domain="$1" maxlen="$2"
+  local file meta
+  file="$(sd_file_for "${domain}")"
+  meta="$(meta_file_for "${domain}")"
+  [[ -f "${file}" ]] || { echo "缺 ${domain} 自蒸馏语料: ${file}（先跑 108 号 MODELS=${MODEL_NAME}）"; exit 1; }
+  [[ -f "${meta}" ]] || { echo "缺 ${domain} 的 meta: ${meta}（没有 meta 就无法确认是谁生成的）"; exit 1; }
+  META="${meta}" DOMAIN="${domain}" WANT_MAXLEN="${maxlen}" python - <<'PY'
+import json, os
+
+meta = json.load(open(os.environ["META"], encoding="utf-8"))
+domain = os.environ["DOMAIN"]
+problems = []
+if meta.get("model_name") != os.environ["MODEL_NAME"]:
+    problems.append(f"model_name={meta.get('model_name')!r}，不是 {os.environ['MODEL_NAME']!r}（跨模型蒸馏）")
+if not meta.get("complete"):
+    problems.append("complete=false（没采完整池，或只是冒烟）")
+if int(meta.get("max_len", -1)) != int(os.environ["WANT_MAXLEN"]):
+    problems.append(f"生成时 max_len={meta.get('max_len')}，本脚本 {os.environ['WANT_MAXLEN']}")
+if int(meta.get("enable_thinking", 0)) != 0:
+    problems.append("enable_thinking=1，与 collect_cov 的 --enable_thinking 0 不一致")
+print(f"  {domain}: model={meta.get('model_name')} 可用 {meta.get('usable_rows')}/{meta.get('generated_rows')}"
+      f" 答案 token 中位 {meta.get('median_answer_tokens')} / P95 {meta.get('p95_answer_tokens')}"
+      f" max_len={meta.get('max_len')}")
+if problems:
+    for item in problems:
+        print(f"  !! {domain}: {item}")
+    raise SystemExit(1)
+PY
+}
+
+if [[ "${DO_IF}" == "1" ]]; then
+  check_corpus if "${IF_MAXLEN}"
+fi
+if [[ "${DO_MATH}" == "1" || "${DO_MATH_ALLTOK}" == "1" ]]; then
+  check_corpus math "${MATH_MAXLEN}"
+fi
+if [[ "${DO_CODE}" == "1" ]]; then
+  check_corpus code "${CODE_MAXLEN}"
+fi
+
+# 落盘体积预检：C 是按输入维度的方阵存的，逐模块算
+DISK_PLAN=$(python - <<'PY'
+import json, os, shutil, sys
+
+model_dir = os.path.join(os.environ["MODEL_DIR"], os.environ["MODEL_NAME"])
+with open(os.path.join(model_dir, "config.json")) as fh:
+    cfg = json.load(fh)
+
+hidden = cfg["hidden_size"]
+inter = cfg["intermediate_size"]
+layers = cfg["num_hidden_layers"]
+heads = cfg["num_attention_heads"]
+head_dim = cfg.get("head_dim", hidden // heads)
+
+in_dim = {
+    "q_proj": hidden,
+    "k_proj": hidden,
+    "v_proj": hidden,
+    "o_proj": heads * head_dim,
+    "gate_proj": hidden,
+    "up_proj": hidden,
+    "down_proj": inter,
+    "lm_head": hidden,
+}
+targets = [m.strip() for m in os.environ["TARGET_MODULES"].split(",") if m.strip()]
+unknown = [m for m in targets if m not in in_dim]
+if unknown:
+    print(f"未知模块名，无法估算体积: {unknown}", file=sys.stderr)
+    raise SystemExit(2)
+
+per_layer = sum(in_dim[m] ** 2 * 4 for m in targets if m != "lm_head")
+total_one = per_layer * layers + sum(in_dim[m] ** 2 * 4 for m in targets if m == "lm_head")
+
+# 去重后的体积按"取样点"算，不按模块算：同一取样点上的模块读同一个输入张量，C 相同。
+# 这张表只用来估算磁盘；真正的去重按内容判等，不依赖它。
+source_of = {
+    "q_proj": "attn_in", "k_proj": "attn_in", "v_proj": "attn_in",
+    "o_proj": "attn_out",
+    "gate_proj": "mlp_in", "up_proj": "mlp_in",
+    "down_proj": "mlp_mid",
+    "lm_head": "head_in",
+}
+source_dim = {source_of[m]: in_dim[m] for m in targets}
+unique_one = sum(
+    d ** 2 * 4 * (1 if s == "head_in" else layers) for s, d in source_dim.items()
+)
+
+n_domains = sum(
+    1 for key in ("DO_IF", "DO_MATH", "DO_CODE", "DO_MATH_ALLTOK")
+    if os.environ.get(key, "0") == "1"
+)
+dedup = os.environ.get("DEDUP", "1") == "1"
+if dedup and n_domains:
+    # 逐份串行：前 n-1 份已是去重件，最后一份原件与它的去重临时件同时在盘上。
+    need = unique_one * (n_domains - 1) + total_one + unique_one
+else:
+    need = total_one * n_domains
+free = shutil.disk_usage(os.environ["COV_DIR"]).free
+
+print(f"config: hidden={hidden} intermediate={inter} layers={layers} head_dim={head_dim}")
+print(f"单份 C 合计 {total_one/2**30:.2f} GiB ({total_one/1e9:.1f} GB)")
+if dedup:
+    print(f"单份去重后 {unique_one/2**30:.2f} GiB ({unique_one/1e9:.1f} GB)，"
+          f"{n_domains} 份最终 {unique_one * n_domains/2**30:.2f} GiB")
+print(f"本次要采 {n_domains} 份，盘上峰值 {need/2**30:.2f} GiB ({need/1e9:.1f} GB)")
+print(f"{os.environ['COV_DIR']} 剩余 {free/2**30:.2f} GiB")
+print(f"PLAN need_gib={need/2**30:.2f} free_gib={free/2**30:.2f}")
+PY
+)
+echo "${DISK_PLAN}"
+
+NEED_GIB="${DISK_PLAN##*need_gib=}"; NEED_GIB="${NEED_GIB%% *}"
+FREE_GIB="${DISK_PLAN##*free_gib=}"; FREE_GIB="${FREE_GIB%% *}"
+# 留 20 GiB 余量：落盘期间 torch.save 会先写临时再改名
+if ! python -c "import sys; sys.exit(0 if float('${FREE_GIB}') >= float('${NEED_GIB}') + 20 else 1)"; then
+  echo "!! 空间不足：需要 ${NEED_GIB} GiB + 20 GiB 余量，实际剩余 ${FREE_GIB} GiB"
+  echo "   要么清理 ${COV_DIR}，要么分批采（DO_* 开关）"
+  exit 1
+fi
+
+if [[ "${DRY_RUN}" == "1" ]]; then
+  echo "DRY_RUN=1：以上为计划，未执行任何采集。确认后 qsub -v DRY_RUN=0 ..."
+  exit 0
+fi
+set -x
+
+# ===========================================================================
+# 去重：让同一取样点上的几个 key 指向同一份矩阵（文件头第 3 条）
+#   写临时件 -> 252 个 key 逐位核对 -> 通过才 mv 覆盖原件。核对失败时 set -e 直接
+#   退出，原件与临时件都留在盘上，原件没被动过。
+#   dedup_covariances 找不到任何可共享项会以非零退出：本脚本不传
+#   --cov_normalization，默认 none 下 q/k/v 必然相等，找不到说明 hook 没读到预期的输入。
+# ===========================================================================
+dedup_one () {
+  local label="$1" path="$2"
+  [[ "${DEDUP}" == "1" && -f "${path}" ]] || return 0
+  # metadata 里的 dedup_source 是 dedup_covariances 写进去的，有它就是已去重件。
+  # 已存在而跳过采集的那份靠这一条避免每次重跑都再读写一遍 36 GB。
+  if COV="${path}" python - <<'PY'
+import os, sys, torch
+try:
+    payload = torch.load(os.environ["COV"], map_location="cpu", mmap=True)
+except (TypeError, RuntimeError):
+    payload = torch.load(os.environ["COV"], map_location="cpu")
+meta = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+sys.exit(0 if meta.get("dedup_source") else 1)
+PY
+  then
+    echo "已去重，跳过 ${label}: ${path}"
+    return 0
+  fi
+
+  local tmp="${path%.pt}_dedup.pt"
+  echo "==== 去重 C_${label} -> ${path} ===="
+  python -m onereplay.scripts.dedup_covariances --cov_path "${path}" --out_path "${tmp}"
+  # mmap 读：两份同时整读进内存要 60+ GiB。
+  COV_OLD="${path}" COV_NEW="${tmp}" python - <<'PY'
+import os, sys, torch
+
+def load(p):
+    payload = torch.load(p, map_location="cpu", mmap=True)
+    return payload["covariances"] if "covariances" in payload else payload
+
+old, new = load(os.environ["COV_OLD"]), load(os.environ["COV_NEW"])
+if set(old) != set(new):
+    raise SystemExit(f"!! 去重前后 key 集合不一致：{len(old)} vs {len(new)}")
+bad = [k for k in old if not torch.equal(old[k], new[k])]
+print(f"逐位核对：{len(old)} 个 key，不一致 {len(bad)}")
+if bad:
+    raise SystemExit(f"!! {len(bad)} 个 key 去重前后不相等，例如 {bad[:3]}；原件未覆盖")
+PY
+  mv "${tmp}" "${path}"
+  ls -lh "${path}"
+}
+
+# ===========================================================================
+# 采集函数：各份 C 只差语料文件、maxlen、batch 和监督范围
+# ===========================================================================
+collect_one () {
+  local label="$1" out_path="$2" maxlen="$3" batch="$4" supervision="$5" data_file="$6"
+  if [[ -f "${out_path}" && "${FORCE}" != "1" ]]; then
+    echo "已存在，跳过 ${label}: ${out_path}（要重采传 FORCE=1）"
+    dedup_one "${label}" "${out_path}"
+    return 0
+  fi
+  echo "==== 采 C_${label} (${supervision}) -> ${out_path} ===="
+  python -m onereplay.scripts.collect_cov \
+    --seed "${SEED}" \
+    --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+    --use_bf16 "${USE_BF16}" \
+    --cache_dir "${DATASET_CACHE}" \
+    --use_chat_template 1 --include_target_in_chat 1 \
+    --enable_thinking 0 --concat_prompt_target 0 \
+    --cov_supervision "${supervision}" \
+    --debug_print_examples "${DEBUG_EXAMPLES}" \
+    --batch_size "${batch}" --max_len "${maxlen}" \
+    --truncation_side left \
+    --target_modules "${TARGET_MODULES}" \
+    --cov_accum_device "${COV_ACCUM_DEVICE}" \
+    --data_files "${data_file}" --dataset_split train \
+    --streaming 0 \
+    --input_column inputs --target_column "${TARGET_COLUMN}" \
+    --require_target 1 \
+    --max_samples 0 \
+    --sample_shuffle 0 --sample_seed "${SAMPLE_SEED}" \
+    --output_path "${out_path}"
+  ls -lh "${out_path}"
+  dedup_one "${label}" "${out_path}"
+}
+
+# ---- Step 1-3: 三份主 C ----
+if [[ "${DO_IF}" == "1" ]]; then
+  collect_one if "${IF_COV}" "${IF_MAXLEN}" "${IF_COV_BATCH}" "${COV_SUPERVISION}" "${IF_FILE}"
+fi
+if [[ "${DO_MATH}" == "1" ]]; then
+  collect_one math "${MATH_COV}" "${MATH_MAXLEN}" "${MATH_COV_BATCH}" "${COV_SUPERVISION}" "${MATH_FILE}"
+fi
+if [[ "${DO_CODE}" == "1" ]]; then
+  collect_one code "${CODE_COV}" "${CODE_MAXLEN}" "${CODE_COV_BATCH}" "${COV_SUPERVISION}" "${CODE_FILE}"
+fi
+
+# ---- Step 4: all_tokens 版 C_math（对照）----
+if [[ "${DO_MATH_ALLTOK}" == "1" ]]; then
+  collect_one math_alltok "${MATH_ALLTOK_COV}" "${MATH_MAXLEN}" "${MATH_COV_BATCH}" all_tokens "${MATH_FILE}"
+fi
+
+# ===========================================================================
+# Step 5: 诊断
+#   1) 层覆盖断言：每一份 C 的 key 数必须等于 len(TARGET_MODULES) x num_layers
+#   2) 分模块 trace + 监督 token 占比
+#   3) C_math ans vs alltok：同池断言 + trace 比值 + 等强度 λ 换算
+#   4) λ 起点：在 q_proj/v_proj 上比 1.7B 的 C_if
+# ===========================================================================
+if [[ "${DO_DIAG}" == "1" ]]; then
+  set +x
+  echo "==== Step 5: 诊断 ===="
+  python - <<'PY'
+import json, os
+
+import torch
+
+model_dir = os.path.join(os.environ["MODEL_DIR"], os.environ["MODEL_NAME"])
+with open(os.path.join(model_dir, "config.json")) as fh:
+    cfg = json.load(fh)
+layers = cfg["num_hidden_layers"]
+targets = [m.strip() for m in os.environ["TARGET_MODULES"].split(",") if m.strip()]
+expect = sum(1 if m == "lm_head" else layers for m in targets)
+
+
+def load_cov(path):
+    """mmap 读：一份 C 有 36 GB，诊断只需要对角线，不必整份进常驻内存。"""
+    try:
+        payload = torch.load(path, map_location="cpu", mmap=True)
+    except (TypeError, RuntimeError):
+        payload = torch.load(path, map_location="cpu")
+    return payload["covariances"], payload.get("metadata", {})
+
+
+def class_of(name):
+    return name.rsplit(".", 1)[-1]
+
+
+def summarize(path, label):
+    covs, meta = load_cov(path)
+    n = len(covs)
+    sup = meta.get("supervised_tokens") or 0
+    total = meta.get("total_tokens") or 0
+    print(f"---- C_{label}: {path}")
+    print(f"     pool_rows={meta.get('pool_rows')} fingerprint={meta.get('pool_fingerprint')}")
+    print(f"     supervision={meta.get('cov_supervision')} tokens {sup}/{total}"
+          f" ({sup / max(total, 1):.1%}) zero_rows={meta.get('zero_supervision_rows')}"
+          f" prefix_mismatch={meta.get('prompt_prefix_mismatches')}")
+    print(f"     max_len={meta.get('max_len')} accum={meta.get('cov_accum_device')}")
+    print(f"     层数 {n} / 期望 {expect}")
+    # 按存储计，不按 key：去重后几个 key 共用一份，这一行才反映真实占用。
+    unique = {m.data_ptr(): m.numel() * m.element_size() for m in covs.values()}
+    print(f"     存储 {sum(unique.values()) / 2**30:.2f} GiB（{len(unique)} 份不同矩阵 / {n} 个 key，"
+          f"dedup={'是' if meta.get('dedup_source') else '否'}）")
+    if n != expect:
+        got = sorted({class_of(k) for k in covs})
+        raise SystemExit(
+            f"!! C_{label} 只覆盖了 {n} 层，期望 {expect}。实际模块类: {got}\n"
+            f"   regularizer 对缺 C 的层是静默跳过的，拿这份去训会让正则只覆盖一部分。"
+        )
+
+    per_class = {}
+    for name, mat in covs.items():
+        # tr(C)/d = 每个方向的平均能量，跨维度可比
+        per_class.setdefault(class_of(name), []).append(float(torch.diagonal(mat).float().mean()))
+    print(f"     {'module':<10} {'层数':>4} {'mean tr(C)/d':>16}")
+    for cls in targets:
+        vals = per_class.get(cls, [])
+        if vals:
+            print(f"     {cls:<10} {len(vals):>4} {sum(vals)/len(vals):>16.4e}")
+    return {cls: sum(v) / len(v) for cls, v in per_class.items()}, meta
+
+
+paths = [
+    (os.environ["IF_COV"], "if"),
+    (os.environ["MATH_COV"], "math"),
+    (os.environ["CODE_COV"], "code"),
+    (os.environ["MATH_ALLTOK_COV"], "math_alltok"),
+]
+stats = {}
+for path, label in paths:
+    if os.path.isfile(path):
+        stats[label] = summarize(path, label)
+    else:
+        print(f"---- C_{label}: 未生成，跳过 ({path})")
+
+print()
+print("---- C_math: assistant_only vs all_tokens")
+if os.environ["COV_SUPERVISION"] != "assistant_only":
+    print("     主 C 不是 assistant_only，这一节不适用。")
+elif "math" in stats and "math_alltok" in stats:
+    ans, ans_meta = stats["math"]
+    alt, alt_meta = stats["math_alltok"]
+    if ans_meta.get("pool_fingerprint") != alt_meta.get("pool_fingerprint"):
+        raise SystemExit(
+            "!! 两份 C_math 的 pool_fingerprint 不同，对照里混进了行集差异，不成立。\n"
+            f"   ans={ans_meta.get('pool_fingerprint')} alltok={alt_meta.get('pool_fingerprint')}"
+        )
+    print(f"     同池: fingerprint={ans_meta.get('pool_fingerprint')}")
+    print(f"     {'module':<10} {'ans':>12} {'alltok':>12} {'alltok/ans':>11}")
+    for cls in targets:
+        if cls in ans and cls in alt:
+            print(f"     {cls:<10} {ans[cls]:>12.4e} {alt[cls]:>12.4e} {alt[cls] / ans[cls]:>11.3f}")
+    shared = [cls for cls in targets if cls in ans and cls in alt]
+    ratio = sum(alt[c] for c in shared) / sum(ans[c] for c in shared)
+    print(f"     全模块 alltok/ans = {ratio:.3f}")
+    print(f"     等强度 λ_alltok ≈ λ_ans / {ratio:.3f}（按 λ x tr(C) 换算，只当扫描中心点）")
+else:
+    print("     两份 C_math 没有同时在，跳过。")
+
+ref_path = os.environ.get("REF_COV_17B", "")
+ref_lambda = float(os.environ.get("REF_LAMBDA", "3e-2"))
+print()
+print("---- λ 起点")
+if not os.path.isfile(ref_path):
+    print(f"     找不到 1.7B 参照 {ref_path}，跳过换算。")
+    print(f"     只能给经验起点：从 {ref_lambda} 开始扫 0.5x / 1x / 2x。")
+else:
+    ref_covs, _ = load_cov(ref_path)
+    ref_vals = [
+        float(torch.diagonal(m).float().mean())
+        for k, m in ref_covs.items()
+        if class_of(k) in ("q_proj", "v_proj")
+    ]
+    ref_mean = sum(ref_vals) / len(ref_vals)
+    print(f"     1.7B C_if (qv, all_tokens, {len(ref_vals)} 层) mean tr(C)/d = {ref_mean:.4e}")
+    print(f"     参照 λ = {ref_lambda}")
+    print()
+    print(f"     {'C':<12} {'8B qv mean':>14} {'比值':>8} {'等强度 λ':>12}")
+    for label, (per_class, _) in stats.items():
+        qv = [per_class[c] for c in ("q_proj", "v_proj") if c in per_class]
+        if not qv:
+            continue
+        mean = sum(qv) / len(qv)
+        ratio = mean / ref_mean
+        print(f"     {label:<12} {mean:>14.4e} {ratio:>8.3f} {ref_lambda/ratio:>12.3e}")
+    print()
+    print("     !! 一阶近似：约束强度正比于 λ x tr(C)。参照那份是 all_tokens，")
+    print("     与 assistant_only 的 C 比时 trace 已经把尺度差吸收进比值，但训练后")
+    print("     A/B 的实际尺度不是 trace 能预测的。当扫描中心点，扫 0.5x / 1x / 2x。")
+PY
+  set -x
+fi
+
+set +x
+echo "========================================================================"
+echo "采集完成。产物："
+ls -lh "${COV_DIR}" || true
+echo
+echo "下一步："
+echo "  1) replay 臂与本脚本同池："
+echo "       --replay_self_distill_file ${SD_DIR}/<domain>_pool_selfdistill_${MODEL_NAME}.jsonl"
+echo "       --replay_target_column ${TARGET_COLUMN} --replay_drop_truncated 1"
+echo "  2) OneReplay 臂用 ${COV_SUPERVISION} 的三份 C，按 Step 5 的 λ 起点扫 0.5x / 1x / 2x"
+echo "  3) 监督范围对照（math）：C_math(ans) 与 C_math(alltok) 两条臂各自扫 λ，"
+echo "     比各自最好的点；alltok 的扫描中心用 Step 5 给的等强度换算"
+echo "========================================================================"

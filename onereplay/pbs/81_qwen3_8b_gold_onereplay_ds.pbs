@@ -16,6 +16,27 @@
 # 并排打出来。
 #
 # -----------------------------------------------------------------------------
+# 09-23 这一轮的三处改动（下文里提到 68 号 / gold C 的地方都是改动之前的口径）
+#
+#   1) C 默认换成 109 号采的 8B 自蒸馏 C，只保护答案（COV_SOURCE=sd, COV_SUP=ans）。
+#        COV_SUP=alltok    整句版 C（prompt + 答案都进 C），109 号只采了 math 这一份，
+#                          用来对照「只保护答案」是不是更好
+#        COV_SOURCE=gold   退回 68 号的 gold C
+#      run 名里的域标签分别是 <域>sd / <域>sd-alltok / <域>gold，互不覆盖。
+#      !! 三种 C 的 trace 不同，λ 不能互相搬，每种各自扫。
+#
+#   2) 评测只跑保护域自己的指标，外加新任务 dialogsum：
+#        if    ifeval + ifbench
+#        math  gsm8k + math500
+#        code  humaneval + mbpp
+#        mix   参与混合的各域的并集（默认 math+code，即 gsm8k/math500/humaneval/mbpp）
+#
+#   3) 训练完打一次 old val loss：保护域 val500 上基座自己的贪心答案（107 号生成的
+#      语料），CE 越低说明越接近基座。mix 的各个域分开报。见「训练后：old val loss」。
+#      val500 是 93 号切池时留出的尾巴，108/109 号的池不含这些行，所以自蒸馏 C
+#      没见过它们；68 号的 gold C 是全池采的，**见过**这些行，gold 臂这一列偏乐观。
+#
+# -----------------------------------------------------------------------------
 # 与 Commonsense170k 线（70 号）的关系：同一套框架，换新任务
 #
 #   C 一个字都不用改，68 号采的那份直接复用 —— C 来自 FLAN，与训练什么无关。
@@ -35,12 +56,12 @@
 #   单域：三个域 x 三个 λ（0.5x / 1x / 2x）= 9 次投递，每次只改 DOMAIN 与
 #   LAMBDA，run 名把两者都编进去，互不覆盖。
 #
-#   评测口径按域走（文档 09-09 第一节）：
-#       DOMAIN=if    评 ifeval + gsm8k + math500 + humaneval + mbpp
-#       DOMAIN=math  评 ifeval + gsm8k + math500
-#       DOMAIN=code  评 ifeval + humaneval + mbpp
-#   if always on：数学分数被格式主导（文档 2.2 节），没有 IFEval 就分不清
-#   「数学掉了」和「不知道该用什么格式答题」。
+#   评测口径按域走，只评保护域自己的指标（09-23 起，见文件头第 2 条）。
+#   之前每个域都带 ifeval，理由是数学分数被格式主导（文档 2.2 节）；现在为了省
+#   评测时间去掉了，math/code 臂要区分「能力掉了」和「格式乱了」时单独补评:
+#       qsub -v DRY_RUN=0,DOMAIN=math,LAMBDA=...,DO_TRAIN=0,EVAL_METRICS=ifeval <本脚本>
+#   EVAL_METRICS 整个替换按域推出来的列表（多个用冒号），dialogsum 仍由
+#   WITH_DIALOGSUM 单独控制。
 #
 # -----------------------------------------------------------------------------
 # DOMAIN=mix：一份 C 能不能同时保住两个域
@@ -306,6 +327,9 @@ if [[ "${ONEREPLAY_IN_CONTAINER:-0}" != "1" ]]; then
     DATASET_CACHE OUT_DIR
     DRY_RUN DO_TRAIN DO_EVAL FORCE_TRAIN FORCE_EVAL PROBE ALLOW_DRIFT COV_DIAG
     DOMAIN LAMBDA LAMBDAS PROBE_STEPS PROBE_LOG_EVERY COV_PATH IF_COV MATH_COV CODE_COV
+    COV_SOURCE COV_SUP EVAL_METRICS
+    DO_OLDVAL FORCE_OLDVAL SDVAL_DIR OLDVAL_ROWS OLDVAL_MAXLEN OLDVAL_BATCH OLDVAL_ROW_BATCH
+    OLDVAL_VERIFY OLDVAL_OUT OLDVAL_REF OLDVAL_PER_ROW_DIR
     MIX_DOMAINS MIX_WEIGHTS MIX_COV FORCE_MIX WITH_RETENTION
     REGULARIZER IDENTITY_COV REG_ONCE NORM_BY_LAYERS
     SEED EPOCHS LR BATCH ACCUM MAXLEN VAL_FRAC MAXVAL
@@ -436,10 +460,42 @@ REG_ONCE="${REG_ONCE:-1}"        # 罚项每次参数更新算一次，不是每
 NORM_BY_LAYERS="${NORM_BY_LAYERS:-1}"   # λ 的换算是在这个前提下做的，改了 λ 就换了尺子
 IDENTITY_COV="${IDENTITY_COV:-0}" # 1 = C 换成单位矩阵，退化成 L2 对照臂
 
-# 68 号的三份 C。名字里的 _8b_all 是与 1.7B 的 _qv 版区分的唯一标记。
-IF_COV="${IF_COV:-${COV_DIR}/cov_flan_chat_20k_8b_all.pt}"
-MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_8b_all.pt}"
-CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_8b_all.pt}"
+# ---- C 的来源（文件头第 1 条）----
+COV_SOURCE="${COV_SOURCE:-sd}"   # sd = 109 号自蒸馏 C；gold = 68 号 gold C
+COV_SUP="${COV_SUP:-ans}"        # 只对 sd 有效：ans = 只保护答案，alltok = 整句
+case "${COV_SOURCE}" in
+  gold)
+    if [[ "${COV_SUP}" != "ans" ]]; then
+      echo "!! COV_SUP=${COV_SUP} 只对 COV_SOURCE=sd 有效，68 号的 gold C 没有整句/答案两个版本"
+      exit 1
+    fi
+    SRC_TAG="gold"
+    COV_PRODUCER="68 号"
+    WANT_SUP=""                  # 68 号采集时没显式传 --cov_supervision，不核对
+    ;;
+  sd)
+    case "${COV_SUP}" in
+      ans)    SRC_TAG="sd";        WANT_SUP="assistant_only" ;;
+      alltok) SRC_TAG="sd-alltok"; WANT_SUP="all_tokens" ;;
+      *) echo "!! COV_SUP 只能是 ans / alltok，得到 '${COV_SUP}'"; exit 1 ;;
+    esac
+    COV_PRODUCER="109 号"
+    ;;
+  *) echo "!! COV_SOURCE 只能是 sd / gold，得到 '${COV_SOURCE}'"; exit 1 ;;
+esac
+
+# 名字里的 _8b_all 是与 1.7B 的 _qv 版区分的唯一标记。
+if [[ "${COV_SOURCE}" == "gold" ]]; then
+  IF_COV="${IF_COV:-${COV_DIR}/cov_flan_chat_20k_8b_all.pt}"
+  MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_metamath30k_gold_8b_all.pt}"
+  CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_opcedu20k_gold_8b_all.pt}"
+  MIX_COV_SUFFIX="gold_8b_all"
+else
+  IF_COV="${IF_COV:-${COV_DIR}/cov_if_sd_8b_all_${COV_SUP}.pt}"
+  MATH_COV="${MATH_COV:-${COV_DIR}/cov_math_sd_8b_all_${COV_SUP}.pt}"
+  CODE_COV="${CODE_COV:-${COV_DIR}/cov_code_sd_8b_all_${COV_SUP}.pt}"
+  MIX_COV_SUFFIX="sd_8b_all_${COV_SUP}"
+fi
 
 cov_for_domain () {
   case "$1" in
@@ -480,21 +536,23 @@ if [[ "${DOMAIN}" == "mix" ]]; then
   done
   # 域和权重都进标签：0.5/0.5 与 0.25/0.75 是两个不同的 C，adapter 不能互相覆盖。
   MIX_TAG="mix-$(IFS=-; printf '%s' "${MIX_DOMAIN_LIST[*]}")-w$(IFS=-; printf '%s' "${MIX_WEIGHT_LIST[*]}")"
-  DOMAIN_TAG="${MIX_TAG}-gold"
-  MIX_COV="${MIX_COV:-${COV_DIR}/cov_${MIX_TAG}_gold_8b_all.pt}"
+  DOMAIN_TAG="${MIX_TAG}-${SRC_TAG}"
+  MIX_COV="${MIX_COV:-${COV_DIR}/cov_${MIX_TAG}_${MIX_COV_SUFFIX}.pt}"
   COV_PATH="${COV_PATH:-${MIX_COV}}"
 else
-  DOMAIN_TAG="${DOMAIN}gold"
+  DOMAIN_TAG="${DOMAIN}${SRC_TAG}"
   COV_PATH="${COV_PATH:-$(cov_for_domain "${DOMAIN}")}"
 fi
 
 # 本脚本打印的每一条 qsub 建议都用这个。mix 下漏掉 MIX_*，抄下来的命令会退回
-# 默认的 math:code / 0.5:0.5，投出去跑的就是另一个实验了。
+# 默认的 math:code / 0.5:0.5，投出去跑的就是另一个实验了。C 来源同理。
 if [[ "${DOMAIN}" == "mix" ]]; then
   DOMAIN_ARGS="DOMAIN=mix,MIX_DOMAINS=${MIX_DOMAINS//,/:},MIX_WEIGHTS=${MIX_WEIGHTS//,/:}"
 else
   DOMAIN_ARGS="DOMAIN=${DOMAIN}"
 fi
+[[ "${COV_SOURCE}" != "sd" ]] && DOMAIN_ARGS="${DOMAIN_ARGS},COV_SOURCE=${COV_SOURCE}"
+[[ "${COV_SUP}" != "ans" ]] && DOMAIN_ARGS="${DOMAIN_ARGS},COV_SUP=${COV_SUP}"
 
 # ---- λ 扫描 ----
 # 传 LAMBDAS 就进扫描模式：网格上每个 λ 各跑 MAX_STEPS 步，不评测不存 adapter，
@@ -611,24 +669,56 @@ WITH_RETENTION="${WITH_RETENTION:-1}"
 EXTRA_MODELS="${EXTRA_MODELS:-}" # "name;/abs/path" 用 | 分隔，额外要评的已有 run
 MIN_HOST_FREE_GIB="${MIN_HOST_FREE_GIB:-4}"   # C 之外还要留给主机的余量
 
-# 按域决定评哪些指标（文档 09-09 第一节的口径）
-case "${DOMAIN}" in
-  if)   DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
-  math) DOMAIN_METRICS="ifeval gsm8k math500" ;;
-  code) DOMAIN_METRICS="ifeval humaneval mbpp" ;;
-  # mix 保的是两个域，就必须两边都评。只评其中一边的话，「另一边被挤掉了」这个
+# 按域决定评哪些指标：只评保护域自己的（文件头第 2 条）
+metrics_for_domain () {
+  case "$1" in
+    if)   printf '%s' "ifeval" ;;
+    math) printf '%s' "gsm8k math500" ;;
+    code) printf '%s' "humaneval mbpp" ;;
+  esac
+}
+EVAL_METRICS="${EVAL_METRICS:-}"
+if [[ -n "${EVAL_METRICS}" ]]; then
+  DOMAIN_METRICS="${EVAL_METRICS//[,:]/ }"
+elif [[ "${DOMAIN}" == "mix" ]]; then
+  # mix 保的是几个域，就必须每个域都评。只评其中一边的话，「另一边被挤掉了」这个
   # 最可能的失败模式根本不会出现在表里 —— 而那正是这一臂要回答的问题。
-  # 当前只有 if / math / code 三个域，if 域本身就是全集，math 与 code 的并集也是
-  # 全集，所以任何两域组合的口径都在这里。以后加了新域要改成按 MIX_DOMAINS 推。
-  mix)  DOMAIN_METRICS="ifeval gsm8k math500 humaneval mbpp" ;;
-esac
+  DOMAIN_METRICS=""
+  for d in "${MIX_DOMAIN_LIST[@]}"; do
+    DOMAIN_METRICS="${DOMAIN_METRICS}${DOMAIN_METRICS:+ }$(metrics_for_domain "${d}")"
+  done
+else
+  DOMAIN_METRICS="$(metrics_for_domain "${DOMAIN}")"
+fi
 # IFEval 的 25 类约束是公开的，「IFEval 没掉」有可能只是记住了那 25 类模板。
 # IFBench 换了 58 类训练时没见过的约束，两个一起看才能区分「能力保住了」和
-# 「模板记住了」。跟着 ifeval 走：哪个域评 ifeval，哪个域就评 ifbench。
+# 「模板记住了」。跟着 ifeval 走：评 ifeval 的臂才评 ifbench。
 # 依赖没装好时下面的 AVAIL 会自动跳过它，不会连累别的指标。
 WITH_IFBENCH="${WITH_IFBENCH:-1}"
-if [[ "${WITH_IFBENCH}" == "1" ]]; then
+if [[ "${WITH_IFBENCH}" == "1" && " ${DOMAIN_METRICS} " == *" ifeval "* \
+      && " ${DOMAIN_METRICS} " != *" ifbench "* ]]; then
   DOMAIN_METRICS="${DOMAIN_METRICS} ifbench"
+fi
+
+# ---- 训练后的 old val loss（文件头第 3 条）----
+# 语料是 107 号 STAGE=gen 的产物：保护域 val500 上基座的贪心答案。base 与 vanilla
+# 的分数优先复用 107 号那份结果（OLDVAL_REF），缺了才在本作业里补打。
+DO_OLDVAL="${DO_OLDVAL:-1}"
+FORCE_OLDVAL="${FORCE_OLDVAL:-0}"          # 1 = 本臂已有记录也重打
+SDVAL_DIR="${SDVAL_DIR:-${RESULTS_ROOT}/selfdistill_val}"
+OLDVAL_ROWS="${OLDVAL_ROWS:-500}"
+OLDVAL_MAXLEN="${OLDVAL_MAXLEN:-2048}"     # = 107 号的 SCORE_MAXLEN，改了就和它的 base 不可比
+OLDVAL_BATCH="${OLDVAL_BATCH:-8}"
+OLDVAL_ROW_BATCH="${OLDVAL_ROW_BATCH:-4}"
+OLDVAL_VERIFY="${OLDVAL_VERIFY:-0}"        # 107 号已经核对过逐行与 evaluate_probe 一致
+OLDVAL_OUT="${OLDVAL_OUT:-${RESULTS_ROOT}/probe_ce/selfdistill_val_onereplay_ds.jsonl}"
+OLDVAL_REF="${OLDVAL_REF:-${RESULTS_ROOT}/probe_ce/selfdistill_val.jsonl}"
+OLDVAL_PER_ROW_DIR="${OLDVAL_PER_ROW_DIR:-${RESULTS_ROOT}/probe_ce/per_row_sdval}"
+OLDVAL_REPORT="${RESULTS_ROOT}/probe_ce/oldval_reports/${RUN}.txt"
+if [[ "${DOMAIN}" == "mix" ]]; then
+  OLDVAL_DOMAINS="${MIX_DOMAIN_LIST[*]}"
+else
+  OLDVAL_DOMAINS="${DOMAIN}"
 fi
 # dialogsum 不按域走：它是新任务，三个域的臂都在同一份 DialogSum 上训练，所以
 # 三个域都得知道自己在新任务上退了多少。这也是判断 λ 选大了的唯一直接证据 ——
@@ -661,6 +751,7 @@ echo "========================================================================"
 echo "Qwen3-8B OneReplay 臂：保护 ${DOMAIN}"
 echo "  run      = ${RUN}"
 echo "  分母     = base / ${VANILLA_RUN}   (74 号产出)"
+echo "  C 来源   = COV_SOURCE=${COV_SOURCE} COV_SUP=${COV_SUP}   (${COV_PRODUCER}，域标签 ${SRC_TAG})"
 echo "  C        = ${COV_PATH}"
 if [[ "${DOMAIN}" == "mix" ]]; then
   echo "             = ${MIX_FORMULA}"
@@ -682,6 +773,8 @@ echo "             eval_batch ${EVAL_BATCH} / seed ${SEED} / max_steps ${MAX_STE
 echo "  评测     = ${DOMAIN_METRICS}"
 echo "             预算 math ${MATH_MAX_NEW_TOKENS} / code ${CODE_MAX_NEW_TOKENS} / ifeval ${IF_MAX_NEW_TOKENS} / ifbench ${IFBENCH_MAX_NEW_TOKENS}"
 echo "             batch math ${MATH_BATCH} / code ${CODE_BATCH} / ifeval ${IFEVAL_BATCH} / ifbench ${IFBENCH_BATCH}"
+echo "  old val  = ${OLDVAL_DOMAINS} @ ${SDVAL_DIR}/<域>_val${OLDVAL_ROWS}_selfdistill_${MODEL_NAME}.jsonl"
+echo "             max_len ${OLDVAL_MAXLEN}   DO_OLDVAL=${DO_OLDVAL}   -> ${OLDVAL_OUT}"
 echo "  阶段     = train:${DO_TRAIN} eval:${DO_EVAL} probe:${PROBE} DRY_RUN=${DRY_RUN}"
 echo "  OUT_DIR  = ${OUT_DIR}"
 echo "========================================================================"
@@ -748,7 +841,7 @@ if [[ "${DOMAIN}" == "mix" ]]; then
   if [[ -f "${COV_PATH}" && "${FORCE_MIX}" != "1" ]]; then
     echo "     C_mix 已存在，复用（FORCE_MIX=1 可重建）。"
   elif (( MIX_SOURCES_OK == 0 )); then
-    echo "!! 源 C 不齐，合不出 C_mix。先跑 68 号把缺的域采出来。"
+    echo "!! 源 C 不齐，合不出 C_mix。先跑 ${COV_PRODUCER}把缺的域采出来。"
     exit 1
   elif [[ "${DRY_RUN}" == "1" ]]; then
     echo "     DRY_RUN=1：不合成（读两份 33.75 GiB 再写一份，约 10-20 min I/O）。"
@@ -817,7 +910,10 @@ fi
     echo "   DOMAIN=mix 的 C 是合成出来的，上面那一节在 DRY_RUN=1 下不会真的去合。"
     echo "   传 DRY_RUN=0 让本脚本自动合成，或先手工跑一次 mix_covariances。"
   else
-    echo "   先跑 68 号采本域的 C（DRY_RUN=1 会先做空间预检）。"
+    echo "   先跑 ${COV_PRODUCER}采本域的 C（DRY_RUN=1 会先做空间预检）。"
+    if [[ "${COV_SUP}" == "alltok" ]]; then
+      echo "   109 号默认只采 math 的整句版；if/code 的整句版要用 COV_SUPERVISION=all_tokens 另采。"
+    fi
   fi
   exit 1
 }
@@ -888,7 +984,7 @@ else
   LAMBDA_GRID="${LAMBDA}"
 fi
 export MODEL_DIR MODEL_NAME COV_PATH TARGET_MODULES LAMBDA LAMBDA_GRID DOMAIN COV_DIAG
-export IDENTITY_COV NORM_BY_LAYERS MIN_HOST_FREE_GIB BATCH MAXLEN
+export IDENTITY_COV NORM_BY_LAYERS MIN_HOST_FREE_GIB BATCH MAXLEN WANT_SUP
 COV_REPORT_FILE="${TMPDIR}/cov_preflight_${RUN}.txt"
 
 if ! python - <<'PY' 2>&1 | tee "${COV_REPORT_FILE}"; then
@@ -947,9 +1043,21 @@ print(f"               cov_accum_device={meta.get('cov_accum_device')} "
       f"normalization={meta.get('cov_normalization')}")
 print(f"               pool_fingerprint={meta.get('pool_fingerprint')}")
 print(f"               model={meta.get('model_name')}")
+print(f"               cov_supervision={meta.get('cov_supervision')}")
 print(f"层数         = {len(covs)} / 期望 {expect} ({len(targets)} 类 x {layers} 层)")
 
 failures = []
+# 整句版与答案版的 C 文件结构完全相同，放错了不会有任何别的报错。合成的 C_mix
+# 顶层没有这个字段，逐份查它的 source_metadata。
+want_sup = os.environ.get("WANT_SUP", "")
+sources = [meta] if "cov_supervision" in meta else list(meta.get("source_metadata") or [])
+got_sups = [src.get("cov_supervision") for src in sources if src.get("cov_supervision")]
+if got_sups and meta.get("source_metadata"):
+    print(f"               源 C 的 cov_supervision={got_sups}")
+if want_sup and any(sup != want_sup for sup in got_sups):
+    failures.append(
+        f"C 的 cov_supervision={got_sups}，而本次要的是 {want_sup}（COV_SUP 与文件不符）"
+    )
 if len(covs) != expect:
     got = sorted({class_of(key) for key in covs})
     failures.append(
@@ -1345,10 +1453,12 @@ set -x
 #   peak memory / epoch wall time / covariance_memory_gb 不开 profile 也照样
 #   写进 metrics jsonl。
 # ===========================================================================
+TRAINED_THIS_JOB=0
 if [[ "${DO_TRAIN}" == "1" ]]; then
   if [[ "${FORCE_TRAIN}" != "1" && "${SAVE}" == "1" && -d "${ADAPTERS}/${RUN}" ]]; then
     echo "跳过训练 ${RUN}：adapter 已存在（FORCE_TRAIN=1 可强制重训）"
   else
+    TRAINED_THIS_JOB=1
     mkdir -p "${RESULTS_ROOT}/map_cache/${RUN}"
     echo "==== train: ${RUN} (C=${COV_PATH} λ=${LAMBDA}) ===="
     # 训练输出同时留一份文件：层覆盖那句只在 stdout 上，metrics jsonl 里没有。
@@ -1549,6 +1659,199 @@ print("训练自检通过。")
 PY
 else
   echo "note: 没有 ${METRICS_FILE}，跳过 metrics 自检"
+fi
+
+# ===========================================================================
+# 训练后：old val loss（CE 对基座自己的贪心答案，107 号那把尺子）
+#   保护 if 就打 if 的 val500，math / code 同理，mix 把参与的域各打一份、分开报。
+#   只有前向，500 行一个域几分钟；放在评测前面，这样 DO_EVAL=0 或评测被 walltime
+#   砍掉时这一列也已经落盘了。
+#
+#   !! 它量的是行为漂移（离基座的输出多远），不是能力。OneReplay 的罚项本身就在压
+#   ΔW，这把尺子天然偏向它，要和 benchmark 并排读，不能单独当遗忘的证据。
+# ===========================================================================
+if [[ "${DO_OLDVAL}" != "1" ]]; then
+  echo "DO_OLDVAL=0：跳过 old val loss。"
+elif [[ "${SAVE}" != "1" || ! -d "${ADAPTERS}/${RUN}" ]]; then
+  echo "note: 没有 adapter ${ADAPTERS}/${RUN}（短跑或训练没存），跳过 old val loss。"
+else
+  echo ""
+  echo "==== old val loss: ${RUN}（域: ${OLDVAL_DOMAINS}）===="
+  OLDVAL_PROBES=""
+  OLDVAL_NAMES=""
+  for d in ${OLDVAL_DOMAINS}; do
+    sd_file="${SDVAL_DIR}/${d}_val${OLDVAL_ROWS}_selfdistill_${MODEL_NAME}.jsonl"
+    sd_meta="${sd_file%.jsonl}.meta.json"
+    if [[ ! -f "${sd_file}" || ! -f "${sd_meta}" ]]; then
+      echo "  ${d}: 缺 ${sd_file} 或它的 .meta.json，跳过这个域"
+      echo "      先生成: qsub -v STAGE=gen,DOMAINS=${d} onereplay/pbs/107_selfdistill_old_val.pbs"
+      continue
+    fi
+    # 别的基座生成的语料照样能打分，只是得到的是"离另一个模型的输出多远"。
+    if ! META="${sd_meta}" WANT_MODEL="${MODEL_NAME}" WANT_MAXLEN="${OLDVAL_MAXLEN}" \
+         python - <<'PY'
+import json
+import os
+import sys
+
+meta = json.load(open(os.environ["META"], encoding="utf-8"))
+problems = []
+if meta.get("model_name") != os.environ["WANT_MODEL"]:
+    problems.append(f"生成它的是 {meta.get('model_name')}，本次基座是 {os.environ['WANT_MODEL']}")
+if not meta.get("complete"):
+    problems.append("meta.complete 不是 true，语料没写完")
+if int(meta.get("max_len", 0)) > int(os.environ["WANT_MAXLEN"]):
+    problems.append(f"生成 max_len {meta.get('max_len')} > 打分 max_len {os.environ['WANT_MAXLEN']}")
+for item in problems:
+    print(f"      {item}")
+sys.exit(1 if problems else 0)
+PY
+    then
+      echo "  ${d}: !! 语料不准入，跳过这个域（原因见上）"
+      continue
+    fi
+    echo "  ${d}: ${sd_file}"
+    OLDVAL_PROBES="${OLDVAL_PROBES}${OLDVAL_PROBES:+,}${d}=${sd_file}"
+    OLDVAL_NAMES="${OLDVAL_NAMES}${OLDVAL_NAMES:+ }${d}"
+  done
+
+  if [[ -z "${OLDVAL_PROBES}" ]]; then
+    echo "!! 没有一份可用的自蒸馏 val 语料，old val loss 跳过（不影响后面的评测）。"
+  else
+    mkdir -p "$(dirname "${OLDVAL_OUT}")" "${OLDVAL_PER_ROW_DIR}" "$(dirname "${OLDVAL_REPORT}")"
+
+    # 某个 run 在给定的几份 jsonl 里有没有同口径（同 max_len、整份语料）的全部域。
+    oldval_has () {
+      NAME="$1" FILES="$2" PROBE_NAMES="${OLDVAL_NAMES}" WANT_MAXLEN="${OLDVAL_MAXLEN}" \
+      python - <<'PY'
+import json
+import os
+import sys
+
+want = int(os.environ["WANT_MAXLEN"])
+names = os.environ["PROBE_NAMES"].split()
+have = set()
+for path in os.environ["FILES"].split(","):
+    if not path or not os.path.isfile(path):
+        continue
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("run_name") != os.environ["NAME"]:
+                continue
+            if int(record.get("max_len", -1)) != want or int(record.get("probe_size") or 0) != 0:
+                continue
+            have.update(name for name in names if f"probe_{name}" in record)
+sys.exit(0 if set(names) <= have else 1)
+PY
+    }
+
+    oldval_score () {
+      local name="$1" adapter="$2"
+      python -m onereplay.scripts.score_probe_ce \
+        --model_dir "${MODEL_DIR}" --model_name "${MODEL_NAME}" \
+        --adapter_path "${adapter}" \
+        --run_name "${name}" \
+        --probes "${OLDVAL_PROBES}" \
+        --probe_size 0 \
+        --max_len "${OLDVAL_MAXLEN}" \
+        --batch_size "${OLDVAL_BATCH}" --row_batch_size "${OLDVAL_ROW_BATCH}" \
+        --replay_input_column inputs \
+        --replay_target_column targets \
+        --replay_drop_truncated 1 \
+        --map_cache_dir "${TMPDIR}/map_cache_oldval_${name}" \
+        --verify_aggregate "${OLDVAL_VERIFY}" \
+        --per_row_dir "${OLDVAL_PER_ROW_DIR}" \
+        --out "${OLDVAL_OUT}"
+    }
+
+    # 分母：base 与 vanilla。107 号通常已经打过，复用；缺了就在这里补。
+    for ref_spec in "base;" "${VANILLA_RUN};${ADAPTERS}/${VANILLA_RUN}"; do
+      ref_name="${ref_spec%%;*}"
+      ref_adapter="${ref_spec#*;}"
+      if oldval_has "${ref_name}" "${OLDVAL_REF},${OLDVAL_OUT}"; then
+        echo "  ${ref_name}: 已有同口径记录，复用"
+        continue
+      fi
+      if [[ -n "${ref_adapter}" && ! -d "${ref_adapter}" ]]; then
+        echo "  ${ref_name}: 找不到 ${ref_adapter}，表里这一列会是 '-'"
+        continue
+      fi
+      echo "  ${ref_name}: 没有同口径记录，补打"
+      oldval_score "${ref_name}" "${ref_adapter}" \
+        || echo "warning: ${ref_name} 的 old val loss 打分失败，表里这一列会是 '-'"
+    done
+
+    # 本臂：刚训完的一律重打，否则 FORCE_TRAIN 重训之后会读到旧 adapter 的数。
+    if [[ "${FORCE_OLDVAL}" == "1" || "${TRAINED_THIS_JOB}" == "1" ]] \
+       || ! oldval_has "${RUN}" "${OLDVAL_REF},${OLDVAL_OUT}"; then
+      oldval_score "${RUN}" "${ADAPTERS}/${RUN}" \
+        || echo "warning: 本臂的 old val loss 打分失败（不影响后面的评测），单独补: DO_TRAIN=0,DO_EVAL=0,FORCE_OLDVAL=1"
+    else
+      echo "  ${RUN}: 已有同口径记录，复用（FORCE_OLDVAL=1 可重打）"
+    fi
+
+    OLDVAL_REF="${OLDVAL_REF}" OLDVAL_OUT="${OLDVAL_OUT}" WANT_MAXLEN="${OLDVAL_MAXLEN}" \
+    PROBE_NAMES="${OLDVAL_NAMES}" RUN_NAME="${RUN}" VANILLA_NAME="${VANILLA_RUN}" \
+    MODEL_NAME="${MODEL_NAME}" \
+    python - <<'PY' | tee "${OLDVAL_REPORT}" || true
+import json
+import os
+
+want = int(os.environ["WANT_MAXLEN"])
+run_name = os.environ["RUN_NAME"]
+vanilla_name = os.environ["VANILLA_NAME"]
+
+# 先读 107 号的，再读本脚本的：同名同字段时后者覆盖前者，本作业刚打的数优先。
+records = {}
+for path in (os.environ["OLDVAL_REF"], os.environ["OLDVAL_OUT"]):
+    if not path or not os.path.isfile(path):
+        continue
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if int(record.get("max_len", -1)) != want or int(record.get("probe_size") or 0) != 0:
+                continue
+            records.setdefault(record["run_name"], {}).update(record)
+
+
+def fmt(value, spec, width):
+    return f"{'-' if value is None else format(value, spec):>{width}}"
+
+
+print("========================================================================")
+print(f"old val loss（CE 对 {os.environ['MODEL_NAME']} 自己的贪心答案，max_len {want}）")
+print("base 是这把尺子的下界不是 0；越接近 base 说明离基座的输出越近。")
+print("消除漂移 = (vanilla - 本臂) / (vanilla - base)，100% = 完全回到 base。")
+print("========================================================================")
+for domain in os.environ["PROBE_NAMES"].split():
+    key = f"probe_{domain}"
+    base = records.get("base", {}).get(key)
+    van = records.get(vanilla_name, {}).get(key)
+    info = records.get(run_name) or records.get("base") or {}
+    print(f"######## {domain}   {info.get(f'{domain}_rows')} 行 / "
+          f"{info.get(f'{domain}_supervised_tokens')} 个 supervised token")
+    print(f"  {'run':<72}{'CE':>9}{'vs base':>10}{'相对':>9}{'消除漂移':>10}")
+    for label, name in (("base", "base"), ("vanilla", vanilla_name), ("本臂", run_name)):
+        ce = records.get(name, {}).get(key)
+        diff = (ce - base) if (ce is not None and base is not None) else None
+        rel = (diff / base) if (diff is not None and base) else None
+        removed = None
+        if ce is not None and base is not None and van is not None and van != base:
+            removed = (van - ce) / (van - base)
+        print(
+            f"  {name:<72}"
+            + fmt(ce, ".4f", 9)
+            + fmt(diff, "+.4f", 10)
+            + fmt(rel, "+.1%", 9)
+            + fmt(removed if label == "本臂" else None, ".1%", 10)
+        )
+PY
+  fi
 fi
 set -x
 
@@ -2013,6 +2316,13 @@ if "dialogsum" in metric_names:
     print("  BERTScore 未做 baseline rescaling，绝对值天然在 0.8+，只有 delta 有意义。")
 PY
 
+# 训练后打的那张 old val loss 表在评测日志前面，几个小时的解码输出之后很难翻到，
+# 这里再贴一次。
+if [[ -s "${OLDVAL_REPORT}" ]]; then
+  echo ""
+  cat "${OLDVAL_REPORT}"
+fi
+
 echo ""
 echo "========================================================================"
 echo "接下来要做的事（文档 6.3 节）"
@@ -2042,7 +2352,7 @@ if [[ "${DOMAIN}" == "mix" ]]; then
   echo "   单域臂差得多时才算成立；若一侧保住、另一侧塌了，要报的是这个权衡，"
   echo "   而不是两边的平均分。对照的是同强度下的:"
   for d in "${MIX_DOMAIN_LIST[@]}"; do
-    echo "     ds_onereplay_8b_${d}gold_${RUN_TAG}_lam<等强度λ>_lr${LR}_seed${SEED}_regonce"
+    echo "     ds_onereplay_8b_${d}${SRC_TAG}_${RUN_TAG}_lam<等强度λ>_lr${LR}_seed${SEED}_regonce"
   done
   echo "   注意是**等强度**不是等 λ：C_mix 的 tr(C) 与任何一份单域 C 都不同，"
   echo "   同一个 λ 在两边不是一个量。拿各自扫描表里 λR/task_loss 相当的点来比。"
@@ -2056,6 +2366,9 @@ echo "  汇总      : ${OUT_DIR}/<metric>_summary.csv"
 echo "  逐题      : ${OUT_DIR}/<metric>/${RUN}/responses.jsonl"
 if [[ -n "${RETENTION_JSON}" ]]; then
   echo "  保留率    : ${RETENTION_JSON}"
+fi
+if [[ -s "${OLDVAL_REPORT}" ]]; then
+  echo "  old val   : ${OLDVAL_OUT}（表: ${OLDVAL_REPORT}）"
 fi
 if [[ "${DOMAIN}" == "mix" ]]; then
   echo "  C_mix     : ${COV_PATH}"
