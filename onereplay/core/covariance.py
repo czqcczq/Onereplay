@@ -32,12 +32,22 @@ def to_identity_covariances(
     from the covariance directions or merely from shrinking DeltaW.
 
     Module-name keys are preserved so lookup_covariance still matches layers.
+
+    One matrix is built per distinct (dim, dtype) and shared by every layer that
+    asks for it. An identity is fully determined by those two numbers, so the
+    per-layer copies the earlier version allocated were identical by
+    construction: Qwen3-8B's seven projections span only 4096 and 12288, which is
+    640 MiB of distinct content stored 252 times for 33.75 GiB. The control arm
+    was paying the full covariance footprint to hold 2 matrices.
     """
 
     identity: dict[str, torch.Tensor] = {}
+    by_shape: dict[tuple[int, torch.dtype], torch.Tensor] = {}
     for name, covariance in covariances.items():
-        dim = covariance.shape[-1]
-        identity[name] = torch.eye(dim, dtype=covariance.dtype)
+        key = (int(covariance.shape[-1]), covariance.dtype)
+        if key not in by_shape:
+            by_shape[key] = torch.eye(key[0], dtype=key[1])
+        identity[name] = by_shape[key]
     return identity
 
 
@@ -51,12 +61,28 @@ def move_covariances_to_device(
     The OneReplay penalty reads every target layer's covariance at every
     optimization step. Keeping C on CPU would repeatedly copy large matrices to
     GPU inside the training loop, so this helper pays that transfer cost once.
+
+    Entries that already share storage are moved once and keep sharing on the
+    device. C describes a layer's input, and a block feeds q_proj, k_proj and
+    v_proj from one layernorm output and gate_proj and up_proj from another, so
+    three of the seven matrices per layer are copies -- 6.75 GiB of the 33.75 GiB
+    that Qwen3-8B's full coverage costs. dedup_covariances.py makes that sharing
+    explicit in the file; a per-key .to() would silently undo it here, since each
+    call allocates its own destination.
+
+    Keyed on data_ptr rather than id: torch.load rebuilds shared storage as
+    distinct tensor objects, so identity does not survive a round trip through
+    the file but the pointer does.
     """
 
-    return {
-        name: covariance.to(device=device, dtype=dtype)
-        for name, covariance in covariances.items()
-    }
+    moved: dict[str, torch.Tensor] = {}
+    on_device: dict[int, torch.Tensor] = {}
+    for name, covariance in covariances.items():
+        key = covariance.data_ptr()
+        if key not in on_device:
+            on_device[key] = covariance.to(device=device, dtype=dtype)
+        moved[name] = on_device[key]
+    return moved
 
 
 def save_covariance_payload(

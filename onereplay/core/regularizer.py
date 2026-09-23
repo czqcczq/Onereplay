@@ -29,6 +29,24 @@ import torch
 from torch import nn
 
 
+def resident_bytes(tensors) -> int:
+    """Bytes these tensors hold on their device, counting shared storage once.
+
+    Several keys can name one matrix. C describes a layer's input, so q_proj,
+    k_proj and v_proj share theirs and so do gate_proj and up_proj, which
+    dedup_covariances.py turns into actual sharing rather than copies; tied
+    lm_head and embed_tokens reach a reference snapshot the same way. Summing
+    over .values() would count those copies that no longer exist and report a
+    cost the run is not paying, which matters here because this number is what
+    the cost tables quote as OneReplay's fixed overhead.
+    """
+
+    unique: dict[int, int] = {}
+    for tensor in tensors:
+        unique[tensor.data_ptr()] = tensor.numel() * tensor.element_size()
+    return sum(unique.values())
+
+
 def get_lora_weight_matrices(module: nn.Module, adapter_name: str = "default"):
     """Return A, B, and scale from one PEFT LoRA-wrapped linear module.
 
@@ -578,13 +596,12 @@ class ReplayRegularizer:
         """Bytes the covariance matrices occupy wherever they were moved.
 
         This is OneReplay's main fixed memory overhead over vanilla LoRA: one
-        d_in x d_in matrix per target layer, resident for the whole run.
+        d_in x d_in matrix per target layer, resident for the whole run -- minus
+        the layers that share one, which is why this counts storage rather than
+        keys. See resident_bytes.
         """
 
-        return sum(
-            covariance.numel() * covariance.element_size()
-            for covariance in self.covariances.values()
-        )
+        return resident_bytes(self.covariances.values())
 
     def reference_memory_bytes(self) -> int:
         """Bytes the W0 snapshot occupies; zero on the LoRA path.
@@ -601,10 +618,7 @@ class ReplayRegularizer:
 
         if not self.reference_weights:
             return 0
-        return sum(
-            reference.numel() * reference.element_size()
-            for reference in self.reference_weights.values()
-        )
+        return resident_bytes(self.reference_weights.values())
 
     def __call__(self, model: nn.Module) -> tuple[torch.Tensor, dict[str, float]]:
         if self.reference_weights is not None:
@@ -688,17 +702,14 @@ class EWCRegularizer:
         while F needs a backward pass per example.
         """
 
-        return sum(fisher.numel() * fisher.element_size() for fisher in self.fishers.values())
+        return resident_bytes(self.fishers.values())
 
     def reference_memory_bytes(self) -> int:
         """Bytes the W0 snapshot occupies; zero on the LoRA path."""
 
         if not self.reference_weights:
             return 0
-        return sum(
-            reference.numel() * reference.element_size()
-            for reference in self.reference_weights.values()
-        )
+        return resident_bytes(self.reference_weights.values())
 
     def __call__(self, model: nn.Module) -> tuple[torch.Tensor, dict[str, float]]:
         if self.reference_weights is not None:

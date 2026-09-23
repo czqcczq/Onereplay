@@ -977,7 +977,11 @@ if bad_dims:
         + (f" ...共 {len(bad_dims)} 处" if len(bad_dims) > 4 else "")
     )
 
-cov_bytes = sum(mat.numel() * 4 for mat in covs.values())  # 训练里统一升 fp32
+# 训练里统一升 fp32。按存储去重而不是按 key：C 描述的是层的**输入**，q/k/v 读同一个
+# input_layernorm 输出、gate/up 读同一个 post_attention_layernorm 输出，所以经
+# dedup_covariances.py 处理过的文件里这几个 key 指向同一份矩阵。按 values() 求和会
+# 把已经不存在的副本算进来，headroom 报小，反而挡住本来装得下的 BATCH。
+cov_bytes = sum({mat.data_ptr(): mat.numel() * 4 for mat in covs.values()}.values())
 weight_bytes = sum(p.stat().st_size for p in model_dir.glob("*.safetensors"))
 gpu_total = (
     torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else 0
